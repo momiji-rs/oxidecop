@@ -88,7 +88,7 @@ Current leaderboard (`ruby oracle/leaderboard.rb`), against RuboCop v1.88.0:
 
 ```
 cop                                  scored   skip         LOC        FULL
-Style/StringLiterals                     32      1    27/32       27/32       84%
+Style/StringLiterals                     32      1    31/32       31/32       97%
 Style/NilComparison                       8      0     6/8         6/8        75%
 Style/ZeroLengthPredicate                74      0    49/74       48/74       65%
 Style/Documentation                      43      4    22/43       22/43       51%
@@ -99,7 +99,7 @@ Style/RedundantReturn                    37      0    19/37       14/37       38
 Style/FrozenStringLiteralComment         90      3    40/90       31/90       34%
 Layout/LineLength                       141     14    32/141      32/141      23%
 ────────────────────────────────────────────────────────────────────────────
-TOTAL (representable examples)          520     28                222/520      43%
+TOTAL (representable examples)          520     28                226/520      43%
 ```
 
 **Read this honestly:** the score is over *representable* examples only. RuboCop's
@@ -138,8 +138,13 @@ C:  4:  8: Style/NilComparison: Prefer the use of the `nil?` predicate.
 ```
 
 Config support is a minimal `.rubocop.yml` subset: `AllCops: DisabledByDefault`,
-per-cop `Enabled`, and simple params (`Max`, `MinDigits`, …). No plugin/require
-support, no `EnforcedStyle` yet.
+per-cop `Enabled`, simple params (`Max`, `MinDigits`, …), and `EnforcedStyle`.
+Parameter defaults and each style cop's `SupportedStyles`/default live in one
+place — the `SCHEMA` table in `src/main.rs` (mirrors rubocop's `config/default.yml`),
+so a cop reads config through `Config::enforced_style`/`int` instead of hardcoding
+its own defaults. `Style/StringLiterals` dispatches on it (`single_quotes` ↔
+`double_quotes`); other style cops just need to be pointed at the same resolver.
+No plugin/require support yet.
 
 ## Repo layout
 

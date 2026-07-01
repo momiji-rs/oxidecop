@@ -53,6 +53,37 @@ fn render(template: &str, caps: &[String]) -> String {
     out
 }
 
+// ---------------- config SCHEMA (single source of truth) ----------------
+/// Per-cop config schema: parameter defaults and (for style cops) the supported
+/// `EnforcedStyle`s + default. This mirrors the relevant slice of rubocop's
+/// `config/default.yml` and is the ONE place defaults live — no default literals
+/// scattered at call sites, EnforcedStyle resolution/validation in one spot.
+/// Ideally generated from rubocop's own `config/default.yml` (see roadmap).
+struct Schema {
+    cop: &'static str,
+    /// (param, default-as-string). For style cops, includes `EnforcedStyle`.
+    params: &'static [(&'static str, &'static str)],
+    /// SupportedStyles — used to validate a configured `EnforcedStyle`.
+    styles: &'static [&'static str],
+}
+const SCHEMA: &[Schema] = &[
+    Schema { cop: "Layout/LineLength", params: &[("Max", "120")], styles: &[] },
+    Schema { cop: "Style/NumericLiterals", params: &[("MinDigits", "5")], styles: &[] },
+    Schema { cop: "Layout/TrailingWhitespace", params: &[("AllowInHeredoc", "false")], styles: &[] },
+    Schema { cop: "Style/StringLiterals", params: &[("EnforcedStyle", "single_quotes")],
+             styles: &["single_quotes", "double_quotes"] },
+    Schema { cop: "Style/NilComparison", params: &[("EnforcedStyle", "predicate")],
+             styles: &["predicate", "comparison"] },
+    Schema { cop: "Naming/MethodName", params: &[("EnforcedStyle", "snake_case")],
+             styles: &["snake_case", "camelCase"] },
+];
+fn schema(cop: &str) -> Option<&'static Schema> {
+    SCHEMA.iter().find(|s| s.cop == cop)
+}
+fn schema_default(cop: &str, key: &str) -> Option<&'static str> {
+    schema(cop).and_then(|s| s.params.iter().find(|(k, _)| *k == key).map(|(_, v)| *v))
+}
+
 // ---------------- config (.rubocop.yml, minimal subset) ----------------
 struct Config {
     // cop/section name -> { key -> value }
@@ -102,8 +133,21 @@ impl Config {
     fn param(&self, cop: &str, key: &str) -> Option<&str> {
         self.sections.get(cop).and_then(|s| s.get(key)).map(|s| s.as_str())
     }
-    fn int(&self, cop: &str, key: &str, default: usize) -> usize {
-        self.param(cop, key).and_then(|v| v.parse().ok()).unwrap_or(default)
+    /// Resolved value: user config if present, else the SCHEMA default.
+    fn get(&self, cop: &str, key: &str) -> Option<&str> {
+        self.param(cop, key).or_else(|| schema_default(cop, key))
+    }
+    fn int(&self, cop: &str, key: &str) -> usize {
+        self.get(cop, key).and_then(|v| v.parse().ok()).unwrap_or(0)
+    }
+    /// The active `EnforcedStyle`: the configured value if it's a supported
+    /// style, otherwise the schema default. One place for style resolution.
+    fn enforced_style(&self, cop: &str) -> &str {
+        let default = schema_default(cop, "EnforcedStyle").unwrap_or("");
+        match self.param(cop, "EnforcedStyle") {
+            Some(v) if schema(cop).map(|s| s.styles.contains(&v)).unwrap_or(false) => v,
+            _ => default,
+        }
     }
 }
 
@@ -189,18 +233,64 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
         if self.on("Style/StringLiterals") {
             if let Some(open) = node.opening_loc() {
-                if open.as_slice() == b"\"" {
-                    let c = node.content_loc().as_slice();
-                    if !c.contains(&b'\'') && !c.contains(&b'\\') {
-                        self.push(open.start_offset(), "Style/StringLiterals", true,
-                            "Prefer single-quoted strings when you don't need string interpolation or special symbols.");
-                        // fix: re-quote `"c"` -> `'c'`
-                        let l = node.location();
-                        let mut rep = vec![b'\''];
-                        rep.extend_from_slice(c);
-                        rep.push(b'\'');
-                        self.fixes.push((l.start_offset(), l.end_offset(), rep));
+                let c = node.content_loc().as_slice();
+                let l = node.location();
+                // Dispatch on the active EnforcedStyle — resolved once, from the
+                // config SCHEMA (see `Config::enforced_style`). Heredocs / %-literals
+                // have other openings and fall through untouched.
+                match self.cfg.enforced_style("Style/StringLiterals") {
+                    // Prefer single quotes: a double-quoted string with no `'` and
+                    // no `\` in its content could be single-quoted losslessly.
+                    "single_quotes" if open.as_slice() == b"\"" => {
+                        if !c.contains(&b'\'') && !c.contains(&b'\\') {
+                            self.push(l.start_offset(), "Style/StringLiterals", true,
+                                "Prefer single-quoted strings when you don't need string interpolation or special symbols.");
+                            // fix: `"c"` -> `'c'`
+                            let mut rep = vec![b'\''];
+                            rep.extend_from_slice(c);
+                            rep.push(b'\'');
+                            self.fixes.push((l.start_offset(), l.end_offset(), rep));
+                        }
                     }
+                    // Prefer double quotes: a single-quoted string is an offense
+                    // UNLESS it needs the single quotes — i.e. it contains a `\`
+                    // that is NOT part of `\\` or `\'` (those are the only escapes
+                    // single quotes interpret; a bare `\x` is a literal backslash
+                    // that double quotes would have to escape as `\\x`).
+                    "double_quotes" if open.as_slice() == b"'" => {
+                        let mut needs_single = false;
+                        let mut i = 0;
+                        while i < c.len() {
+                            if c[i] == b'\\' {
+                                match c.get(i + 1) {
+                                    Some(b'\\') | Some(b'\'') => { i += 2; continue; }
+                                    _ => { needs_single = true; break; }
+                                }
+                            }
+                            i += 1;
+                        }
+                        if !needs_single {
+                            self.push(l.start_offset(), "Style/StringLiterals", true,
+                                "Prefer double-quoted strings unless you need single quotes to avoid extra backslashes for escaping.");
+                            // fix: `'c'` -> `"c"`, unescaping `\'` -> `'` (`\\` stays)
+                            let mut inner = Vec::new();
+                            let mut i = 0;
+                            while i < c.len() {
+                                if c[i] == b'\\' && c.get(i + 1) == Some(&b'\'') {
+                                    inner.push(b'\'');
+                                    i += 2;
+                                } else {
+                                    inner.push(c[i]);
+                                    i += 1;
+                                }
+                            }
+                            let mut rep = vec![b'"'];
+                            rep.extend_from_slice(&inner);
+                            rep.push(b'"');
+                            self.fixes.push((l.start_offset(), l.end_offset(), rep));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -222,7 +312,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let s = self.node_src(&node.as_node());
             // decimal only, no existing underscore, > configured digit count
             let digits = s.iter().filter(|c| c.is_ascii_digit()).count();
-            let min = self.cfg.int("Style/NumericLiterals", "MinDigits", 5);
+            let min = self.cfg.int("Style/NumericLiterals", "MinDigits");
             if !s.contains(&b'_') && !s.starts_with(b"0x") && !s.starts_with(b"0b") && !s.starts_with(b"0o") && digits >= min {
                 self.push(node.location().start_offset(), "Style/NumericLiterals", true,
                     "Use underscores(_) as thousands separator and separate every 3 digits with them.".to_string());
@@ -348,7 +438,7 @@ fn main() {
         cops.fixes.push((0, 0, b"# frozen_string_literal: true\n\n".to_vec()));
     }
     if cops.on("Layout/LineLength") {
-        let max = cfg.int("Layout/LineLength", "Max", 120);
+        let max = cfg.int("Layout/LineLength", "Max");
         for (li, line) in src.split(|&b| b == b'\n').enumerate() {
             let len = String::from_utf8_lossy(line).chars().count();
             if len > max {
