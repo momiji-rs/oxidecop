@@ -240,24 +240,29 @@ struct Cops<'a> {
     // DECLARATIVE cops: (parsed pattern, cop name, message). Built once from
     // the DECLARATIVE table — the cop "logic" is entirely in the pattern.
     decl: Vec<(Pat, &'static str, &'static str, Anchor, Option<&'static str>)>,
-    // Cross-cutting `AllowedPatterns`: per-cop compiled regexes. A cop consults
-    // `allowed(cop, text)` to suppress an offense whose relevant string (a method
-    // name, a source line, …) matches — exactly rubocop's shared AllowedPatterns.
+    // Cross-cutting exemptions, mirroring rubocop's `AllowedMethods` mixin: a cop
+    // consults `allowed(cop, text)` to suppress an offense whose relevant string
+    // (a method name, a source line, …) is either an exact `AllowedMethods` entry
+    // or matches an `AllowedPatterns` regex.
     allowed: HashMap<String, Vec<regex::Regex>>,
+    allowed_methods: HashMap<String, Vec<String>>,
 }
 impl<'a> Cops<'a> {
     fn on(&self, cop: &str) -> bool {
         self.cfg.enabled(cop)
     }
-    /// Is `text` exempt for `cop` via its configured AllowedPatterns?
+    /// Is `text` exempt for `cop` via AllowedMethods (exact) or AllowedPatterns?
     fn allowed(&self, cop: &str, text: &[u8]) -> bool {
-        match self.allowed.get(cop) {
-            Some(pats) if !pats.is_empty() => {
-                let s = String::from_utf8_lossy(text);
-                pats.iter().any(|re| re.is_match(&s))
-            }
-            _ => false,
-        }
+        let s = String::from_utf8_lossy(text);
+        let by_name = self
+            .allowed_methods
+            .get(cop)
+            .is_some_and(|names| names.iter().any(|n| n.as_bytes() == text));
+        let by_pattern = self
+            .allowed
+            .get(cop)
+            .is_some_and(|pats| pats.iter().any(|re| re.is_match(&s)));
+        by_name || by_pattern
     }
     fn push(&mut self, off: usize, cop: &'static str, correctable: bool, msg: impl Into<String>) {
         let (line, col) = self.idx.loc(off);
@@ -575,8 +580,10 @@ fn main() {
         .map(|(p, cop, msg, a, style)| (nodepattern::parse(p), *cop, *msg, *a, *style))
         .collect();
 
-    // Compile each cop's AllowedPatterns once (invalid regexes are dropped).
+    // Compile each cop's AllowedPatterns once (invalid regexes dropped); collect
+    // AllowedMethods as exact-name lists. Both back `Cops::allowed`.
     let mut allowed: HashMap<String, Vec<regex::Regex>> = HashMap::new();
+    let mut allowed_methods: HashMap<String, Vec<String>> = HashMap::new();
     for (sec, kv) in &cfg.sections {
         if let Some(v) = kv.get("AllowedPatterns") {
             let pats = parse_allowed_list(v)
@@ -585,9 +592,12 @@ fn main() {
                 .collect();
             allowed.insert(sec.clone(), pats);
         }
+        if let Some(v) = kv.get("AllowedMethods") {
+            allowed_methods.insert(sec.clone(), parse_allowed_list(v));
+        }
     }
 
-    let mut cops = Cops { src: &src, idx: &idx, cfg: &cfg, comment_lines, offenses: Vec::new(), fixes: Vec::new(), decl, allowed };
+    let mut cops = Cops { src: &src, idx: &idx, cfg: &cfg, comment_lines, offenses: Vec::new(), fixes: Vec::new(), decl, allowed, allowed_methods };
 
     // ---- text-based cops ----
     if cops.on("Style/FrozenStringLiteralComment") && !has_frozen {

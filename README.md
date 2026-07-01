@@ -145,11 +145,13 @@ so a cop reads config through `Config::enforced_style`/`int` instead of hardcodi
 its own defaults. `Style/StringLiterals` dispatches on it (`single_quotes` ↔
 `double_quotes`); other style cops just need to be pointed at the same resolver.
 
-`AllowedPatterns` is a cross-cutting mechanism: patterns are compiled once
-(via the `regex` crate) and a cop calls `Cops::allowed(cop, text)` to suppress
-an offense whose relevant string matches — the method name for `Naming/MethodName`,
-the source line for `Layout/LineLength`. Adding it to another cop is a one-line
-guard. No plugin/require support yet.
+`AllowedMethods` / `AllowedPatterns` are a cross-cutting mechanism (rubocop's
+shared `AllowedMethods` mixin): a cop calls `Cops::allowed(cop, text)` to suppress
+an offense whose relevant string is either an exact `AllowedMethods` entry or
+matches an `AllowedPatterns` regex (compiled once via the `regex` crate). It's
+wired to the method name for `Naming/MethodName` and the source line for
+`Layout/LineLength`; adding it to another cop is a one-line guard. No plugin/
+require support yet.
 
 ## Repo layout
 
