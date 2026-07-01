@@ -66,18 +66,29 @@ examples = []
 lines = File.readlines(SPEC, chomp: true)
 i = 0
 cur_ctx = ''
-cur_cfg = 'default' # active cop_config; reset on each context, set by let(:cop_config)
+# cop_config is scoped like RSpec `let`: defined in a context, it applies to that
+# context AND its nested contexts. Track a stack of [indent, cfg] frames; a new
+# `context`/`describe` at indent N pops frames at indent >= N (scopes we left) and
+# inherits the enclosing cfg. This is why a single outer `let(:cop_config)` above
+# many nested example groups reaches all of them.
+# frame = [indent, cfg, skip]. `skip` marks contexts rubocop itself doesn't run
+# under Prism (`unsupported_on: :prism`) — not valid fidelity targets for us.
+cfg_stack = []
 while i < lines.length
   l = lines[i]
+  indent = l[/\A */].length
   if l =~ /^\s*(context|describe)\s/
     cur_ctx = l.strip
-    cur_cfg = 'default'
+    cfg_stack.pop while cfg_stack.any? && cfg_stack.last[0] >= indent
+    inh_cfg  = cfg_stack.any? ? cfg_stack.last[1] : 'default'
+    inh_skip = cfg_stack.any? ? cfg_stack.last[2] : false
+    cfg_stack.push([indent, inh_cfg, inh_skip || l.include?('unsupported_on: :prism')])
   end
   # `let(:cop_config)` in either single-line `{ {...} }` or multi-line `do..end`
   # form. Capture the raw hash text (quotes preserved, whitespace collapsed) so
-  # array values like AllowedPatterns survive; unparseable blocks stay 'default'.
+  # array values like AllowedPatterns survive; sets the innermost context's cfg.
   if l =~ /let\(:cop_config\)\s*\{(.*)\}\s*\z/
-    cur_cfg = extract_hash(Regexp.last_match(1))
+    cfg_stack.last[1] = extract_hash(Regexp.last_match(1)) if cfg_stack.any?
   elsif l =~ /let\(:cop_config\)\s*do\s*\z/
     blk = []
     i += 1
@@ -85,8 +96,10 @@ while i < lines.length
       blk << lines[i]
       i += 1
     end
-    cur_cfg = extract_hash(blk.join(' '))
+    cfg_stack.last[1] = extract_hash(blk.join(' ')) if cfg_stack.any?
   end
+  cur_cfg = cfg_stack.any? ? cfg_stack.last[1] : 'default'
+  cur_skip = cfg_stack.any? ? cfg_stack.last[2] : false
   if l =~ /expect_(offense|no_offenses)\(<<[~-]RUBY\)/
     kind = Regexp.last_match(1) == 'offense' ? :offense : :no_offense
     body = []
@@ -96,9 +109,9 @@ while i < lines.length
       i += 1
     end
     src, expected = parse_block(body)
-    examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, src: src, expected: expected }
+    examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, src: src, expected: expected }
   elsif l =~ /expect_no_offenses\((['"])(.*?)\1\)/
-    examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, src: Regexp.last_match(2) + "\n", expected: [] }
+    examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, src: Regexp.last_match(2) + "\n", expected: [] }
   end
   i += 1
 end
@@ -175,6 +188,8 @@ def parse_val(v)
   if v.start_with?('[')
     inner = v.sub(/\A\[/, '').sub(/\]\s*\z/, '')
     split_top(inner).map { |item| normalize_pattern(item) }
+  elsif (m = v.match(/\A%[wi]\[(.*)\]\z/m)) # %w[a b] / %i[a b] word/symbol arrays
+    m[1].split(/\s+/).reject(&:empty?)
   else
     v.sub(/\A(['"])(.*)\1\z/m, '\2')
   end
@@ -236,6 +251,14 @@ groups = Hash.new { |h, k| h[k] = { loc: 0, full: 0, total: 0, skipped: 0 } }
 fails = []
 examples.each_with_index do |ex, n|
   g = groups[ex[:cfg]]
+
+  # Context rubocop skips under Prism (unsupported_on: :prism) — not a valid
+  # fidelity target for a Prism-based tool, so exclude rather than score.
+  if ex[:skip]
+    g[:skipped] += 1
+    next
+  end
+
   cfg_hash = parse_cfg(ex[:cfg])
   src = resolve_interp(ex[:src], cfg_hash)
 
