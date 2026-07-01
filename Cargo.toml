@@ -1,0 +1,18 @@
+[package]
+name = "rubocop-rs"
+version = "0.0.1"
+edition = "2021"
+description = "A fast, native RuboCop-compatible Ruby linter — cops as data over the Prism AST"
+license = "MIT"
+repository = "https://github.com/lawrencelin/rubocop-rs"
+
+[[bin]]
+name = "rubocop-rs"
+path = "src/main.rs"
+
+[dependencies]
+ruby-prism = "1.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
