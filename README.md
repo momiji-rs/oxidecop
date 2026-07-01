@@ -80,33 +80,41 @@ RUBY
 ```
 
 The **oracle** (`oracle/oracle.rb`) parses those fixtures, runs the
-de-annotated source through the `rubocop-rs` binary, and diffs at two levels:
-**LOC** (right line:col) and **FULL** (line:col *and* identical message).
+de-annotated source through the `rubocop-rs` binary under *the example's own*
+`cop_config`, and diffs at two levels: **LOC** (right line:col) and **FULL**
+(line:col *and* identical message).
 
 Current leaderboard (`ruby oracle/leaderboard.rb`), against RuboCop v1.88.0:
 
 ```
-cop                                examples         LOC        FULL
-Style/StringLiterals                     33    28/33       28/33       85%
-Style/NilComparison                       8     6/8         6/8        75%
-Style/ZeroLengthPredicate                74    49/74       48/74       65%
-Style/Documentation                      47    24/47       24/47       51%
-Style/NumericLiterals                    28    14/28       13/28       46%
-Naming/MethodName                        54    26/54       23/54       43%
-Style/RedundantReturn                    37    19/37       14/37       38%
-Style/FrozenStringLiteralComment         93    41/93       32/93       34%
-Layout/LineLength                       155    45/155      45/155      29%
-Layout/TrailingWhitespace                19     2/19        2/19       11%
-────────────────────────────────────────────────────────────────────
-TOTAL (all spec examples)               548                235/548      43%
+cop                                  scored   skip         LOC        FULL
+Style/StringLiterals                     32      1    27/32       27/32       84%
+Style/NilComparison                       8      0     6/8         6/8        75%
+Style/ZeroLengthPredicate                74      0    49/74       48/74       65%
+Style/Documentation                      43      4    22/43       22/43       51%
+Style/NumericLiterals                    28      0    14/28       13/28       46%
+Naming/MethodName                        48      6    21/48       21/48       44%
+Layout/TrailingWhitespace                19      0     8/19        8/19       42%
+Style/RedundantReturn                    37      0    19/37       14/37       38%
+Style/FrozenStringLiteralComment         90      3    40/90       31/90       34%
+Layout/LineLength                       141     14    32/141      32/141      23%
+────────────────────────────────────────────────────────────────────────────
+TOTAL (representable examples)          520     28                222/520      43%
 ```
 
-**Read this honestly:** the oracle runs each example with the cop's *default*
-behavior and ignores per-example `cop_config`. So examples that require an
-alternate config (e.g. `NilComparison`'s `comparison` style, `StringLiterals`'s
-`single_quotes`) count as failures — that is "config coverage we haven't built,"
-folded into the score. Low scorers (`LineLength`, `TrailingWhitespace`) are text
-cops with large edge-case suites relative to their core behavior.
+**Read this honestly:** the score is over *representable* examples only. RuboCop's
+specs encode some text via Ruby interpolation — trailing whitespace as
+`x = 0#{trailing_whitespace}` (editors strip literal trailing spaces), loop
+variables as `#{keyword}`/`#{args}` in `.each`-generated examples. The oracle
+resolves the known-constant helpers (`trailing_whitespace`, and `#{enforced_style}`
+from the active config) and **skips** anything still-interpolated in the source
+rather than scoring a harness limitation as a cop miss — hence the `skip` column.
+
+Each example runs under its own `let(:cop_config)`, translated to `.rubocop.yml`.
+So a `LineLength` example with `Max: 30, AllowURI: true` is tested at that `Max` —
+and its failures then honestly attribute to features rubocop-rs lacks (`AllowURI`,
+`AllowedPatterns`, `EnforcedStyle`, …), not to a coincidental default. That is
+"config coverage we haven't built," measured where it actually bites.
 
 The value is that **every gap is a named, reproducible spec example**, so
 improving a cop is a test-driven grind, and residual failures cluster into

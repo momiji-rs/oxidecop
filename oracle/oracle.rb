@@ -83,12 +83,47 @@ while i < lines.length
 end
 
 # ---- run the PoC on each example ---------------------------------------------
-cfg = <<~YML
-  AllCops:
-    DisabledByDefault: true
-  #{COP}:
-    Enabled: true
-YML
+# RuboCop's spec suite encodes some source and message text via Ruby string
+# interpolation (e.g. `x = 0#{trailing_whitespace}`, `Use #{enforced_style}
+# ...`) because editors strip literal trailing whitespace and messages vary by
+# EnforcedStyle. The oracle's static parser can't eval Ruby, so we resolve the
+# KNOWN-CONSTANT helpers here and treat anything still-interpolated as
+# "unrepresentable" (skipped, excluded from the denominator) — that keeps the
+# fidelity score honest instead of scoring a harness limitation as a cop miss.
+# A cop's default EnforcedStyle, used to resolve `#{enforced_style}` in expected
+# messages when the example doesn't override it (the `default` config group).
+# Only cops whose MSG interpolates the style need an entry.
+COP_DEFAULT_STYLE = {
+  'Naming/MethodName' => 'snake_case'
+}.freeze
+
+def resolve_interp(text, cfg_hash)
+  text = text.gsub(/\#\{trailing_whitespace \* (\d+)\}/) { ' ' * Regexp.last_match(1).to_i }
+  text = text.gsub('#{trailing_whitespace}', ' ')
+  style = cfg_hash['EnforcedStyle'] || COP_DEFAULT_STYLE[COP]
+  text = text.gsub('#{enforced_style}', style) if style
+  text
+end
+
+# `ex[:cfg]` is the normalized `let(:cop_config)` hash string, e.g.
+# "{ EnforcedStyle => single_quotes }" or "{ AllowInHeredoc => false }" or
+# "default". Parse it into a Ruby hash of config keys.
+def parse_cfg(cfgstr)
+  return {} if cfgstr == 'default'
+
+  h = {}
+  cfgstr.scan(/(\w+)\s*=>\s*([^,}]+)/) { |k, v| h[k.strip] = v.strip }
+  h
+end
+
+# Build the per-example .rubocop.yml: enable only this cop, and pass through the
+# example's own cop_config so config-reading cops (Layout/LineLength `Max`,
+# Style/NumericLiterals `MinDigits`, …) are exercised faithfully.
+def build_cfg(cop, cfg_hash)
+  lines = ['AllCops:', '  DisabledByDefault: true', "#{cop}:", '  Enabled: true']
+  cfg_hash.each { |k, v| lines << "  #{k}: #{v}" }
+  lines.join("\n") + "\n"
+end
 
 def run_poc(poc, src, cfg)
   Dir.mktmpdir do |d|
@@ -107,13 +142,26 @@ def run_poc(poc, src, cfg)
 end
 
 # ---- compare + report --------------------------------------------------------
-# group tallies by active cop_config so config-gated examples are transparent
-groups = Hash.new { |h, k| h[k] = { loc: 0, full: 0, total: 0 } }
+# group tallies by active cop_config so config-gated examples are transparent.
+# `skipped` = examples the harness cannot faithfully represent (unresolved
+# interpolation in the SOURCE); they're excluded from loc/full/total.
+groups = Hash.new { |h, k| h[k] = { loc: 0, full: 0, total: 0, skipped: 0 } }
 fails = []
 examples.each_with_index do |ex, n|
-  actual = run_poc(POC, ex[:src], cfg)
-  exp = ex[:expected]
   g = groups[ex[:cfg]]
+  cfg_hash = parse_cfg(ex[:cfg])
+  src = resolve_interp(ex[:src], cfg_hash)
+
+  # Unrepresentable: source still interpolates a value we can't resolve
+  # statically (loop vars like #{keyword}, #{args}, …). Linting the literal
+  # `#{...}` text would be meaningless, so exclude rather than score as a miss.
+  if src =~ /\#\{/
+    g[:skipped] += 1
+    next
+  end
+
+  actual = run_poc(POC, src, build_cfg(COP, cfg_hash))
+  exp = ex[:expected].map { |l, c, m| [l, c, resolve_interp(m, cfg_hash)] }
   g[:total] += 1
 
   exp_loc = exp.map { |l, c, _| [l, c] }.sort
@@ -137,11 +185,14 @@ examples.each_with_index do |ex, n|
   fails << format("  #%-2d {%s} `%s`\n       %s", n, ex[:cfg][0, 30], first[0, 40], reason)
 end
 
-total = examples.length
+total     = examples.length
+skipped   = groups.values.sum { |g| g[:skipped] }
+scored    = total - skipped # representable examples — the honest denominator
 puts "== oracle: #{COP} (#{File.basename(SPEC)}) =="
-puts "   #{total} examples, grouped by active cop_config:"
+puts "   #{total} examples (#{scored} representable, #{skipped} skipped), grouped by active cop_config:"
 groups.each do |cfgname, g|
-  puts format('     %-34s LOC %d/%d   FULL %d/%d', cfgname[0, 34], g[:loc], g[:total], g[:full], g[:total])
+  skip = g[:skipped].positive? ? "   (#{g[:skipped]} skipped)" : ''
+  puts format('     %-34s LOC %d/%d   FULL %d/%d%s', cfgname[0, 34], g[:loc], g[:total], g[:full], g[:total], skip)
 end
 def_g = groups['default'] || { loc: 0, full: 0, total: 0 }
 puts "   >> default-config detection fidelity: #{def_g[:loc]}/#{def_g[:total]} LOC, #{def_g[:full]}/#{def_g[:total]} FULL" if def_g[:total].positive?
@@ -150,8 +201,9 @@ unless fails.empty?
   puts fails.join("\n") unless ENV['ORACLE_QUIET']
 end
 
-# machine-readable summary for the leaderboard driver:
-# SUMMARY<TAB>cop<TAB>total<TAB>all_loc<TAB>all_full<TAB>def_total<TAB>def_loc<TAB>def_full
+# machine-readable summary for the leaderboard driver. `total` here is the
+# REPRESENTABLE count (skipped excluded) so downstream percentages are honest.
+# SUMMARY<TAB>cop<TAB>total<TAB>all_loc<TAB>all_full<TAB>def_total<TAB>def_loc<TAB>def_full<TAB>skipped
 all_loc  = groups.values.sum { |g| g[:loc] }
 all_full = groups.values.sum { |g| g[:full] }
-warn "SUMMARY\t#{COP}\t#{total}\t#{all_loc}\t#{all_full}\t#{def_g[:total]}\t#{def_g[:loc]}\t#{def_g[:full]}"
+warn "SUMMARY\t#{COP}\t#{scored}\t#{all_loc}\t#{all_full}\t#{def_g[:total]}\t#{def_g[:loc]}\t#{def_g[:full]}\t#{skipped}"
