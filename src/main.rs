@@ -225,13 +225,27 @@ impl<'a> Cops<'a> {
     }
 }
 
-fn is_snake_case(s: &[u8]) -> bool {
-    // allow trailing ? ! =, and leading _
-    let core: &[u8] = match s.last() {
+/// Strip a trailing `?`/`!`/`=` (predicate/bang/setter) from a method name.
+fn name_core(s: &[u8]) -> &[u8] {
+    match s.last() {
         Some(b'?') | Some(b'!') | Some(b'=') => &s[..s.len() - 1],
         _ => s,
-    };
-    !core.iter().any(|&c| c.is_ascii_uppercase())
+    }
+}
+fn is_snake_case(s: &[u8]) -> bool {
+    !name_core(s).iter().any(|&c| c.is_ascii_uppercase())
+}
+fn is_camel_case(s: &[u8]) -> bool {
+    // camelCase: no underscores, and doesn't start with an uppercase letter.
+    let core = name_core(s);
+    !core.contains(&b'_') && core.first().map(|&c| !c.is_ascii_uppercase()).unwrap_or(true)
+}
+/// Does `name` conform to the active `Naming/MethodName` EnforcedStyle?
+fn name_matches_style(name: &[u8], style: &str) -> bool {
+    match style {
+        "camelCase" => is_camel_case(name),
+        _ => is_snake_case(name),
+    }
 }
 
 impl<'pr, 'a> Visit<'pr> for Cops<'a> {
@@ -337,10 +351,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
         if self.on("Naming/MethodName") {
+            let style = self.cfg.enforced_style("Naming/MethodName");
             let name = node.name().as_slice();
-            if !is_snake_case(name) {
+            if !name_matches_style(name, style) {
                 self.push(node.name_loc().start_offset(), "Naming/MethodName", false,
-                    "Use snake_case for method names.");
+                    format!("Use {style} for method names."));
             }
         }
         // Style/RedundantReturn: body's last statement is a bare `return x`
@@ -364,6 +379,35 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // Naming/MethodName also names methods via attr macros — check each
+        // symbol/string arg of attr / attr_reader / attr_writer / attr_accessor.
+        if self.on("Naming/MethodName")
+            && matches!(node.name().as_slice(),
+                        b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor")
+        {
+            let style = self.cfg.enforced_style("Naming/MethodName").to_string();
+            let mut bad: Vec<usize> = Vec::new();
+            if let Some(args) = node.arguments() {
+                for arg in args.arguments().iter() {
+                    let ok = if let Some(sym) = arg.as_symbol_node() {
+                        match sym.value_loc() {
+                            Some(v) => name_matches_style(&self.src[v.start_offset()..v.end_offset()], &style),
+                            None => true,
+                        }
+                    } else if let Some(st) = arg.as_string_node() {
+                        name_matches_style(st.content_loc().as_slice(), &style)
+                    } else {
+                        true
+                    };
+                    if !ok {
+                        bad.push(arg.location().start_offset());
+                    }
+                }
+            }
+            for off in bad {
+                self.push(off, "Naming/MethodName", false, format!("Use {style} for method names."));
+            }
+        }
         // Run every DECLARATIVE send-pattern against this call. The cop is data.
         let n = node.as_node();
         let node_off = node.location().start_offset();
