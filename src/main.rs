@@ -253,6 +253,12 @@ struct Cops<'a> {
     // Style/NumericPredicate's AllowedMethods on a wrapping `where(...)`, and its
     // `!x.zero?` negation) without a parent pointer.
     call_stack: Vec<Vec<u8>>,
+    // Ancestor counters for Lint/NestedMethodDefinition: how many enclosing
+    // `def`s, and how many enclosing "scoping" blocks/sclass (Class.new,
+    // instance_eval, class << self, AllowedMethods, …). A nested def is an
+    // offense iff def_depth >= 1 and scoping_depth == 0.
+    def_depth: usize,
+    scoping_depth: usize,
 }
 impl<'a> Cops<'a> {
     fn on(&self, cop: &str) -> bool {
@@ -432,6 +438,25 @@ fn predicate_for(op: &[u8], inverted: bool) -> &'static str {
     }
 }
 
+// ---- Lint/NestedMethodDefinition helpers: is this block "scoping"? ----
+fn is_eval_exec(node: &ruby_prism::CallNode) -> bool {
+    matches!(
+        node.name().as_slice(),
+        b"instance_eval" | b"class_eval" | b"module_eval" | b"instance_exec" | b"class_exec" | b"module_exec"
+    )
+}
+/// `Class.new` / `Module.new` / `Struct.new` / `Data.define` (incl. `::`-prefixed).
+fn is_class_constructor(node: &ruby_prism::CallNode, src: &[u8]) -> bool {
+    let Some(r) = node.receiver() else { return false };
+    let l = r.location();
+    let recv = &src[l.start_offset()..l.end_offset()];
+    match node.name().as_slice() {
+        b"new" => matches!(recv, b"Class" | b"::Class" | b"Module" | b"::Module" | b"Struct" | b"::Struct"),
+        b"define" => matches!(recv, b"Data" | b"::Data"),
+        _ => false,
+    }
+}
+
 /// A method name introduced by a macro argument (attr/alias_method/Struct member):
 /// the arg must be a plain symbol or string literal (interpolated ones are
 /// skipped). Returns (name bytes, offense anchor = the argument's start offset).
@@ -557,6 +582,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                     format!("Use {style} for method names."));
             }
         }
+        // Lint/NestedMethodDefinition: a def with an enclosing def and no
+        // intervening scoping block/sclass. `def recv.name` where recv is a
+        // var/const/call (not `self`) is exempt from being flagged itself.
+        if self.on("Lint/NestedMethodDefinition") {
+            let exempt = node.receiver().is_some_and(|r| r.as_self_node().is_none());
+            if !exempt && self.def_depth >= 1 && self.scoping_depth == 0 {
+                self.push(node.location().start_offset(), "Lint/NestedMethodDefinition", false,
+                    "Method definitions must not be nested. Use `lambda` instead.");
+            }
+        }
         // Style/RedundantReturn: body's last statement is a bare `return x`
         if self.on("Style/RedundantReturn") {
             if let Some(ruby_prism::Node::StatementsNode { .. }) = node.body() {
@@ -573,9 +608,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        // Descend into the body as one deeper def level (for nested-def detection).
+        self.def_depth += 1;
         if let Some(b) = node.body() {
             self.visit(&b);
         }
+        self.def_depth -= 1;
+    }
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        // `class << self` is a scoping context — nested defs inside are allowed.
+        self.scoping_depth += 1;
+        if let Some(b) = node.body() {
+            self.visit(&b);
+        }
+        self.scoping_depth -= 1;
     }
     fn visit_alias_method_node(&mut self, node: &ruby_prism::AliasMethodNode<'pr>) {
         // `alias new_name old_name` — check the new name against the style.
@@ -675,7 +721,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         if let Some(b) = node.block() {
+            // A block is "scoping" (allows nested defs) if it's a class
+            // constructor, an (instance|class|module)_(eval|exec), or its method
+            // is in AllowedMethods.
+            let scoping = self.on("Lint/NestedMethodDefinition")
+                && (is_eval_exec(node)
+                    || is_class_constructor(node, self.src)
+                    || self.allowed("Lint/NestedMethodDefinition", node.name().as_slice()));
+            if scoping {
+                self.scoping_depth += 1;
+            }
             self.visit(&b);
+            if scoping {
+                self.scoping_depth -= 1;
+            }
         }
         self.call_stack.pop();
     }
@@ -730,7 +789,7 @@ fn main() {
         }
     }
 
-    let mut cops = Cops { src: &src, idx: &idx, cfg: &cfg, comment_lines, offenses: Vec::new(), fixes: Vec::new(), decl, allowed, allowed_methods, call_stack: Vec::new() };
+    let mut cops = Cops { src: &src, idx: &idx, cfg: &cfg, comment_lines, offenses: Vec::new(), fixes: Vec::new(), decl, allowed, allowed_methods, call_stack: Vec::new(), def_depth: 0, scoping_depth: 0 };
 
     // ---- text-based cops ----
     if cops.on("Style/FrozenStringLiteralComment") && !has_frozen {

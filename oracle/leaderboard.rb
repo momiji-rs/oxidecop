@@ -32,6 +32,7 @@ COPS = {
   'Style/Documentation'              => 'style/documentation',
   'Style/FrozenStringLiteralComment' => 'style/frozen_string_literal_comment',
   'Naming/MethodName'                => 'naming/method_name',
+  'Lint/NestedMethodDefinition'      => 'lint/nested_method_definition',
   'Layout/LineLength'                => 'layout/line_length',
   'Layout/TrailingWhitespace'        => 'layout/trailing_whitespace'
 }.freeze
