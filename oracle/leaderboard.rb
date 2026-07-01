@@ -24,6 +24,7 @@ abort "build the binary first: cargo build --release" unless File.exist?(BIN)
 # cop -> spec path within rubocop's repo (spec/rubocop/cop/<path>_spec.rb)
 COPS = {
   'Style/NilComparison'              => 'style/nil_comparison',
+  'Style/NumericPredicate'           => 'style/numeric_predicate',
   'Style/ZeroLengthPredicate'        => 'style/zero_length_predicate',
   'Style/RedundantReturn'            => 'style/redundant_return',
   'Style/NumericLiterals'            => 'style/numeric_literals',

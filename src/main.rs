@@ -79,6 +79,8 @@ const SCHEMA: &[Schema] = &[
              styles: &["single_quotes", "double_quotes"] },
     Schema { cop: "Style/NilComparison", params: &[("EnforcedStyle", "predicate")],
              styles: &["predicate", "comparison"] },
+    Schema { cop: "Style/NumericPredicate", params: &[("EnforcedStyle", "predicate")],
+             styles: &["predicate", "comparison"] },
     Schema { cop: "Naming/MethodName", params: &[("EnforcedStyle", "snake_case")],
              styles: &["snake_case", "camelCase"] },
 ];
@@ -246,6 +248,11 @@ struct Cops<'a> {
     // or matches an `AllowedPatterns` regex.
     allowed: HashMap<String, Vec<regex::Regex>>,
     allowed_methods: HashMap<String, Vec<String>>,
+    // Enclosing call/block method names (outermost first), maintained around the
+    // manual recursion in `visit_call_node`. Lets cops consult ancestors (e.g.
+    // Style/NumericPredicate's AllowedMethods on a wrapping `where(...)`, and its
+    // `!x.zero?` negation) without a parent pointer.
+    call_stack: Vec<Vec<u8>>,
 }
 impl<'a> Cops<'a> {
     fn on(&self, cop: &str) -> bool {
@@ -271,6 +278,72 @@ impl<'a> Cops<'a> {
     fn node_src(&self, n: &ruby_prism::Node) -> &'a [u8] {
         let l = n.location();
         &self.src[l.start_offset()..l.end_offset()]
+    }
+    /// Style/NumericPredicate: under `predicate` style flag `x {==,>,<} 0` (and
+    /// inverted) → suggest `x.zero?/positive?/negative?`; under `comparison`
+    /// style flag those predicates → suggest the comparison. Returns the offense
+    /// (whole-node offset, rendered message) or None. Verbatim rubocop logic.
+    fn numeric_predicate(&self, node: &ruby_prism::CallNode) -> Option<(usize, String)> {
+        if !self.on("Style/NumericPredicate") {
+            return None;
+        }
+        let name = node.name().as_slice();
+        // AllowedMethods/Patterns: the offending method OR any ancestor call/block.
+        if self.allowed("Style/NumericPredicate", name)
+            || self.call_stack.iter().any(|n| self.allowed("Style/NumericPredicate", n))
+        {
+            return None;
+        }
+        let recv = node.receiver();
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let node_off = node.location().start_offset();
+        let current = String::from_utf8_lossy(self.node_src(&node.as_node())).into_owned();
+
+        let prefer = match self.cfg.enforced_style("Style/NumericPredicate") {
+            "comparison" => {
+                // flag `x.zero?/positive?/negative?` (receiver, no args)
+                let r = recv?;
+                if !args.is_empty() {
+                    return None;
+                }
+                let op = match name {
+                    b"zero?" => "==",
+                    b"positive?" => ">",
+                    b"negative?" => "<",
+                    _ => return None,
+                };
+                let rsrc = String::from_utf8_lossy(self.node_src(&r));
+                let negated = self.call_stack.last().is_some_and(|n| n.as_slice() == b"!");
+                if negated {
+                    format!("({rsrc} {op} 0)")
+                } else {
+                    format!("{rsrc} {op} 0")
+                }
+            }
+            _ => {
+                // predicate style: flag `x {==,>,<} 0` and the inverted `0 {..} x`
+                if args.len() != 1 {
+                    return None;
+                }
+                let op: &[u8] = match name {
+                    b"==" => b"==",
+                    b">" => b">",
+                    b"<" => b"<",
+                    _ => return None,
+                };
+                let r = recv?;
+                let arg = &args[0];
+                if is_int_zero(arg, self.src) && !is_gvar(&r) {
+                    format!("{}.{}", paren_src(&r, self.src), predicate_for(op, false))
+                } else if is_int_zero(&r, self.src) && !is_gvar(arg) {
+                    format!("{}.{}", paren_src(arg, self.src), predicate_for(op, true))
+                } else {
+                    return None;
+                }
+            }
+        };
+        Some((node_off, format!("Use `{prefer}` instead of `{current}`.")))
     }
     fn check_documentation(&mut self, start_off: usize, kind: &str, name: &ruby_prism::Node) {
         if !self.on("Style/Documentation") {
@@ -307,6 +380,58 @@ fn name_matches_style(name: &[u8], style: &str) -> bool {
         _ => is_snake_case(name),
     }
 }
+// ---- Style/NumericPredicate helpers ----
+fn is_int_zero(node: &ruby_prism::Node, src: &[u8]) -> bool {
+    node.as_integer_node()
+        .map(|i| {
+            let l = i.location();
+            &src[l.start_offset()..l.end_offset()] == b"0"
+        })
+        .unwrap_or(false)
+}
+fn is_gvar(node: &ruby_prism::Node) -> bool {
+    node.as_global_variable_read_node().is_some()
+}
+/// A binary-operator send like `foo - 1` (operator name + receiver + one arg).
+fn is_binary_op(node: &ruby_prism::Node) -> bool {
+    node.as_call_node()
+        .map(|c| {
+            c.receiver().is_some()
+                && c.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0) == 1
+                && c.name().as_slice().first().is_some_and(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+        })
+        .unwrap_or(false)
+}
+/// rubocop's `parenthesized_source`: wrap a bare binary operation in parens.
+fn paren_src(node: &ruby_prism::Node, src: &[u8]) -> String {
+    let l = node.location();
+    let s = String::from_utf8_lossy(&src[l.start_offset()..l.end_offset()]);
+    if is_binary_op(node) {
+        format!("({s})")
+    } else {
+        s.into_owned()
+    }
+}
+/// The predicate for a comparison operator (`==`→zero?, `>`→positive?, `<`→
+/// negative?); when `inverted` (e.g. `0 < x`), `>`/`<` swap first.
+fn predicate_for(op: &[u8], inverted: bool) -> &'static str {
+    let eff: &[u8] = if inverted {
+        match op {
+            b">" => b"<",
+            b"<" => b">",
+            o => o,
+        }
+    } else {
+        op
+    };
+    match eff {
+        b"==" => "zero?",
+        b">" => "positive?",
+        b"<" => "negative?",
+        _ => "",
+    }
+}
+
 /// A method name introduced by a macro argument (attr/alias_method/Struct member):
 /// the arg must be a plain symbol or string literal (interpolated ones are
 /// skipped). Returns (name bytes, offense anchor = the argument's start offset).
@@ -533,7 +658,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.push(off, cop, false, render(msg, &caps));
             }
         }
-        // recurse into children (we've overridden the default walk)
+        // Style/NumericPredicate (imperative: message interpolates a constructed
+        // suggestion). Uses call_stack for AllowedMethods-on-ancestor + negation.
+        if let Some((off, msg)) = self.numeric_predicate(node) {
+            self.push(off, "Style/NumericPredicate", true, msg);
+        }
+        // recurse into children (we've overridden the default walk). Push this
+        // call's name so descendants can see it as an ancestor.
+        self.call_stack.push(node.name().as_slice().to_vec());
         if let Some(r) = node.receiver() {
             self.visit(&r);
         }
@@ -545,6 +677,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if let Some(b) = node.block() {
             self.visit(&b);
         }
+        self.call_stack.pop();
     }
 }
 
@@ -597,7 +730,7 @@ fn main() {
         }
     }
 
-    let mut cops = Cops { src: &src, idx: &idx, cfg: &cfg, comment_lines, offenses: Vec::new(), fixes: Vec::new(), decl, allowed, allowed_methods };
+    let mut cops = Cops { src: &src, idx: &idx, cfg: &cfg, comment_lines, offenses: Vec::new(), fixes: Vec::new(), decl, allowed, allowed_methods, call_stack: Vec::new() };
 
     // ---- text-based cops ----
     if cops.on("Style/FrozenStringLiteralComment") && !has_frozen {
