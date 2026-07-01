@@ -12,22 +12,27 @@ use std::collections::HashMap;
 /// are shaped exactly like this, so porting them is transcription, not coding.
 /// `anchor` is the one bit NOT derivable from the pattern — where rubocop's
 /// `add_offense` points (matched-node start vs. the send operator/selector).
-const DECLARATIVE: &[(&str, &str, &str, Anchor)] = &[
-    // NilComparison (default `predicate` style). Verbatim from rubocop source.
-    ("(send _ {:== :===} (nil))", "Style/NilComparison", "Prefer the use of the `nil?` predicate.", Anchor::Op),
+/// A declarative cop row. The optional last field is an `EnforcedStyle` gate:
+/// `Some("comparison")` means the row only fires when the cop's active style is
+/// `comparison` (resolved via the SCHEMA); `None` means style-agnostic. This is
+/// how one pattern cop expresses multiple styles as data — no imperative branch.
+const DECLARATIVE: &[(&str, &str, &str, Anchor, Option<&str>)] = &[
+    // NilComparison. Two styles, two rows, gated on EnforcedStyle. Verbatim msgs.
+    ("(send _ {:== :===} (nil))", "Style/NilComparison", "Prefer the use of the `nil?` predicate.", Anchor::Op, Some("predicate")),
+    ("(send (...) :nil?)", "Style/NilComparison", "Prefer the use of the `==` comparison.", Anchor::Op, Some("comparison")),
 
     // ZeroLengthPredicate — `empty?` (zero-length) shapes. The `${:size :length}`
     // captures the method so the message interpolates it, exactly like rubocop.
-    ("(send (send (...) ${:size :length}) :== (int 0))", "Style/ZeroLengthPredicate", "Use `empty?` instead of `{} == 0`.", Anchor::Node),
-    ("(send (int 0) :== (send (...) ${:size :length}))", "Style/ZeroLengthPredicate", "Use `empty?` instead of `0 == {}`.", Anchor::Node),
-    ("(send (send (...) ${:size :length}) :< (int 1))", "Style/ZeroLengthPredicate", "Use `empty?` instead of `{} < 1`.", Anchor::Node),
-    ("(send (int 1) :> (send (...) ${:size :length}))", "Style/ZeroLengthPredicate", "Use `empty?` instead of `1 > {}`.", Anchor::Node),
-    ("(send (send (...) ${:size :length}) :zero?)", "Style/ZeroLengthPredicate", "Use `empty?` instead of `{}.zero?`.", Anchor::RecvOp),
+    ("(send (send (...) ${:size :length}) :== (int 0))", "Style/ZeroLengthPredicate", "Use `empty?` instead of `{} == 0`.", Anchor::Node, None),
+    ("(send (int 0) :== (send (...) ${:size :length}))", "Style/ZeroLengthPredicate", "Use `empty?` instead of `0 == {}`.", Anchor::Node, None),
+    ("(send (send (...) ${:size :length}) :< (int 1))", "Style/ZeroLengthPredicate", "Use `empty?` instead of `{} < 1`.", Anchor::Node, None),
+    ("(send (int 1) :> (send (...) ${:size :length}))", "Style/ZeroLengthPredicate", "Use `empty?` instead of `1 > {}`.", Anchor::Node, None),
+    ("(send (send (...) ${:size :length}) :zero?)", "Style/ZeroLengthPredicate", "Use `empty?` instead of `{}.zero?`.", Anchor::RecvOp, None),
     // ZeroLengthPredicate — `!empty?` (nonzero-length) shapes.
-    ("(send (send (...) ${:size :length}) :> (int 0))", "Style/ZeroLengthPredicate", "Use `!empty?` instead of `{} > 0`.", Anchor::Node),
-    ("(send (int 0) :< (send (...) ${:size :length}))", "Style/ZeroLengthPredicate", "Use `!empty?` instead of `0 < {}`.", Anchor::Node),
-    ("(send (send (...) ${:size :length}) :!= (int 0))", "Style/ZeroLengthPredicate", "Use `!empty?` instead of `{} != 0`.", Anchor::Node),
-    ("(send (int 0) :!= (send (...) ${:size :length}))", "Style/ZeroLengthPredicate", "Use `!empty?` instead of `0 != {}`.", Anchor::Node),
+    ("(send (send (...) ${:size :length}) :> (int 0))", "Style/ZeroLengthPredicate", "Use `!empty?` instead of `{} > 0`.", Anchor::Node, None),
+    ("(send (int 0) :< (send (...) ${:size :length}))", "Style/ZeroLengthPredicate", "Use `!empty?` instead of `0 < {}`.", Anchor::Node, None),
+    ("(send (send (...) ${:size :length}) :!= (int 0))", "Style/ZeroLengthPredicate", "Use `!empty?` instead of `{} != 0`.", Anchor::Node, None),
+    ("(send (int 0) :!= (send (...) ${:size :length}))", "Style/ZeroLengthPredicate", "Use `!empty?` instead of `0 != {}`.", Anchor::Node, None),
 ];
 
 /// Where a declarative offense points. Per-cop metadata, since rubocop's cops
@@ -193,7 +198,7 @@ struct Cops<'a> {
     fixes: Vec<(usize, usize, Vec<u8>)>,
     // DECLARATIVE cops: (parsed pattern, cop name, message). Built once from
     // the DECLARATIVE table — the cop "logic" is entirely in the pattern.
-    decl: Vec<(Pat, &'static str, &'static str, Anchor)>,
+    decl: Vec<(Pat, &'static str, &'static str, Anchor, Option<&'static str>)>,
 }
 impl<'a> Cops<'a> {
     fn on(&self, cop: &str) -> bool {
@@ -369,9 +374,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             .map(|l| l.start_offset())
             .unwrap_or(node_off);
         for i in 0..self.decl.len() {
-            let (pat, cop, msg, anchor) = &self.decl[i];
+            let (pat, cop, msg, anchor, style) = &self.decl[i];
             if !self.on(cop) {
                 continue;
+            }
+            // EnforcedStyle gate: a style-specific row fires only under its style.
+            if let Some(s) = style {
+                if self.cfg.enforced_style(cop) != *s {
+                    continue;
+                }
             }
             if let Some(caps) = nodepattern::matches(pat, &n, self.src) {
                 let (cop, msg) = (*cop, *msg);
@@ -425,9 +436,9 @@ fn main() {
         }
     }
 
-    let decl: Vec<(Pat, &'static str, &'static str, Anchor)> = DECLARATIVE
+    let decl: Vec<(Pat, &'static str, &'static str, Anchor, Option<&'static str>)> = DECLARATIVE
         .iter()
-        .map(|(p, cop, msg, a)| (nodepattern::parse(p), *cop, *msg, *a))
+        .map(|(p, cop, msg, a, style)| (nodepattern::parse(p), *cop, *msg, *a, *style))
         .collect();
 
     let mut cops = Cops { src: &src, idx: &idx, cfg: &cfg, comment_lines, offenses: Vec::new(), fixes: Vec::new(), decl };
