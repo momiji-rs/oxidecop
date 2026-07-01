@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 ruby-prism = "1.9"
+regex = "1"
 
 [profile.release]
 opt-level = 3

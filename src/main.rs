@@ -89,6 +89,47 @@ fn schema_default(cop: &str, key: &str) -> Option<&'static str> {
     schema(cop).and_then(|s| s.params.iter().find(|(k, _)| *k == key).map(|(_, v)| *v))
 }
 
+/// Parse a YAML flow sequence of patterns (`['\Afoo\z', '^\s*bar']`) into their
+/// raw regex sources. Quote-aware so commas inside quotes aren't split points.
+/// This backs the cross-cutting `AllowedPatterns` config (see `Cops::allowed`).
+fn parse_allowed_list(s: &str) -> Vec<String> {
+    let s = s.trim();
+    if !s.starts_with('[') {
+        return Vec::new(); // `nil` / absent / scalar → no patterns
+    }
+    let inner = &s[1..s.len().saturating_sub(1)];
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in inner.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                ',' => {
+                    let t = cur.trim().to_string();
+                    if !t.is_empty() {
+                        out.push(t);
+                    }
+                    cur.clear();
+                }
+                _ => cur.push(c),
+            },
+        }
+    }
+    let t = cur.trim().to_string();
+    if !t.is_empty() {
+        out.push(t);
+    }
+    out
+}
+
 // ---------------- config (.rubocop.yml, minimal subset) ----------------
 struct Config {
     // cop/section name -> { key -> value }
@@ -199,10 +240,24 @@ struct Cops<'a> {
     // DECLARATIVE cops: (parsed pattern, cop name, message). Built once from
     // the DECLARATIVE table — the cop "logic" is entirely in the pattern.
     decl: Vec<(Pat, &'static str, &'static str, Anchor, Option<&'static str>)>,
+    // Cross-cutting `AllowedPatterns`: per-cop compiled regexes. A cop consults
+    // `allowed(cop, text)` to suppress an offense whose relevant string (a method
+    // name, a source line, …) matches — exactly rubocop's shared AllowedPatterns.
+    allowed: HashMap<String, Vec<regex::Regex>>,
 }
 impl<'a> Cops<'a> {
     fn on(&self, cop: &str) -> bool {
         self.cfg.enabled(cop)
+    }
+    /// Is `text` exempt for `cop` via its configured AllowedPatterns?
+    fn allowed(&self, cop: &str, text: &[u8]) -> bool {
+        match self.allowed.get(cop) {
+            Some(pats) if !pats.is_empty() => {
+                let s = String::from_utf8_lossy(text);
+                pats.iter().any(|re| re.is_match(&s))
+            }
+            _ => false,
+        }
     }
     fn push(&mut self, off: usize, cop: &'static str, correctable: bool, msg: impl Into<String>) {
         let (line, col) = self.idx.loc(off);
@@ -367,7 +422,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if self.on("Naming/MethodName") {
             let style = self.cfg.enforced_style("Naming/MethodName");
             let name = node.name().as_slice();
-            if !name_matches_style(name, style) {
+            if !name_matches_style(name, style) && !self.allowed("Naming/MethodName", name) {
                 self.push(node.name_loc().start_offset(), "Naming/MethodName", false,
                     format!("Use {style} for method names."));
             }
@@ -398,7 +453,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let style = self.cfg.enforced_style("Naming/MethodName").to_string();
             let nn = node.new_name();
             if let Some((nm, off)) = method_name_arg(&nn, self.src) {
-                if !name_matches_style(nm, &style) {
+                if !name_matches_style(nm, &style) && !self.allowed("Naming/MethodName", nm) {
                     self.push(off, "Naming/MethodName", false, format!("Use {style} for method names."));
                 }
             }
@@ -436,7 +491,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let bad: Vec<usize> = members
                 .iter()
                 .filter_map(|arg| method_name_arg(arg, self.src))
-                .filter(|(nm, _)| !name_matches_style(nm, &style))
+                .filter(|(nm, _)| !name_matches_style(nm, &style) && !self.allowed("Naming/MethodName", nm))
                 .map(|(_, off)| off)
                 .collect();
             for off in bad {
@@ -520,7 +575,19 @@ fn main() {
         .map(|(p, cop, msg, a, style)| (nodepattern::parse(p), *cop, *msg, *a, *style))
         .collect();
 
-    let mut cops = Cops { src: &src, idx: &idx, cfg: &cfg, comment_lines, offenses: Vec::new(), fixes: Vec::new(), decl };
+    // Compile each cop's AllowedPatterns once (invalid regexes are dropped).
+    let mut allowed: HashMap<String, Vec<regex::Regex>> = HashMap::new();
+    for (sec, kv) in &cfg.sections {
+        if let Some(v) = kv.get("AllowedPatterns") {
+            let pats = parse_allowed_list(v)
+                .into_iter()
+                .filter_map(|p| regex::Regex::new(&p).ok())
+                .collect();
+            allowed.insert(sec.clone(), pats);
+        }
+    }
+
+    let mut cops = Cops { src: &src, idx: &idx, cfg: &cfg, comment_lines, offenses: Vec::new(), fixes: Vec::new(), decl, allowed };
 
     // ---- text-based cops ----
     if cops.on("Style/FrozenStringLiteralComment") && !has_frozen {
@@ -531,7 +598,7 @@ fn main() {
         let max = cfg.int("Layout/LineLength", "Max");
         for (li, line) in src.split(|&b| b == b'\n').enumerate() {
             let len = String::from_utf8_lossy(line).chars().count();
-            if len > max {
+            if len > max && !cops.allowed("Layout/LineLength", line) {
                 let off = idx.starts[li] + line.iter().take(max).count();
                 cops.offenses.push(Offense { line: li + 1, col: max + 1, cop: "Layout/LineLength", correctable: false,
                     message: format!("Line is too long. [{len}/{max}]") });

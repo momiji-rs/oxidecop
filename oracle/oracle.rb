@@ -52,6 +52,16 @@ def parse_block(raw_lines)
   [src.join("\n") + "\n", expected]
 end
 
+# Pull the outermost `{...}` hash literal out of a (possibly multi-line)
+# `let(:cop_config)` body and collapse whitespace to one line. Returns 'default'
+# when there's no hash literal (e.g. a `super().merge(...)` block).
+def extract_hash(text)
+  s = text[/\{.*\}/m]
+  return 'default' unless s
+
+  s.gsub(/\s+/, ' ').strip
+end
+
 examples = []
 lines = File.readlines(SPEC, chomp: true)
 i = 0
@@ -63,8 +73,19 @@ while i < lines.length
     cur_ctx = l.strip
     cur_cfg = 'default'
   end
-  if l =~ /let\(:cop_config\)\s*\{\s*(\{.*\})\s*\}/
-    cur_cfg = Regexp.last_match(1).gsub(/['"]/, '').gsub(/\s+/, ' ')
+  # `let(:cop_config)` in either single-line `{ {...} }` or multi-line `do..end`
+  # form. Capture the raw hash text (quotes preserved, whitespace collapsed) so
+  # array values like AllowedPatterns survive; unparseable blocks stay 'default'.
+  if l =~ /let\(:cop_config\)\s*\{(.*)\}\s*\z/
+    cur_cfg = extract_hash(Regexp.last_match(1))
+  elsif l =~ /let\(:cop_config\)\s*do\s*\z/
+    blk = []
+    i += 1
+    while i < lines.length && lines[i].strip != 'end'
+      blk << lines[i]
+      i += 1
+    end
+    cur_cfg = extract_hash(blk.join(' '))
   end
   if l =~ /expect_(offense|no_offenses)\(<<[~-]RUBY\)/
     kind = Regexp.last_match(1) == 'offense' ? :offense : :no_offense
@@ -100,28 +121,94 @@ COP_DEFAULT_STYLE = {
 def resolve_interp(text, cfg_hash)
   text = text.gsub(/\#\{trailing_whitespace \* (\d+)\}/) { ' ' * Regexp.last_match(1).to_i }
   text = text.gsub('#{trailing_whitespace}', ' ')
-  style = cfg_hash['EnforcedStyle'] || COP_DEFAULT_STYLE[COP]
+  style = cfg_hash['EnforcedStyle']
+  # `enforced_style` (an RSpec variable) can't be resolved statically; fall back
+  # to the cop's default so the message still compares meaningfully.
+  style = COP_DEFAULT_STYLE[COP] if style.nil? || style == 'enforced_style'
   text = text.gsub('#{enforced_style}', style) if style
   text
 end
 
-# `ex[:cfg]` is the normalized `let(:cop_config)` hash string, e.g.
-# "{ EnforcedStyle => single_quotes }" or "{ AllowInHeredoc => false }" or
-# "default". Parse it into a Ruby hash of config keys.
+# Split a hash/array body on top-level commas, respecting quotes and [] nesting
+# (so `['a', 'b']` and patterns containing commas aren't split apart).
+def split_top(s)
+  parts = []
+  cur = +''
+  depth = 0
+  quote = nil
+  s.each_char do |c|
+    if quote
+      cur << c
+      quote = nil if c == quote
+    elsif c == "'" || c == '"'
+      quote = c
+      cur << c
+    elsif c == '['
+      depth += 1
+      cur << c
+    elsif c == ']'
+      depth -= 1
+      cur << c
+    elsif c == ',' && depth.zero?
+      parts << cur
+      cur = +''
+    else
+      cur << c
+    end
+  end
+  parts << cur unless cur.strip.empty?
+  parts
+end
+
+# Normalize one array item to its raw pattern source: `/re/opts` -> re,
+# 'str'/"str" -> str, else as-is.
+def normalize_pattern(item)
+  item = item.strip
+  if (m = item.match(%r{\A/(.*)/[a-z]*\z}m)) then m[1]
+  elsif (m = item.match(/\A(['"])(.*)\1\z/m)) then m[2]
+  else item
+  end
+end
+
+def parse_val(v)
+  v = v.strip
+  if v.start_with?('[')
+    inner = v.sub(/\A\[/, '').sub(/\]\s*\z/, '')
+    split_top(inner).map { |item| normalize_pattern(item) }
+  else
+    v.sub(/\A(['"])(.*)\1\z/m, '\2')
+  end
+end
+
+# `ex[:cfg]` is the raw `let(:cop_config)` hash text (quotes preserved), e.g.
+# "{ 'EnforcedStyle' => single_quotes }" or
+# "{ 'Max' => 18, 'AllowedPatterns' => ['^\\s*test\\s'] }" or "default".
 def parse_cfg(cfgstr)
   return {} if cfgstr == 'default'
 
+  body = cfgstr.strip.sub(/\A\{/, '').sub(/\}\z/, '')
   h = {}
-  cfgstr.scan(/(\w+)\s*=>\s*([^,}]+)/) { |k, v| h[k.strip] = v.strip }
+  split_top(body).each do |pair|
+    next unless pair =~ /\A\s*['"]?(\w+)['"]?\s*=>\s*(.*)\z/m
+
+    h[Regexp.last_match(1)] = parse_val(Regexp.last_match(2))
+  end
   h
 end
 
 # Build the per-example .rubocop.yml: enable only this cop, and pass through the
 # example's own cop_config so config-reading cops (Layout/LineLength `Max`,
-# Style/NumericLiterals `MinDigits`, …) are exercised faithfully.
+# Style/NumericLiterals `MinDigits`, AllowedPatterns, …) are exercised faithfully.
+# Array values (AllowedPatterns) are emitted as single-quoted YAML flow sequences.
 def build_cfg(cop, cfg_hash)
   lines = ['AllCops:', '  DisabledByDefault: true', "#{cop}:", '  Enabled: true']
-  cfg_hash.each { |k, v| lines << "  #{k}: #{v}" }
+  cfg_hash.each do |k, v|
+    if v.is_a?(Array)
+      lines << "  #{k}: [#{v.map { |p| "'#{p}'" }.join(', ')}]"
+    else
+      lines << "  #{k}: #{v}"
+    end
+  end
   lines.join("\n") + "\n"
 end
 
