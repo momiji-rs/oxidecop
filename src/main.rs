@@ -247,6 +247,20 @@ fn name_matches_style(name: &[u8], style: &str) -> bool {
         _ => is_snake_case(name),
     }
 }
+/// A method name introduced by a macro argument (attr/alias_method/Struct member):
+/// the arg must be a plain symbol or string literal (interpolated ones are
+/// skipped). Returns (name bytes, offense anchor = the argument's start offset).
+fn method_name_arg<'a>(arg: &ruby_prism::Node, src: &'a [u8]) -> Option<(&'a [u8], usize)> {
+    if let Some(sym) = arg.as_symbol_node() {
+        let v = sym.value_loc()?;
+        Some((&src[v.start_offset()..v.end_offset()], arg.location().start_offset()))
+    } else if let Some(st) = arg.as_string_node() {
+        let c = st.content_loc();
+        Some((&src[c.start_offset()..c.end_offset()], arg.location().start_offset()))
+    } else {
+        None
+    }
+}
 
 impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
@@ -378,32 +392,53 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.visit(&b);
         }
     }
-    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
-        // Naming/MethodName also names methods via attr macros — check each
-        // symbol/string arg of attr / attr_reader / attr_writer / attr_accessor.
-        if self.on("Naming/MethodName")
-            && matches!(node.name().as_slice(),
-                        b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor")
-        {
+    fn visit_alias_method_node(&mut self, node: &ruby_prism::AliasMethodNode<'pr>) {
+        // `alias new_name old_name` — check the new name against the style.
+        if self.on("Naming/MethodName") {
             let style = self.cfg.enforced_style("Naming/MethodName").to_string();
-            let mut bad: Vec<usize> = Vec::new();
-            if let Some(args) = node.arguments() {
-                for arg in args.arguments().iter() {
-                    let ok = if let Some(sym) = arg.as_symbol_node() {
-                        match sym.value_loc() {
-                            Some(v) => name_matches_style(&self.src[v.start_offset()..v.end_offset()], &style),
-                            None => true,
-                        }
-                    } else if let Some(st) = arg.as_string_node() {
-                        name_matches_style(st.content_loc().as_slice(), &style)
-                    } else {
-                        true
-                    };
-                    if !ok {
-                        bad.push(arg.location().start_offset());
-                    }
+            let nn = node.new_name();
+            if let Some((nm, off)) = method_name_arg(&nn, self.src) {
+                if !name_matches_style(nm, &style) {
+                    self.push(off, "Naming/MethodName", false, format!("Use {style} for method names."));
                 }
             }
+        }
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // Naming/MethodName also names methods through macros. Check the relevant
+        // symbol/string args of each: attr*, alias_method, and Struct/Data members.
+        if self.on("Naming/MethodName") {
+            let style = self.cfg.enforced_style("Naming/MethodName").to_string();
+            let args: Vec<ruby_prism::Node> = node
+                .arguments()
+                .map(|a| a.arguments().iter().collect())
+                .unwrap_or_default();
+            let recv_src = node.receiver().map(|r| {
+                let l = r.location();
+                self.src[l.start_offset()..l.end_offset()].to_vec()
+            });
+            // Which args carry method names for this macro?
+            let members: &[ruby_prism::Node] = match node.name().as_slice() {
+                b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor" => &args,
+                // alias_method(new, old) — only the new name, and only at arity 2.
+                b"alias_method" if args.len() == 2 => &args[0..1],
+                // Struct.new(...) — a leading string is the class name, not a member.
+                b"new" if matches!(recv_src.as_deref(), Some(b"Struct") | Some(b"::Struct")) => {
+                    if args.first().map(|a| a.as_string_node().is_some()).unwrap_or(false) {
+                        &args[1..]
+                    } else {
+                        &args
+                    }
+                }
+                b"define" if matches!(recv_src.as_deref(), Some(b"Data") | Some(b"::Data")) => &args,
+                _ => &[],
+            };
+            let bad: Vec<usize> = members
+                .iter()
+                .filter_map(|arg| method_name_arg(arg, self.src))
+                .filter(|(nm, _)| !name_matches_style(nm, &style))
+                .map(|(_, off)| off)
+                .collect();
             for off in bad {
                 self.push(off, "Naming/MethodName", false, format!("Use {style} for method names."));
             }

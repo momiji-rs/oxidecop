@@ -90,8 +90,8 @@ Current leaderboard (`ruby oracle/leaderboard.rb`), against RuboCop v1.88.0:
 cop                                  scored   skip         LOC        FULL
 Style/NilComparison                       8      0     8/8         8/8       100%
 Style/StringLiterals                     32      1    31/32       31/32       97%
+Naming/MethodName                        48      6    43/48       43/48       90%
 Style/ZeroLengthPredicate                74      0    49/74       48/74       65%
-Naming/MethodName                        48      6    29/48       29/48       60%
 Style/Documentation                      43      4    22/43       22/43       51%
 Style/NumericLiterals                    28      0    14/28       13/28       46%
 Layout/TrailingWhitespace                19      0     8/19        8/19       42%
@@ -99,7 +99,7 @@ Style/RedundantReturn                    37      0    19/37       14/37       38
 Style/FrozenStringLiteralComment         90      3    40/90       31/90       34%
 Layout/LineLength                       141     14    32/141      32/141      23%
 ────────────────────────────────────────────────────────────────────────────
-TOTAL (representable examples)          520     28                236/520      45%
+TOTAL (representable examples)          520     28                250/520      48%
 ```
 
 **Read this honestly:** the score is over *representable* examples only. RuboCop's
