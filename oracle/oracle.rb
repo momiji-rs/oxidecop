@@ -352,7 +352,12 @@ examples.each_with_index do |ex, n|
 
   exp_full = exp.map { |l, c, m| [l, c, m] }.sort
   act_full = actual.sort
-  full_ok = exp_full == act_full
+  # `[...]` in an expect_offense annotation abbreviates the message — any
+  # message at the right location matches.
+  full_ok = exp_full.size == act_full.size &&
+            exp_full.zip(act_full).all? do |(el, ec, em), (al, ac, am)|
+              el == al && ec == ac && (em == '[...]' || em == am)
+            end
 
   g[:loc] += 1 if loc_ok
   g[:full] += 1 if full_ok
