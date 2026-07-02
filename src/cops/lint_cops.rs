@@ -1868,3 +1868,232 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Lint/FloatComparison — avoid direct comparison of floats for equality.
+    pub(crate) fn check_float_comparison(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/FloatComparison";
+        if !self.on(COP) {
+            return;
+        }
+
+        let name = node.name().as_slice();
+        if !matches!(name, b"==" | b"!=" | b"eql?" | b"equal?") {
+            return;
+        }
+
+        // Must have exactly 1 argument
+        let Some(args) = node.arguments() else { return };
+        let mut args_iter = args.arguments().iter();
+        let Some(rhs) = args_iter.next() else { return };
+        if args_iter.next().is_some() {
+            return; // More than one argument
+        }
+
+        let lhs = node.receiver();
+
+        // Check if either side is "safe"
+        let lhs_safe = lhs.as_ref().map_or(false, |n| self.literal_safe_node(&n));
+        let rhs_safe = self.literal_safe_node(&rhs);
+        if lhs_safe || rhs_safe {
+            return;
+        }
+
+        // Check if either side is a float
+        let lhs_float = lhs.as_ref().map_or(false, |n| self.is_float_node(&n));
+        let rhs_float = self.is_float_node(&rhs);
+        if !lhs_float && !rhs_float {
+            return;
+        }
+
+        let message = if name == b"!=" {
+            "Avoid inequality comparisons of floats as they are unreliable."
+        } else {
+            "Avoid equality comparisons of floats as they are unreliable."
+        };
+
+        self.push(node.location().start_offset(), COP, false, message);
+    }
+
+    /// Check case statement for float comparisons
+    pub(crate) fn check_float_comparison_case(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Lint/FloatComparison";
+        if !self.on(COP) {
+            return;
+        }
+
+        for branch in node.conditions().iter() {
+            let Some(when_node) = branch.as_when_node() else { continue };
+            for condition in when_node.conditions().iter() {
+                if !self.is_float_node(&condition) || self.literal_safe_node(&condition) {
+                    continue;
+                }
+                self.push(
+                    condition.location().start_offset(),
+                    COP,
+                    false,
+                    "Avoid float literal comparisons in case statements as they are unreliable.",
+                );
+            }
+        }
+    }
+
+    /// Check if a node represents a float value
+    fn is_float_node(&self, node: &ruby_prism::Node) -> bool {
+        // Direct float literal
+        if node.as_float_node().is_some() {
+            return true;
+        }
+
+        // Parentheses node - recurse on the first inner statement, like
+        // upstream's `float?(node.children.first)` for :begin nodes.
+        if let Some(paren) = node.as_parentheses_node() {
+            if let Some(inner) = paren
+                .body()
+                .and_then(|b| b.as_statements_node().and_then(|st| st.body().iter().next()))
+            {
+                return self.is_float_node(&inner);
+            }
+            return false;
+        }
+
+        // Call node - check if it returns a float
+        if let Some(call) = node.as_call_node() {
+            return self.is_float_send(&call);
+        }
+
+        false
+    }
+
+    /// Check if a send node returns a float
+    fn is_float_send(&self, node: &ruby_prism::CallNode) -> bool {
+        let name = node.name().as_slice();
+
+        // Float-returning methods: to_f, Float, fdiv
+        if matches!(name, b"to_f" | b"Float" | b"fdiv") {
+            return true;
+        }
+
+        // Check for arithmetic operations
+        if self.is_arithmetic_operation(node) {
+            if let Some(receiver) = node.receiver() {
+                if self.is_float_node(&receiver) {
+                    return true;
+                }
+            }
+            if let Some(args) = node.arguments() {
+                if let Some(first_arg) = args.arguments().iter().next() {
+                    if self.is_float_node(&first_arg) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Check for methods on float receivers
+        if let Some(receiver) = node.receiver() {
+            if receiver.as_float_node().is_some() {
+                // FLOAT_INSTANCE_METHODS: @-, abs, magnitude, modulo, next_float, prev_float, quo
+                if matches!(
+                    name,
+                    b"-@" | b"abs" | b"magnitude" | b"modulo" | b"next_float" | b"prev_float" | b"quo"
+                ) {
+                    return true;
+                }
+
+                // Check numeric-returning methods that can return floats
+                if self.numeric_returning_method_returns_float(node) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Check if a call node is an arithmetic operation
+    fn is_arithmetic_operation(&self, node: &ruby_prism::CallNode) -> bool {
+        matches!(
+            node.name().as_slice(),
+            b"+" | b"-" | b"*" | b"/" | b"%" | b"**"
+        )
+    }
+
+    /// Check if a numeric-returning method returns float (has precision argument)
+    fn numeric_returning_method_returns_float(&self, node: &ruby_prism::CallNode) -> bool {
+        let name = node.name().as_slice();
+
+        match name {
+            b"angle" | b"arg" | b"phase" => {
+                // These return float if receiver is negative
+                if let Some(receiver) = node.receiver() {
+                    if receiver.as_float_node().is_some() {
+                        // Check if the float value is negative by looking at source
+                        let src = self.node_src(&receiver);
+                        let src_str = String::from_utf8_lossy(src);
+                        // If source starts with -, it's negative
+                        return src_str.starts_with('-');
+                    }
+                }
+                false
+            }
+            b"ceil" | b"floor" | b"round" | b"truncate" => {
+                // These return float only if they have a positive precision argument
+                if let Some(args) = node.arguments() {
+                    if let Some(first_arg) = args.arguments().iter().next() {
+                        if first_arg.as_integer_node().is_some() {
+                            let src = self.node_src(&first_arg);
+                            let src_str = String::from_utf8_lossy(src);
+                            // Try to parse as integer
+                            if let Ok(precision) = src_str.parse::<i64>() {
+                                return precision > 0;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if a node is "safe" for comparison (zero numeric or nil)
+    fn literal_safe_node(&self, node: &ruby_prism::Node) -> bool {
+        // Handle parentheses node - recurse on the first inner statement,
+        // like upstream's `literal_safe?(node.children.first)` for :begin.
+        if let Some(paren) = node.as_parentheses_node() {
+            if let Some(inner) = paren
+                .body()
+                .and_then(|b| b.as_statements_node().and_then(|st| st.body().iter().next()))
+            {
+                return self.literal_safe_node(&inner);
+            }
+            return false;
+        }
+
+        // Check for nil
+        if node.as_nil_node().is_some() {
+            return true;
+        }
+
+        // Numeric zero, by value like upstream's `node.value.zero?` (so
+        // `0.00`, `0_0`, `0x0` count) rather than by source spelling.
+        if node.as_integer_node().is_some() || node.as_float_node().is_some() {
+            let src = String::from_utf8_lossy(self.node_src(&node)).replace('_', "");
+            let t = src.trim_start_matches(['-', '+']);
+            let zero = if let Some(rest) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                i128::from_str_radix(rest, 16) == Ok(0)
+            } else if let Some(rest) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+                i128::from_str_radix(rest, 2) == Ok(0)
+            } else if let Some(rest) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+                i128::from_str_radix(rest, 8) == Ok(0)
+            } else {
+                src.parse::<f64>() == Ok(0.0)
+            };
+            return zero;
+        }
+
+        false
+    }
+}
