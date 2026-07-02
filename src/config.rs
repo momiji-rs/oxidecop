@@ -145,6 +145,16 @@ impl Config {
             _ => default,
         }
     }
+    /// AllCops/TargetRubyVersion — rubocop's DEFAULT_VERSION (2.7) when unset.
+    /// Version-gated cop behavior (parser names, minimum_target_ruby_version)
+    /// dispatches on this.
+    pub fn target_ruby(&self) -> f64 {
+        self.sections
+            .get("AllCops")
+            .and_then(|s| s.get("TargetRubyVersion"))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2.7)
+    }
     /// AllCops/ActiveSupportExtensionsEnabled (default false). Gates whether
     /// `proc`/`lambda`/`Proc.new` blocks are candidates for Style/SymbolProc.
     pub fn active_support(&self) -> bool {

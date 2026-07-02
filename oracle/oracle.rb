@@ -175,12 +175,15 @@ while i < lines.length
     inh_as   = cfg_stack.any? ? cfg_stack.last[3] : nil
     inh_sec  = cfg_stack.any? ? cfg_stack.last[4] : nil
     inh_ovr  = cfg_stack.any? ? cfg_stack.last[5] : nil
+    inh_rb   = cfg_stack.any? ? cfg_stack.last[6] : nil
+    # a `:rubyXY` context tag pins TargetRubyVersion for its examples
+    inh_rb = "#{Regexp.last_match(1)}.#{Regexp.last_match(2)}" if l =~ /,\s*:ruby(\d)(\d)\b/
     # A parameterized shared_examples group (`do |style|`) runs differently
     # per caller — its inline examples are not statically representable.
     parameterized = !(l =~ /^\s*shared_examples\b.*do\s*\|/).nil?
     cfg_stack.push([indent, inh_cfg,
                     inh_skip || l.include?('unsupported_on: :prism') || parameterized,
-                    inh_as, inh_sec, inh_ovr])
+                    inh_as, inh_sec, inh_ovr, inh_rb])
   elsif l =~ /^\s*(it|specify)\b/
     # An `it` at indent N means every context defined at indent >= N has
     # closed — without this, a trailing top-level example would inherit the
@@ -242,6 +245,7 @@ while i < lines.length
   cur_as = cfg_stack.any? ? cfg_stack.last[3] : nil
   cur_sec = cfg_stack.any? ? cfg_stack.last[4] : nil
   cur_ovr = cfg_stack.any? ? cfg_stack.last[5] : nil
+  cur_rb  = cfg_stack.any? ? cfg_stack.last[6] : nil
   # Heredoc examples, all forms: `<<~RUBY` (escapes render), `<<~'RUBY'` (raw),
   # `<<-RUBY`, and trailing keyword args (`, identifier: identifier` — those
   # substitute `%{key}` in the body; unresolvable statically, so they fall into
@@ -258,14 +262,14 @@ while i < lines.length
     end
     src, expected = parse_block(body, raw_heredoc, squiggly)
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
-                  sections: cur_sec, override: cur_ovr, src: src, expected: expected }
+                  sections: cur_sec, override: cur_ovr, ruby: cur_rb, src: src, expected: expected }
   elsif l =~ /expect_no_offenses\((['"])(.*?)\1\)/
     quote, body = Regexp.last_match(1), Regexp.last_match(2)
     # A plain string arg renders by its quote's rules: double-quoted like a
     # heredoc; single-quoted only interprets \\ and \'.
     body = quote == '"' ? unescape_dq(body) : body.gsub(/\\([\\'])/, '\1')
     examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
-                  sections: cur_sec, override: cur_ovr, src: body + "\n", expected: [] }
+                  sections: cur_sec, override: cur_ovr, ruby: cur_rb, src: body + "\n", expected: [] }
   end
   i += 1
 end
@@ -377,9 +381,10 @@ end
 # `replace: true` mirrors a spec whose `let(:config)` rebuilt the whole
 # RuboCop::Config — unspecified cop params are nil there, NOT default.yml
 # values, which `__replace_defaults__` tells the engine.
-def build_cfg(cop, cfg_hash, as_val = nil, extra_sections = [], replace: false)
+def build_cfg(cop, cfg_hash, as_val = nil, extra_sections = [], replace: false, ruby: nil)
   lines = ['AllCops:', '  DisabledByDefault: true']
   lines << "  ActiveSupportExtensionsEnabled: #{as_val}" if as_val
+  lines << "  TargetRubyVersion: #{ruby}" if ruby
   lines += ["#{cop}:", '  Enabled: true']
   lines << '  __replace_defaults__: true' if replace
   emit_pairs(lines, cfg_hash)
@@ -469,7 +474,7 @@ examples.each_with_index do |ex, n|
     next
   end
 
-  actual = run_poc(POC, src, build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace))
+  actual = run_poc(POC, src, build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace, ruby: ex[:ruby]))
   exp = ex[:expected].map { |l, c, m| [l, c, resolve_interp(m, cfg_hash)] }
   g[:total] += 1
 
