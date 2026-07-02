@@ -88,6 +88,7 @@ COPS = {
   'Security/MarshalLoad'             => 'security/marshal_load',
   'Layout/SpaceAfterMethodName'      => 'layout/space_after_method_name',
   'Layout/SpaceAfterSemicolon'       => 'layout/space_after_semicolon',
+  'Layout/SpaceAfterNot'             => 'layout/space_after_not',
   'Style/DefWithParentheses'         => 'style/def_with_parentheses',
   'Style/WhileUntilDo'               => 'style/while_until_do',
   'Style/MultilineIfThen'            => 'style/multiline_if_then',

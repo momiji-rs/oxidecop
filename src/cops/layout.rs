@@ -688,6 +688,31 @@ impl<'a> Cops<'a> {
             }
         }
     }
+
+    /// Layout/SpaceAfterNot — unary `!` must not be followed by whitespace
+    /// before its operand (`! foo` is an offense; fix removes the space).
+    pub(crate) fn check_space_after_not(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/SpaceAfterNot";
+        if !self.on(COP) || node.name().as_slice() != b"!" {
+            return;
+        }
+        let Some(sel) = node.message_loc() else { return };
+        // Exclude the `not` keyword — only check the unary `!` operator
+        if sel.as_slice() == b"not" {
+            return;
+        }
+        let Some(recv) = node.receiver() else { return };
+        let recv_start = recv.location().start_offset();
+        let node_start = node.location().start_offset();
+        // whitespace_after_operator?: distance from node start to receiver start > 1
+        if recv_start - node_start <= 1 {
+            return;
+        }
+        // Offense is on the whole node (from `!` to the start of receiver)
+        self.push(node_start, COP, true, "Do not leave space between `!` and its argument.");
+        // Fix: remove the whitespace between `!` (end_pos) and receiver start
+        self.fixes.push((sel.end_offset(), recv_start, Vec::new()));
+    }
 }
 
 impl<'a> Cops<'a> {
