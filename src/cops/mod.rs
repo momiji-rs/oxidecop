@@ -155,6 +155,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/NumericLiterals", "Style/NumericPredicate", "Style/RandomWithOffset",
     "Style/RedundantReturn", "Style/StringChars", "Style/StringLiterals",
     "Style/SymbolProc", "Style/UnpackFirst", "Style/ZeroLengthPredicate",
+    "Lint/RegexpAsCondition",
 ];
 
 impl Engine {
@@ -461,6 +462,16 @@ pub(crate) struct Cops<'a> {
     pub(crate) mod_stack: Vec<String>,
     // Whether each enclosing class/module carried `#:nodoc: all`.
     pub(crate) nodoc_all_stack: Vec<bool>,
+    // Depth of enclosing if/unless/while/until/case/case-in nodes —
+    // Lint/RegexpAsCondition's `node.ancestors.none?(&:conditional?)` guard
+    // (a real ancestor walk, not just "am I the predicate") ported as a
+    // counter maintained around each conditional's visit.
+    pub(crate) cond_depth: usize,
+    // Start offsets of MatchLastLineNode/InterpolatedMatchLastLineNode
+    // literals already offended-on as the receiver of an enclosing `!`/`not`
+    // call — the later direct visit of the literal skips these so it isn't
+    // double-flagged (rubocop's `ignore_node`).
+    pub(crate) regexp_bang_ignore: Vec<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -686,7 +697,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 );
             }
         }
+        self.cond_depth += 1;
         ruby_prism::visit_if_node(self, node);
+        self.cond_depth -= 1;
     }
     fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
         self.check_unless_else(node);
@@ -696,7 +709,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.statements().map(|s| s.location().start_offset()),
             "unless",
         );
+        self.cond_depth += 1;
         ruby_prism::visit_unless_node(self, node);
+        self.cond_depth -= 1;
     }
     fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
@@ -722,7 +737,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
         self.check_duplicate_case_condition(node);
+        self.cond_depth += 1;
         ruby_prism::visit_case_node(self, node);
+        self.cond_depth -= 1;
+    }
+    fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
+        self.cond_depth += 1;
+        ruby_prism::visit_case_match_node(self, node);
+        self.cond_depth -= 1;
     }
     fn visit_when_node(&mut self, node: &ruby_prism::WhenNode<'pr>) {
         self.check_when_then(node);
@@ -760,6 +782,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_flip_flop(node);
         ruby_prism::visit_flip_flop_node(self, node);
     }
+    fn visit_match_last_line_node(&mut self, node: &ruby_prism::MatchLastLineNode<'pr>) {
+        if !self.regexp_bang_ignore.contains(&node.location().start_offset()) {
+            self.check_regexp_as_condition(&node.as_node(), None);
+        }
+        // leaf node — ruby_prism::visit_match_last_line_node is a no-op.
+    }
+    fn visit_interpolated_match_last_line_node(&mut self, node: &ruby_prism::InterpolatedMatchLastLineNode<'pr>) {
+        if !self.regexp_bang_ignore.contains(&node.location().start_offset()) {
+            self.check_regexp_as_condition(&node.as_node(), None);
+        }
+        ruby_prism::visit_interpolated_match_last_line_node(self, node);
+    }
     fn visit_range_node(&mut self, node: &ruby_prism::RangeNode<'pr>) {
         if self.hot.semicolon {
             let l = node.location();
@@ -778,13 +812,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
         self.check_while_until_do(&node.predicate(), node.do_keyword_loc(), node.location(),
             node.statements().map(|s| s.location().start_offset()), "while");
+        self.cond_depth += 1;
         ruby_prism::visit_while_node(self, node);
+        self.cond_depth -= 1;
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
         self.check_while_until_do(&node.predicate(), node.do_keyword_loc(), node.location(),
             node.statements().map(|s| s.location().start_offset()), "until");
+        self.cond_depth += 1;
         ruby_prism::visit_until_node(self, node);
+        self.cond_depth -= 1;
     }
     fn visit_pre_execution_node(&mut self, node: &ruby_prism::PreExecutionNode<'pr>) {
         if self.on("Style/BeginBlock") {
@@ -1047,6 +1085,22 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        // `!/foo/` / `not /foo/` — rubocop's fix wraps the WHOLE `!` call
+        // (`!(/foo/ =~ $_)`), not just the regexp, since `!` binds tighter
+        // than `=~`. Only the immediate `!` wrapping the literal matters —
+        // `!!/foo/` corrects to `!!(/foo/ =~ $_)`, wrapping the inner `!`.
+        if node.name().as_slice() == b"!" && node.arguments().is_none() {
+            if let Some(r) = node.receiver() {
+                let regexp_loc = r
+                    .as_match_last_line_node()
+                    .map(|m| m.location())
+                    .or_else(|| r.as_interpolated_match_last_line_node().map(|m| m.location()));
+                if let Some(rl) = regexp_loc {
+                    self.regexp_bang_ignore.push(rl.start_offset());
+                    self.check_regexp_as_condition(&r, Some(node.location()));
+                }
+            }
+        }
         self.check_method_name_macros(node);
         self.check_colon_method_call(node);
         self.check_deprecated_class_methods(node);
@@ -1276,6 +1330,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         comments: &comment_data,
         mod_stack: Vec::new(),
         nodoc_all_stack: Vec::new(),
+        cond_depth: 0,
+        regexp_bang_ignore: Vec::new(),
     };
 
     let t = tick(&T_PREP, t);

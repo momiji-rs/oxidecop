@@ -866,3 +866,59 @@ impl<'a> super::Cops<'a> {
         );
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/RegexpAsCondition — a regexp literal used directly as a boolean
+    /// condition matches implicitly against `$_`. Prism represents this
+    /// directly as a `MatchLastLineNode` (or `InterpolatedMatchLastLineNode`
+    /// for `/#{x}/`-style interpolated ones) wherever a bare regexp literal
+    /// sits as: (1) the predicate of an `if`/`unless`/`while`/`until` (which
+    /// also covers ternaries — prism parses `cond ? a : b` as an `IfNode`
+    /// too), or (2) the receiver of a `!`/`not` call, in EITHER case
+    /// regardless of whether that call itself is inside a conditional. This
+    /// mirrors whitequark's `match_current_line` node, but rubocop's own
+    /// `on_match_current_line` re-derives "is this really a condition" via
+    /// `node.ancestors.none?(&:conditional?)` — a real ancestor walk (any
+    /// enclosing if/unless/while/until/case/case-in, not just "am I the
+    /// predicate"). `cond_depth` (maintained around each conditional's
+    /// visit in `visit_if_node`/`visit_unless_node`/`visit_while_node`/
+    /// `visit_until_node`/`visit_case_node`/`visit_case_match_node`) plays
+    /// that same role here.
+    ///
+    /// `visit_call_node` special-cases the `!`/`not`-wrapped form: since `!`
+    /// binds tighter than `=~`, the fix must wrap the WHOLE `!` call
+    /// (`!(/foo/ =~ $_)`) rather than just the regexp, so it calls this with
+    /// `bang` set to that call's location and pre-marks the regexp's start
+    /// offset in `regexp_bang_ignore` so the later direct visit of the
+    /// literal (`visit_match_last_line_node` /
+    /// `visit_interpolated_match_last_line_node`) doesn't double-flag it.
+    pub(crate) fn check_regexp_as_condition(
+        &mut self,
+        node: &ruby_prism::Node,
+        bang: Option<ruby_prism::Location>,
+    ) {
+        const COP: &str = "Lint/RegexpAsCondition";
+        if !self.on(COP) || self.cond_depth == 0 {
+            return;
+        }
+        let loc = node.location();
+        self.push(
+            loc.start_offset(),
+            COP,
+            true,
+            "Do not use regexp literal as a condition. The regexp literal matches `$_` implicitly.",
+        );
+        let src = self.node_src(node);
+        let mut text = Vec::with_capacity(src.len() + 8);
+        if let Some(bl) = bang {
+            text.extend_from_slice(b"!(");
+            text.extend_from_slice(src);
+            text.extend_from_slice(b" =~ $_)");
+            self.fixes.push((bl.start_offset(), bl.end_offset(), text));
+        } else {
+            text.extend_from_slice(src);
+            text.extend_from_slice(b" =~ $_");
+            self.fixes.push((loc.start_offset(), loc.end_offset(), text));
+        }
+    }
+}
