@@ -1058,3 +1058,57 @@ impl<'a> super::Cops<'a> {
         );
     }
 }
+/// Find bare `next` nodes (no arguments) in a reduce/inject block body,
+/// not descending into nested blocks (which have their own scope).
+fn collect_bare_next_in_reduce(node: &ruby_prism::Node, out: &mut Vec<usize>) {
+    struct Finder<'a> {
+        out: &'a mut Vec<usize>,
+    }
+    impl<'pr, 'a> ruby_prism::Visit<'pr> for Finder<'a> {
+        fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
+            // Only collect if this next has no arguments (bare next)
+            if node.arguments().is_none() {
+                self.out.push(node.location().start_offset());
+            }
+            ruby_prism::visit_next_node(self, node);
+        }
+        fn visit_block_node(&mut self, _node: &ruby_prism::BlockNode<'pr>) {
+            // Don't descend into nested blocks; they have their own scope
+        }
+    }
+    let mut f = Finder { out };
+    use ruby_prism::Visit;
+    f.visit(node);
+}
+
+
+impl<'a> super::Cops<'a> {
+    /// Lint/NextWithoutAccumulator — a bare `next` (no arguments) inside
+    /// a `reduce` or `inject` block. The accumulator should be passed to
+    /// `next` to preserve its value across iterations. This check looks for
+    /// bare `next` statements in reduce/inject blocks and reports them,
+    /// but correctly ignores `next` statements in nested blocks (which have
+    /// their own scope).
+    pub(crate) fn check_next_without_accumulator(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/NextWithoutAccumulator";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !matches!(name, b"reduce" | b"inject") {
+            return;
+        }
+        let Some(block) = node.block() else { return };
+        let Some(block) = block.as_block_node() else { return };
+        let Some(body) = block.body() else { return };
+
+        // Collect all bare next nodes in the block body, not descending into nested blocks
+        let mut bare_nexts = Vec::new();
+        collect_bare_next_in_reduce(&body, &mut bare_nexts);
+
+        // Report each bare next
+        for off in bare_nexts {
+            self.push(off, COP, false, "Use `next` with an accumulator argument in a `reduce`.");
+        }
+    }
+}
