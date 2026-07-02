@@ -545,6 +545,12 @@ impl<'a> Cops<'a> {
                 if next.is_ascii_whitespace() || *next == b';' {
                     continue;
                 }
+                // rubocop's allowed_type?: `)`, `]`, `|` (and interpolation
+                // ends) never need a space after a comma; `}` only under the
+                // no_space hash-brace style
+                if matches!(*next, b')' | b']' | b'|') {
+                    continue;
+                }
                 if *next == b'}' && rcurly_no_space {
                     continue;
                 }

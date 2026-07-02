@@ -1984,6 +1984,39 @@ const BUILT_IN_GVARS: &[&str] = &[
 ];
 
 impl<'a> super::Cops<'a> {
+    /// whitequark's lexer reads `#$-X` inside an interpolating string as a
+    /// `$-X` gvar interpolation; real Ruby (and prism) treat it as plain
+    /// text. rubocop therefore flags it — replicate for byte parity.
+    pub(crate) fn check_gvar_artifact(&mut self, node: &ruby_prism::StringNode) {
+        if !self.on("Style/GlobalVars") {
+            return;
+        }
+        let interpolating = match node.opening_loc() {
+            Some(o) => o.as_slice().starts_with(b"\"") || o.as_slice().starts_with(b"%Q") || o.as_slice().starts_with(b"%W"),
+            None => true, // a text part of an interpolated string
+        };
+        if !interpolating {
+            return;
+        }
+        let c = node.content_loc();
+        let content = &self.src[c.start_offset()..c.end_offset()];
+        for i in 0..content.len().saturating_sub(2) {
+            if content[i] == b'#' && content[i + 1] == b'$' && content[i + 2] == b'-'
+                && (i == 0 || content[i - 1] != b'\\')
+            {
+                if let Some(ch) = content.get(i + 3) {
+                    if ch.is_ascii_alphanumeric() || *ch == b'_' {
+                        let name = format!("$-{}", *ch as char);
+                        if !BUILT_IN_GVARS.contains(&name.as_str()) {
+                            self.push(c.start_offset() + i + 1, "Style/GlobalVars", false,
+                                "Do not introduce global variables.");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Style/GlobalVars — user-introduced globals (built-ins and
     /// AllowedVariables pass).
     pub(crate) fn check_global_var(&mut self, name: &[u8], name_start: usize) {

@@ -594,6 +594,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
         self.check_string_literals(node);
         self.check_character_literal(node);
+        self.check_gvar_artifact(node);
         self.ll_check_str(node);
     }
     fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
