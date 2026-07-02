@@ -77,6 +77,7 @@ COPS = {
   'Style/GlobalVars'                 => 'style/global_vars',
   'Layout/SpaceAfterComma'           => 'layout/space_after_comma',
   'Layout/SpaceBeforeSemicolon'      => 'layout/space_before_semicolon',
+  'Layout/SpaceBeforeComma'          => 'layout/space_before_comma',
   'Style/DefWithParentheses'         => 'style/def_with_parentheses',
   'Style/WhileUntilDo'               => 'style/while_until_do',
   'Style/MultilineIfThen'            => 'style/multiline_if_then',

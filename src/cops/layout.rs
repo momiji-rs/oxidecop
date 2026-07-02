@@ -605,3 +605,48 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/SpaceBeforeComma — a comma must not be preceded by space
+    /// (kept after `{` when the block-brace style wants that space).
+    pub(crate) fn check_space_before_comma(&mut self) {
+        const COP: &str = "Layout/SpaceBeforeComma";
+        if !self.on(COP) || !self.src.contains(&b',') {
+            return;
+        }
+        for line in 1..=self.idx.starts.len() {
+            let ls = self.idx.starts[line - 1];
+            let le = self.line_end(line);
+            // a trailing comment caps the code
+            let code_end = self
+                .comments
+                .iter()
+                .find(|(l, s, _)| *l == line && *s >= ls && *s < le)
+                .map(|(_, s, _)| *s)
+                .unwrap_or(le);
+            for p in ls..code_end {
+                if self.src[p] != b',' || self.in_lit_span(p) {
+                    continue;
+                }
+                // the whitespace run, bounded to THIS line — a leading
+                // comma's "space" is the previous line's newline, which
+                // rubocop's same-line token adjacency never flags
+                let mut space_start = p;
+                while space_start > ls && self.src[space_start - 1].is_ascii_whitespace() {
+                    space_start -= 1;
+                }
+                if space_start == p || space_start == ls {
+                    continue;
+                }
+                // space required after `{` unless the block-brace style says no_space
+                if self.src[space_start - 1] == b'{'
+                    && self.cfg.get("Layout/SpaceInsideBlockBraces", "EnforcedStyle") != Some("no_space")
+                {
+                    continue;
+                }
+                self.fixes.push((space_start, p, Vec::new()));
+                self.push(space_start, COP, true, "Space found before comma.");
+            }
+        }
+    }
+}
