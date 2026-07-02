@@ -132,3 +132,11 @@ puts format('  %-34s %8d %6d  %10s   %4d/%-4d  %5.0f%%   FIX %d/%d',
             $fix_pass || 0, $fix_total || 0)
 puts "  (skipped = spec examples the harness can't faithfully represent; excluded from scoring)"
 puts
+
+# --assert: CI guardrail — anything short of 100% detection AND 100% FIX fails
+if ARGV.include?('--assert')
+  problems = []
+  problems << "detection #{tot_full}/#{tot_all}" if tot_full != tot_all
+  problems << "FIX #{$fix_pass}/#{$fix_total}" if ($fix_pass || 0) != ($fix_total || 0)
+  abort("FIDELITY REGRESSION: #{problems.join(', ')}") if problems.any?
+end

@@ -1,0 +1,58 @@
+# The guardrail: every push must keep (1) the unit tests green, (2) the
+# oracle at 100% — all representable examples of rubocop's own spec suite,
+# detection AND autocorrection, (3) real-tree parity byte-identical against
+# the reference rubocop on its own source, and (4) whole-repo lint speed
+# within an order-of-magnitude sanity bound (catches accidental
+# quadratic-ness, not noise).
+name: ci
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test-oracle-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Unit tests
+        run: cargo test --release
+
+      - name: Oracle — 100% of rubocop's representable spec examples
+        run: ruby oracle/leaderboard.rb target/release/rubocop-rs --assert
+
+      - name: Fetch reference rubocop + its source tree
+        run: |
+          gem install rubocop -v 1.88.0
+          git clone --depth 1 --branch v1.88.0 https://github.com/rubocop/rubocop /tmp/rubocop-src
+
+      - name: Parity — byte-identical offenses on rubocop's own source
+        run: |
+          # the repo config plugs in gems we don't install; parity.sh prefers
+          # a cleaned copy when present
+          ruby -e '
+            text = File.read("/tmp/rubocop-src/.rubocop.yml")
+            text = text.gsub(/^(plugins|require):\n(  - .*\n)+/, "")
+            File.write("/tmp/rubocop-src/.rubocop_bench.yml", text)
+          '
+          cd /tmp/rubocop-src && sh $GITHUB_WORKSPACE/tools/parity.sh .
+
+      - name: Bench smoke — whole-tree lint stays under 2s
+        run: |
+          cd /tmp/rubocop-src
+          start=$(date +%s%N)
+          $GITHUB_WORKSPACE/target/release/rubocop-rs . > /dev/null || true
+          ms=$(( ($(date +%s%N) - start) / 1000000 ))
+          echo "lint of rubocop-src took ${ms}ms"
+          test "$ms" -lt 2000
