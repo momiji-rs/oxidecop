@@ -78,7 +78,29 @@ def resolve_literal_interp(text)
   text.gsub(/(?<!\\)\#\{'([^']*)'\}/) { Regexp.last_match(1) }
 end
 
-def parse_block(raw_lines, raw_heredoc, squiggly)
+# `#{name}` where `name` is a scalar `let` binding — resolve like RSpec's
+# lazy lets. Only simple literals participate: strings without escapes or
+# nested interpolation, integers, booleans. Anything else stays unresolved
+# (and falls through to the unrepresentable skip downstream). Used both on
+# heredoc bodies BEFORE caret-splitting (whole annotation lines can live in
+# a let, e.g. `let(:beginning_offense_annotation) { '^{} Extra ...' }`) and
+# on already-parsed messages/corrections.
+def resolve_lets(text, lets)
+  return text if lets.nil? || lets.empty?
+
+  text.gsub(/(?<!\\)\#\{(\w+)\}/) do
+    whole = Regexp.last_match(0)
+    v = lets[Regexp.last_match(1)]
+    case v
+    when /\A'([^'\\]*)'\z/ then Regexp.last_match(1)
+    when /\A"([^"\\#]*)"\z/ then Regexp.last_match(1)
+    when /\A(-?\d+|true|false)\z/ then v
+    else whole
+    end
+  end
+end
+
+def parse_block(raw_lines, raw_heredoc, squiggly, lets = {})
   # raw_lines: the heredoc body (already the interior). Dedent ONLY for the
   # squiggly `<<~` form — `<<-` keeps its indentation at runtime, and line-
   # length expectations depend on it. Render escapes unless the heredoc was
@@ -87,6 +109,7 @@ def parse_block(raw_lines, raw_heredoc, squiggly)
   # split is what RSpec sees: a `\n` inside a line legitimately becomes two.
   text = (squiggly ? dedent(raw_lines) : raw_lines).join("\n")
   text = resolve_literal_interp(text) unless raw_heredoc
+  text = resolve_lets(text, lets) unless raw_heredoc
   text = unescape_dq(text) unless raw_heredoc
   src = []
   expected = []
@@ -351,7 +374,7 @@ while i < lines.length
       body << lines[i]
       i += 1
     end
-    src, expected = parse_block(body, raw_heredoc, squiggly)
+    src, expected = parse_block(body, raw_heredoc, squiggly, cur_lets)
     src = src.chomp if chomp
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
                   sections: cur_sec, override: cur_ovr, ruby: cur_rb, raw: raw_heredoc,
@@ -368,6 +391,7 @@ while i < lines.length
     end
     text = (squiggly ? dedent(body) : body).join("\n") + "\n"
     text = resolve_literal_interp(text) unless raw_heredoc
+    text = resolve_lets(text, cur_lets) unless raw_heredoc
     text = unescape_dq(text) unless raw_heredoc
     text = text.chomp if chomp
     examples.last[:correction] = text
@@ -402,7 +426,7 @@ COP_DEFAULT_STYLE = {
   'Naming/MethodName' => 'snake_case'
 }.freeze
 
-def resolve_interp(text, cfg_hash, raw: false)
+def resolve_interp(text, cfg_hash, lets = {}, raw: false)
   text = text.gsub(/\#\{trailing_whitespace \* (\d+)\}/) { ' ' * Regexp.last_match(1).to_i }
   text = text.gsub('#{trailing_whitespace}', ' ')
   style = cfg_hash['EnforcedStyle']
@@ -410,7 +434,7 @@ def resolve_interp(text, cfg_hash, raw: false)
   # to the cop's default so the message still compares meaningfully.
   style = COP_DEFAULT_STYLE[COP] if style.nil? || style == 'enforced_style'
   text = text.gsub('#{enforced_style}', style) if style
-  text
+  resolve_lets(text, lets)
 end
 
 
@@ -622,7 +646,7 @@ examples.each_with_index do |ex, n|
     end
   end
 
-  src = resolve_interp(ex[:src], cfg_hash, raw: ex[:raw])
+  src = resolve_interp(ex[:src], cfg_hash, ex[:lets] || {}, raw: ex[:raw])
 
   # Unrepresentable: source still interpolates a value we can't resolve
   # statically — `#{keyword}`-style RSpec loop vars, or `%{identifier}`
@@ -635,7 +659,7 @@ examples.each_with_index do |ex, n|
   end
 
   actual = run_poc(POC, src, build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace, ruby: ex[:ruby]))
-  exp = ex[:expected].map { |l, c, m| [l, c, resolve_interp(m, cfg_hash)] }
+  exp = ex[:expected].map { |l, c, m| [l, c, resolve_interp(m, cfg_hash, ex[:lets] || {})] }
   g[:total] += 1
 
   exp_loc = exp.map { |l, c, _| [l, c] }.sort
@@ -659,7 +683,7 @@ examples.each_with_index do |ex, n|
     fix_total += 1
     yml = build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace, ruby: ex[:ruby])
     got = run_fix(POC, src, yml)
-    want_text = want == :none ? src : resolve_interp(want, cfg_hash, raw: ex[:correction_raw])
+    want_text = want == :none ? src : resolve_interp(want, cfg_hash, ex[:lets] || {}, raw: ex[:correction_raw])
     # expect_correction iterates with ONE cop instance, so `ignore_node`
     # suppressions persist structurally across rounds; a fresh `rubocop -a`
     # (our --fix) iterates with fresh instances and corrects more. Both are
