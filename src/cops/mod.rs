@@ -136,7 +136,7 @@ const IMPLEMENTED: &[&str] = &[
     "Naming/ClassAndModuleCamelCase", "Naming/ConstantName", "Style/MultilineIfThen",
     "Style/Not", "Style/StderrPuts", "Style/WhileUntilDo", "Style/ColonMethodCall",
     "Lint/EmptyClass", "Lint/DeprecatedClassMethods", "Layout/EmptyLineAfterMagicComment",
-    "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon",
+    "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon", "Style/GlobalVars",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
     "Style/CharacterLiteral", "Style/EndBlock", "Style/NegatedWhile", "Style/UnlessElse",
@@ -687,6 +687,28 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             "unless",
         );
         ruby_prism::visit_unless_node(self, node);
+    }
+    fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
+        self.check_global_var(node.name().as_slice(), node.location().start_offset());
+    }
+    fn visit_global_variable_write_node(&mut self, node: &ruby_prism::GlobalVariableWriteNode<'pr>) {
+        self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
+        ruby_prism::visit_global_variable_write_node(self, node);
+    }
+    fn visit_global_variable_operator_write_node(&mut self, node: &ruby_prism::GlobalVariableOperatorWriteNode<'pr>) {
+        self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
+        ruby_prism::visit_global_variable_operator_write_node(self, node);
+    }
+    fn visit_global_variable_or_write_node(&mut self, node: &ruby_prism::GlobalVariableOrWriteNode<'pr>) {
+        self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
+        ruby_prism::visit_global_variable_or_write_node(self, node);
+    }
+    fn visit_global_variable_and_write_node(&mut self, node: &ruby_prism::GlobalVariableAndWriteNode<'pr>) {
+        self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
+        ruby_prism::visit_global_variable_and_write_node(self, node);
+    }
+    fn visit_global_variable_target_node(&mut self, node: &ruby_prism::GlobalVariableTargetNode<'pr>) {
+        self.check_global_var(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_range_node(&mut self, node: &ruby_prism::RangeNode<'pr>) {
         if self.hot.semicolon {

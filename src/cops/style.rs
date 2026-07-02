@@ -1963,3 +1963,42 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+/// Ruby's built-in global variables (Style/GlobalVars never flags them).
+const BUILT_IN_GVARS: &[&str] = &[
+    "$:", "$LOAD_PATH", "$\"", "$LOADED_FEATURES", "$0", "$PROGRAM_NAME", "$!",
+    "$ERROR_INFO", "$@", "$ERROR_POSITION", "$;", "$FS", "$FIELD_SEPARATOR", "$,",
+    "$OFS", "$OUTPUT_FIELD_SEPARATOR", "$/", "$RS", "$INPUT_RECORD_SEPARATOR",
+    "$\\", "$ORS", "$OUTPUT_RECORD_SEPARATOR", "$.", "$NR", "$INPUT_LINE_NUMBER",
+    "$_", "$LAST_READ_LINE", "$>", "$DEFAULT_OUTPUT", "$<", "$DEFAULT_INPUT",
+    "$$", "$PID", "$PROCESS_ID", "$?", "$CHILD_STATUS", "$~", "$LAST_MATCH_INFO",
+    "$=", "$IGNORECASE", "$*", "$ARGV", "$&", "$MATCH", "$`", "$PREMATCH", "$'",
+    "$POSTMATCH", "$+", "$LAST_PAREN_MATCH", "$stdin", "$stdout", "$stderr",
+    "$DEBUG", "$FILENAME", "$VERBOSE", "$SAFE", "$-0", "$-a", "$-d", "$-F",
+    "$-i", "$-I", "$-l", "$-p", "$-v", "$-w", "$CLASSPATH", "$JRUBY_VERSION",
+    "$JRUBY_REVISION", "$ENV_JAVA",
+];
+
+impl<'a> super::Cops<'a> {
+    /// Style/GlobalVars — user-introduced globals (built-ins and
+    /// AllowedVariables pass).
+    pub(crate) fn check_global_var(&mut self, name: &[u8], name_start: usize) {
+        const COP: &str = "Style/GlobalVars";
+        if !self.on(COP) {
+            return;
+        }
+        let name = String::from_utf8_lossy(name);
+        if BUILT_IN_GVARS.contains(&name.as_ref()) {
+            return;
+        }
+        if let Some(v) = self.cfg.param(COP, "AllowedVariables") {
+            if crate::config::parse_allowed_list(v)
+                .iter()
+                .any(|a| a == name.as_ref() || format!("${a}") == name.as_ref())
+            {
+                return;
+            }
+        }
+        self.push(name_start, COP, false, "Do not introduce global variables.");
+    }
+}
