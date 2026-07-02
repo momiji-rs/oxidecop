@@ -97,6 +97,13 @@ pub(crate) struct Cops<'a> {
     // defined as its direct children — Naming/MethodName's "class emitter
     // method" exemption consults this.
     pub(crate) class_children_stack: Vec<Vec<Vec<u8>>>,
+    // Every comment as (line, start_offset, text), in source order.
+    pub(crate) comments: &'a [(usize, usize, Vec<u8>)],
+    // Enclosing class/module names (their constant-path sources) — the
+    // qualified identifier in Style/Documentation messages.
+    pub(crate) mod_stack: Vec<String>,
+    // Whether each enclosing class/module carried `#:nodoc: all`.
+    pub(crate) nodoc_all_stack: Vec<bool>,
 }
 impl<'a> Cops<'a> {
     pub(crate) fn on(&self, cop: &str) -> bool {
@@ -179,17 +186,21 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.class_children_stack.pop();
     }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
-        self.check_documentation(node.location().start_offset(), "class", &node.constant_path());
+        self.check_documentation("class", node.location().start_offset(), &node.constant_path(), node.body());
+        self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         // Default walk — covers the superclass expression too, not just the body.
         ruby_prism::visit_class_node(self, node);
         self.class_children_stack.pop();
+        self.leave_namespace();
     }
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
-        self.check_documentation(node.location().start_offset(), "module", &node.constant_path());
+        self.check_documentation("module", node.location().start_offset(), &node.constant_path(), node.body());
+        self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         ruby_prism::visit_module_node(self, node);
         self.class_children_stack.pop();
+        self.leave_namespace();
     }
     fn visit_integer_node(&mut self, node: &ruby_prism::IntegerNode<'pr>) {
         if !self.num_ignore.contains(&node.location().start_offset()) {
@@ -426,11 +437,14 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         heredoc_lines,
         data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
         class_children_stack: Vec::new(),
+        comments: &comment_data,
+        mod_stack: Vec::new(),
+        nodoc_all_stack: Vec::new(),
     };
 
     // ---- text-based cops ----
-    cops.check_frozen_string_literal(&comment_data, first_code_line);
-    cops.check_line_length(&comment_data);
+    cops.check_frozen_string_literal(first_code_line);
+    cops.check_line_length();
     cops.check_trailing_whitespace();
 
     // ---- AST-based cops ----

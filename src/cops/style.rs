@@ -203,17 +203,117 @@ impl<'a> Cops<'a> {
         }
     }
 
-    /// Style/Documentation — a class/module wants a comment on the line above.
-    pub(crate) fn check_documentation(&mut self, start_off: usize, kind: &str, name: &ruby_prism::Node) {
-        if !self.on("Style/Documentation") {
+    /// Style/Documentation — rubocop's check verbatim. A class/module needs a
+    /// real documentation comment directly above unless it is a pure namespace
+    /// (all children are constant declarations), carries `#:nodoc:` on its
+    /// header (or an ancestor's `#:nodoc: all`), is in AllowedConstants, or
+    /// its body is only include/extend/prepend statements. A class with no
+    /// body is skipped outright; annotation (`# TODO:`), magic-comment, and
+    /// rubocop-directive lines do not count as documentation.
+    pub(crate) fn check_documentation(
+        &mut self,
+        kind: &str,
+        node_start: usize,
+        constant_path: &ruby_prism::Node,
+        body: Option<ruby_prism::Node>,
+    ) {
+        const COP: &str = "Style/Documentation";
+        if !self.on(COP) {
             return;
         }
-        let (line, _) = self.idx.loc(start_off);
-        if !self.comment_lines.contains(&(line.wrapping_sub(1))) {
-            let nm = String::from_utf8_lossy(self.node_src(name)).to_string();
-            self.push(start_off, "Style/Documentation", false,
-                format!("Missing top-level documentation comment for `{kind} {nm}`."));
+        if kind == "class" && body.is_none() {
+            return;
         }
+        if body.as_ref().is_some_and(is_namespace) {
+            return;
+        }
+        let line = self.idx.loc(node_start).0;
+        if self.has_documentation_comment(line) {
+            return;
+        }
+        let name_src = self.node_src(constant_path);
+        let short = name_src.rsplit(|&b| b == b':').next().unwrap_or(name_src);
+        if let Some(v) = self.cfg.param(COP, "AllowedConstants") {
+            if crate::config::parse_allowed_list(v).iter().any(|c| c.as_bytes() == short) {
+                return;
+            }
+        }
+        if self.nodoc_on_line(line, false) || self.nodoc_all_stack.iter().any(|b| *b) {
+            return;
+        }
+        if body.as_ref().is_some_and(|b| include_statements_only(b)) {
+            return;
+        }
+        let mut parts = self.mod_stack.clone();
+        parts.push(String::from_utf8_lossy(name_src).into_owned());
+        let ident = parts.join("::").replace("::::", "::");
+        self.push(node_start, COP, false,
+            format!("Missing top-level documentation comment for `{kind} {ident}`."));
+    }
+    /// Track the enclosing class/module for qualified Documentation messages
+    /// and `#:nodoc: all` inheritance.
+    pub(crate) fn enter_namespace(&mut self, node_start: usize, constant_path: &ruby_prism::Node) {
+        let name = String::from_utf8_lossy(self.node_src(constant_path)).into_owned();
+        self.mod_stack.push(name);
+        let line = self.idx.loc(node_start).0;
+        self.nodoc_all_stack.push(self.nodoc_on_line(line, true));
+    }
+    pub(crate) fn leave_namespace(&mut self) {
+        self.mod_stack.pop();
+        self.nodoc_all_stack.pop();
+    }
+    /// A `#:nodoc:` (or `#:nodoc: all` when `require_all`) trailing comment on
+    /// this line.
+    fn nodoc_on_line(&self, line: usize, require_all: bool) -> bool {
+        static NODOC: OnceLock<regex::Regex> = OnceLock::new();
+        static NODOC_ALL: OnceLock<regex::Regex> = OnceLock::new();
+        let re = if require_all {
+            NODOC_ALL.get_or_init(|| regex::Regex::new(r"^#\s*:nodoc:\s+all\s*$").unwrap())
+        } else {
+            NODOC.get_or_init(|| regex::Regex::new(r"^#\s*:nodoc:").unwrap())
+        };
+        self.comments
+            .iter()
+            .find(|(l, _, _)| *l == line)
+            .is_some_and(|(_, _, t)| re.is_match(&String::from_utf8_lossy(t)))
+    }
+    /// rubocop's `documentation_comment?`: a comment block ends directly above
+    /// the node, and at least one of its lines is real prose — not a `# TODO:`
+    /// style annotation, magic comment, or rubocop directive.
+    fn has_documentation_comment(&self, node_line: usize) -> bool {
+        if node_line < 2 || !self.comment_lines.contains(&(node_line - 1)) {
+            return false;
+        }
+        static ANNOTATION: OnceLock<regex::Regex> = OnceLock::new();
+        static MAGIC: OnceLock<regex::Regex> = OnceLock::new();
+        static DIRECTIVE: OnceLock<regex::Regex> = OnceLock::new();
+        let annotation = ANNOTATION.get_or_init(|| {
+            regex::Regex::new(r"^#\s*(?:TODO|FIXME|OPTIMIZE|HACK|REVIEW|NOTE)\b").unwrap()
+        });
+        let magic = MAGIC
+            .get_or_init(|| regex::Regex::new(r"^#\s*(frozen_string_literal|encoding):").unwrap());
+        let directive = DIRECTIVE.get_or_init(|| {
+            regex::Regex::new(r"^#\s*rubocop\s*:\s*(?:disable|todo|enable)\b").unwrap()
+        });
+        let mut line = node_line - 1;
+        while line >= 1 && self.comment_lines.contains(&line) {
+            if let Some((_, off, t)) = self.comments.iter().find(|(l, _, _)| *l == line) {
+                // A trailing comment (code before it) is not a doc line and
+                // ends the block (`module A # The A Module` documents nothing).
+                if !self.src[self.idx.starts[line - 1]..*off].iter().all(|b| b.is_ascii_whitespace()) {
+                    break;
+                }
+                let t = String::from_utf8_lossy(t);
+                if !annotation.is_match(&t) && !magic.is_match(&t) && !directive.is_match(&t) {
+                    return true;
+                }
+            }
+            if line == 1 {
+                break;
+            }
+            line -= 1;
+        }
+        false
     }
 
     /// Style/FrozenStringLiteralComment — text-based, runs once per file.
@@ -222,11 +322,12 @@ impl<'a> Cops<'a> {
     /// `always_true` demands it be literally `true`.
     /// `comments` are all comments (line, offset, text); `first_code_line`
     /// bounds the "leading" region (comments strictly before the first code).
-    pub(crate) fn check_frozen_string_literal(&mut self, comments: &[(usize, usize, Vec<u8>)], first_code_line: Option<usize>) {
+    pub(crate) fn check_frozen_string_literal(&mut self, first_code_line: Option<usize>) {
         const COP: &str = "Style/FrozenStringLiteralComment";
         if !self.on(COP) {
             return;
         }
+        let comments = self.comments;
         // rubocop bails on a token-less file (empty / whitespace-only).
         if comments.is_empty() && first_code_line.is_none() {
             return;
@@ -270,14 +371,14 @@ impl<'a> Cops<'a> {
                 }
                 None => {
                     self.push(0, COP, true, "Missing magic comment `# frozen_string_literal: true`.");
-                    self.insert_fsl_fix(comments, first_code_line);
+                    self.insert_fsl_fix(first_code_line);
                 }
             },
             _ => {
                 // "always" (default)
                 if !exists_valid {
                     self.push(0, COP, true, "Missing frozen string literal comment.");
-                    self.insert_fsl_fix(comments, first_code_line);
+                    self.insert_fsl_fix(first_code_line);
                 }
             }
         }
@@ -291,7 +392,8 @@ impl<'a> Cops<'a> {
     /// Insert `# frozen_string_literal: true` below the last special comment
     /// (shebang, then an encoding comment — rubocop's `last_special_comment`),
     /// or at the very top when there is none.
-    fn insert_fsl_fix(&mut self, comments: &[(usize, usize, Vec<u8>)], first_code_line: Option<usize>) {
+    fn insert_fsl_fix(&mut self, first_code_line: Option<usize>) {
+        let comments = self.comments;
         let is_leading = |l: usize| first_code_line.is_none_or(|fc| l < fc);
         let mut special: Option<usize> = None; // its line
         let mut next = 0; // index of the token to test for an encoding comment
@@ -731,6 +833,50 @@ impl<'a> Cops<'a> {
             format!("Pass `&:{method}` as an argument to `lambda` instead of a block."),
         ))
     }
+}
+
+// ---- Style/Documentation helpers ----
+/// rubocop's `namespace?`: every statement in the body is a constant
+/// declaration — a class/module definition, a constant assignment, or a
+/// `public_constant`/`private_constant` visibility call.
+fn is_namespace(body: &ruby_prism::Node) -> bool {
+    let Some(stmts) = body.as_statements_node() else {
+        return is_constant_declaration(body);
+    };
+    stmts.body().iter().all(|n| is_constant_declaration(&n))
+}
+fn is_constant_declaration(n: &ruby_prism::Node) -> bool {
+    if n.as_class_node().is_some()
+        || n.as_module_node().is_some()
+        || n.as_constant_write_node().is_some()
+        || n.as_constant_path_write_node().is_some()
+    {
+        return true;
+    }
+    n.as_call_node().is_some_and(|c| {
+        c.receiver().is_none()
+            && matches!(c.name().as_slice(), b"public_constant" | b"private_constant")
+            && c.arguments().is_some_and(|a| {
+                let args: Vec<_> = a.arguments().iter().collect();
+                args.len() == 1 && (args[0].as_symbol_node().is_some() || args[0].as_string_node().is_some())
+            })
+    })
+}
+/// rubocop's `include_statement_only?`: the body is nothing but bare
+/// `include`/`extend`/`prepend Const` statements.
+fn include_statements_only(body: &ruby_prism::Node) -> bool {
+    if let Some(stmts) = body.as_statements_node() {
+        return stmts.body().iter().all(|n| include_statements_only(&n));
+    }
+    body.as_call_node().is_some_and(|c| {
+        c.receiver().is_none()
+            && matches!(c.name().as_slice(), b"include" | b"extend" | b"prepend")
+            && c.arguments().is_some_and(|a| {
+                let args: Vec<_> = a.arguments().iter().collect();
+                args.len() == 1
+                    && (args[0].as_constant_read_node().is_some() || args[0].as_constant_path_node().is_some())
+            })
+    })
 }
 
 // ---- Style/ZeroLengthPredicate helper ----

@@ -100,17 +100,17 @@ Style/FrozenStringLiteralComment         88      7    88/88       88/88      100
 Style/ZeroLengthPredicate                74      0    74/74       74/74      100%
 Style/SymbolProc                         57     13    57/57       57/57      100%
 Style/StringLiterals                     49      5    49/49       49/49      100%
+Style/Documentation                      43      6    43/43       43/43      100%
 Style/NumericPredicate                   39      4    39/39       39/39      100%
 Lint/NestedMethodDefinition              38      0    38/38       38/38      100%
+Style/RedundantReturn                    37      1    37/37       37/37      100%
+Naming/MethodName                        29     49    29/29       29/29      100%
+Style/NumericLiterals                    28      0    28/28       28/28      100%
+Layout/TrailingWhitespace                19      0    19/19       19/19      100%
 Style/NilComparison                       8      0     8/8         8/8       100%
-Naming/MethodName                        48     30    45/48       45/48       94%
-Layout/LineLength                       145     41   111/145     111/145      77%
-Layout/TrailingWhitespace                19      0    13/19       13/19       68%
-Style/Documentation                      43      6    22/43       22/43       51%
-Style/NumericLiterals                    28      0    14/28       13/28       46%
-Style/RedundantReturn                    37      1    19/37       14/37       38%
+Layout/LineLength                       145     41   138/145     138/145      95%
 ────────────────────────────────────────────────────────────────────────────
-TOTAL (representable examples)          673    107                571/673      85%
+TOTAL (representable examples)          654    126                647/654      99%
 ```
 
 **Read this honestly:** the score is over *representable* examples only. RuboCop's

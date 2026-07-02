@@ -7,11 +7,12 @@ impl<'a> Cops<'a> {
     /// patterns, shebang, permitted heredocs, RBS inline annotations, cop
     /// directives (length re-measured without the directive), and the
     /// AllowURI / AllowQualifiedName excessive-range dance.
-    pub(crate) fn check_line_length(&mut self, comments: &[(usize, usize, Vec<u8>)]) {
+    pub(crate) fn check_line_length(&mut self) {
         const COP: &str = "Layout/LineLength";
         if !self.on(COP) {
             return;
         }
+        let comments = self.comments;
         let max = self.cfg.int(COP, "Max");
         let allow_uri = self.cfg.get(COP, "AllowURI") == Some("true");
         let allow_qn = self.cfg.get(COP, "AllowQualifiedName") == Some("true");

@@ -139,6 +139,11 @@ while i < lines.length
     # previous sibling context's cop_config.
     cfg_stack.pop while cfg_stack.any? && cfg_stack.last[0] >= indent
   end
+  # `before { config['Cop/Name'] = { ... } }` — an alternative way specs set
+  # cop config; honored when it targets the cop under test.
+  if l =~ /before\s*\{\s*config\['#{Regexp.escape(COP)}'\]\s*=\s*(\{.*\})\s*\}/ && cfg_stack.any?
+    cfg_stack.last[1] = extract_hash(Regexp.last_match(1))
+  end
   # `let(:cop_config)` in either single-line `{ {...} }` or multi-line `do..end`
   # form. Capture the raw hash text (quotes preserved, whitespace collapsed) so
   # array values like AllowedPatterns survive; sets the innermost context's cfg.
