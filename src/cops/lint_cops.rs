@@ -58,7 +58,14 @@ impl<'a> Cops<'a> {
         );
         if !self.requires_seen.insert(key) {
             let m = String::from_utf8_lossy(name);
-            self.push(node.location().start_offset(), COP, true, format!("Duplicate `{m}` detected."));
+            let l = node.location();
+            self.push(l.start_offset(), COP, true, format!("Duplicate `{m}` detected."));
+            // remove the whole line(s), final newline included
+            let (line_s, _) = self.idx.loc(l.start_offset());
+            let (line_e, _) = self.idx.loc(l.end_offset().saturating_sub(1));
+            let start = self.idx.starts[line_s - 1];
+            let end = self.idx.starts.get(line_e).copied().unwrap_or(self.src.len());
+            self.fixes.push((start, end, Vec::new()));
         }
     }
 

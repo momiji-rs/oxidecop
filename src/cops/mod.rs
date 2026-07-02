@@ -396,9 +396,9 @@ pub(crate) struct Cops<'a> {
     // Start offsets of nodes that are a DIRECT operand of a call / array /
     // hash pair — rubocop's `assumed_argument?` parent check.
     pub(crate) assumed_arg_offsets: HashSet<usize>,
-    // Heredoc BODIES as (first line, last line, delimiter) — terminator
-    // excluded. Layout/TrailingWhitespace and Layout/LineLength consult these.
-    pub(crate) heredoc_lines: Vec<(usize, usize, Vec<u8>)>,
+    // Heredoc BODIES as (first line, last line, delimiter, static) —
+    // terminator excluded; `static` marks the `<<~'X'` uninterpolated form.
+    pub(crate) heredoc_lines: Vec<(usize, usize, Vec<u8>, bool)>,
     // The `__END__` line — nothing at or after it is lintable text.
     pub(crate) data_line: Option<usize>,
     // Per enclosing body (program/class/module/def), the names of classes
@@ -456,6 +456,55 @@ impl<'a> Cops<'a> {
         let l = n.location();
         &self.src[l.start_offset()..l.end_offset()]
     }
+    /// Autocorrects for DECLARATIVE-table cops (the one thing a pattern row
+    /// can't express). Returns whether a fix was produced.
+    fn decl_fix(&mut self, cop: &str, node: &ruby_prism::CallNode) -> bool {
+        let l = node.location();
+        match cop {
+            "Style/NilComparison" => {
+                let Some(recv) = node.receiver() else { return false };
+                let recv_src = String::from_utf8_lossy(self.node_src(&recv)).into_owned();
+                let rep = if node.name().as_slice() == b"nil?" {
+                    format!("{recv_src} == nil")
+                } else {
+                    format!("{recv_src}.nil?")
+                };
+                self.fixes.push((l.start_offset(), l.end_offset(), rep.into_bytes()));
+                true
+            }
+            "Lint/BigDecimalNew" => {
+                // `BigDecimal.new(x)` -> `BigDecimal(x)`; a `::` anchor drops
+                if let (Some(dotish), Some(sel)) = (node.call_operator_loc(), node.message_loc()) {
+                    self.fixes.push((dotish.start_offset(), sel.end_offset(), Vec::new()));
+                    if let Some(r) = node.receiver() {
+                        if self.node_src(&r).starts_with(b"::") {
+                            let rs = r.location().start_offset();
+                            self.fixes.push((rs, rs + 2, Vec::new()));
+                        }
+                    }
+                    return true;
+                }
+                false
+            }
+            "Style/ArrayJoin" => {
+                let (Some(recv), Some(arg)) = (
+                    node.receiver(),
+                    node.arguments().and_then(|a| a.arguments().iter().next()),
+                ) else {
+                    return false;
+                };
+                let rep = format!(
+                    "{}.join({})",
+                    String::from_utf8_lossy(self.node_src(&recv)),
+                    String::from_utf8_lossy(self.node_src(&arg))
+                );
+                self.fixes.push((l.start_offset(), l.end_offset(), rep.into_bytes()));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Names of `class` nodes that are direct children of `body`.
     fn direct_child_classes(body: &Option<ruby_prism::Node>) -> Vec<Vec<u8>> {
         body.as_ref()
@@ -748,7 +797,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                         .map(|l| l.start_offset())
                         .unwrap_or(node_off),
                 };
-                self.push(off, cop, false, render(msg, &caps));
+                let correctable = self.decl_fix(cop, node);
+                self.push(off, cop, correctable, render(msg, &caps));
             }
         }
         self.check_zero_length(node);
@@ -776,9 +826,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Style/NumericPredicate (imperative: message interpolates a constructed
         // suggestion). Uses call_stack for AllowedMethods-on-ancestor + negation.
         if let Some((off, msg)) = self.numeric_predicate(node) {
+            // the message quotes the replacement — reuse it as the fix
+            if let (Some(s), Some(e)) = (msg.find('`'), msg.rfind("` instead")) {
+                let l = node.location();
+                self.fixes.push((l.start_offset(), l.end_offset(), msg[s + 1..e].as_bytes().to_vec()));
+            }
             self.push(off, "Style/NumericPredicate", true, msg);
         }
         if let Some((off, msg)) = self.symbol_proc(node) {
+            self.symbol_proc_fix(node, &msg);
             self.push(off, "Style/SymbolProc", true, msg);
         }
         // recurse into children (we've overridden the default walk). Push this
@@ -918,10 +974,10 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
 /// excluded), mirroring rubocop's `extract_heredocs`.
 struct HeredocFinder<'a> {
     idx: &'a LineIndex,
-    ranges: Vec<(usize, usize, Vec<u8>)>,
+    ranges: Vec<(usize, usize, Vec<u8>, bool)>,
 }
 impl<'a> HeredocFinder<'a> {
-    fn add_span(&mut self, start: usize, end: usize, closing: Option<ruby_prism::Location>) {
+    fn add_span(&mut self, start: usize, end: usize, closing: Option<ruby_prism::Location>, stat: bool) {
         let delim: Vec<u8> = closing
             .map(|c| {
                 c.as_slice()
@@ -932,27 +988,35 @@ impl<'a> HeredocFinder<'a> {
             })
             .unwrap_or_default();
         if start < end {
-            self.ranges.push((self.idx.loc(start).0, self.idx.loc(end - 1).0, delim));
+            self.ranges.push((self.idx.loc(start).0, self.idx.loc(end - 1).0, delim, stat));
         }
     }
 }
 impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
-        if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) {
-            let c = node.content_loc();
-            self.add_span(c.start_offset(), c.end_offset(), node.closing_loc());
+        if let Some(o) = node.opening_loc() {
+            if o.as_slice().starts_with(b"<<") {
+                let stat = o.as_slice().contains(&b'\'');
+                let c = node.content_loc();
+                self.add_span(c.start_offset(), c.end_offset(), node.closing_loc(), stat);
+            }
         }
     }
     fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
         if node.opening_loc().as_slice().starts_with(b"<<") {
             let c = node.content_loc();
-            self.add_span(c.start_offset(), c.end_offset(), Some(node.closing_loc()));
+            self.add_span(c.start_offset(), c.end_offset(), Some(node.closing_loc()), false);
         }
     }
     fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
-        if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) {
-            if let (Some(first), Some(close)) = (node.parts().iter().next(), node.closing_loc()) {
-                self.add_span(first.location().start_offset(), close.start_offset(), node.closing_loc());
+        // prism represents MULTI-LINE heredocs as interpolated containers even
+        // when they're pure text — the single-quote form is still static.
+        if let Some(o) = node.opening_loc() {
+            if o.as_slice().starts_with(b"<<") {
+                let stat = o.as_slice().contains(&b'\'');
+                if let (Some(first), Some(close)) = (node.parts().iter().next(), node.closing_loc()) {
+                    self.add_span(first.location().start_offset(), close.start_offset(), node.closing_loc(), stat);
+                }
             }
         }
         // keep walking — interpolations can nest further heredocs

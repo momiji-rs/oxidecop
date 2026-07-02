@@ -783,13 +783,84 @@ impl<'a> Cops<'a> {
         const RAND: &str =
             "(send {nil? (const {nil? cbase} :Random) (const {nil? cbase} :Kernel)} :rand {int (range int int)})";
         let n = node.as_node();
-        let hit = nodepattern::matches(matcher(&INT_OP_RAND, &format!("(send int {{:+ :-}} {RAND})")), &n, self.src)
-            .or_else(|| nodepattern::matches(matcher(&RAND_OP_INT, &format!("(send {RAND} {{:+ :-}} int)")), &n, self.src))
-            .or_else(|| nodepattern::matches(matcher(&RAND_MODIFIED, &format!("(send {RAND} {{:succ :pred :next}})")), &n, self.src));
-        if hit.is_some() {
-            self.push(node.location().start_offset(), COP, true,
-                "Prefer ranges when generating random numbers instead of integers with offsets.");
-        }
+        let kind = if nodepattern::matches(matcher(&INT_OP_RAND, &format!("(send int {{:+ :-}} {RAND})")), &n, self.src).is_some() {
+            1
+        } else if nodepattern::matches(matcher(&RAND_OP_INT, &format!("(send {RAND} {{:+ :-}} int)")), &n, self.src).is_some() {
+            2
+        } else if nodepattern::matches(matcher(&RAND_MODIFIED, &format!("(send {RAND} {{:succ :pred :next}})")), &n, self.src).is_some() {
+            3
+        } else {
+            return;
+        };
+        self.push(node.location().start_offset(), COP, true,
+            "Prefer ranges when generating random numbers instead of integers with offsets.");
+        self.random_with_offset_fix(node, kind);
+    }
+
+    /// The range rewrite: `rand(6) + 1` → `rand(1..6)` etc.
+    fn random_with_offset_fix(&mut self, node: &ruby_prism::CallNode, kind: u8) {
+        let int_of = |n: &ruby_prism::Node| -> Option<i64> {
+            let l = n.location();
+            std::str::from_utf8(&self.src[l.start_offset()..l.end_offset()])
+                .ok()?
+                .replace('_', "")
+                .parse()
+                .ok()
+        };
+        // locate the rand call (receiver side for kinds 2/3, argument for 1)
+        let rand_call = match kind {
+            1 => node.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| a.as_call_node()),
+            _ => node.receiver().and_then(|r| r.as_call_node()),
+        };
+        let Some(rand_call) = rand_call else { return };
+        let prefix = match rand_call.receiver() {
+            Some(r) => format!("{}.rand", String::from_utf8_lossy(self.node_src(&r))),
+            None => "rand".to_string(),
+        };
+        let Some(rand_arg) = rand_call.arguments().and_then(|a| a.arguments().iter().next()) else {
+            return;
+        };
+        let (left, right) = if let Some(r) = rand_arg.as_range_node() {
+            let (Some(b), Some(e)) = (r.left(), r.right()) else { return };
+            let (Some(b), Some(e)) = (int_of(&b), int_of(&e)) else { return };
+            if r.operator_loc().as_slice() == b"..." { (b, e - 1) } else { (b, e) }
+        } else if let Some(v) = int_of(&rand_arg) {
+            (0, v - 1)
+        } else {
+            return;
+        };
+        let plus = node.name().as_slice() == b"+";
+        let rep = match kind {
+            1 => {
+                let Some(off) = node.receiver().and_then(|r| int_of(&r)) else { return };
+                if plus {
+                    format!("{prefix}({}..{})", off + left, off + right)
+                } else {
+                    format!("{prefix}({}..{})", off - right, off - left)
+                }
+            }
+            2 => {
+                let Some(off) =
+                    node.arguments().and_then(|a| a.arguments().iter().next()).and_then(|a| int_of(&a))
+                else {
+                    return;
+                };
+                if plus {
+                    format!("{prefix}({}..{})", left + off, right + off)
+                } else {
+                    format!("{prefix}({}..{})", left - off, right - off)
+                }
+            }
+            _ => {
+                if matches!(node.name().as_slice(), b"succ" | b"next") {
+                    format!("{prefix}({}..{})", left + 1, right + 1)
+                } else {
+                    format!("{prefix}({}..{})", left - 1, right - 1)
+                }
+            }
+        };
+        let l = node.location();
+        self.fixes.push((l.start_offset(), l.end_offset(), rep.into_bytes()));
     }
 
     /// Style/NegatedIf — `if !x` → `unless x` (rubocop's NegativeConditional:
@@ -870,10 +941,24 @@ impl<'a> Cops<'a> {
         if !self.on(COP) {
             return;
         }
-        if node.else_clause().is_some() {
-            self.push(node.location().start_offset(), COP, false,
-                "Do not use `unless` with `else`. Rewrite these with the positive case first.");
-        }
+        let Some(else_clause) = node.else_clause() else { return };
+        self.push(node.location().start_offset(), COP, true,
+            "Do not use `unless` with `else`. Rewrite these with the positive case first.");
+        // swap keyword to `if` and exchange the two bodies
+        let kw = node.keyword_loc();
+        self.fixes.push((kw.start_offset(), kw.end_offset(), b"if".to_vec()));
+        let cond_end = node
+            .then_keyword_loc()
+            .map(|t| t.end_offset())
+            .unwrap_or_else(|| node.predicate().location().end_offset());
+        let else_kw = else_clause.else_keyword_loc();
+        let Some(end_kw) = node.end_keyword_loc() else { return };
+        let body_range = (cond_end, else_kw.start_offset());
+        let else_range = (else_kw.end_offset(), end_kw.start_offset());
+        let body_text = self.src[body_range.0..body_range.1].to_vec();
+        let else_text = self.src[else_range.0..else_range.1].to_vec();
+        self.fixes.push((body_range.0, body_range.1, else_text));
+        self.fixes.push((else_range.0, else_range.1, body_text));
     }
 
     /// Style/StderrPuts — `$stderr.puts x` → `warn x`.
@@ -959,7 +1044,7 @@ impl<'a> Cops<'a> {
         self.fixes.push((s, then_kw.end_offset(), Vec::new()));
     }
 
-    /// Style/Not — `not x` → `!x`.
+    /// Style/Not — `not x` → `!x` (or the opposite comparison operator).
     pub(crate) fn check_not(&mut self, node: &ruby_prism::CallNode) {
         const COP: &str = "Style/Not";
         if !self.on(COP) || node.name().as_slice() != b"!" {
@@ -970,6 +1055,44 @@ impl<'a> Cops<'a> {
             return;
         }
         self.push(sel.start_offset(), COP, true, "Use `!` instead of `not`.");
+        // `not` plus the space(s) after it
+        let mut sel_end = sel.end_offset();
+        while sel_end < self.src.len() && self.src[sel_end] == b' ' {
+            sel_end += 1;
+        }
+        let Some(recv) = node.receiver() else { return };
+        if let Some(c) = recv.as_call_node() {
+            let opposite: Option<&[u8]> = match c.name().as_slice() {
+                b"==" => Some(b"!="),
+                b"!=" => Some(b"=="),
+                b"<=" => Some(b">"),
+                b">" => Some(b"<="),
+                b"<" => Some(b">="),
+                b">=" => Some(b"<"),
+                _ => None,
+            };
+            if let (Some(op), Some(csel)) = (opposite, c.message_loc()) {
+                self.fixes.push((sel.start_offset(), sel_end, Vec::new()));
+                self.fixes.push((csel.start_offset(), csel.end_offset(), op.to_vec()));
+                return;
+            }
+        }
+        // and/or/ternary/binary sends need parens
+        let needs_parens = recv.as_and_node().is_some()
+            || recv.as_or_node().is_some()
+            || recv.as_if_node().is_some_and(|i| i.if_keyword_loc().is_none())
+            || recv.as_call_node().is_some_and(|c| {
+                c.receiver().is_some()
+                    && c.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0) == 1
+                    && !c.name().as_slice().first().is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            });
+        if needs_parens {
+            self.fixes.push((sel.start_offset(), sel_end, b"!(".to_vec()));
+            let e = node.location().end_offset();
+            self.fixes.push((e, e, b")".to_vec()));
+        } else {
+            self.fixes.push((sel.start_offset(), sel_end, b"!".to_vec()));
+        }
     }
 
     /// Lint/BooleanSymbol — `:true` / `:false` literals (outside `%i[]`).
@@ -990,9 +1113,12 @@ impl<'a> Cops<'a> {
         let value = String::from_utf8_lossy(value).into_owned();
         self.push(l.start_offset(), COP, true,
             format!("Symbol with a boolean name - you probably meant to use `{value}`."));
-        // fix: `:true` -> `true` (the `key:` label form is left alone).
         if self.src[l.start_offset()] == b':' {
+            // `:true` -> `true`
             self.fixes.push((l.start_offset(), l.end_offset(), value.into_bytes()));
+        } else if node.closing_loc().is_some_and(|c| c.as_slice() == b":") {
+            // hash-shorthand key `true:` -> `true =>`
+            self.fixes.push((l.start_offset(), l.end_offset(), format!("{value} =>").into_bytes()));
         }
     }
 
@@ -1163,9 +1289,40 @@ impl<'a> Cops<'a> {
         ))
     }
 
+    /// Autocorrect for the method-call SymbolProc form: drop the block, pass
+    /// `&:method` (appending to existing parenthesized args when present).
+    pub(crate) fn symbol_proc_fix(&mut self, node: &ruby_prism::CallNode, msg: &str) {
+        let Some(method) = msg.strip_prefix("Pass `&:").and_then(|m| m.split('`').next()) else {
+            return;
+        };
+        let Some(block) = node.block() else { return };
+        let bl = block.location();
+        let node_end = node.location().end_offset();
+        if let Some(cl) = node.closing_loc() {
+            // existing parens: `m(a) { block }` -> `m(a, &:x)`
+            let insert_at = cl.start_offset();
+            let args_present = node.arguments().is_some();
+            let rep = if args_present { format!(", &:{method}") } else { format!("&:{method}") };
+            self.fixes.push((insert_at, insert_at, rep.into_bytes()));
+            // remove the block plus the space before it
+            let mut bs = bl.start_offset();
+            while bs > 0 && self.src[bs - 1] == b' ' {
+                bs -= 1;
+            }
+            self.fixes.push((bs, node_end.max(bl.end_offset()), Vec::new()));
+        } else {
+            // no parens: replace ` { block }` with `(&:x)`
+            let mut bs = bl.start_offset();
+            while bs > 0 && self.src[bs - 1] == b' ' {
+                bs -= 1;
+            }
+            self.fixes.push((bs, bl.end_offset(), format!("(&:{method})").into_bytes()));
+        }
+    }
+
     /// Style/SymbolProc for a `super { |x| x.meth }` / `super(...) { … }` block →
     /// `super(&:meth)`. `super` is always a candidate (no ActiveSupport gating).
-    pub(crate) fn symbol_proc_super(&self, block: &ruby_prism::Node, has_args: bool) -> Option<(usize, String)> {
+    pub(crate) fn symbol_proc_super(&mut self, block: &ruby_prism::Node, has_args: bool) -> Option<(usize, String)> {
         if !self.hot.symbol_proc {
             return None;
         }
@@ -1183,6 +1340,12 @@ impl<'a> Cops<'a> {
         {
             return None;
         }
+        // fix: `super { |x| x.m }` -> `super(&:m)` (args keep their parens)
+        let mut bs = block.opening_loc().start_offset();
+        while bs > 0 && self.src[bs - 1] == b' ' {
+            bs -= 1;
+        }
+        self.fixes.push((bs, block.closing_loc().end_offset(), format!("(&:{method})").into_bytes()));
         Some((
             block.opening_loc().start_offset(),
             format!("Pass `&:{method}` as an argument to `super` instead of a block."),
@@ -1191,7 +1354,7 @@ impl<'a> Cops<'a> {
 
     /// Style/SymbolProc for an arrow lambda literal `->(x) { x.meth }` →
     /// `lambda(&:meth)`. Only a candidate when ActiveSupport extensions are off.
-    pub(crate) fn symbol_proc_lambda(&self, node: &ruby_prism::LambdaNode) -> Option<(usize, String)> {
+    pub(crate) fn symbol_proc_lambda(&mut self, node: &ruby_prism::LambdaNode) -> Option<(usize, String)> {
         if !self.hot.symbol_proc || self.hot.active_support {
             return None;
         }
@@ -1204,6 +1367,9 @@ impl<'a> Cops<'a> {
         {
             return None;
         }
+        // fix: `->(x) { x.m }` -> `lambda(&:m)`
+        let l = node.location();
+        self.fixes.push((l.start_offset(), l.end_offset(), format!("lambda(&:{method})").into_bytes()));
         Some((
             node.opening_loc().start_offset(),
             format!("Pass `&:{method}` as an argument to `lambda` instead of a block."),

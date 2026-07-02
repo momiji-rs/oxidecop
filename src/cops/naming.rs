@@ -221,9 +221,45 @@ impl<'a> Cops<'a> {
             return;
         }
         let op = String::from_utf8_lossy(name);
-        self.push(arg.location().start_offset(), COP, false,
+        self.push(arg.location().start_offset(), COP, true,
             format!("When defining the `{op}` operator, name its argument `other`."));
+        // rename the parameter and every reference to it in the body
+        let al = arg.location();
+        self.fixes.push((al.start_offset(), al.end_offset(), b"other".to_vec()));
+        if let Some(body) = node.body() {
+            let mut spans = Vec::new();
+            collect_lvar_spans(&body, arg_name, &mut spans);
+            for (s, e) in spans {
+                self.fixes.push((s, e, b"other".to_vec()));
+            }
+        }
     }
+}
+
+/// Spans of local-variable reads/writes named `name` within `node`.
+fn collect_lvar_spans(node: &ruby_prism::Node, name: &[u8], out: &mut Vec<(usize, usize)>) {
+    struct V<'x> {
+        name: &'x [u8],
+        out: &'x mut Vec<(usize, usize)>,
+    }
+    impl<'pr, 'x> ruby_prism::Visit<'pr> for V<'x> {
+        fn visit_local_variable_read_node(&mut self, n: &ruby_prism::LocalVariableReadNode<'pr>) {
+            if n.name().as_slice() == self.name {
+                let l = n.location();
+                self.out.push((l.start_offset(), l.end_offset()));
+            }
+        }
+        fn visit_local_variable_write_node(&mut self, n: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            if n.name().as_slice() == self.name {
+                let l = n.name_loc();
+                self.out.push((l.start_offset(), l.end_offset()));
+            }
+            ruby_prism::visit_local_variable_write_node(self, n);
+        }
+    }
+    let mut v = V { name, out };
+    use ruby_prism::Visit;
+    v.visit(node);
 }
 
 /// rubocop's `allowed_assignment?` for Naming/ConstantName.

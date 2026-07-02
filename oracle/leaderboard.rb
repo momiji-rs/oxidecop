@@ -100,8 +100,9 @@ COPS.each do |cop, rel|
   line = err.lines.find { |l| l.start_with?('SUMMARY') }
   next unless line
 
-  _, name, total, aloc, afull, _dt, _dl, _df, skipped = line.chomp.split("\t")
-  rows << { cop: name, total: total.to_i, loc: aloc.to_i, full: afull.to_i, skipped: skipped.to_i }
+  _, name, total, aloc, afull, _dt, _dl, _df, skipped, fpass, ftotal = line.chomp.split("\t")
+  rows << { cop: name, total: total.to_i, loc: aloc.to_i, full: afull.to_i, skipped: skipped.to_i,
+            fpass: fpass.to_i, ftotal: ftotal.to_i }
 end
 
 # rank by FULL pass-rate across ALL rubocop spec examples for the cop
@@ -115,15 +116,19 @@ tot_full = tot_all = tot_skip = 0
 rows.each do |r|
   pct = r[:total].zero? ? 0 : (100.0 * r[:full] / r[:total])
   bar = '█' * (pct / 10).round
-  puts format('  %-34s %8d %6d  %4d/%-4d   %4d/%-4d  %5.0f%% %s',
-              r[:cop], r[:total], r[:skipped], r[:loc], r[:total], r[:full], r[:total], pct, bar)
+  fixcol = r[:ftotal].zero? ? '     —' : format('%3d/%-3d', r[:fpass], r[:ftotal])
+  puts format('  %-34s %8d %6d  %4d/%-4d   %4d/%-4d  %s %5.0f%% %s',
+              r[:cop], r[:total], r[:skipped], r[:loc], r[:total], r[:full], r[:total], fixcol, pct, bar)
   tot_full += r[:full]
   tot_all  += r[:total]
   tot_skip += r[:skipped]
+  $fix_pass = ($fix_pass || 0) + r[:fpass]
+  $fix_total = ($fix_total || 0) + r[:ftotal]
 end
 puts '  ' + ('─' * 80)
 overall = tot_all.zero? ? 0 : (100.0 * tot_full / tot_all)
-puts format('  %-34s %8d %6d  %10s   %4d/%-4d  %5.0f%%',
-            'TOTAL (representable examples)', tot_all, tot_skip, '', tot_full, tot_all, overall)
+puts format('  %-34s %8d %6d  %10s   %4d/%-4d  %5.0f%%   FIX %d/%d',
+            'TOTAL (representable examples)', tot_all, tot_skip, '', tot_full, tot_all, overall,
+            $fix_pass || 0, $fix_total || 0)
 puts "  (skipped = spec examples the harness can't faithfully represent; excluded from scoring)"
 puts

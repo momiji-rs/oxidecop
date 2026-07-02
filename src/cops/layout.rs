@@ -68,10 +68,10 @@ impl<'a> Cops<'a> {
             if li == 0 && line.starts_with("#!") {
                 continue;
             }
-            if let Some((_, _, delim)) = self
+            if let Some((_, _, delim, _)) = self
                 .heredoc_lines
                 .iter()
-                .find(|(s, e, _)| line_no >= *s && line_no <= *e)
+                .find(|(s, e, _, _)| line_no >= *s && line_no <= *e)
             {
                 match heredoc_allow.as_str() {
                     "true" => continue,
@@ -245,8 +245,12 @@ impl<'a> Cops<'a> {
             if !text.chars().next_back().is_some_and(is_blank) {
                 continue;
             }
-            let in_heredoc = self.heredoc_lines.iter().any(|(s, e, _)| line_no >= *s && line_no <= *e);
-            if allow_heredoc && in_heredoc {
+            let heredoc = self
+                .heredoc_lines
+                .iter()
+                .find(|(s, e, _, _)| line_no >= *s && line_no <= *e)
+                .cloned();
+            if allow_heredoc && heredoc.is_some() {
                 continue;
             }
             // column (1-based, chars) and byte offset of the trailing run
@@ -262,13 +266,40 @@ impl<'a> Cops<'a> {
             let ls = self.idx.starts[li];
             self.offenses.push(Offense { line: line_no, col, cop: COP, correctable: true,
                 message: "Trailing whitespace detected.".into() });
-            if !in_heredoc {
-                let end = ls + text.len();
-                self.fixes.push((end - run_bytes, end, Vec::new())); // strip the run
+            let end = ls + text.len();
+            match &heredoc {
+                None => self.fixes.push((end - run_bytes, end, Vec::new())),
+                Some((hs, he, _, stat)) => {
+                    // rubocop's process_line_in_heredoc: pure-indentation
+                    // whitespace lines are removable; other runs get wrapped
+                    // in an interpolation (never touch a static heredoc).
+                    let indent = (*hs..=*he)
+                        .filter_map(|ln| {
+                            let s = self.idx.starts[ln - 1];
+                            let e = self.idx.starts.get(ln).copied().unwrap_or(self.src.len());
+                            let line = &self.src[s..e];
+                            if line.iter().all(|b| b.is_ascii_whitespace()) {
+                                None
+                            } else {
+                                Some(line.iter().take_while(|b| matches!(b, b' ' | b'\t')).count())
+                            }
+                        })
+                        .min()
+                        .unwrap_or(0);
+                    let whitespace_only = text.bytes().all(|b| matches!(b, b' ' | b'\t'));
+                    let run_start = end - run_bytes;
+                    if whitespace_only && text.len() <= indent {
+                        self.fixes.push((run_start, end, Vec::new()));
+                    } else if !stat {
+                        let ws_start = if whitespace_only { ls + indent } else { run_start };
+                        let inner = self.src[ws_start..end].to_vec();
+                        let mut rep = b"#{'".to_vec();
+                        rep.extend_from_slice(&inner);
+                        rep.extend_from_slice(b"'}");
+                        self.fixes.push((ws_start, end, rep));
+                    }
+                }
             }
-            // inside a heredoc the whitespace is string CONTENT — rubocop's
-            // correction wraps it in an interpolation; we report but leave
-            // `--fix` alone rather than corrupt the value.
         }
     }
 }

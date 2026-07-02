@@ -295,6 +295,22 @@ while i < lines.length
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
                   sections: cur_sec, override: cur_ovr, ruby: cur_rb, raw: raw_heredoc,
                   src: src, expected: expected }
+  elsif l =~ /expect_correction\(<<([~-])('?)RUBY\2\s*[,)]/ && examples.any?
+    squiggly = Regexp.last_match(1) == '~'
+    raw_heredoc = Regexp.last_match(2) == "'"
+    chomp = !(l =~ /chomp:\s*true/).nil?
+    body = []
+    i += 1
+    until lines[i].strip == 'RUBY'
+      body << lines[i]
+      i += 1
+    end
+    text = (squiggly ? dedent(body) : body).join("\n") + "\n"
+    text = unescape_dq(text) unless raw_heredoc
+    text = text.chomp if chomp
+    examples.last[:correction] = text
+  elsif l =~ /expect_no_corrections/ && examples.any?
+    examples.last[:correction] = :none
   elsif l =~ /expect_no_offenses\((['"])(.*?)\1\)/
     quote, body = Regexp.last_match(1), Regexp.last_match(2)
     # A plain string arg renders by its quote's rules: double-quoted like a
@@ -456,6 +472,20 @@ end
 # interpolation in the SOURCE); they're excluded from loc/full/total.
 groups = Hash.new { |h, k| h[k] = { loc: 0, full: 0, total: 0, skipped: 0 } }
 fails = []
+def run_fix(poc, src, cfg)
+  Dir.mktmpdir do |d|
+    rb = File.join(d, 'ex.rb')
+    yml = File.join(d, 'c.yml')
+    File.write(rb, src)
+    File.write(yml, cfg)
+    out, = Open3.capture2(poc, rb, yml, '--fix')
+    out
+  end
+end
+
+fix_total = 0
+fix_pass = 0
+fix_fails = []
 examples.each_with_index do |ex, n|
   g = groups[ex[:override] || ex[:cfg]]
 
@@ -533,6 +563,20 @@ examples.each_with_index do |ex, n|
 
   g[:loc] += 1 if loc_ok
   g[:full] += 1 if full_ok
+
+  # FIX dimension: expect_correction / expect_no_corrections
+  if (want = ex[:correction])
+    fix_total += 1
+    got = run_fix(POC, src, build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace, ruby: ex[:ruby]))
+    want_text = want == :none ? src : resolve_interp(want, cfg_hash)
+    if got == want_text
+      fix_pass += 1
+    else
+      fix_fails << format("  FIX #%-2d `%s`\n       want=%s\n       got =%s",
+                          n, ex[:src].lines.first.to_s.strip[0, 40],
+                          want_text.inspect[0, 90], got.inspect[0, 90])
+    end
+  end
   next if loc_ok && full_ok
 
   first = ex[:src].lines.first.to_s.strip
@@ -559,10 +603,14 @@ unless fails.empty?
   puts '   --- misses ---'
   puts fails.join("\n") unless ENV['ORACLE_QUIET']
 end
+if fix_total.positive?
+  puts "   FIX (autocorrect): #{fix_pass}/#{fix_total}"
+  puts fix_fails.join("\n") unless fix_fails.empty? || ENV['ORACLE_QUIET']
+end
 
 # machine-readable summary for the leaderboard driver. `total` here is the
 # REPRESENTABLE count (skipped excluded) so downstream percentages are honest.
 # SUMMARY<TAB>cop<TAB>total<TAB>all_loc<TAB>all_full<TAB>def_total<TAB>def_loc<TAB>def_full<TAB>skipped
 all_loc  = groups.values.sum { |g| g[:loc] }
 all_full = groups.values.sum { |g| g[:full] }
-warn "SUMMARY\t#{COP}\t#{scored}\t#{all_loc}\t#{all_full}\t#{def_g[:total]}\t#{def_g[:loc]}\t#{def_g[:full]}\t#{skipped}"
+warn "SUMMARY\t#{COP}\t#{scored}\t#{all_loc}\t#{all_full}\t#{def_g[:total]}\t#{def_g[:loc]}\t#{def_g[:full]}\t#{skipped}\t#{fix_pass}\t#{fix_total}"
