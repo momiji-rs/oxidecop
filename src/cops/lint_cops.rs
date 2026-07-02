@@ -1183,3 +1183,67 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((cl.start_offset(), cl.end_offset(), text));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/IdentityComparison — `a.object_id == b.object_id` or
+    /// `a.object_id != b.object_id` should use `equal?` instead.
+    pub(crate) fn check_identity_comparison(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/IdentityComparison";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !matches!(name, b"==" | b"!=") {
+            return;
+        }
+
+        // Get the receiver and check it's a call to object_id
+        let Some(receiver) = node.receiver() else { return };
+        let Some(lhs_call) = receiver.as_call_node() else { return };
+        if lhs_call.name().as_slice() != b"object_id" {
+            return;
+        }
+        if lhs_call.arguments().is_some() {
+            return;
+        }
+        // The lhs receiver must be present (not bare object_id)
+        let Some(_lhs_receiver) = lhs_call.receiver() else { return };
+
+        // Get the first argument and check it's a call to object_id
+        let Some(args) = node.arguments() else { return };
+        let Some(first_arg) = args.arguments().iter().next() else { return };
+        let Some(rhs_call) = first_arg.as_call_node() else { return };
+        if rhs_call.name().as_slice() != b"object_id" {
+            return;
+        }
+        if rhs_call.arguments().is_some() {
+            return;
+        }
+        // The rhs receiver must be present (not bare object_id)
+        let Some(_rhs_receiver) = rhs_call.receiver() else { return };
+
+        // Build the message
+        let comparison_method = String::from_utf8_lossy(name);
+        let bang = if name == b"==" { "" } else { "!" };
+        let message = format!(
+            "Use `{bang}equal?` instead of `{comparison_method}` when comparing `object_id`."
+        );
+
+        self.push(node.location().start_offset(), COP, true, message);
+
+        // Build the fix
+        let lhs_src = self.node_src(&_lhs_receiver);
+        let rhs_src = self.node_src(&_rhs_receiver);
+        let mut replacement = Vec::new();
+        if !bang.is_empty() {
+            replacement.extend_from_slice(bang.as_bytes());
+        }
+        replacement.extend_from_slice(lhs_src);
+        replacement.extend_from_slice(b".equal?(");
+        replacement.extend_from_slice(rhs_src);
+        replacement.extend_from_slice(b")");
+
+        let l = node.location();
+        self.fixes.push((l.start_offset(), l.end_offset(), replacement));
+    }
+}
