@@ -2463,3 +2463,44 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((open_start, open_end, replacement));
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Style/EmptyLambdaParameter — an arrow lambda (`->`) with an EMPTY but
+    /// present parameter list: `-> () { ... }`. The parens are redundant;
+    /// autocorrect drops them (and the whitespace around them) entirely.
+    ///
+    /// Ported from rubocop's `EmptyLambdaParameter` cop plus its shared
+    /// `EmptyParameter` mixin (`check`/`empty_arguments?`). Only arrow-lambda
+    /// literals are in scope — `lambda { || ... }` and `super { || ... }` use
+    /// ordinary block syntax with no `LambdaNode`, so this visitor never sees
+    /// them (mirrors rubocop's `node.lambda_literal?` guard).
+    pub(crate) fn check_empty_lambda_parameter(&mut self, node: &ruby_prism::LambdaNode<'_>) {
+        const COP: &str = "Style/EmptyLambdaParameter";
+        if !self.on(COP) {
+            return;
+        }
+        // `-> { }` — no parameter list at all: rubocop's `args` node has no
+        // source location and `empty_and_without_delimiters?` short-circuits.
+        let Some(params) = node.parameters() else { return };
+        let Some(bp) = params.as_block_parameters_node() else { return };
+        // rubocop's NodePattern `(args)` only matches a ZERO-arity args node
+        // — any real parameter (or block-local `;`-declared var) means this
+        // isn't the "empty" case at all, regardless of parens.
+        if bp.parameters().is_some() || bp.locals().iter().next().is_some() {
+            return;
+        }
+        // "without delimiters" (bare, unparenthesized empty list) is exempt;
+        // only a written, empty `()` offends.
+        let Some(open) = bp.opening_loc() else { return };
+        let open_start = open.start_offset();
+        let close_end = bp.closing_loc().map(|c| c.end_offset()).unwrap_or_else(|| open.end_offset());
+
+        self.push(open_start, COP, true, "Omit parentheses for the empty lambda parameters.");
+
+        // autocorrect: `range_between(send_node.end, args.end)` in rubocop —
+        // the send node for an arrow lambda IS the `->` operator itself, so
+        // this removes everything from right after `->` through the closing
+        // paren (e.g. the ` ()` in `-> () { ... }`).
+        let remove_start = node.operator_loc().end_offset();
+        self.fixes.push((remove_start, close_end, Vec::new()));
+    }
+}

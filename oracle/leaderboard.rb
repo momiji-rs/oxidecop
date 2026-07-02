@@ -67,6 +67,7 @@ COPS = {
   'Lint/NextWithoutAccumulator'      => 'lint/next_without_accumulator',
   'Layout/SpaceAfterColon'           => 'layout/space_after_colon',
   'Lint/MultipleComparison'          => 'lint/multiple_comparison',
+  'Style/EmptyLambdaParameter'       => 'style/empty_lambda_parameter',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
