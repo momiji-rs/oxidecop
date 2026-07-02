@@ -295,7 +295,7 @@ while i < lines.length
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
                   sections: cur_sec, override: cur_ovr, ruby: cur_rb, raw: raw_heredoc,
                   src: src, expected: expected }
-  elsif l =~ /expect_correction\(<<([~-])('?)RUBY\2\s*[,)]/ && examples.any?
+  elsif l =~ /expect_correction\(<<([~-])('?)RUBY\2\s*[,)]/ && examples.any? && examples.last[:kind] == :offense
     squiggly = Regexp.last_match(1) == '~'
     raw_heredoc = Regexp.last_match(2) == "'"
     chomp = !(l =~ /chomp:\s*true/).nil?
@@ -309,7 +309,7 @@ while i < lines.length
     text = unescape_dq(text) unless raw_heredoc
     text = text.chomp if chomp
     examples.last[:correction] = text
-  elsif l =~ /expect_no_corrections/ && examples.any?
+  elsif l =~ /expect_no_corrections/ && examples.any? && examples.last[:kind] == :offense
     examples.last[:correction] = :none
   elsif l =~ /expect_no_offenses\((['"])(.*?)\1\)/
     quote, body = Regexp.last_match(1), Regexp.last_match(2)
