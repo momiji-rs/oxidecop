@@ -2828,3 +2828,56 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Style/MultilineBlockChain — chaining a method call onto a MULTILINE
+    /// block: `foo do ... end.bar { }`. Ported from rubocop's `on_block`,
+    /// which walks `node.send_node`'s call-node descendants
+    /// (`each_node(:call)`, preorder — so send_node itself is checked
+    /// first) for the first one whose RECEIVER is a block node that spans
+    /// multiple lines, then `break`s. The offense range starts at that
+    /// receiver's closing `end`/`}` and runs through the end of send_node.
+    ///
+    /// Prism fuses rubocop's separate Block node + send_node into one
+    /// CallNode (the block just hangs off `.block()`), so what rubocop
+    /// calls "on_block firing per block node" is here: any CallNode WITH a
+    /// block attached, checked using itself (minus its own `.block()`) as
+    /// the send_node. Walking `.receiver()` links one at a time reproduces
+    /// each_node(:call)'s preorder descent through the receiver chain: a
+    /// receiver that's a call WITHOUT a block, or WITH a single-line block,
+    /// isn't a match — rubocop's traversal doesn't stop there either, it
+    /// keeps descending into THAT receiver's own receiver. A receiver
+    /// that's a call WITH a multiline block IS a match: push the offense
+    /// and stop. Later links in a longer chain are caught independently
+    /// when `on_block` later fires on THEIR OWN attached block (this
+    /// function runs once per call-with-block, from `visit_call_node`).
+    ///
+    /// Only the offense START position matters for this port — `self.push`
+    /// takes no end offset, and the oracle diff only compares line:col +
+    /// message, never underline width — so there's no need to compute
+    /// rubocop's `node.send_node.source_range.end_pos`.
+    ///
+    /// No autocorrect: rubocop's cop doesn't extend `AutoCorrector`.
+    pub(crate) fn check_multiline_block_chain(&mut self, outer: &ruby_prism::CallNode<'_>) {
+        const COP: &str = "Style/MultilineBlockChain";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(mut cur) = outer.receiver() else { return };
+        loop {
+            let Some(call) = cur.as_call_node() else { return };
+            if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
+                let bloc = block.location();
+                let start_line = self.idx.loc(bloc.start_offset()).0;
+                let end_line = self.idx.loc(bloc.end_offset().saturating_sub(1)).0;
+                if start_line != end_line {
+                    let start = block.closing_loc().start_offset();
+                    self.push(start, COP, false, "Avoid multi-line chains of blocks.");
+                    return;
+                }
+            }
+            let Some(next) = call.receiver() else { return };
+            cur = next;
+        }
+    }
+}
