@@ -2153,3 +2153,23 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+
+    /// Style/ColonMethodDefinition — a singleton method defined using `::`
+    /// (e.g. `def self::bar`) instead of `.` (`def self.bar`). Only defs
+    /// with an explicit receiver (prism's `DefNode#receiver`) are singleton
+    /// method definitions; autocorrect swaps the `::` operator for `.`.
+    pub(crate) fn check_colon_method_definition(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/ColonMethodDefinition";
+        if !self.on(COP) || node.receiver().is_none() {
+            return;
+        }
+        let Some(op) = node.operator_loc() else { return };
+        if self.src.get(op.start_offset()..op.end_offset()) != Some(b"::".as_slice()) {
+            return;
+        }
+        self.fixes.push((op.start_offset(), op.end_offset(), b".".to_vec()));
+        self.push(op.start_offset(), COP, true, "Do not use `::` for defining class methods.");
+    }
+}

@@ -140,7 +140,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Layout/SpaceBeforeComma",
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
-    "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition",
+    "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -921,6 +921,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
         self.check_def_with_parentheses(node);
         self.check_space_after_method_name(node);
+        self.check_colon_method_definition(node);
         self.check_method_name_def(node);
         self.check_binary_operator_parameter(node);
         self.check_nested_method_definition(node);
