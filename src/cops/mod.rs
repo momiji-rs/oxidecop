@@ -141,7 +141,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
-    "Layout/LeadingEmptyLines", "Style/Strip",
+    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -747,6 +747,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         ruby_prism::visit_constant_path_node(self, node);
+    }
+    fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+        self.check_top_level_return_with_argument(node);
+        ruby_prism::visit_return_node(self, node);
     }
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
         self.check_rescue_exception(node);

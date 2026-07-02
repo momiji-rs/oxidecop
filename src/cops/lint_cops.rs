@@ -731,3 +731,27 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/TopLevelReturnWithArgument — a `return` with arguments at the top
+    /// level (outside any def or block). The arguments are ignored by Ruby,
+    /// so this is likely an error.
+    pub(crate) fn check_top_level_return_with_argument(&mut self, node: &ruby_prism::ReturnNode) {
+        const COP: &str = "Lint/TopLevelReturnWithArgument";
+        if !self.on(COP) {
+            return;
+        }
+        // Top-level return: not inside a def and not inside a block
+        if self.def_depth > 0 || self.usage_block_depth > 0 {
+            return;
+        }
+        // Check if return has arguments
+        if node.arguments().is_none() {
+            return;
+        }
+        let l = node.location();
+        self.push(l.start_offset(), COP, true, "Top level return with argument detected.");
+        // Autocorrect: replace entire return node with just "return"
+        self.fixes.push((l.start_offset(), l.end_offset(), b"return".to_vec()));
+    }
+}
