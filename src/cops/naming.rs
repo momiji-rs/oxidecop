@@ -350,3 +350,147 @@ fn method_name_arg<'a>(arg: &ruby_prism::Node, src: &'a [u8]) -> Option<(&'a [u8
         None
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Naming/BlockParameterName — checks block parameter names for length,
+    /// case, forbidden names, and number endings. Highly configurable.
+    pub(crate) fn check_block_parameter_name(&mut self, block: &ruby_prism::BlockNode) {
+        const COP: &str = "Naming/BlockParameterName";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(params_node) = block.parameters() else {
+            return;
+        };
+        let Some(params) = params_node.as_block_parameters_node() else {
+            return;
+        };
+        let Some(pn) = params.parameters() else {
+            return;
+        };
+
+        let min_length = self.cfg.param(COP, "MinNameLength")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1);
+        let allow_nums = self.cfg.param(COP, "AllowNamesEndingInNumbers")
+            == Some("true");
+        let allowed_names: Vec<String> = self.cfg.param(COP, "AllowedNames")
+            .map(|v| crate::config::parse_allowed_list(v))
+            .unwrap_or_default();
+        let forbidden_names: Vec<String> = self.cfg.param(COP, "ForbiddenNames")
+            .map(|v| crate::config::parse_allowed_list(v))
+            .unwrap_or_default();
+
+        // Process required parameters
+        for param in pn.requireds().iter() {
+            if let Some(rp) = param.as_required_parameter_node() {
+                self.check_block_param(rp.name().as_slice(), rp.location().start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            }
+        }
+
+        // Process optional parameters
+        for param in pn.optionals().iter() {
+            if let Some(op) = param.as_optional_parameter_node() {
+                self.check_block_param(op.name().as_slice(), op.location().start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            }
+        }
+
+        // Process rest parameter
+        if let Some(rest) = pn.rest() {
+            if let Some(rp) = rest.as_rest_parameter_node() {
+                if let Some(name) = rp.name() {
+                    let loc = rp.location();
+                    self.check_block_param(name.as_slice(), loc.start_offset(),
+                        min_length, allow_nums, &allowed_names, &forbidden_names);
+                }
+            }
+        }
+
+        // Process post parameters
+        for param in pn.posts().iter() {
+            if let Some(pp) = param.as_required_parameter_node() {
+                self.check_block_param(pp.name().as_slice(), pp.location().start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            }
+        }
+
+        // Process keyword parameters
+        for param in pn.keywords().iter() {
+            if let Some(kp) = param.as_optional_keyword_parameter_node() {
+                self.check_block_param(kp.name().as_slice(), kp.location().start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            } else if let Some(kp) = param.as_required_keyword_parameter_node() {
+                self.check_block_param(kp.name().as_slice(), kp.location().start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            }
+        }
+
+        // Process keyword rest parameter
+        if let Some(kwrest) = pn.keyword_rest() {
+            if let Some(kw) = kwrest.as_keyword_rest_parameter_node() {
+                if let Some(name) = kw.name() {
+                    let loc = kw.location();
+                    self.check_block_param(name.as_slice(), loc.start_offset(),
+                        min_length, allow_nums, &allowed_names, &forbidden_names);
+                }
+            }
+        }
+
+        // Process block parameter
+        if let Some(bp) = pn.block() {
+            if let Some(name) = bp.name() {
+                let loc = bp.location();
+                self.check_block_param(name.as_slice(), loc.start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            }
+        }
+    }
+
+    fn check_block_param(&mut self, name_bytes: &[u8], start_off: usize,
+                         min_length: usize, allow_nums: bool, allowed_names: &[String],
+                         forbidden_names: &[String]) {
+        const COP: &str = "Naming/BlockParameterName";
+
+        let full_name = String::from_utf8_lossy(name_bytes).into_owned();
+
+        // Skip if full_name is just "_"
+        if full_name == "_" {
+            return;
+        }
+
+        // Remove leading underscores for name-based checks
+        let name = full_name.trim_start_matches('_');
+
+        // Skip if in allowed names
+        if allowed_names.contains(&full_name) {
+            return;
+        }
+
+        // Check forbidden names first
+        if forbidden_names.contains(&name.to_string()) {
+            let msg = format!("Do not use {name} as a name for a block parameter.");
+            self.push(start_off, COP, false, msg);
+            return; // Don't check other conditions if forbidden
+        }
+
+        // Check for uppercase characters
+        if name.chars().any(|c| c.is_uppercase()) {
+            self.push(start_off, COP, false,
+                "Only use lowercase characters for block parameter.".to_string());
+        }
+
+        // Check minimum length
+        if name.len() < min_length {
+            let msg = format!("Block parameter must be at least {min_length} characters long.");
+            self.push(start_off, COP, false, msg);
+        }
+
+        // Check for numbers at the end
+        if !allow_nums && name.chars().last().is_some_and(|c| c.is_numeric()) {
+            self.push(start_off, COP, false,
+                "Do not end block parameter with a number.".to_string());
+        }
+    }
+}
