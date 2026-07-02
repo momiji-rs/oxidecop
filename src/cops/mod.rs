@@ -139,7 +139,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon", "Style/GlobalVars",
     "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Layout/SpaceBeforeComma",
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
-    "Lint/RescueException", "Style/WhenThen",
+    "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -623,6 +623,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_symbol_literal(node);
     }
     fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
+        self.check_duplicate_hash_key(node);
         if self.ll_active {
             let l = node.location();
             self.ll_enter_collection(

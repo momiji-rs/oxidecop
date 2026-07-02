@@ -2,6 +2,7 @@
 //! public entry point.)
 use super::Cops;
 use crate::nodepattern::{self, Pat};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 /// A rubocop `def_node_matcher` equivalent: the pattern string parses once.
@@ -475,4 +476,110 @@ fn const_name_root(node: &ruby_prism::Node) -> Option<String> {
         }
     }
     None
+}
+
+impl<'a> super::Cops<'a> {
+    /// Lint/DuplicateHashKey — every hash-literal key after the first that
+    /// duplicates an earlier one (by source text), among keys eligible per
+    /// rubocop's `key.recursive_basic_literal? || key.const_type?`. `**splat`
+    /// elements aren't keys and are skipped; duplicates only matter within
+    /// this ONE hash node (nested hashes get their own `visit_hash_node` call).
+    pub(crate) fn check_duplicate_hash_key(&mut self, node: &ruby_prism::HashNode) {
+        const COP: &str = "Lint/DuplicateHashKey";
+        if !self.on(COP) {
+            return;
+        }
+        let mut seen: HashSet<&'a [u8]> = HashSet::new();
+        for el in node.elements().iter() {
+            let Some(assoc) = el.as_assoc_node() else { continue };
+            let key = assoc.key();
+            if !is_duplicate_hash_key_candidate(&key) {
+                continue;
+            }
+            let src = self.node_src(&key);
+            if !seen.insert(src) {
+                self.push(key.location().start_offset(), COP, false, "Duplicated key in hash literal.");
+            }
+        }
+    }
+}
+
+/// rubocop-ast's `recognized_key?`-style test for `Lint/DuplicateHashKey`:
+/// `key.recursive_basic_literal? || key.const_type?`.
+fn is_duplicate_hash_key_candidate(node: &ruby_prism::Node) -> bool {
+    node.as_constant_read_node().is_some()
+        || node.as_constant_path_node().is_some()
+        || is_recursive_basic_literal(node)
+}
+
+/// rubocop-ast's `recursive_basic_literal?`: recurse through `and`/`or`,
+/// parenthesized/interpolated bodies, comparison/`*`/`!`/`<=>` sends, and
+/// composite literals (array/hash/pair/range/regexp/string/symbol/xstring),
+/// bottoming out at non-composite basic literals (int/float/sym/true/false/
+/// nil/str/rational/complex).
+fn is_recursive_basic_literal(node: &ruby_prism::Node) -> bool {
+    if let Some(call) = node.as_call_node() {
+        const OPS: &[&[u8]] = &[b"==", b"===", b"!=", b"<=", b">=", b">", b"<", b"*", b"!", b"<=>"];
+        let Some(recv) = call.receiver() else { return false };
+        return OPS.contains(&call.name().as_slice())
+            && is_recursive_basic_literal(&recv)
+            && call
+                .arguments()
+                .is_none_or(|a| a.arguments().iter().all(|arg| is_recursive_basic_literal(&arg)));
+    }
+    if let Some(a) = node.as_and_node() {
+        return is_recursive_basic_literal(&a.left()) && is_recursive_basic_literal(&a.right());
+    }
+    if let Some(o) = node.as_or_node() {
+        return is_recursive_basic_literal(&o.left()) && is_recursive_basic_literal(&o.right());
+    }
+    if let Some(p) = node.as_parentheses_node() {
+        return p.body().is_none_or(|b| is_recursive_basic_literal(&b));
+    }
+    if let Some(s) = node.as_statements_node() {
+        return s.body().iter().all(|n| is_recursive_basic_literal(&n));
+    }
+    if let Some(arr) = node.as_array_node() {
+        return arr.elements().iter().all(|e| is_recursive_basic_literal(&e));
+    }
+    if let Some(h) = node.as_hash_node() {
+        return h.elements().iter().all(|e| is_recursive_basic_literal(&e));
+    }
+    if let Some(assoc) = node.as_assoc_node() {
+        return is_recursive_basic_literal(&assoc.key()) && is_recursive_basic_literal(&assoc.value());
+    }
+    if let Some(splat) = node.as_assoc_splat_node() {
+        return splat.value().is_none_or(|v| is_recursive_basic_literal(&v));
+    }
+    if let Some(r) = node.as_range_node() {
+        return r.left().is_none_or(|l| is_recursive_basic_literal(&l))
+            && r.right().is_none_or(|rr| is_recursive_basic_literal(&rr));
+    }
+    if node.as_regular_expression_node().is_some() || node.as_x_string_node().is_some() {
+        return true;
+    }
+    if let Some(ire) = node.as_interpolated_regular_expression_node() {
+        return ire.parts().iter().all(|p| is_recursive_basic_literal(&p));
+    }
+    if let Some(s) = node.as_interpolated_string_node() {
+        return s.parts().iter().all(|p| is_recursive_basic_literal(&p));
+    }
+    if let Some(s) = node.as_interpolated_symbol_node() {
+        return s.parts().iter().all(|p| is_recursive_basic_literal(&p));
+    }
+    if let Some(s) = node.as_interpolated_x_string_node() {
+        return s.parts().iter().all(|p| is_recursive_basic_literal(&p));
+    }
+    if let Some(es) = node.as_embedded_statements_node() {
+        return es.statements().is_none_or(|st| st.body().iter().all(|n| is_recursive_basic_literal(&n)));
+    }
+    node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+        || node.as_nil_node().is_some()
+        || node.as_string_node().is_some()
+        || node.as_rational_node().is_some()
+        || node.as_imaginary_node().is_some()
 }
