@@ -63,6 +63,7 @@ COPS = {
   'Style/TrailingBodyOnClass'        => 'style/trailing_body_on_class',
   'Lint/SafeNavigationWithEmpty'     => 'lint/safe_navigation_with_empty',
   'Style/RedundantCapitalW'          => 'style/redundant_capital_w',
+  'Lint/HashCompareByIdentity'       => 'lint/hash_compare_by_identity',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

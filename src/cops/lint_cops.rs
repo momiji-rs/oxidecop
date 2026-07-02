@@ -1018,3 +1018,43 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((l.start_offset(), l.end_offset(), replacement.into_bytes()));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/HashCompareByIdentity — a hash access/write keyed by an object's
+    /// `object_id` (`hash[foo.object_id]`, `hash.key?(foo.object_id)`, …)
+    /// rather than the object itself. Mirrors rubocop's node pattern
+    /// `(call _ {:key? :has_key? :fetch :[] :[]=} (send _ :object_id) ...)`:
+    /// any receiver, one of the five methods, whose FIRST argument is itself
+    /// a no-arg call named `object_id` (any receiver, including implicit
+    /// self, as in the bare `object_id` case). Fires on both `.` and `&.`
+    /// calls (rubocop aliases `on_csend` to `on_send`), and offense is
+    /// anchored at the whole call node's start, matching rubocop's default
+    /// `add_offense(node)` behavior.
+    pub(crate) fn check_hash_compare_by_identity(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/HashCompareByIdentity";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !matches!(name, b"key?" | b"has_key?" | b"fetch" | b"[]" | b"[]=") {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let Some(first_arg) = args.arguments().iter().next() else { return };
+        let Some(call) = first_arg.as_call_node() else { return };
+        if call.name().as_slice() != b"object_id" || call.arguments().is_some() {
+            return;
+        }
+        // rubocop's pattern is `send`, not `call` — a `&.object_id` key
+        // doesn't match there, so it doesn't here
+        if call.call_operator_loc().is_some_and(|o| o.as_slice() == b"&.") {
+            return;
+        }
+        self.push(
+            node.location().start_offset(),
+            COP,
+            false,
+            "Use `Hash#compare_by_identity` instead of using `object_id` for keys.",
+        );
+    }
+}
