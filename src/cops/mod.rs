@@ -136,7 +136,7 @@ const IMPLEMENTED: &[&str] = &[
     "Naming/ClassAndModuleCamelCase", "Naming/ConstantName", "Style/MultilineIfThen",
     "Style/Not", "Style/StderrPuts", "Style/WhileUntilDo", "Style/ColonMethodCall",
     "Lint/EmptyClass", "Lint/DeprecatedClassMethods", "Layout/EmptyLineAfterMagicComment",
-    "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon", "Style/GlobalVars",
+    "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon", "Style/GlobalVars", "Layout/SpaceAfterComma",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
     "Style/CharacterLiteral", "Style/EndBlock", "Style/NegatedWhile", "Style/UnlessElse",
@@ -1235,6 +1235,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     // needs the breakable nominations the walk collected
     cops.check_line_length();
     cops.check_semicolon_lines();
+    cops.check_space_after_comma();
     let t = tick(&T_VISIT, t);
 
     let mut offenses = cops.offenses;

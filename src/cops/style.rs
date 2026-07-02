@@ -1821,6 +1821,10 @@ fn empty_lit_const(node: &ruby_prism::Node) -> Option<String> {
 impl<'a> super::Cops<'a> {
     /// Whether a byte offset sits inside a literal's content (string/regex/
     /// symbol text) — semicolons there are data.
+    pub(crate) fn in_lit_span(&self, pos: usize) -> bool {
+        self.in_literal(pos)
+    }
+
     fn in_literal(&self, pos: usize) -> bool {
         let i = self.lit_spans.partition_point(|(s, _)| *s <= pos);
         i > 0 && pos < self.lit_spans[i - 1].1

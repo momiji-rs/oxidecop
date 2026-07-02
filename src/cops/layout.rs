@@ -516,3 +516,41 @@ fn is_magic_comment(comment: &[u8]) -> bool {
     )
     .is_match(&String::from_utf8_lossy(comment))
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/SpaceAfterComma — a comma must be followed by whitespace
+    /// (semicolons after and `}` under no_space hash style are exempt).
+    pub(crate) fn check_space_after_comma(&mut self) {
+        const COP: &str = "Layout/SpaceAfterComma";
+        if !self.on(COP) || !self.src.contains(&b',') {
+            return;
+        }
+        let rcurly_no_space =
+            self.cfg.get("Layout/SpaceInsideHashLiteralBraces", "EnforcedStyle") == Some("no_space");
+        for line in 1..=self.idx.starts.len() {
+            let ls = self.idx.starts[line - 1];
+            let le = self.line_end(line);
+            // a trailing comment caps the code
+            let code_end = self
+                .comments
+                .iter()
+                .find(|(l, s, _)| *l == line && *s >= ls && *s < le)
+                .map(|(_, s, _)| *s)
+                .unwrap_or(le);
+            for p in ls..code_end {
+                if self.src[p] != b',' || self.in_lit_span(p) {
+                    continue;
+                }
+                let Some(next) = self.src.get(p + 1) else { continue };
+                if next.is_ascii_whitespace() || *next == b';' {
+                    continue;
+                }
+                if *next == b'}' && rcurly_no_space {
+                    continue;
+                }
+                self.fixes.push((p + 1, p + 1, b" ".to_vec()));
+                self.push(p, COP, true, "Space missing after comma.");
+            }
+        }
+    }
+}
