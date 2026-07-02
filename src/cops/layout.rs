@@ -1468,3 +1468,188 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/AssignmentIndentation — ports rubocop's `CheckAssignment` +
+    /// `Alignment` mixins: when the right-hand-side of a multi-line
+    /// assignment starts on a line of its own, that first line must be
+    /// indented `configured_indentation_width` columns past the start of
+    /// the assignment's own left-hand side.
+    ///
+    /// Every write-node visitor (`mod.rs`) calls `assignment_indentation_hook`
+    /// with `(own_start_offset, operator_end_offset, rhs)` — this single
+    /// entry point resolves the "leftmost multiple assignment" base (via
+    /// `self.assignment_leftmost`, populated top-down since prism nodes
+    /// carry no parent pointer) and then delegates to `check_assignment_indentation`,
+    /// which is rubocop's `check_assignment` + `check_alignment` verbatim.
+    ///
+    /// `leftmost_multiple_assignment(node)` in upstream is:
+    /// ```ruby
+    /// def leftmost_multiple_assignment(node)
+    ///   return node unless same_line?(node, node.parent) && node.parent.assignment?
+    ///   leftmost_multiple_assignment(node.parent)  # <- return value discarded!
+    ///   node.parent
+    /// end
+    /// ```
+    /// Because the recursive call's result is thrown away, the method only
+    /// ever climbs ONE level: node's own start if it doesn't share a line
+    /// with an assignment parent, else the immediate parent's start —
+    /// regardless of how much further the chain continues. We replicate
+    /// that (bug-for-bug) via a one-shot override map instead of a real
+    /// parent walk: whichever assignment visits `rhs` next looks itself up.
+    pub(crate) fn assignment_indentation_hook(
+        &mut self,
+        own_start_offset: usize,
+        operator_end_offset: usize,
+        rhs: ruby_prism::Node,
+    ) {
+        // Tell a same-line chained rhs (`foo = bar = baz`) to use OUR start
+        // as ITS leftmost base, before consuming `rhs` below.
+        if is_assignment_like(&rhs) {
+            let rhs_start = rhs.location().start_offset();
+            if self.idx.loc(own_start_offset).0 == self.idx.loc(rhs_start).0 {
+                self.assignment_leftmost.insert(rhs_start, own_start_offset);
+            }
+        }
+        // Resolve any override left for US by an enclosing same-line
+        // assignment (falls back to our own start otherwise).
+        let base = self.assignment_leftmost.remove(&own_start_offset).unwrap_or(own_start_offset);
+        self.check_assignment_indentation(base, operator_end_offset, rhs);
+    }
+
+    /// `check_assignment` + `Alignment#check_alignment` for a single-item
+    /// `[rhs]` list (this cop only ever aligns the one rhs node).
+    fn check_assignment_indentation(
+        &mut self,
+        lhs_start_offset: usize,
+        operator_end_offset: usize,
+        rhs: ruby_prism::Node,
+    ) {
+        const COP: &str = "Layout/AssignmentIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let rhs_loc = rhs.location();
+        let rhs_start = rhs_loc.start_offset();
+        let (op_line, _) = self.idx.loc(operator_end_offset);
+        let (rhs_line, _) = self.idx.loc(rhs_start);
+        // `return if same_line?(node.loc.operator, rhs)`.
+        if op_line == rhs_line {
+            return;
+        }
+        // `each_bad_alignment`'s `begins_its_line?` guard — only the first
+        // non-whitespace token on its line can be misaligned.
+        let line_start = self.idx.starts[rhs_line - 1];
+        if !self.src[line_start..rhs_start].iter().all(u8::is_ascii_whitespace) {
+            return;
+        }
+        let width = self.assignment_indentation_width(COP);
+        let base = self.display_column(lhs_start_offset);
+        let expected = base + width;
+        let actual = self.display_column(rhs_start);
+        if actual == expected {
+            return;
+        }
+        self.push(
+            rhs_start,
+            COP,
+            true,
+            "Indent the first line of the right-hand-side of a multi-line assignment.",
+        );
+        // `AlignmentCorrector.correct`: replace the rhs's own leading
+        // whitespace with exactly `expected` spaces (reindents its first
+        // line; a genuinely multi-line rhs keeps its interior lines as-is —
+        // no fixture here has one, and those are `IndentationConsistency`'s
+        // and `EndAlignment`'s job upstream too).
+        self.fixes.push((line_start, rhs_start, vec![b' '; expected]));
+    }
+
+    /// `Alignment#configured_indentation_width`: cop-local `IndentationWidth`,
+    /// else `Layout/IndentationWidth`'s `Width`, else 2.
+    fn assignment_indentation_width(&self, cop: &'static str) -> usize {
+        self.cfg
+            .param(cop, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+
+    /// `Alignment#display_column`: the display width (Unicode East-Asian
+    /// Width; fullwidth/wide characters count as 2 columns) of the text
+    /// preceding `offset` on its own line.
+    fn display_column(&self, offset: usize) -> usize {
+        let (line, _) = self.idx.loc(offset);
+        let line_start = self.idx.starts[line - 1];
+        display_width(&self.src[line_start..offset])
+    }
+}
+
+/// Is `node` one of the node kinds rubocop's `Node#assignment?` recognizes
+/// (`lvasgn`/`ivasgn`/`cvasgn`/`gvasgn`/`casgn`/`masgn`/`op_asgn`/`or_asgn`/
+/// `and_asgn`), reachable as the `value` of another write node — used to
+/// detect a chained multiple assignment (`foo = bar = baz`).
+///
+/// Deliberately NOT covered (rubocop's `on_send` branch of `CheckAssignment`,
+/// gated on `node.loc.operator` — true only for setter/index sends): attr
+/// writers (`obj.attr = x`) and indexed assignment (`a[i] = x`), plain or
+/// compound (prism's `CallOperatorWriteNode`/`CallOrWriteNode`/
+/// `CallAndWriteNode`/`IndexOperatorWriteNode`/`IndexOrWriteNode`/
+/// `IndexAndWriteNode`, and plain `CallNode` for `=`/`[]=`). None of the
+/// fixture's examples exercise them.
+fn is_assignment_like(node: &ruby_prism::Node) -> bool {
+    node.as_local_variable_write_node().is_some()
+        || node.as_local_variable_operator_write_node().is_some()
+        || node.as_local_variable_or_write_node().is_some()
+        || node.as_local_variable_and_write_node().is_some()
+        || node.as_instance_variable_write_node().is_some()
+        || node.as_instance_variable_operator_write_node().is_some()
+        || node.as_instance_variable_or_write_node().is_some()
+        || node.as_instance_variable_and_write_node().is_some()
+        || node.as_class_variable_write_node().is_some()
+        || node.as_class_variable_operator_write_node().is_some()
+        || node.as_class_variable_or_write_node().is_some()
+        || node.as_class_variable_and_write_node().is_some()
+        || node.as_global_variable_write_node().is_some()
+        || node.as_global_variable_operator_write_node().is_some()
+        || node.as_global_variable_or_write_node().is_some()
+        || node.as_global_variable_and_write_node().is_some()
+        || node.as_constant_write_node().is_some()
+        || node.as_constant_operator_write_node().is_some()
+        || node.as_constant_or_write_node().is_some()
+        || node.as_constant_and_write_node().is_some()
+        || node.as_constant_path_write_node().is_some()
+        || node.as_constant_path_operator_write_node().is_some()
+        || node.as_constant_path_or_write_node().is_some()
+        || node.as_constant_path_and_write_node().is_some()
+        || node.as_multi_write_node().is_some()
+}
+
+/// Unicode East-Asian-Width column width, good enough for `Unicode::
+/// DisplayWidth`'s default table on the ranges that matter here (CJK,
+/// Hangul, fullwidth forms count as 2 columns; everything else is 1 —
+/// combining marks aren't handled, no fixture exercises them).
+fn display_width(bytes: &[u8]) -> usize {
+    if bytes.is_ascii() {
+        return bytes.len();
+    }
+    String::from_utf8_lossy(bytes).chars().map(char_width).sum()
+}
+
+fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    let wide = matches!(cp,
+        0x1100..=0x115F   // Hangul Jamo
+        | 0x2E80..=0x303E // CJK Radicals .. CJK Symbols/Punctuation
+        | 0x3041..=0x33FF // Hiragana .. CJK Compat
+        | 0x3400..=0x4DBF // CJK Ext A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xA000..=0xA4CF // Yi
+        | 0xAC00..=0xD7A3 // Hangul syllables
+        | 0xF900..=0xFAFF // CJK Compat Ideographs
+        | 0xFE30..=0xFE4F // CJK Compat Forms
+        | 0xFF00..=0xFF60 // Fullwidth Forms
+        | 0xFFE0..=0xFFE6
+        | 0x20000..=0x3FFFD
+    );
+    if wide { 2 } else { 1 }
+}

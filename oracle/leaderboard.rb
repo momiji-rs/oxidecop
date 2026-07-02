@@ -100,6 +100,7 @@ COPS = {
   'Layout/SpaceInsideStringInterpolation' => 'layout/space_inside_string_interpolation',
   'Layout/EmptyLinesAroundMethodBody' => 'layout/empty_lines_around_method_body',
   'Style/NestedTernaryOperator'      => 'style/nested_ternary_operator',
+  'Layout/AssignmentIndentation'     => 'layout/assignment_indentation',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

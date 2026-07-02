@@ -142,7 +142,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire", "Lint/TrailingCommaInAttributeDeclaration",
-    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator",
+    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -484,6 +484,12 @@ pub(crate) struct Cops<'a> {
     // reported — avoids duplicate offenses when the same nested ternary appears
     // in multiple outer ternaries.
     pub(crate) nested_ternary_reported: HashSet<usize>,
+    // Layout/AssignmentIndentation: maps a chained assignment's own start
+    // offset (`bar` in `foo = bar = baz`) to the start offset of its
+    // immediate same-line enclosing assignment (`foo`) — see
+    // `assignment_indentation_hook` in layout.rs for why this is only ever
+    // ONE level, matching upstream's `leftmost_multiple_assignment` bug.
+    pub(crate) assignment_leftmost: HashMap<usize, usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -619,6 +625,40 @@ impl<'a> Cops<'a> {
     }
 }
 
+// Layout/AssignmentIndentation: the four write-node shapes share these field
+// layouts (see `layout.rs` for the actual check). Plain/`||=`/`&&=` writes
+// expose `name_loc`+`operator_loc`; compound (`+=` etc) writes expose
+// `name_loc`+`binary_operator_loc`; `Foo::Bar = x` path writes expose
+// `target()` (a `ConstantPathNode`) instead of `name_loc`.
+macro_rules! assignment_write {
+    ($self:expr, $node:expr) => {{
+        let lhs_start = $node.name_loc().start_offset();
+        let op_end = $node.operator_loc().end_offset();
+        $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+    }};
+}
+macro_rules! assignment_operator_write {
+    ($self:expr, $node:expr) => {{
+        let lhs_start = $node.name_loc().start_offset();
+        let op_end = $node.binary_operator_loc().end_offset();
+        $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+    }};
+}
+macro_rules! assignment_path_write {
+    ($self:expr, $node:expr) => {{
+        let lhs_start = $node.target().location().start_offset();
+        let op_end = $node.operator_loc().end_offset();
+        $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+    }};
+}
+macro_rules! assignment_path_operator_write {
+    ($self:expr, $node:expr) => {{
+        let lhs_start = $node.target().location().start_offset();
+        let op_end = $node.binary_operator_loc().end_offset();
+        $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+    }};
+}
+
 impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
         self.check_string_literals(node);
@@ -683,11 +723,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
         let v = node.value();
         self.check_constant_name(node.name().as_slice(), node.name_loc().start_offset(), Some(&v));
+        assignment_write!(self, node);
         ruby_prism::visit_constant_write_node(self, node);
     }
     fn visit_constant_or_write_node(&mut self, node: &ruby_prism::ConstantOrWriteNode<'pr>) {
         let v = node.value();
         self.check_constant_name(node.name().as_slice(), node.name_loc().start_offset(), Some(&v));
+        assignment_write!(self, node);
         ruby_prism::visit_constant_or_write_node(self, node);
     }
     fn visit_constant_target_node(&mut self, node: &ruby_prism::ConstantTargetNode<'pr>) {
@@ -700,7 +742,28 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let v = node.value();
             self.check_constant_name(name.as_slice(), t.name_loc().start_offset(), Some(&v));
         }
+        assignment_path_write!(self, node);
         ruby_prism::visit_constant_path_write_node(self, node);
+    }
+    fn visit_constant_and_write_node(&mut self, node: &ruby_prism::ConstantAndWriteNode<'pr>) {
+        assignment_write!(self, node);
+        ruby_prism::visit_constant_and_write_node(self, node);
+    }
+    fn visit_constant_operator_write_node(&mut self, node: &ruby_prism::ConstantOperatorWriteNode<'pr>) {
+        assignment_operator_write!(self, node);
+        ruby_prism::visit_constant_operator_write_node(self, node);
+    }
+    fn visit_constant_path_operator_write_node(&mut self, node: &ruby_prism::ConstantPathOperatorWriteNode<'pr>) {
+        assignment_path_operator_write!(self, node);
+        ruby_prism::visit_constant_path_operator_write_node(self, node);
+    }
+    fn visit_constant_path_or_write_node(&mut self, node: &ruby_prism::ConstantPathOrWriteNode<'pr>) {
+        assignment_path_write!(self, node);
+        ruby_prism::visit_constant_path_or_write_node(self, node);
+    }
+    fn visit_constant_path_and_write_node(&mut self, node: &ruby_prism::ConstantPathAndWriteNode<'pr>) {
+        assignment_path_write!(self, node);
+        ruby_prism::visit_constant_path_and_write_node(self, node);
     }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
         self.check_nested_ternary_operator(node);
@@ -766,18 +829,22 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_class_variable_write_node(&mut self, node: &ruby_prism::ClassVariableWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
+        assignment_write!(self, node);
         ruby_prism::visit_class_variable_write_node(self, node);
     }
     fn visit_class_variable_operator_write_node(&mut self, node: &ruby_prism::ClassVariableOperatorWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
+        assignment_operator_write!(self, node);
         ruby_prism::visit_class_variable_operator_write_node(self, node);
     }
     fn visit_class_variable_or_write_node(&mut self, node: &ruby_prism::ClassVariableOrWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
+        assignment_write!(self, node);
         ruby_prism::visit_class_variable_or_write_node(self, node);
     }
     fn visit_class_variable_and_write_node(&mut self, node: &ruby_prism::ClassVariableAndWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
+        assignment_write!(self, node);
         ruby_prism::visit_class_variable_and_write_node(self, node);
     }
     fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
@@ -785,22 +852,67 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_global_variable_write_node(&mut self, node: &ruby_prism::GlobalVariableWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
+        assignment_write!(self, node);
         ruby_prism::visit_global_variable_write_node(self, node);
     }
     fn visit_global_variable_operator_write_node(&mut self, node: &ruby_prism::GlobalVariableOperatorWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
+        assignment_operator_write!(self, node);
         ruby_prism::visit_global_variable_operator_write_node(self, node);
     }
     fn visit_global_variable_or_write_node(&mut self, node: &ruby_prism::GlobalVariableOrWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
+        assignment_write!(self, node);
         ruby_prism::visit_global_variable_or_write_node(self, node);
     }
     fn visit_global_variable_and_write_node(&mut self, node: &ruby_prism::GlobalVariableAndWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
+        assignment_write!(self, node);
         ruby_prism::visit_global_variable_and_write_node(self, node);
     }
     fn visit_global_variable_target_node(&mut self, node: &ruby_prism::GlobalVariableTargetNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
+    }
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        assignment_write!(self, node);
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        assignment_operator_write!(self, node);
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        assignment_write!(self, node);
+        ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        assignment_write!(self, node);
+        ruby_prism::visit_local_variable_and_write_node(self, node);
+    }
+    fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
+        assignment_write!(self, node);
+        ruby_prism::visit_instance_variable_write_node(self, node);
+    }
+    fn visit_instance_variable_operator_write_node(
+        &mut self,
+        node: &ruby_prism::InstanceVariableOperatorWriteNode<'pr>,
+    ) {
+        assignment_operator_write!(self, node);
+        ruby_prism::visit_instance_variable_operator_write_node(self, node);
+    }
+    fn visit_instance_variable_or_write_node(&mut self, node: &ruby_prism::InstanceVariableOrWriteNode<'pr>) {
+        assignment_write!(self, node);
+        ruby_prism::visit_instance_variable_or_write_node(self, node);
+    }
+    fn visit_instance_variable_and_write_node(&mut self, node: &ruby_prism::InstanceVariableAndWriteNode<'pr>) {
+        assignment_write!(self, node);
+        ruby_prism::visit_instance_variable_and_write_node(self, node);
+    }
+    fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        let lhs_start = node.location().start_offset();
+        let op_end = node.operator_loc().end_offset();
+        self.assignment_indentation_hook(lhs_start, op_end, node.value());
+        ruby_prism::visit_multi_write_node(self, node);
     }
     fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
         self.check_duplicate_case_condition(node);
@@ -1454,6 +1566,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         regexp_bang_ignore: Vec::new(),
         multiline_if_mod_seen: HashSet::new(),
         nested_ternary_reported: HashSet::new(),
+        assignment_leftmost: HashMap::new(),
     };
 
     let t = tick(&T_PREP, t);
