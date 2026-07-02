@@ -241,6 +241,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.push(off, cop, false, render(msg, &caps));
             }
         }
+        self.check_zero_length(node);
         // Style/NumericPredicate (imperative: message interpolates a constructed
         // suggestion). Uses call_stack for AllowedMethods-on-ancestor + negation.
         if let Some((off, msg)) = self.numeric_predicate(node) {
@@ -396,5 +397,17 @@ mod tests {
     fn visits_lambda_parameter_defaults() {
         let got = offenses("f = ->(x = 1000000) { x }\n", NUMERIC_ONLY);
         assert_eq!(got, vec![(1, 12, "Style/NumericLiterals")]);
+    }
+
+    // nodepattern extensions: const/cbase scopes, `...` rest-args, csend.
+    #[test]
+    fn zero_length_non_polymorphic_guard_and_csend() {
+        let cfg = "AllCops:\n  DisabledByDefault: true\nStyle/ZeroLengthPredicate:\n  Enabled: true\n";
+        assert_eq!(offenses("File.stat(foo).size == 0\n", cfg), vec![]);
+        assert_eq!(offenses("::File::Stat.new(foo).size.zero?\n", cfg), vec![]);
+        assert_eq!(offenses("foo.size == 0\n", cfg), vec![(1, 1, "Style/ZeroLengthPredicate")]);
+        // csend dispatch: zero-shapes flag, nonzero-shapes don't (on_send only)
+        assert_eq!(offenses("x&.length == 0\n", cfg), vec![(1, 1, "Style/ZeroLengthPredicate")]);
+        assert_eq!(offenses("x&.length > 0\n", cfg), vec![]);
     }
 }

@@ -48,13 +48,21 @@ matches it against Prism nodes. Supported so far:
 | DSL form | meaning |
 |---|---|
 | `(send RECV :meth ARG…)` | a call node, mapped onto Prism's `receiver`/`name`/`arguments` |
+| `(csend …)` / `(call …)` | safe-navigation call (`&.`) / either form (rubocop's `call`) |
 | `nil?` | absent / nil receiver |
 | `_` | any node |
 | `(...)` | any **present** node (requires an explicit receiver) |
+| `...` | rest — any remaining children (a send's method+args, or trailing args) |
 | `:sym` | a method-name symbol |
-| `{a b c}` | union — any alternative matches |
+| `{a b c}` | union — any alternative matches (captures backtrack on failure) |
 | `$…` | **capture** — records matched text for message interpolation |
-| `(nil)` / `(int N)` / `(int _)` | literal nodes |
+| `(nil)` / `(int N)` / `(int $N)` | literal nodes |
+| `(const SCOPE :Name)` / `cbase` | constants: `Foo` (`nil?` scope), `::Foo` (`cbase`), `File::Stat` (nested) |
+
+Imperative cops reuse the same engine as **matchers** — a parsed pattern held in
+a `OnceLock`, rubocop's `def_node_matcher` — e.g. `Style/ZeroLengthPredicate`
+transcribes rubocop's four patterns verbatim and builds its messages from the
+captures.
 
 Two things are **not** derivable from the pattern and live alongside it as data:
 
@@ -89,20 +97,20 @@ Current leaderboard (`ruby oracle/leaderboard.rb`), against RuboCop v1.88.0:
 ```
 cop                                  scored   skip         LOC        FULL
 Style/FrozenStringLiteralComment         88      7    88/88       88/88      100%
+Style/ZeroLengthPredicate                74      0    74/74       74/74      100%
 Style/SymbolProc                         57     13    57/57       57/57      100%
+Style/StringLiterals                     49      5    49/49       49/49      100%
 Style/NumericPredicate                   39      4    39/39       39/39      100%
 Lint/NestedMethodDefinition              38      0    38/38       38/38      100%
 Style/NilComparison                       8      0     8/8         8/8       100%
 Naming/MethodName                        48     30    45/48       45/48       94%
 Layout/LineLength                       145     41   111/145     111/145      77%
-Style/StringLiterals                     49      5    38/49       37/49       76%
 Layout/TrailingWhitespace                19      0    13/19       13/19       68%
-Style/ZeroLengthPredicate                74      0    49/74       48/74       65%
 Style/Documentation                      43      6    22/43       22/43       51%
 Style/NumericLiterals                    28      0    14/28       13/28       46%
 Style/RedundantReturn                    37      1    19/37       14/37       38%
 ────────────────────────────────────────────────────────────────────────────
-TOTAL (representable examples)          673    107                533/673      79%
+TOTAL (representable examples)          673    107                571/673      85%
 ```
 
 **Read this honestly:** the score is over *representable* examples only. RuboCop's

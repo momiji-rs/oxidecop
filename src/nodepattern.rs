@@ -1,18 +1,23 @@
 //! Mini node-pattern engine — a subset of rubocop's `def_node_matcher` DSL,
 //! matched against Prism nodes. The POINT: once this exists, a pattern cop is
-//! DATA (pattern string + message), not code. Supported subset:
-//!   (send RECV :meth ARG...)   nil?   _   :sym   (nil)   (int N)   (const _ :Name)
+//! DATA (pattern string + message), not code — and imperative cops use parsed
+//! patterns as matchers, exactly like rubocop's `def_node_matcher`. Supported:
+//!   (send RECV :meth ARG...)   (csend ...)   (call ...)  — call = send|csend
+//!   nil?   _   :sym   {a b c}   $capture   ...   cbase
+//!   (nil)   (int N)   (int $N)   (const SCOPE :Name)
 use ruby_prism::Node;
 
 #[derive(Debug, Clone)]
 pub enum Pat {
     Any,             // _
-    NilRecv,         // nil?  (a nil / absent receiver)
+    NilRecv,         // nil?  (a nil / absent receiver or scope)
     Sym(String),     // :foo  (a method-name symbol)
     Node { ty: String, children: Vec<Pat> }, // (ty c...)
     Int(i64),        // 0, 42
     Union(Vec<Pat>), // {a b c}  — any alternative matches
     Capture(Box<Pat>), // $pat  — on match, records the matched text (left-to-right)
+    Rest,            // ...  — any remaining children (a send's method+args, or args)
+    Cbase,           // cbase — the `::` top-level scope anchor
 }
 
 pub fn parse(s: &str) -> Pat {
@@ -50,6 +55,8 @@ fn atom(s: &str) -> Pat {
     match s {
         "_" => Pat::Any,
         "nil?" => Pat::NilRecv,
+        "..." => Pat::Rest,
+        "cbase" => Pat::Cbase,
         _ if s.starts_with(':') => Pat::Sym(s[1..].to_string()),
         _ if s.parse::<i64>().is_ok() => Pat::Int(s.parse().unwrap()),
         _ => Pat::Sym(s.to_string()),
@@ -109,7 +116,8 @@ fn m(pat: &Pat, node: &Node, src: &[u8], caps: &mut Vec<String>) -> bool {
             .map(|i| int_of(&i.as_node(), src) == Some(*n))
             .unwrap_or(false),
         Pat::Sym(_) => false, // a bare sym only meaningful as a send's :meth slot
-        Pat::Union(alts) => alts.iter().any(|p| m(p, node, src, caps)),
+        Pat::Rest | Pat::Cbase => false, // positional/scope-only; handled by parents
+        Pat::Union(alts) => union(alts, caps, |p, caps| m(p, node, src, caps)),
         Pat::Capture(inner) => {
             if m(inner, node, src, caps) {
                 caps.push(node_text(node, src));
@@ -122,12 +130,27 @@ fn m(pat: &Pat, node: &Node, src: &[u8], caps: &mut Vec<String>) -> bool {
     }
 }
 
+/// Try alternatives left-to-right, undoing any captures a failed branch made
+/// (a branch can capture, then fail on a later slot — without the rollback the
+/// stale capture would leak into the winning branch's interpolations).
+fn union(alts: &[Pat], caps: &mut Vec<String>, mut f: impl FnMut(&Pat, &mut Vec<String>) -> bool) -> bool {
+    alts.iter().any(|p| {
+        let mark = caps.len();
+        if f(p, caps) {
+            true
+        } else {
+            caps.truncate(mark);
+            false
+        }
+    })
+}
+
 /// Match a `:meth` slot (Sym / Union-of-Syms / a `$`capture of either).
 fn match_meth(pat: &Pat, name: &[u8], caps: &mut Vec<String>) -> bool {
     match pat {
         Pat::Any => true,
         Pat::Sym(s) => s.as_bytes() == name,
-        Pat::Union(alts) => alts.iter().any(|p| match_meth(p, name, caps)),
+        Pat::Union(alts) => union(alts, caps, |p, caps| match_meth(p, name, caps)),
         Pat::Capture(inner) => {
             if match_meth(inner, name, caps) {
                 caps.push(String::from_utf8_lossy(name).into_owned());
@@ -149,15 +172,42 @@ fn int_of(n: &Node, src: &[u8]) -> Option<i64> {
         .ok()
 }
 
+/// A constant's scope slot: `File` has scope Nil, `::File` has scope Cbase,
+/// `File::Stat`'s scope is the `File` node.
+enum ConstScope<'pr> {
+    Nil,
+    Cbase,
+    Parent(Node<'pr>),
+}
+fn match_const_scope(pat: &Pat, scope: &ConstScope, src: &[u8], caps: &mut Vec<String>) -> bool {
+    match pat {
+        Pat::Any => true,
+        Pat::NilRecv => matches!(scope, ConstScope::Nil),
+        Pat::Cbase => matches!(scope, ConstScope::Cbase),
+        Pat::Union(alts) => union(alts, caps, |p, caps| match_const_scope(p, scope, src, caps)),
+        p => match scope {
+            ConstScope::Parent(n) => m(p, n, src, caps),
+            _ => false,
+        },
+    }
+}
+
 fn match_typed(ty: &str, children: &[Pat], node: &Node, src: &[u8], caps: &mut Vec<String>) -> bool {
     match ty {
-        "send" | "csend" => {
+        // `send` is a plain call, `csend` the `&.` safe-navigation form,
+        // `call` either (rubocop's alias for `{send csend}`).
+        "send" | "csend" | "call" => {
             let Some(call) = node.as_call_node() else { return false };
-            // children: [receiver, :method, args...]
-            if children.len() < 2 {
+            match ty {
+                "send" if call.is_safe_navigation() => return false,
+                "csend" if !call.is_safe_navigation() => return false,
+                _ => {}
+            }
+            // children: [receiver, :method, args...] — `...` anywhere after the
+            // receiver consumes the rest (method and/or remaining args).
+            if children.is_empty() {
                 return false;
             }
-            // receiver
             let recv_ok = match &children[0] {
                 Pat::NilRecv => call.receiver().is_none(),
                 Pat::Any => true,
@@ -166,20 +216,28 @@ fn match_typed(ty: &str, children: &[Pat], node: &Node, src: &[u8], caps: &mut V
             if !recv_ok {
                 return false;
             }
-            // method name (a :sym slot, possibly a {union} of syms or a $capture)
-            if !match_meth(&children[1], call.name().as_slice(), caps) {
+            // method slot: `...` here matches any method + any args.
+            let Some(meth_pat) = children.get(1) else { return false };
+            if matches!(meth_pat, Pat::Rest) {
+                return true;
+            }
+            if !match_meth(meth_pat, call.name().as_slice(), caps) {
                 return false;
             }
-            // args
+            // args, with a trailing `...` matching any remainder (incl. empty)
             let args: Vec<Node> = call
                 .arguments()
                 .map(|a| a.arguments().iter().collect())
                 .unwrap_or_default();
             let arg_pats = &children[2..];
-            if arg_pats.len() != args.len() {
-                return false;
+            if let Some(last) = arg_pats.last() {
+                if matches!(last, Pat::Rest) {
+                    let fixed = &arg_pats[..arg_pats.len() - 1];
+                    return fixed.len() <= args.len()
+                        && fixed.iter().zip(&args).all(|(p, a)| m(p, a, src, caps));
+                }
             }
-            arg_pats.iter().zip(&args).all(|(p, a)| m(p, a, src, caps))
+            arg_pats.len() == args.len() && arg_pats.iter().zip(&args).all(|(p, a)| m(p, a, src, caps))
         }
         // `(...)` — any node that EXISTS. In a receiver slot this requires an
         // explicit receiver (absent receivers never reach here), which is how
@@ -187,15 +245,32 @@ fn match_typed(ty: &str, children: &[Pat], node: &Node, src: &[u8], caps: &mut V
         "..." => true,
         "nil" => node.as_nil_node().is_some(),
         "int" => {
-            if let Some(Pat::Int(n)) = children.first() {
-                node.as_integer_node()
-                    .map(|i| int_of(&i.as_node(), src) == Some(*n))
-                    .unwrap_or(false)
+            if let Some(p) = children.first() {
+                node.as_integer_node().is_some() && m(p, node, src, caps)
             } else {
                 node.as_integer_node().is_some()
             }
         }
-        "const" => node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some(),
+        // `(const SCOPE :Name)` — scope: `nil?` (bare `Foo`), `cbase` (`::Foo`),
+        // or a nested pattern (`File::Stat`). Without children: any constant.
+        "const" => {
+            if children.len() != 2 {
+                return node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some();
+            }
+            if let Some(cr) = node.as_constant_read_node() {
+                match_const_scope(&children[0], &ConstScope::Nil, src, caps)
+                    && match_meth(&children[1], cr.name().as_slice(), caps)
+            } else if let Some(cp) = node.as_constant_path_node() {
+                let scope = match cp.parent() {
+                    None => ConstScope::Cbase,
+                    Some(p) => ConstScope::Parent(p),
+                };
+                match_const_scope(&children[0], &scope, src, caps)
+                    && cp.name().is_some_and(|n| match_meth(&children[1], n.as_slice(), caps))
+            } else {
+                false
+            }
+        }
         _ => false,
     }
 }

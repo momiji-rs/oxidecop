@@ -1,6 +1,15 @@
 //! Style department: imperative cop logic too stateful for the DECLARATIVE
 //! table (constructed suggestions, block-shape analysis, text-level checks).
+//! Imperative cops still use node patterns as MATCHERS — parsed once, exactly
+//! like rubocop's `def_node_matcher`.
 use super::Cops;
+use crate::nodepattern::{self, Pat};
+use std::sync::OnceLock;
+
+/// A rubocop `def_node_matcher` equivalent: the pattern string parses once.
+fn matcher(cell: &'static OnceLock<Pat>, pattern: &str) -> &'static Pat {
+    cell.get_or_init(|| nodepattern::parse(pattern))
+}
 
 impl<'a> Cops<'a> {
     /// Style/StringLiterals on a plain string — rubocop's `wrong_quotes?` over
@@ -294,6 +303,84 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Style/ZeroLengthPredicate — `x.size == 0` → `empty?`, `x.size > 0` →
+    /// `!empty?`, `x.size.zero?` → `empty?`. Transcribed from rubocop's cop:
+    /// its `def_node_matcher` patterns verbatim, matched on the OUTER
+    /// (comparison/predicate) node; messages interpolate the captured pieces.
+    pub(crate) fn check_zero_length(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/ZeroLengthPredicate";
+        if !self.on(COP) {
+            return;
+        }
+        let n = node.as_node();
+        // rubocop's `non_polymorphic_collection?`: File/Tempfile/StringIO/
+        // File::Stat implement #size but not #empty? — never flag those.
+        static NON_POLY: OnceLock<Pat> = OnceLock::new();
+        let non_poly = matcher(&NON_POLY,
+            "{(send (send (send (const {nil? cbase} :File) :stat _) ...) ...) \
+              (send (send (send (const {nil? cbase} {:File :Tempfile :StringIO}) {:new :open} ...) ...) ...) \
+              (send (send (send (const (const {nil? cbase} :File) :Stat) :new ...) ...) ...)}");
+        if nodepattern::matches(non_poly, &n, self.src).is_some() {
+            return;
+        }
+        // `x.size.zero?` / `x&.length&.zero?` — offense spans selector..end so
+        // the message shows the real dispatch (`length&.zero?`).
+        static PREDICATE: OnceLock<Pat> = OnceLock::new();
+        if nodepattern::matches(matcher(&PREDICATE, "(call (call (...) {:length :size}) :zero?)"), &n, self.src).is_some() {
+            if let Some(sel) = node.receiver().and_then(|r| r.as_call_node()).and_then(|c| c.message_loc()) {
+                let (sel, end) = (sel.start_offset(), node.location().end_offset());
+                let cur = String::from_utf8_lossy(&self.src[sel..end]).into_owned();
+                self.push(sel, COP, true, format!("Use `empty?` instead of `{cur}`."));
+                self.fixes.push((sel, end, b"empty?".to_vec()));
+            }
+            return;
+        }
+        // Comparison shapes. Captures come out [lhs, op, rhs] in source order,
+        // so the message's "current" is just the captures joined. The nonzero
+        // shapes require a plain send for the size/length dispatch — rubocop
+        // only checks them from on_send, so `x&.size > 0` is never flagged.
+        static ZERO: OnceLock<Pat> = OnceLock::new();
+        static NONZERO: OnceLock<Pat> = OnceLock::new();
+        let zero_cmp = matcher(&ZERO,
+            "{(call (call (...) ${:length :size}) $:== (int $0)) \
+              (call (int $0) $:== (call (...) ${:length :size})) \
+              (call (call (...) ${:length :size}) $:< (int $1)) \
+              (call (int $1) $:> (call (...) ${:length :size}))}");
+        let nonzero_cmp = matcher(&NONZERO,
+            "{(call (send (...) ${:length :size}) ${:> :!=} (int $0)) \
+              (call (int $0) ${:< :!=} (send (...) ${:length :size}))}");
+        let (caps, zero) = if let Some(c) = nodepattern::matches(zero_cmp, &n, self.src) {
+            (c, true)
+        } else if let Some(c) = nodepattern::matches(nonzero_cmp, &n, self.src) {
+            (c, false)
+        } else {
+            return;
+        };
+        let current = caps.join(" ");
+        let l = node.location();
+        self.push(l.start_offset(), COP, true,
+            if zero { format!("Use `empty?` instead of `{current}`.") }
+            else { format!("Use `!empty?` instead of `{current}`.") });
+        // fix: `recv.size == 0` -> `recv.empty?` / `recv.size > 0` -> `!recv.empty?`
+        let inner = node
+            .receiver()
+            .and_then(|r| len_call(&r))
+            .or_else(|| {
+                node.arguments()
+                    .and_then(|a| a.arguments().iter().next())
+                    .and_then(|a| len_call(&a))
+            });
+        if let Some(ic) = inner {
+            let recv = String::from_utf8_lossy(self.node_src(&ic.receiver().unwrap())).into_owned();
+            let dot = ic
+                .call_operator_loc()
+                .map(|o| String::from_utf8_lossy(o.as_slice()).into_owned())
+                .unwrap_or_else(|| ".".into());
+            let bang = if zero { "" } else { "!" };
+            self.fixes.push((l.start_offset(), l.end_offset(), format!("{bang}{recv}{dot}empty?").into_bytes()));
+        }
+    }
+
     /// Style/NumericPredicate: under `predicate` style flag `x {==,>,<} 0` (and
     /// inverted) → suggest `x.zero?/positive?/negative?`; under `comparison`
     /// style flag those predicates → suggest the comparison. Returns the offense
@@ -501,6 +588,13 @@ impl<'a> Cops<'a> {
             format!("Pass `&:{method}` as an argument to `lambda` instead of a block."),
         ))
     }
+}
+
+// ---- Style/ZeroLengthPredicate helper ----
+/// A `.length`/`.size` call with an explicit receiver.
+fn len_call<'pr>(x: &ruby_prism::Node<'pr>) -> Option<ruby_prism::CallNode<'pr>> {
+    x.as_call_node()
+        .filter(|c| matches!(c.name().as_slice(), b"length" | b"size") && c.receiver().is_some())
 }
 
 // ---- Style/StringLiterals helpers ----
