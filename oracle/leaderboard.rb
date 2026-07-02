@@ -82,6 +82,7 @@ COPS = {
   'Lint/FloatOutOfRange'             => 'lint/float_out_of_range',
   'Style/SymbolLiteral'              => 'style/symbol_literal',
   'Lint/RescueException'             => 'lint/rescue_exception',
+  'Style/WhenThen'                   => 'style/when_then',
   'Style/DefWithParentheses'         => 'style/def_with_parentheses',
   'Style/WhileUntilDo'               => 'style/while_until_do',
   'Style/MultilineIfThen'            => 'style/multiline_if_then',

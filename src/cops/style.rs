@@ -2087,4 +2087,40 @@ impl<'a> super::Cops<'a> {
         self.push(lp.start_offset(), COP, true,
             "Omit the parentheses in defs when the method doesn't accept any arguments.");
     }
+
+    /// Style/WhenThen — `when x;` (semicolon separating a `when` clause's
+    /// condition from its body) → `when x then`. Prism doesn't record the
+    /// `;`/`then` separator as a distinct field on `WhenNode` the way it does
+    /// for `IfNode`/`UnlessNode` (`then_keyword_loc` is `None` for `;`), so
+    /// the `;` is located by scanning from the end of the last condition to
+    /// the start of the body.
+    pub(crate) fn check_when_then(&mut self, node: &ruby_prism::WhenNode) {
+        const COP: &str = "Style/WhenThen";
+        if !self.on(COP) || node.then_keyword_loc().is_some() {
+            return;
+        }
+        let Some(statements) = node.statements() else { return }; // empty branch
+        let nl = node.location();
+        if self.src[nl.start_offset()..nl.end_offset()].contains(&b'\n') {
+            return; // multiline `when` clause
+        }
+        let conditions: Vec<ruby_prism::Node> = node.conditions().iter().collect();
+        let Some(last_cond) = conditions.last() else { return };
+        let mut pos = last_cond.location().end_offset();
+        let stmt_start = statements.location().start_offset();
+        while pos < stmt_start && matches!(self.src[pos], b' ' | b'\t') {
+            pos += 1;
+        }
+        if pos >= stmt_start || self.src[pos] != b';' {
+            return;
+        }
+        let expression = conditions
+            .iter()
+            .map(|c| String::from_utf8_lossy(self.node_src(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.push(pos, COP, true,
+            format!("Do not use `when {expression};`. Use `when {expression} then` instead."));
+        self.fixes.push((pos, pos + 1, b" then".to_vec()));
+    }
 }
