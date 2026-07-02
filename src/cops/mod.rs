@@ -244,8 +244,8 @@ pub(crate) struct Cops<'a> {
     // defined as its direct children — Naming/MethodName's "class emitter
     // method" exemption consults this.
     pub(crate) class_children_stack: Vec<Vec<Vec<u8>>>,
-    // Every comment as (line, start_offset, text), in source order.
-    pub(crate) comments: &'a [(usize, usize, Vec<u8>)],
+    // Every comment as (line, start_offset, end_offset) spans into src.
+    pub(crate) comments: &'a [(usize, usize, usize)],
     // Enclosing class/module names (their constant-path sources) — the
     // qualified identifier in Style/Documentation messages.
     pub(crate) mod_stack: Vec<String>,
@@ -575,14 +575,14 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine) -> LintResult {
     let idx = LineIndex::new(src);
 
     let mut comment_lines = HashSet::new();
-    // Every comment as (line, start_offset, text) in source order — the
-    // "comment tokens" FrozenStringLiteralComment reasons about.
-    let mut comment_data: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    // Every comment as (line, start, end) spans — the "comment tokens"
+    // FrozenStringLiteralComment reasons about. No text copies.
+    let mut comment_data: Vec<(usize, usize, usize)> = Vec::new();
     for c in result.comments() {
         let l = c.location();
         let line = idx.loc(l.start_offset()).0;
         comment_lines.insert(line);
-        comment_data.push((line, l.start_offset(), src[l.start_offset()..l.end_offset()].to_vec()));
+        comment_data.push((line, l.start_offset(), l.end_offset()));
     }
     // The line of the first real code token — comments before it are the
     // "leading comment lines" magic comments live in (rubocop's mixin).
@@ -693,7 +693,7 @@ impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
 /// department names (`Style`) are supported.
 fn apply_disable_directives(
     offenses: &mut Vec<Offense>,
-    comments: &[(usize, usize, Vec<u8>)],
+    comments: &[(usize, usize, usize)],
     src: &[u8],
     idx: &LineIndex,
 ) {
@@ -705,8 +705,8 @@ fn apply_disable_directives(
     let mut ranges: Vec<(Option<Vec<String>>, usize, usize)> = Vec::new();
     let mut open: Vec<(Option<Vec<String>>, usize)> = Vec::new();
     let eof = idx.starts.len();
-    for (line, off, text) in comments {
-        let t = String::from_utf8_lossy(text);
+    for (line, off, end) in comments {
+        let t = String::from_utf8_lossy(&src[*off..*end]);
         let Some(c) = re.captures(&t) else { continue };
         let list: Option<Vec<String>> = if c[2].trim() == "all" {
             None

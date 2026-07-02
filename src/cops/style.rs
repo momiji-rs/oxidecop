@@ -275,7 +275,7 @@ impl<'a> Cops<'a> {
         self.comments
             .iter()
             .find(|(l, _, _)| *l == line)
-            .is_some_and(|(_, _, t)| re.is_match(&String::from_utf8_lossy(t)))
+            .is_some_and(|(_, off, end)| re.is_match(&String::from_utf8_lossy(&self.src[*off..*end])))
     }
     /// rubocop's `documentation_comment?`: a comment block ends directly above
     /// the node, and at least one of its lines is real prose — not a `# TODO:`
@@ -297,13 +297,13 @@ impl<'a> Cops<'a> {
         });
         let mut line = node_line - 1;
         while line >= 1 && self.comment_lines.contains(&line) {
-            if let Some((_, off, t)) = self.comments.iter().find(|(l, _, _)| *l == line) {
+            if let Some((_, off, end)) = self.comments.iter().find(|(l, _, _)| *l == line) {
                 // A trailing comment (code before it) is not a doc line and
                 // ends the block (`module A # The A Module` documents nothing).
                 if !self.src[self.idx.starts[line - 1]..*off].iter().all(|b| b.is_ascii_whitespace()) {
                     break;
                 }
-                let t = String::from_utf8_lossy(t);
+                let t = String::from_utf8_lossy(&self.src[*off..*end]);
                 if !annotation.is_match(&t) && !magic.is_match(&t) && !directive.is_match(&t) {
                     return true;
                 }
@@ -334,7 +334,9 @@ impl<'a> Cops<'a> {
         }
         let vals: Vec<(usize, usize, Option<String>)> = comments
             .iter()
-            .map(|(l, off, t)| (*l, *off, fsl_value(&String::from_utf8_lossy(t))))
+            .map(|(l, off, end)| {
+                (*l, *off, fsl_value(&String::from_utf8_lossy(&self.src[*off..*end])))
+            })
             .collect();
         let is_leading = |l: usize| first_code_line.is_none_or(|fc| l < fc);
         // The first LEADING comment that specifies frozen_string_literal (any
@@ -397,14 +399,14 @@ impl<'a> Cops<'a> {
         let is_leading = |l: usize| first_code_line.is_none_or(|fc| l < fc);
         let mut special: Option<usize> = None; // its line
         let mut next = 0; // index of the token to test for an encoding comment
-        if let Some((l, _, t)) = comments.first() {
-            if is_leading(*l) && t.starts_with(b"#!") {
+        if let Some((l, off, end)) = comments.first() {
+            if is_leading(*l) && self.src[*off..*end].starts_with(b"#!") {
                 special = Some(*l);
                 next = 1;
             }
         }
-        if let Some((l, _, t)) = comments.get(next) {
-            if is_leading(*l) && encoding_re().is_match(&String::from_utf8_lossy(t)) {
+        if let Some((l, off, end)) = comments.get(next) {
+            if is_leading(*l) && encoding_re().is_match(&String::from_utf8_lossy(&self.src[*off..*end])) {
                 special = Some(*l);
             }
         }

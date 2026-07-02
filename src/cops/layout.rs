@@ -39,11 +39,24 @@ impl<'a> Cops<'a> {
 
         for (li, raw) in self.src.split(|&b| b == b'\n').enumerate() {
             let line_no = li + 1;
-            let owned = String::from_utf8_lossy(raw);
-            let line = owned.strip_suffix('\r').unwrap_or(&owned);
-            let nchars = line.chars().count();
-            let tabs = line.chars().take_while(|c| *c == '\t').count();
+            // ASCII fast path: bytes == chars, no decode, no allocation. A
+            // line can only be an offense if it is long enough in BYTES
+            // (chars <= bytes), so short lines bail immediately.
+            let raw = if raw.last() == Some(&b'\r') { &raw[..raw.len() - 1] } else { raw };
+            let tabs = raw.iter().take_while(|b| **b == b'\t').count();
             let indent_diff = tabs * tab_width.saturating_sub(1);
+            if raw.len() + indent_diff <= max {
+                continue;
+            }
+            let owned;
+            let line: &str = if raw.is_ascii() {
+                // SAFETY-free: is_ascii guarantees valid UTF-8
+                std::str::from_utf8(raw).unwrap_or("")
+            } else {
+                owned = String::from_utf8_lossy(raw);
+                &owned
+            };
+            let nchars = if raw.is_ascii() { raw.len() } else { line.chars().count() };
             let line_len = nchars + indent_diff;
             if line_len <= max {
                 continue;
@@ -71,12 +84,12 @@ impl<'a> Cops<'a> {
                 }
             }
             let comment = comments.iter().find(|(l, _, _)| *l == line_no);
-            if allow_rbs && comment.is_some_and(|(_, _, t)| is_rbs_annotation(t)) {
+            if allow_rbs && comment.is_some_and(|(_, off, end)| is_rbs_annotation(&self.src[*off..*end])) {
                 continue;
             }
             if allow_directives {
-                if let Some((_, coff, t)) = comment {
-                    if is_directive_comment(t) {
+                if let Some((_, coff, cend)) = comment {
+                    if is_directive_comment(&self.src[*coff..*cend]) {
                         // re-measure without the trailing directive
                         let prefix = &self.src[self.idx.starts[li]..*coff];
                         let len = String::from_utf8_lossy(prefix).trim_end().chars().count();
@@ -137,8 +150,17 @@ impl<'a> Cops<'a> {
             if self.data_line.is_some_and(|d| line_no >= d) {
                 break;
             }
-            let text = String::from_utf8_lossy(line);
-            let text = text.strip_suffix('\r').unwrap_or(&text);
+            let line = if line.last() == Some(&b'\r') { &line[..line.len() - 1] } else { line };
+            // fast bail: an ASCII line whose last byte isn't space/tab cannot
+            // end in a blank (multibyte blanks all have non-ASCII last bytes)
+            match line.last() {
+                None => continue,
+                Some(b' ') | Some(b'\t') => {}
+                Some(b) if b.is_ascii() => continue,
+                _ => {}
+            }
+            let owned = String::from_utf8_lossy(line);
+            let text: &str = &owned;
             if !text.chars().next_back().is_some_and(is_blank) {
                 continue;
             }
