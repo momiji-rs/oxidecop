@@ -55,6 +55,7 @@ COPS = {
   'Style/Strip'                      => 'style/strip',
   'Lint/TopLevelReturnWithArgument'  => 'lint/top_level_return_with_argument',
   'Security/Eval'                    => 'security/eval',
+  'Style/VariableInterpolation'      => 'style/variable_interpolation',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -2217,3 +2217,35 @@ impl<'a> super::Cops<'a> {
         self.push(start, COP, true, message);
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/VariableInterpolation — checks for shorthand variable interpolation
+    /// (like `"#@ivar"`, `"#@@cvar"`, `"#$gvar"`) and suggests wrapping them in
+    /// braces (`"#{@ivar}"`). In prism, these are EmbeddedVariableNode containing
+    /// the variable node. The offense is reported on the variable, and the fix
+    /// wraps the entire `#variable` with braces.
+    pub(crate) fn check_variable_interpolation(&mut self, node: &ruby_prism::EmbeddedVariableNode) {
+        const COP: &str = "Style/VariableInterpolation";
+        if !self.on(COP) {
+            return;
+        }
+        let var = node.variable();
+        let var_src = self.node_src(&var);
+        let message = format!(
+            "Replace interpolated variable `{}` with expression `#{{{}}}`.",
+            String::from_utf8_lossy(var_src),
+            String::from_utf8_lossy(var_src)
+        );
+        // Report offense at the variable location
+        self.push(var.location().start_offset(), COP, true, &message);
+        // Fix: wrap the entire #variable with braces, changing #@ivar to #{@ivar}
+        let node_loc = node.location();
+        let replacement = {
+            let mut result = b"#{".to_vec();
+            result.extend_from_slice(var_src);
+            result.extend_from_slice(b"}");
+            result
+        };
+        self.fixes.push((node_loc.start_offset(), node_loc.end_offset(), replacement));
+    }
+}
