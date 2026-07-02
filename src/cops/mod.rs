@@ -139,6 +139,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon", "Style/GlobalVars",
     "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Layout/SpaceBeforeComma",
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
+    "Lint/RescueException",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -714,6 +715,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_global_variable_target_node(&mut self, node: &ruby_prism::GlobalVariableTargetNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
+    }
+    fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
+        self.check_rescue_exception(node);
+        ruby_prism::visit_rescue_node(self, node);
     }
     fn visit_range_node(&mut self, node: &ruby_prism::RangeNode<'pr>) {
         if self.hot.semicolon {

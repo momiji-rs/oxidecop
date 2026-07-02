@@ -201,6 +201,26 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Lint/RescueException — `rescue Exception` (or `::Exception`) catches
+    /// the root exception class; the offense anchors on the resbody's
+    /// `rescue` keyword. Splats and namespaced/local-var paths never match
+    /// `const_name_root`, so they're silently ignored (no crash).
+    pub(crate) fn check_rescue_exception(&mut self, node: &ruby_prism::RescueNode) {
+        const COP: &str = "Lint/RescueException";
+        if !self.on(COP) {
+            return;
+        }
+        let targets_exception = node
+            .exceptions()
+            .iter()
+            .any(|e| const_name_root(&e).as_deref() == Some("Exception"));
+        if !targets_exception {
+            return;
+        }
+        self.push(node.keyword_loc().start_offset(), COP, false,
+            "Avoid rescuing the `Exception` class. Perhaps you meant to rescue `StandardError`?");
+    }
+
     /// Lint/EnsureReturn — a `return` inside an `ensure` body (not from an
     /// inner def/lambda scope).
     pub(crate) fn check_ensure_return(&mut self, node: &ruby_prism::EnsureNode) {
