@@ -3311,3 +3311,45 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((end_start, end_start, format!("\n{indent}").into_bytes()));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/OptionalBooleanParameter: an optional POSITIONAL parameter whose
+    /// default is a boolean literal (`def foo(bar = false)`) hides its
+    /// meaning at call sites (`foo(true)`) — prefer a keyword argument
+    /// (`def foo(bar: false)`). `AllowedMethods` (default:
+    /// `respond_to_missing?`, whose boolean 3rd arg is dictated by Ruby's own
+    /// dispatch protocol, not the author) exempts specific method names.
+    /// Ports rubocop's `on_def`/`alias on_defs`: prism's `DefNode` already
+    /// covers both `def foo` and `def self.foo`, so one hook suffices.
+    pub(crate) fn check_optional_boolean_parameter(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/OptionalBooleanParameter";
+        if !self.on(COP) {
+            return;
+        }
+        if self.allowed(COP, node.name().as_slice()) {
+            return;
+        }
+        let Some(params) = node.parameters() else { return };
+        for param in params.optionals().iter() {
+            let Some(opt) = param.as_optional_parameter_node() else { continue };
+            let value = opt.value();
+            if value.as_true_node().is_none() && value.as_false_node().is_none() {
+                continue;
+            }
+            let name = opt.name().as_slice();
+            let original = self.node_src(&param);
+            let default_src = self.node_src(&value);
+            let mut replacement = Vec::with_capacity(name.len() + 2 + default_src.len());
+            replacement.extend_from_slice(name);
+            replacement.extend_from_slice(b": ");
+            replacement.extend_from_slice(default_src);
+            let msg = format!(
+                "Prefer keyword arguments for arguments with a boolean default value; \
+                 use `{}` instead of `{}`.",
+                String::from_utf8_lossy(&replacement),
+                String::from_utf8_lossy(original),
+            );
+            self.push(param.location().start_offset(), COP, false, msg);
+        }
+    }
+}

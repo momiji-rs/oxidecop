@@ -142,7 +142,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire", "Lint/TrailingCommaInAttributeDeclaration",
-    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement",
+    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -1051,6 +1051,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
         self.check_trailing_method_end_statement(node);
+        self.check_optional_boolean_parameter(node);
         self.check_def_with_parentheses(node);
         self.check_space_after_method_name(node);
         self.check_colon_method_definition(node);

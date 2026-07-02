@@ -96,6 +96,7 @@ COPS = {
   'Lint/PercentSymbolArray'          => 'lint/percent_symbol_array',
   'Style/MinMax'                     => 'style/min_max',
   'Style/TrailingMethodEndStatement' => 'style/trailing_method_end_statement',
+  'Style/OptionalBooleanParameter'   => 'style/optional_boolean_parameter',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
