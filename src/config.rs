@@ -219,6 +219,26 @@ impl Config {
             _ => default,
         }
     }
+    /// A deterministic serialization of the resolved config — the cache key
+    /// component that captures "same effective configuration".
+    pub fn identity(&self) -> String {
+        let mut secs: Vec<_> = self.sections.iter().collect();
+        secs.sort_by(|a, b| a.0.cmp(b.0));
+        let mut out = String::new();
+        for (sec, kv) in secs {
+            let mut kvs: Vec<_> = kv.iter().collect();
+            kvs.sort_by(|a, b| a.0.cmp(b.0));
+            out.push_str(sec);
+            out.push('\u{1}');
+            for (k, v) in kvs {
+                out.push_str(k);
+                out.push('\u{2}');
+                out.push_str(v);
+                out.push('\u{2}');
+            }
+        }
+        out
+    }
     /// AllCops/TargetRubyVersion — rubocop's DEFAULT_VERSION (2.7) when unset.
     /// Version-gated cop behavior (parser names, minimum_target_ruby_version)
     /// dispatches on this.

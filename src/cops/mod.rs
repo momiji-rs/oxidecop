@@ -122,6 +122,11 @@ pub(crate) struct Hot {
     pub(crate) negated_if_style: u8,
 }
 
+/// Resolve a cop name string to its &'static form (cache deserialization).
+pub fn intern_cop(name: &str) -> Option<&'static str> {
+    IMPLEMENTED.iter().find(|c| **c == name).copied()
+}
+
 /// Every cop name the engine implements — enablement resolves once per run.
 const IMPLEMENTED: &[&str] = &[
     "Lint/DuplicateRequire", "Naming/BinaryOperatorParameterName",

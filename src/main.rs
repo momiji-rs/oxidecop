@@ -6,6 +6,7 @@
 //! This file is only the runner: argv, file discovery, config I/O, output
 //! formatting, `--fix`, and the exit code. All linting lives behind
 //! `cops::lint`, which is pure per file — so files lint in parallel.
+mod cache;
 mod config;
 mod cops;
 mod declarative;
@@ -103,11 +104,16 @@ fn main() {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut cfg_path: Option<String> = None;
     let mut fix = false;
+    let mut use_cache = true;
     let mut only: Option<Vec<String>> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--fix" => fix = true,
+            "--no-cache" => use_cache = false,
+            "--cache" => {
+                use_cache = it.next().map(|v| v == "true").unwrap_or(true);
+            }
             "--only" => {
                 only = it.next().map(|v| v.split(',').map(|c| c.trim().to_string()).collect());
             }
@@ -124,6 +130,7 @@ fn main() {
     let cfg_file = cfg_path.clone().unwrap_or_else(|| ".rubocop.yml".to_string());
     let mut cfg = load_config_chain(Path::new(&cfg_file), 0);
     cfg.only = only;
+    let cfg_text_for_cache = cfg.identity();
     let eng = cops::Engine::new(&cfg);
 
     let mut files: Vec<PathBuf> = Vec::new();
@@ -167,6 +174,9 @@ fn main() {
         return;
     }
 
+    // Result cache: keyed by (binary identity, config, --only set, content).
+    let cache = if use_cache { cache::Cache::open(&cfg_text_for_cache, &cfg.only) } else { None };
+
     // Lint in parallel; report in deterministic (sorted) file order.
     let mut results: Vec<(String, Vec<cops::Offense>)> = files
         .par_iter()
@@ -174,7 +184,18 @@ fn main() {
             let display = f.display().to_string();
             let rel = f.strip_prefix("./").unwrap_or(f).to_string_lossy().replace('\\', "/");
             match std::fs::read(f) {
-                Ok(src) => (display, cops::lint(&src, &cfg, &eng, &rel).offenses),
+                Ok(src) => {
+                    if let Some(c) = &cache {
+                        if let Some(hit) = c.get(&src) {
+                            return (display, hit);
+                        }
+                    }
+                    let offenses = cops::lint(&src, &cfg, &eng, &rel).offenses;
+                    if let Some(c) = &cache {
+                        c.put(&src, &offenses);
+                    }
+                    (display, offenses)
+                }
                 Err(e) => {
                     eprintln!("rubocop-rs: cannot read {display}: {e}");
                     (display, Vec::new())
@@ -183,6 +204,9 @@ fn main() {
         })
         .collect();
     results.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(c) = cache {
+        c.flush();
+    }
 
     let mut total = 0usize;
     let mut correctable = 0usize;
