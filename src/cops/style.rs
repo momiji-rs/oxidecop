@@ -2944,3 +2944,34 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+
+    /// Style/RedundantFileExtensionInRequire — `require 'foo.rb'` is
+    /// redundant; Ruby tries adding `.rb` automatically if the name is not found.
+    /// Only string literals are checked; identifiers/expressions are ignored.
+    pub(crate) fn check_redundant_file_extension_in_require(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/RedundantFileExtensionInRequire";
+        let name = node.name().as_slice();
+        if !matches!(name, b"require" | b"require_relative") || !self.on(COP) {
+            return;
+        }
+        let Some(args_node) = node.arguments() else { return };
+        let args = args_node.arguments();
+        if args.iter().count() != 1 {
+            return;
+        }
+        let arg = args.iter().next().unwrap();
+        let Some(str_node) = arg.as_string_node() else { return };
+        let content = str_node.content_loc().as_slice();
+        if !content.ends_with(b".rb") {
+            return;
+        }
+        // The offense is positioned at the `.rb` part (last 3 bytes of the string content).
+        let loc = str_node.content_loc();
+        let start_offset = loc.end_offset() - 3;
+        let end_offset = loc.end_offset();
+        self.push(start_offset, COP, true, "Redundant `.rb` file extension detected.");
+        self.fixes.push((start_offset, end_offset, Vec::new()));
+    }
+}

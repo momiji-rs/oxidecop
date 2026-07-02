@@ -82,6 +82,7 @@ COPS = {
   'Lint/ReturnInVoidContext'         => 'lint/return_in_void_context',
   'Style/MultilineBlockChain'        => 'style/multiline_block_chain',
   'Style/OptionalArguments'          => 'style/optional_arguments',
+  'Style/RedundantFileExtensionInRequire' => 'style/redundant_file_extension_in_require',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -141,7 +141,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
-    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments",
+    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -1148,6 +1148,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_multiple_comparison(node);
         self.check_identity_comparison(node);
         self.check_class_check(node);
+        self.check_redundant_file_extension_in_require(node);
         self.check_proc_new(node);
         self.check_strip(node);
         self.check_space_after_not(node);
