@@ -2517,3 +2517,147 @@ impl<'a> Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Lint/IneffectiveAccessModifier — a bare `private`/`protected` inside a
+    /// class/module body has no effect on `def self.foo` (a "defs", i.e. a
+    /// method def with an explicit receiver) that follows it; only
+    /// `private_class_method`, or `private`/`protected` inside a
+    /// `class << self` block, actually restricts singleton methods.
+    ///
+    /// Ported from the upstream `ineffective_modifier` walk: only runs when
+    /// the class/module body is a `begin_type?` (2+ statements — a
+    /// single-statement body can never contain both a modifier and a defs).
+    /// Walks the body's direct statements, tracking the most recently seen
+    /// bare `public`/`private`/`protected` call (module_function is a bare
+    /// access-modifier-shaped send too, but is excluded from consideration —
+    /// it neither sets nor clears the tracked modifier) and recursing into
+    /// bare `begin...end` blocks (no rescue/else/ensure — whitequark's
+    /// `kwbegin`) with the modifier/ignore-list carried in, but changes made
+    /// inside the nested block do NOT propagate back out (matching upstream's
+    /// per-call local variable semantics).
+    pub(crate) fn check_ineffective_access_modifier(&mut self, body: Option<ruby_prism::Node>) {
+        const COP: &str = "Lint/IneffectiveAccessModifier";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = body else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+
+        // `private_class_method_names`: upstream's `def_node_search` scans
+        // the ENTIRE body subtree once (memoized on first use, but always
+        // rooted at the top-level body node regardless of nesting depth) —
+        // precomputing it eagerly here is equivalent.
+        let mut ignored: HashSet<Vec<u8>> = HashSet::new();
+        iam_collect_private_class_method_names(&stmts.as_node(), self.src, &mut ignored);
+
+        self.iam_walk(&stmts, &ignored, None);
+    }
+
+    fn iam_walk(
+        &mut self,
+        stmts: &ruby_prism::StatementsNode,
+        ignored: &HashSet<Vec<u8>>,
+        mut modifier: Option<(usize, &'static str)>,
+    ) {
+        for child in stmts.body().iter() {
+            if let Some(call) = child.as_call_node() {
+                if call.receiver().is_none() && call.arguments().is_none() {
+                    let off = call.location().start_offset();
+                    match call.name().as_slice() {
+                        b"public" => modifier = Some((off, "public")),
+                        b"private" => modifier = Some((off, "private")),
+                        b"protected" => modifier = Some((off, "protected")),
+                        // `module_function` is structurally a bare access
+                        // modifier too, but upstream's `access_modifier?`
+                        // explicitly excludes it — leave `modifier` as-is.
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if let Some(def) = child.as_def_node() {
+                if def.receiver().is_some() {
+                    self.iam_check_defs(&def, modifier, ignored);
+                }
+                continue;
+            }
+            if let Some(b) = child.as_begin_node() {
+                if b.rescue_clause().is_none() && b.else_clause().is_none() && b.ensure_clause().is_none() {
+                    if let Some(inner) = b.statements() {
+                        self.iam_walk(&inner, ignored, modifier);
+                    }
+                }
+            }
+        }
+    }
+
+    fn iam_check_defs(
+        &mut self,
+        def: &ruby_prism::DefNode,
+        modifier: Option<(usize, &'static str)>,
+        ignored: &HashSet<Vec<u8>>,
+    ) {
+        const COP: &str = "Lint/IneffectiveAccessModifier";
+        let Some((mod_off, visibility)) = modifier else { return };
+        if visibility == "public" {
+            return;
+        }
+        if ignored.contains(def.name().as_slice()) {
+            return;
+        }
+        let alternative = if visibility == "private" {
+            "`private_class_method` or `private` inside a `class << self` block"
+        } else {
+            "`protected` inside a `class << self` block"
+        };
+        let line = self.idx.loc(mod_off).0;
+        let message = format!(
+            "`{visibility}` (on line {line}) does not make singleton methods {visibility}. Use {alternative} instead."
+        );
+        self.push(def.def_keyword_loc().start_offset(), COP, false, message);
+    }
+}
+
+/// Collects the symbol-literal arguments of every bare (no receiver)
+/// `private_class_method` call anywhere in `node`'s subtree — upstream's
+/// `private_class_methods` node search + `.select(&:basic_literal?)`.
+///
+/// Upstream's `$...` capture collects the call's direct argument nodes into a
+/// plain Ruby array, and `.to_a.flatten` only flattens THAT array (multiple
+/// args to one call, or across multiple calls) — it does NOT unpack an
+/// `ArrayNode` passed as a single argument (`private_class_method [:a, :b]`):
+/// `Array#flatten` doesn't descend into non-Array AST node objects, and an
+/// array-literal *node* itself fails `basic_literal?` (arrays are a
+/// `COMPOSITE_LITERAL`, excluded from `BASIC_LITERALS`) so it's filtered out
+/// entirely — verified against real rubocop 1.88, which still flags every
+/// singleton def when `private_class_method` is passed an array literal.
+/// Only direct symbol-literal arguments are ever collected here; string/
+/// numeric/etc. literal args are dropped too, since they can never satisfy
+/// the `ignored_methods.include?` check upstream performs against a `defs`
+/// node's (always-a-symbol) `method_name`.
+fn iam_collect_private_class_method_names(node: &ruby_prism::Node, src: &[u8], out: &mut HashSet<Vec<u8>>) {
+    struct Finder<'a> {
+        src: &'a [u8],
+        out: &'a mut HashSet<Vec<u8>>,
+    }
+    impl<'pr, 'a> ruby_prism::Visit<'pr> for Finder<'a> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.receiver().is_none() && node.name().as_slice() == b"private_class_method" {
+                if let Some(args) = node.arguments() {
+                    for arg in args.arguments().iter() {
+                        if let Some(sym) = arg.as_symbol_node() {
+                            if let Some(v) = sym.value_loc() {
+                                self.out.insert(self.src[v.start_offset()..v.end_offset()].to_vec());
+                            }
+                        }
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut f = Finder { src, out };
+    use ruby_prism::Visit;
+    f.visit(node);
+}

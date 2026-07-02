@@ -112,6 +112,7 @@ COPS = {
   'Lint/ElseLayout'                  => 'lint/else_layout',
   'Layout/EmptyLinesAroundModuleBody' => 'layout/empty_lines_around_module_body',
   'Lint/DisjunctiveAssignmentInConstructor' => 'lint/disjunctive_assignment_in_constructor',
+  'Lint/IneffectiveAccessModifier'   => 'lint/ineffective_access_modifier',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
