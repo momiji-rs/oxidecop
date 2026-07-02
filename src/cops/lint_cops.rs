@@ -79,6 +79,68 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Lint/Debugger — debugger entry points (`binding.pry`, `byebug`, …).
+    /// The candidate name is the CHAINED dispatch (`Kernel.binding.irb`),
+    /// matched against DebuggerMethods (default: rubocop's grouped list,
+    /// flattened); `require 'debug/open'`-style entries via DebuggerRequires.
+    pub(crate) fn check_debugger(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/Debugger";
+        if !self.on(COP) {
+            return;
+        }
+        const DEFAULT_METHODS: &[&str] = &[
+            "binding.irb", "Kernel.binding.irb", "byebug", "remote_byebug", "Kernel.byebug",
+            "Kernel.remote_byebug", "page.save_and_open_page", "page.save_and_open_screenshot",
+            "page.save_page", "page.save_screenshot", "save_and_open_page",
+            "save_and_open_screenshot", "save_page", "save_screenshot", "binding.b",
+            "binding.break", "Kernel.binding.b", "Kernel.binding.break", "binding.pry",
+            "binding.remote_pry", "binding.pry_remote", "Kernel.binding.pry",
+            "Kernel.binding.remote_pry", "Kernel.binding.pry_remote", "Pry.rescue", "pry",
+            "debugger", "Kernel.debugger", "jard", "binding.console",
+        ];
+        const DEFAULT_REQUIRES: &[&str] = &["debug/open", "debug/start"];
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        // rubocop's assumed_usage_context?: a bare no-arg call that is a
+        // direct operand of another expression (or, outside any block/
+        // kwbegin/lambda, merely has a call ancestor) is assumed to be a
+        // normal method, not a breakpoint.
+        let l = node.location();
+        if args.is_empty()
+            && !self.call_stack.is_empty()
+            && (self.assumed_arg_offsets.contains(&l.start_offset()) || self.usage_block_depth == 0)
+        {
+            return;
+        }
+        let hit = if node.name().as_slice() == b"require" && args.len() == 1 {
+            let requires = self.cfg.param(COP, "DebuggerRequires").map(crate::config::parse_allowed_list);
+            args[0].as_string_node().is_some_and(|s| {
+                let v = s.content_loc().as_slice();
+                match &requires {
+                    Some(list) => list.iter().any(|r| r.as_bytes() == v),
+                    None => DEFAULT_REQUIRES.iter().any(|r| r.as_bytes() == v),
+                }
+            })
+        } else {
+            let chained = chained_method_name(node, self.src);
+            match self.cfg.param(COP, "DebuggerMethods").map(crate::config::parse_allowed_list) {
+                Some(list) => list.iter().any(|m| *m == chained),
+                None => DEFAULT_METHODS.contains(&chained.as_str()),
+            }
+        };
+        if hit {
+            // the offense is the SEND — an attached block is not part of it
+            let end = node
+                .closing_loc()
+                .map(|c| c.end_offset())
+                .or_else(|| args.last().map(|a| a.location().end_offset()))
+                .or_else(|| node.message_loc().map(|m| m.end_offset()))
+                .unwrap_or(l.end_offset());
+            let source = String::from_utf8_lossy(&self.src[l.start_offset()..end]);
+            self.push(l.start_offset(), COP, false, format!("Remove debugger entry point `{source}`."));
+        }
+    }
+
     /// Lint/UriEscapeUnescape — `URI.escape` & friends are obsolete; the
     /// message lists the case-specific replacements.
     pub(crate) fn check_uri_escape_unescape(&mut self, node: &ruby_prism::CallNode) {
@@ -105,6 +167,32 @@ impl<'a> Cops<'a> {
             "`{double_colon}URI.{method}` method is obsolete and should not be used. \
              Instead, use {replacements} depending on your specific use case."));
     }
+}
+
+/// rubocop's `chained_method_name`: the dispatch name prefixed by its
+/// receiver chain of send/const names (`Kernel.binding.irb`).
+fn chained_method_name(node: &ruby_prism::CallNode, src: &[u8]) -> String {
+    let mut name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+    let mut recv = node.receiver();
+    while let Some(r) = recv {
+        if let Some(c) = r.as_call_node() {
+            name = format!("{}.{name}", String::from_utf8_lossy(c.name().as_slice()));
+            recv = c.receiver();
+        } else if let Some(c) = r.as_constant_read_node() {
+            name = format!("{}.{name}", String::from_utf8_lossy(c.name().as_slice()));
+            break;
+        } else if r.as_constant_path_node().is_some() {
+            let l = r.location();
+            let text = String::from_utf8_lossy(&src[l.start_offset()..l.end_offset()]);
+            // rubocop's const_name ignores the `::` cbase anchor
+            name = format!("{}.{name}", text.trim_start_matches("::"));
+            break;
+        } else {
+            // a non-send/const receiver can't produce a listed name
+            return String::new();
+        }
+    }
+    name
 }
 
 // ---- is this block "scoping" (its body may define methods)? ----

@@ -49,7 +49,9 @@ COPS = {
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
   'Style/UnpackFirst'                => 'style/unpack_first',
-  'Style/RandomWithOffset'           => 'style/random_with_offset'
+  'Style/RandomWithOffset'           => 'style/random_with_offset',
+  'Lint/Debugger'                    => 'lint/debugger',
+  'Style/NegatedIf'                  => 'style/negated_if'
 }.freeze
 
 FileUtils.mkdir_p(DIR)

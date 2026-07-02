@@ -92,6 +92,12 @@ pub(crate) struct Cops<'a> {
     pub(crate) percent_sym_spans: Vec<(usize, usize)>,
     // Inner `File.dirname` calls claimed by an outer chain (NestedFileDirname).
     pub(crate) dirname_ignore: Vec<usize>,
+    // Depth of enclosing blocks / kwbegin / lambdas — Lint/Debugger's
+    // assumed-usage heuristic consults this.
+    pub(crate) usage_block_depth: usize,
+    // Start offsets of nodes that are a DIRECT operand of a call / array /
+    // hash pair — rubocop's `assumed_argument?` parent check.
+    pub(crate) assumed_arg_offsets: HashSet<usize>,
     // Heredoc BODIES as (first line, last line, delimiter) — terminator
     // excluded. Layout/TrailingWhitespace and Layout/LineLength consult these.
     pub(crate) heredoc_lines: Vec<(usize, usize, Vec<u8>)>,
@@ -182,6 +188,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
         self.check_boolean_symbol(node);
     }
+    fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        self.check_negated_if(node);
+        ruby_prism::visit_if_node(self, node);
+    }
+    fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
+        let kwbegin = node.begin_keyword_loc().is_some();
+        if kwbegin {
+            self.usage_block_depth += 1;
+        }
+        ruby_prism::visit_begin_node(self, node);
+        if kwbegin {
+            self.usage_block_depth -= 1;
+        }
+    }
     fn visit_ensure_node(&mut self, node: &ruby_prism::EnsureNode<'pr>) {
         self.check_empty_ensure(node);
         ruby_prism::visit_ensure_node(self, node);
@@ -195,7 +215,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let l = node.location();
             self.percent_sym_spans.push((l.start_offset(), l.end_offset()));
         }
+        for e in node.elements().iter() {
+            self.assumed_arg_offsets.insert(e.location().start_offset());
+        }
         ruby_prism::visit_array_node(self, node);
+    }
+    fn visit_assoc_node(&mut self, node: &ruby_prism::AssocNode<'pr>) {
+        // both sides of a hash pair are "assumed arguments"
+        self.assumed_arg_offsets.insert(node.key().location().start_offset());
+        self.assumed_arg_offsets.insert(node.value().location().start_offset());
+        ruby_prism::visit_assoc_node(self, node);
     }
     fn visit_embedded_statements_node(&mut self, node: &ruby_prism::EmbeddedStatementsNode<'pr>) {
         self.interp_depth += 1;
@@ -257,7 +286,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.rr_branch(&b);
             }
         }
+        self.usage_block_depth += 1;
         ruby_prism::visit_lambda_node(self, node);
+        self.usage_block_depth -= 1;
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
         if let Some(b) = node.block() {
@@ -342,6 +373,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_uri_escape_unescape(node);
         self.check_unpack_first(node);
         self.check_random_with_offset(node);
+        self.check_debugger(node);
         // Style/RedundantReturn also fires for method-defining blocks
         // (rubocop's RESTRICT_ON_SEND: define_method & friends, lambda).
         if self.on("Style/RedundantReturn")
@@ -363,10 +395,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // call's name so descendants can see it as an ancestor.
         self.call_stack.push(node.name().as_slice().to_vec());
         if let Some(r) = node.receiver() {
+            self.assumed_arg_offsets.insert(r.location().start_offset());
             self.visit(&r);
         }
         if let Some(a) = node.arguments() {
             for arg in a.arguments().iter() {
+                self.assumed_arg_offsets.insert(arg.location().start_offset());
                 self.visit(&arg);
             }
         }
@@ -381,7 +415,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if scoping {
                 self.scoping_depth += 1;
             }
+            self.usage_block_depth += 1;
             self.visit(&b);
+            self.usage_block_depth -= 1;
             if scoping {
                 self.scoping_depth -= 1;
             }
@@ -470,6 +506,8 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         num_ignore: Vec::new(),
         percent_sym_spans: Vec::new(),
         dirname_ignore: Vec::new(),
+        usage_block_depth: 0,
+        assumed_arg_offsets: HashSet::new(),
         heredoc_lines,
         data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
         class_children_stack: Vec::new(),

@@ -783,6 +783,49 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Style/NegatedIf — `if !x` → `unless x` (rubocop's NegativeConditional:
+    /// a single `!` on the condition, no else branch, style-gated on the
+    /// modifier form).
+    pub(crate) fn check_negated_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/NegatedIf";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(kw) = node.if_keyword_loc() else { return }; // ternary
+        if kw.as_slice() != b"if" || node.subsequent().is_some() {
+            return; // elsif, or an else/elsif branch exists
+        }
+        let modifier = node.end_keyword_loc().is_none();
+        match self.cfg.enforced_style(COP) {
+            "prefix" if modifier => return,
+            "postfix" if !modifier => return,
+            _ => {}
+        }
+        // unwrap parens (taking the last statement), bail on empty `()`
+        let mut cond = node.predicate();
+        while let Some(p) = cond.as_parentheses_node() {
+            let Some(last) = p.body().and_then(|b| b.as_statements_node()).and_then(|s| s.body().iter().last())
+            else {
+                return;
+            };
+            cond = last;
+        }
+        // single_negative?: `(send !(send _ :!) :!)`
+        let Some(call) = cond.as_call_node() else { return };
+        if call.name().as_slice() != b"!" {
+            return;
+        }
+        let Some(recv) = call.receiver() else { return };
+        if recv.as_call_node().is_some_and(|c| c.name().as_slice() == b"!") {
+            return; // double negation is Style/DoubleNegation's business
+        }
+        let l = node.location();
+        self.push(l.start_offset(), COP, true, "Favor `unless` over `if` for negative conditions.");
+        // fix: swap the keyword and drop the `!`
+        self.fixes.push((kw.start_offset(), kw.end_offset(), b"unless".to_vec()));
+        self.fixes.push((call.location().start_offset(), recv.location().start_offset(), Vec::new()));
+    }
+
     /// Lint/BooleanSymbol — `:true` / `:false` literals (outside `%i[]`).
     pub(crate) fn check_boolean_symbol(&mut self, node: &ruby_prism::SymbolNode) {
         const COP: &str = "Lint/BooleanSymbol";
