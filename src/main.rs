@@ -33,9 +33,27 @@ fn collect_files(path: &Path, out: &mut Vec<PathBuf>) {
         for e in entries {
             collect_files(&e, out);
         }
-    } else if is_ruby_file(path) {
+    } else if is_ruby_file(path) || ruby_shebang(path) {
         out.push(path.to_path_buf());
     }
+}
+
+/// rubocop's TargetFinder also picks up extensionless executables whose first
+/// line is a ruby shebang.
+fn ruby_shebang(path: &Path) -> bool {
+    if path.extension().is_some() {
+        return false;
+    }
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    use std::io::Read;
+    let mut buf = [0u8; 64];
+    let n = std::io::BufReader::new(f).read(&mut buf).unwrap_or(0);
+    let head = &buf[..n];
+    head.starts_with(b"#!")
+        && head
+            .split(|b| *b == b'\n')
+            .next()
+            .is_some_and(|l| l.windows(4).any(|w| w == b"ruby"))
 }
 
 fn is_ruby_file(path: &Path) -> bool {

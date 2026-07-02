@@ -51,8 +51,10 @@ rows = cops.map do |cop, conf|
   end
   styles = (conf['SupportedStyles'] || []).map { |s| rust_str(s) }
   allowed = (conf['AllowedMethods'] || []).map { |m| rust_str(m) }
+  sg = conf['StyleGuide'] ? rust_str(conf['StyleGuide']) : 'e'
+  sg = sg == 'e' ? 'None' : "Some(#{sg})"
   "    Schema { cop: #{rust_str(cop)}, params: &[#{params.join(', ')}], " \
-    "styles: &[#{styles.join(', ')}], allowed_methods: &[#{allowed.join(', ')}] },"
+    "styles: &[#{styles.join(', ')}], allowed_methods: &[#{allowed.join(', ')}], style_guide: #{sg} },"
 end
 
 File.write(OUT, <<~RUST)

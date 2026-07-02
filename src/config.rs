@@ -16,6 +16,9 @@ pub struct Schema {
     /// Default `AllowedMethods` when the config doesn't set one (e.g. rubocop
     /// ships `Style/SymbolProc` with `AllowedMethods: [define_method]`).
     pub allowed_methods: &'static [&'static str],
+    /// The style-guide anchor/URL (default.yml `StyleGuide:`) — appended to
+    /// messages under `AllCops: DisplayStyleGuide`.
+    pub style_guide: Option<&'static str>,
 }
 pub use crate::schema_gen::SCHEMA;
 pub fn schema(cop: &str) -> Option<&'static Schema> {

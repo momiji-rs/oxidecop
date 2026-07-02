@@ -80,6 +80,9 @@ pub struct Engine {
     // Direct enablement bits + hot per-cop config, resolved once — the
     // per-node checks read fields instead of hashing strings.
     pub(crate) hot: Hot,
+    // AllCops: DisplayStyleGuide — append " (url)" to messages.
+    display_style_guide: bool,
+    style_guide_base: String,
     // Per-cop Exclude patterns (cop name, matchers) — applied per file.
     cop_excludes: Vec<(&'static str, Vec<regex::Regex>)>,
 }
@@ -254,6 +257,11 @@ impl Engine {
                 _ => 0,
             },
         };
+        let display_style_guide = cfg.param("AllCops", "DisplayStyleGuide") == Some("true");
+        let style_guide_base = cfg
+            .param("AllCops", "StyleGuideBaseURL")
+            .unwrap_or("https://rubystyle.guide")
+            .to_string();
         let cop_excludes: Vec<(&'static str, Vec<regex::Regex>)> = IMPLEMENTED
             .iter()
             .filter_map(|c| {
@@ -261,7 +269,22 @@ impl Engine {
                 (!m.is_empty()).then_some((*c, m))
             })
             .collect();
-        Engine { decl, enabled, allowed_patterns, allowed_methods, debugger_on, debugger_last, hot, cop_excludes }
+        Engine {
+            decl, enabled, allowed_patterns, allowed_methods, debugger_on, debugger_last, hot,
+            cop_excludes, display_style_guide, style_guide_base,
+        }
+    }
+    /// The " (https://...)" message suffix for a cop, when configured.
+    fn style_guide_suffix(&self, cop: &str) -> Option<String> {
+        if !self.display_style_guide {
+            return None;
+        }
+        let sg = crate::config::schema(cop)?.style_guide?;
+        Some(if sg.starts_with('#') {
+            format!(" ({}{sg})", self.style_guide_base)
+        } else {
+            format!(" ({sg})")
+        })
     }
     /// The hot flags for one file: the base view with per-cop Excludes for
     /// matching cops switched off. Returns the excluded non-hot cop names too.
@@ -407,7 +430,11 @@ impl<'a> Cops<'a> {
     }
     pub(crate) fn push(&mut self, off: usize, cop: &'static str, correctable: bool, msg: impl Into<String>) {
         let (line, col) = self.idx.loc(off);
-        self.offenses.push(Offense { line, col, cop, correctable, message: msg.into() });
+        let mut message = msg.into();
+        if let Some(sfx) = self.eng.style_guide_suffix(cop) {
+            message.push_str(&sfx);
+        }
+        self.offenses.push(Offense { line, col, cop, correctable, message });
     }
     pub(crate) fn node_src(&self, n: &ruby_prism::Node) -> &'a [u8] {
         let l = n.location();
@@ -836,10 +863,12 @@ fn apply_disable_directives(
     for (line, off, end) in comments {
         let t = String::from_utf8_lossy(&src[*off..*end]);
         let Some(c) = re.captures(&t) else { continue };
-        let list: Option<Vec<String>> = if c[2].trim() == "all" {
+        // a ` -- reason` trailer is a comment, not part of the cop list
+        let cops_part = c[2].split(" -- ").next().unwrap_or(&c[2]).trim();
+        let list: Option<Vec<String>> = if cops_part == "all" {
             None
         } else {
-            Some(c[2].split(',').map(|s| s.trim().to_string()).collect())
+            Some(cops_part.split(',').map(|s| s.trim().to_string()).collect())
         };
         let standalone = src[idx.starts[line - 1]..*off].iter().all(|b| b.is_ascii_whitespace());
         match &c[1] {

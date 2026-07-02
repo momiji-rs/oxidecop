@@ -38,6 +38,10 @@ impl<'a> Cops<'a> {
         let style = self.hot.method_name_style.clone();
         let nn = node.new_name();
         if let Some((nm, off)) = method_name_arg(&nn, self.src) {
+            // operator methods (`alias << push`) are exempt
+            if matches!(nm.first(), Some(c) if c.is_ascii_punctuation()) {
+                return;
+            }
             if !name_matches_style(nm, &style) && !self.allowed("Naming/MethodName", nm) {
                 self.push(off, "Naming/MethodName", false, format!("Use {style} for method names."));
             }
@@ -51,7 +55,8 @@ impl<'a> Cops<'a> {
         // this runs for every call node in the file
         if !matches!(
             node.name().as_slice(),
-            b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor" | b"alias_method" | b"new" | b"define"
+            b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor" | b"alias_method"
+                | b"new" | b"define" | b"define_method" | b"define_singleton_method"
         ) || !self.hot.method_name
         {
             return;
@@ -65,11 +70,15 @@ impl<'a> Cops<'a> {
             let l = r.location();
             self.src[l.start_offset()..l.end_offset()].to_vec()
         });
-        // Which args carry method names for this macro?
+        // Which args carry method names for this macro? attr*/alias_method/
+        // define_method are BARE macros (nil receiver) in rubocop's patterns.
+        let bare = node.receiver().is_none();
         let members: &[ruby_prism::Node] = match node.name().as_slice() {
-            b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor" => &args,
+            b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor" if bare => &args,
             // alias_method(new, old) — only the new name, and only at arity 2.
-            b"alias_method" if args.len() == 2 => &args[0..1],
+            b"alias_method" if bare && args.len() == 2 => &args[0..1],
+            // define_method(:name) { } / define_singleton_method — first arg.
+            b"define_method" | b"define_singleton_method" if bare && !args.is_empty() => &args[0..1],
             // Struct.new(...) — a leading string is the class name, not a member.
             b"new" if matches!(recv_src.as_deref(), Some(b"Struct") | Some(b"::Struct")) => {
                 if args.first().map(|a| a.as_string_node().is_some()).unwrap_or(false) {
@@ -81,14 +90,28 @@ impl<'a> Cops<'a> {
             b"define" if matches!(recv_src.as_deref(), Some(b"Data") | Some(b"::Data")) => &args,
             _ => &[],
         };
+        // Anchoring differs by macro: attr*/alias_method/define_method go
+        // through rubocop's range_position on the SEND (right after the
+        // selector); Struct.new/Data.define members anchor on the ARG itself.
+        let send_anchor = matches!(
+            node.name().as_slice(),
+            b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor" | b"alias_method"
+                | b"define_method" | b"define_singleton_method"
+        );
+        let sel_anchor = node
+            .message_loc()
+            .map(|l| l.end_offset() + 1)
+            .unwrap_or_else(|| node.location().start_offset());
         let bad: Vec<usize> = members
             .iter()
             .filter_map(|arg| method_name_arg(arg, self.src))
+            .filter(|(nm, _)| !matches!(nm.first(), Some(c) if c.is_ascii_punctuation()))
             .filter(|(nm, _)| !name_matches_style(nm, &style) && !self.allowed("Naming/MethodName", nm))
             .map(|(_, off)| off)
             .collect();
         for off in bad {
-            self.push(off, "Naming/MethodName", false, format!("Use {style} for method names."));
+            let anchor = if send_anchor { sel_anchor } else { off };
+            self.push(anchor, "Naming/MethodName", false, format!("Use {style} for method names."));
         }
     }
 }
