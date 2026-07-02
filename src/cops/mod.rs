@@ -142,7 +142,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire", "Lint/TrailingCommaInAttributeDeclaration",
-    "Layout/ConditionPosition",
+    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -613,12 +613,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_string_literals(node);
         self.check_character_literal(node);
         self.check_gvar_artifact(node);
+        self.check_heredoc_delimiter_naming(node.opening_loc(), node.closing_loc());
         self.ll_check_str(node);
     }
     fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
         // `'a' \` line-continuation concatenation parses as this node with
         // quoted string parts — the ConsistentQuotesInMultiline check.
         self.check_string_concat(node);
+        self.check_heredoc_delimiter_naming(node.opening_loc(), node.closing_loc());
         self.ll_check_dstr(node);
         let delim = node.opening_loc().and_then(|o| match o.as_slice() {
             b"'" | b"\"" => Some(o.as_slice()[0]),
@@ -635,6 +637,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
         self.check_boolean_symbol(node);
         self.check_symbol_literal(node);
+    }
+    fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
+        self.check_heredoc_delimiter_naming(Some(node.opening_loc()), Some(node.closing_loc()));
+        ruby_prism::visit_x_string_node(self, node);
     }
     fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
         self.check_duplicate_hash_key(node);

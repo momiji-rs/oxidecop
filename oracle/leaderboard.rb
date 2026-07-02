@@ -85,6 +85,7 @@ COPS = {
   'Style/RedundantFileExtensionInRequire' => 'style/redundant_file_extension_in_require',
   'Lint/TrailingCommaInAttributeDeclaration' => 'lint/trailing_comma_in_attribute_declaration',
   'Layout/ConditionPosition'         => 'layout/condition_position',
+  'Naming/HeredocDelimiterNaming'    => 'naming/heredoc_delimiter_naming',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

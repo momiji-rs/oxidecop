@@ -495,3 +495,78 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+
+    /// Naming/HeredocDelimiterNaming — checks that heredoc delimiters are meaningful
+    pub(crate) fn check_heredoc_delimiter_naming(&mut self,
+        opening_loc: Option<ruby_prism::Location>,
+        closing_loc: Option<ruby_prism::Location>) {
+        const COP: &str = "Naming/HeredocDelimiterNaming";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is a heredoc by looking at opening_loc
+        let Some(opening) = opening_loc else {
+            return;
+        };
+
+        if !opening.as_slice().starts_with(b"<<") {
+            return;
+        }
+
+        let Some(closing) = closing_loc else {
+            return;
+        };
+
+        // Extract the delimiter by filtering whitespace from closing_loc
+        let delimiter_bytes: Vec<u8> = closing
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|b| !b.is_ascii_whitespace())
+            .collect();
+
+        if delimiter_bytes.is_empty() {
+            return;
+        }
+
+        let delimiter_str = String::from_utf8_lossy(&delimiter_bytes);
+
+        // Check if delimiter contains word characters (\w)
+        let has_word_chars = delimiter_str.chars().any(|c| c.is_alphanumeric() || c == '_');
+
+        if !has_word_chars {
+            // Non-word delimiters are always forbidden
+            self.push(closing.start_offset(), COP, false,
+                "Use meaningful heredoc delimiters.".to_string());
+            return;
+        }
+
+        // Get the forbidden delimiters from config
+        if let Some(forbidden_list) = self.cfg.get(COP, "ForbiddenDelimiters") {
+            let forbidden_patterns = crate::config::parse_allowed_list(forbidden_list);
+
+            for pattern_str in forbidden_patterns {
+                // Strip Ruby regex wrappers if present
+                let pattern = pattern_str
+                    .strip_prefix("!ruby/regexp")
+                    .map(|s| s.trim())
+                    .and_then(|s| s.strip_prefix('/'))
+                    .and_then(|s| s.rsplit_once('/').map(|(b, _)| b))
+                    .unwrap_or(&pattern_str);
+
+                // Try to compile and match the regex (case-insensitive like Ruby regexes)
+                if let Ok(re) = regex::Regex::new(&format!("(?i){pattern}")) {
+                    if re.is_match(&delimiter_str) {
+                        self.push(closing.start_offset(), COP, false,
+                            "Use meaningful heredoc delimiters.".to_string());
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
