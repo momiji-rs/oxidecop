@@ -69,13 +69,14 @@ def unescape_dq(s)
   out
 end
 
-def parse_block(raw_lines, raw_heredoc)
-  # raw_lines: the heredoc body (already the interior). Dedent (matches `<<~`,
-  # computed on the literal lines), render escapes unless the heredoc was the
-  # quoted `<<~'RUBY'` form (raw — no escape processing), THEN split source
-  # lines from caret-annotation lines. Escape-rendering before the split is
-  # what RSpec sees: a `\n` inside a line legitimately becomes two lines.
-  text = dedent(raw_lines).join("\n")
+def parse_block(raw_lines, raw_heredoc, squiggly)
+  # raw_lines: the heredoc body (already the interior). Dedent ONLY for the
+  # squiggly `<<~` form — `<<-` keeps its indentation at runtime, and line-
+  # length expectations depend on it. Render escapes unless the heredoc was
+  # the quoted `<<~'RUBY'` form (raw — no escape processing), THEN split
+  # source lines from caret-annotation lines. Escape-rendering before the
+  # split is what RSpec sees: a `\n` inside a line legitimately becomes two.
+  text = (squiggly ? dedent(raw_lines) : raw_lines).join("\n")
   text = unescape_dq(text) unless raw_heredoc
   src = []
   expected = []
@@ -174,16 +175,17 @@ while i < lines.length
   # `<<-RUBY`, and trailing keyword args (`, identifier: identifier` — those
   # substitute `%{key}` in the body; unresolvable statically, so they fall into
   # the skip column below instead of being silently dropped).
-  if l =~ /expect_(offense|no_offenses)\(<<[~-]('?)RUBY\2\s*[,)]/
+  if l =~ /expect_(offense|no_offenses)\(<<([~-])('?)RUBY\3\s*[,)]/
     kind = Regexp.last_match(1) == 'offense' ? :offense : :no_offense
-    raw_heredoc = Regexp.last_match(2) == "'"
+    squiggly = Regexp.last_match(2) == '~'
+    raw_heredoc = Regexp.last_match(3) == "'"
     body = []
     i += 1
     until lines[i].strip == 'RUBY'
       body << lines[i]
       i += 1
     end
-    src, expected = parse_block(body, raw_heredoc)
+    src, expected = parse_block(body, raw_heredoc, squiggly)
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as, src: src, expected: expected }
   elsif l =~ /expect_no_offenses\((['"])(.*?)\1\)/
     quote, body = Regexp.last_match(1), Regexp.last_match(2)
