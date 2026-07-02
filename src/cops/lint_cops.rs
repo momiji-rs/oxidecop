@@ -2335,3 +2335,134 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/ElseLayout — flags an `if`/`elsif`/`unless` whose `else` branch's
+    /// first statement sits on the SAME source line as the `else` keyword
+    /// itself (e.g. `else do_this`), since that's usually a mistake for
+    /// `elsif`.
+    ///
+    /// Upstream's `on_if` (which also fires for `unless`, normalized to the
+    /// same node shape) guards with `ternary?`, `then? && !else_branch
+    /// .begin_type?`, and `single_line?`, then calls a private `check`
+    /// that recurses ONE level, UNGUARDED, into an elsif's own
+    /// `else_branch` — but only when the CURRENT node's own keyword is
+    /// literally `if` (not `elsif`, not `unless`). Every node in an elsif
+    /// chain is *also* visited independently by the normal AST walk (prism
+    /// recurses into `subsequent()`, re-running this same guarded entry
+    /// point), which is what actually handles chains of 2+ elsifs — the
+    /// recursion only ever bridges exactly one level.
+    ///
+    /// Because the recursion bypasses the guards, it can surface an offense
+    /// that the guarded entry for that SAME node would have suppressed:
+    /// `if a; elsif b then y; else short; end` still offends on `short`
+    /// even though `b`'s own `then?` + single-statement-else guard would
+    /// block it if reached only via the normal walk (verified against a
+    /// live `rubocop` run). Both paths can also converge on the very same
+    /// `else` (one elsif directly followed by the real `else`); upstream
+    /// dedups via `Base#add_offense`'s `current_offense_locations.add?`, so
+    /// `else_layout_seen` (keyed by the offense's anchor offset) mirrors
+    /// that here.
+    pub(crate) fn check_else_layout_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Lint/ElseLayout";
+        if !self.on(COP) {
+            return;
+        }
+        // A `?:` ternary has no `if`/`elsif` keyword in prism.
+        let Some(kw) = node.if_keyword_loc() else { return };
+        let then_present = node.then_keyword_loc().is_some();
+        let subsequent = node.subsequent();
+        if then_present && !else_layout_begin_type(&subsequent) {
+            return;
+        }
+        let l = node.location();
+        if self.idx.loc(l.start_offset()).0 == self.idx.loc(l.end_offset().saturating_sub(1)).0 {
+            return;
+        }
+        let is_if_kw = kw.as_slice() == b"if";
+        self.else_layout_check(l.start_offset(), subsequent, is_if_kw);
+    }
+
+    /// Lint/ElseLayout for `unless ... else ...` — `unless` can't chain into
+    /// an `elsif`, so there's no unguarded-recursion path here; only the
+    /// guarded entry applies.
+    pub(crate) fn check_else_layout_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Lint/ElseLayout";
+        if !self.on(COP) {
+            return;
+        }
+        let then_present = node.then_keyword_loc().is_some();
+        let subsequent = node.else_clause().map(|e| e.as_node());
+        if then_present && !else_layout_begin_type(&subsequent) {
+            return;
+        }
+        let l = node.location();
+        if self.idx.loc(l.start_offset()).0 == self.idx.loc(l.end_offset().saturating_sub(1)).0 {
+            return;
+        }
+        self.else_layout_check(l.start_offset(), subsequent, false);
+    }
+
+    /// Upstream's private `check`: unconditional (no ternary/then/single_line
+    /// guards — those only gate the entry points above). `node_start` is the
+    /// start offset of whichever if/elsif node is "current" (its own column
+    /// drives the autocorrect's indentation, matching `indentation(node)` on
+    /// whatever node upstream's recursion last reassigned `node` to).
+    fn else_layout_check(&mut self, node_start: usize, subsequent: Option<ruby_prism::Node>, is_if_kw: bool) {
+        let Some(sub) = subsequent else { return };
+        if let Some(else_node) = sub.as_else_node() {
+            self.check_else_layout_body(node_start, &else_node);
+        } else if is_if_kw {
+            // `node.if?` — only a genuine `if` (not `elsif`/`unless`) recurses;
+            // the recursed-into elsif's own keyword is always "elsif", so this
+            // never continues past one level.
+            if let Some(elsif) = sub.as_if_node() {
+                self.else_layout_check(elsif.location().start_offset(), elsif.subsequent(), false);
+            }
+        }
+    }
+
+    /// Upstream's `check_else`: offense anchored on the else body's first
+    /// statement when it shares a source line with the `else` keyword.
+    fn check_else_layout_body(&mut self, node_start: usize, else_node: &ruby_prism::ElseNode) {
+        const COP: &str = "Lint/ElseLayout";
+        let Some(stmts) = else_node.statements() else { return };
+        let Some(first) = stmts.body().iter().next() else { return };
+        let first_start = first.location().start_offset();
+        let else_kw = else_node.else_keyword_loc();
+        if self.idx.loc(first_start).0 != self.idx.loc(else_kw.start_offset()).0 {
+            return;
+        }
+        if !self.else_layout_seen.insert(first_start) {
+            return;
+        }
+        self.push(first_start, COP, true, "Odd `else` layout detected. Did you mean to use `elsif`?");
+        // `Alignment#indentation`: the owning node's own column, plus
+        // `configured_indentation_width` (cop-local `IndentationWidth`, else
+        // `Layout/IndentationWidth`'s `Width`, else 2).
+        let width = self
+            .cfg
+            .param(COP, "IndentationWidth")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| self.cfg.int("Layout/IndentationWidth", "Width"));
+        let (_, col) = self.idx.loc(node_start);
+        let mut replacement = vec![b'\n'];
+        replacement.extend(std::iter::repeat(b' ').take(col - 1 + width));
+        // `corrector.insert_after(loc.else, "\n")` + replacing the blank gap
+        // through the first statement with `indentation(node)` collapse into
+        // one range replace: the gap only ever holds whitespace (`first` is
+        // upstream's `first_else`, the immediate next token after `else`).
+        self.fixes.push((else_kw.end_offset(), first_start, replacement));
+    }
+}
+
+/// Upstream's `else_branch.begin_type?` (via `&.`, so `nil` counts as
+/// not-begin too): true only when the falsy branch is a real `else` whose
+/// body holds 2+ statements (a single statement, or an elsif chain link —
+/// itself a lone `:if` node — is never wrapped in a `:begin`).
+fn else_layout_begin_type(subsequent: &Option<ruby_prism::Node>) -> bool {
+    subsequent.as_ref().is_some_and(|n| {
+        n.as_else_node()
+            .is_some_and(|e| e.statements().is_some_and(|s| s.body().iter().count() >= 2))
+    })
+}

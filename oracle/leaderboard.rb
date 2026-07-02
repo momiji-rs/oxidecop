@@ -109,6 +109,7 @@ COPS = {
   'Lint/EmptyWhen'                   => 'lint/empty_when',
   'Lint/InheritException'            => 'lint/inherit_exception',
   'Lint/ConstantDefinitionInBlock'   => 'lint/constant_definition_in_block',
+  'Lint/ElseLayout'                  => 'lint/else_layout',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
