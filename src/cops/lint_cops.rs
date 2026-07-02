@@ -1112,3 +1112,74 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/MultipleComparison — a chained mathematical comparison like
+    /// `x < y < z`, which Ruby (unlike math or Python) does NOT parse as two
+    /// comparisons ANDed together: it parses as `(x < y) < z`, comparing a
+    /// boolean against `z`. Not a syntax error, just nonsense.
+    ///
+    /// Mirrors rubocop's node-matcher verbatim:
+    ///   `(send (send _ {:< :> :<= :>=} $_) {:< :> :<= :>=} _)`
+    /// i.e. an outer send whose METHOD is a comparison operator and whose
+    /// RECEIVER is itself a send with a comparison-operator method; the
+    /// capture is the INNER send's argument (the shared middle value, `y`
+    /// in `x < y < z`) — not the inner send's receiver.
+    ///
+    /// rubocop allows chaining through the `&`/`|`/`^` set-operation
+    /// operators (`x >= y & y < z`, which — because `&`/`|`/`^` bind TIGHTER
+    /// than comparisons — actually parses as `x >= (y & y) < z`): if the
+    /// captured middle value is itself a send whose method is one of those,
+    /// it's exempted.
+    ///
+    /// Autocorrect duplicates the middle value with `&&`: `corrector.replace
+    /// (center, "#{center.source} && #{center.source}")`, i.e. replace just
+    /// the captured node's span with `"<src> && <src>"` — turning
+    /// `x < y < z` into `x < y && y < z`.
+    pub(crate) fn check_multiple_comparison(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/MultipleComparison";
+        if !self.on(COP) {
+            return;
+        }
+        const COMPARISON: &[&[u8]] = &[b"<", b">", b"<=", b">="];
+        if !COMPARISON.contains(&node.name().as_slice()) {
+            return;
+        }
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.len() != 1 {
+            return;
+        }
+        let Some(inner) = node.receiver().and_then(|r| r.as_call_node()) else { return };
+        if !COMPARISON.contains(&inner.name().as_slice()) {
+            return;
+        }
+        let inner_args: Vec<ruby_prism::Node> =
+            inner.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if inner_args.len() != 1 {
+            return;
+        }
+        let center = &inner_args[0];
+        // "It allows multiple comparison using `&`, `|`, and `^` set
+        // operation operators. e.g. `x >= y & y < z`"
+        if let Some(c) = center.as_call_node() {
+            if matches!(c.name().as_slice(), b"&" | b"|" | b"^") {
+                return;
+            }
+        }
+        let loc = node.location();
+        self.push(
+            loc.start_offset(),
+            COP,
+            true,
+            "Use the `&&` operator to compare multiple values.",
+        );
+        let center_src = self.node_src(center);
+        let mut text = Vec::with_capacity(center_src.len() * 2 + 4);
+        text.extend_from_slice(center_src);
+        text.extend_from_slice(b" && ");
+        text.extend_from_slice(center_src);
+        let cl = center.location();
+        self.fixes.push((cl.start_offset(), cl.end_offset(), text));
+    }
+}
