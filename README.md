@@ -160,8 +160,11 @@ one-line guard. No plugin/require support yet.
 ## Repo layout
 
 ```
-src/main.rs          entry point, config, offense reporting, the DECLARATIVE
-                     table, imperative Visit cops, --fix autocorrect
+src/main.rs          the runner: argv, file/config I/O, output, --fix application
+src/config.rs        .rubocop.yml subset + the per-cop SCHEMA (defaults/styles)
+src/declarative.rs   the DECLARATIVE pattern-cop table + Anchor + message render
+src/cops/mod.rs      the Cops visitor, thin Visit dispatch, lint() entry, tests
+src/cops/*.rs        per-department imperative cop logic (style, naming, …)
 src/nodepattern.rs   the node-pattern DSL parser + Prism matcher (captures, unions)
 oracle/oracle.rb     spec-suite oracle: one cop's fixtures vs. the binary
 oracle/leaderboard.rb runs the oracle across all cops, prints the ranked table
