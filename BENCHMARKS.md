@@ -45,6 +45,34 @@ zero exactly. Message-level agreement is verified separately by
 by the oracle (100% of RuboCop's own representable spec examples for every
 implemented cop).
 
+## nitrocop
+
+[nitrocop](https://github.com/6/nitrocop) (v0.0.1-pre12, built from source) is
+a much more serious competitor than oxicop: it parses with prism like we do,
+implements 915 cops across 7 gems, supports the full config surface
+(inherit_from/inherit_gem), and validates against RuboCop on a 5,587-repo
+corpus at 99.99% match — note its corpus compares file/line/cop only, not
+columns or message text, both of which our oracle and parity check require.
+
+Correctness: on rubygems.org (1,317 files, a config exercising per-cop
+Exclude, `!ruby/regexp` excludes and inherit_from), RuboCop, nitrocop and
+rubocop-rs all report **zero offenses** — three-way agreement.
+
+Speed (same 6-cop protocol, median of 7):
+
+| Corpus | rubocop-rs | nitrocop (no cache) | vs |
+|---|--:|--:|--:|
+| Jekyll | **12 ms** | 997 ms | 85× |
+| RuboCop repo | **44 ms** | 1,049 ms | 24× |
+| Mastodon | **86 ms** | 669 ms | 8× |
+| Rails | **103 ms** | 1,603 ms | 16× |
+| rubygems.org | **31 ms** | 417 ms | 14× |
+
+nitrocop's warm-cache path on the RuboCop repo still measures 981 ms here —
+its fixed per-run overhead (config resolution across 915 cops) dominates at
+this cop count. Its own README reports 279 ms uncached on rubygems.org; on
+this machine, this protocol, we measure what the table shows.
+
 ## A note on oxicop's published RuboCop baseline
 
 oxicop's BENCHMARKS.md reports RuboCop at a near-constant ~775 ms on every
