@@ -88,6 +88,11 @@ pub(crate) struct Cops<'a> {
     pub(crate) str_ignore: Vec<(usize, usize)>,
     // Numeric literals already checked as part of a folded `-@` call.
     pub(crate) num_ignore: Vec<usize>,
+    // Inclusive line ranges of heredoc BODIES (terminator excluded) — the
+    // regions Layout/TrailingWhitespace treats specially.
+    pub(crate) heredoc_lines: Vec<(usize, usize)>,
+    // The `__END__` line — nothing at or after it is lintable text.
+    pub(crate) data_line: Option<usize>,
 }
 impl<'a> Cops<'a> {
     pub(crate) fn on(&self, cop: &str) -> bool {
@@ -369,6 +374,11 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         }
     }
 
+    // Heredoc body line ranges, for Layout/TrailingWhitespace.
+    let mut hd = HeredocFinder { idx: &idx, ranges: Vec::new() };
+    hd.visit(&result.node());
+    let heredoc_lines = hd.ranges;
+
     let mut cops = Cops {
         src,
         idx: &idx,
@@ -385,6 +395,8 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         interp_depth: 0,
         str_ignore: Vec::new(),
         num_ignore: Vec::new(),
+        heredoc_lines,
+        data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
     };
 
     // ---- text-based cops ----
@@ -399,6 +411,43 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
     apply_disable_directives(&mut offenses, &comment_data, src, &idx);
     offenses.sort_by(|a, b| (a.line, a.col, a.cop).cmp(&(b.line, b.col, b.cop)));
     LintResult { offenses, fixes: cops.fixes }
+}
+
+/// Collects the inclusive line ranges of heredoc bodies (terminator line
+/// excluded), mirroring rubocop's `extract_heredocs`.
+struct HeredocFinder<'a> {
+    idx: &'a LineIndex,
+    ranges: Vec<(usize, usize)>,
+}
+impl<'a> HeredocFinder<'a> {
+    fn add_span(&mut self, start: usize, end: usize) {
+        if start < end {
+            self.ranges.push((self.idx.loc(start).0, self.idx.loc(end - 1).0));
+        }
+    }
+}
+impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
+    fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
+        if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) {
+            let c = node.content_loc();
+            self.add_span(c.start_offset(), c.end_offset());
+        }
+    }
+    fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
+        if node.opening_loc().as_slice().starts_with(b"<<") {
+            let c = node.content_loc();
+            self.add_span(c.start_offset(), c.end_offset());
+        }
+    }
+    fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
+        if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) {
+            if let (Some(first), Some(close)) = (node.parts().iter().next(), node.closing_loc()) {
+                self.add_span(first.location().start_offset(), close.start_offset());
+            }
+        }
+        // keep walking — interpolations can nest further heredocs
+        ruby_prism::visit_interpolated_string_node(self, node);
+    }
 }
 
 /// Honor `# rubocop:disable Cop[, Cop…]` / `rubocop:todo` / `rubocop:enable`
