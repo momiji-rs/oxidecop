@@ -117,6 +117,7 @@ COPS = {
   'Lint/DeprecatedOpenSSLConstant'   => 'lint/deprecated_open_ssl_constant',
   'Lint/AssignmentInCondition'       => 'lint/assignment_in_condition',
   'Layout/EmptyLinesAroundClassBody' => 'layout/empty_lines_around_class_body',
+  'Lint/AmbiguousRegexpLiteral'      => 'lint/ambiguous_regexp_literal',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

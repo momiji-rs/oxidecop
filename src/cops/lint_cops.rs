@@ -3023,3 +3023,236 @@ fn is_assignment_call(node: &ruby_prism::Node) -> bool {
 fn is_assignment_method_name(name: &[u8]) -> bool {
     !matches!(name, b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<") && name.ends_with(b"=")
 }
+
+impl<'a> Cops<'a> {
+    /// Lint/AmbiguousRegexpLiteral — a bare (paren-less) command call whose
+    /// argument list starts with `/`, which the LEXER itself can't
+    /// disambiguate from division. Upstream detects this off
+    /// `processed_source.diagnostics` (`reason == :ambiguous_regexp`), which
+    /// under rubocop's Prism translation is produced directly from prism's
+    /// OWN `PM_WARN_AMBIGUOUS_SLASH` lex-level warning (see
+    /// `Prism::Translation::Parser#warning_diagnostic`,
+    /// `:ambiguous_slash => Diagnostic.new(:warning, :ambiguous_regexp, ...)`)
+    /// — the message text and the 1-byte `/`-anchored location are passed
+    /// through unchanged. Reimplementing prism's lex-state machine (`ARG`/
+    /// `CMDARG` + `space_seen` + no-space-after) would be significant
+    /// surface area for the exact same signal prism already computes and
+    /// exposes via `ParseResult#warnings`; we ride that instead, matching
+    /// upstream byte-for-byte since it rides the identical warning.
+    ///
+    /// Only the AUTOCORRECT target — which enclosing call to parenthesize —
+    /// needs an AST walk, ported from `find_offense_node`/`first_argument_is_regexp?`/
+    /// `method_chain_to_regexp_receiver?` (ambiguous_regexp_literal.rb) and
+    /// `Util#add_parentheses` (util.rb).
+    pub(crate) fn check_ambiguous_regexp_literal(&mut self, result: &ruby_prism::ParseResult) {
+        const COP: &str = "Lint/AmbiguousRegexpLiteral";
+        if !self.on(COP) {
+            return;
+        }
+        const MSG: &str = "Ambiguous regexp literal. Parenthesize the method arguments if it's surely a regexp literal, or add a whitespace to the right of the `/` if it should be a division.";
+        const WARN_TEXT: &str = "ambiguous `/`; wrap regexp in parentheses or add a space after `/` operator";
+
+        let mut targets: Vec<usize> = Vec::new();
+        for w in result.warnings() {
+            if w.message() == WARN_TEXT {
+                targets.push(w.location().start_offset());
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let target_set: HashSet<usize> = targets.iter().copied().collect();
+        let fixes = arl_find_fixes(&result.node(), &target_set);
+
+        for off in targets {
+            let fix = fixes.iter().find(|(o, _)| *o == off).map(|(_, f)| f);
+            self.push(off, COP, fix.is_some(), MSG);
+            match fix {
+                Some(ArlFix::ArgsParen(msg_end, args_end)) => {
+                    self.fixes.push((*msg_end, *msg_end + 1, b"(".to_vec()));
+                    self.fixes.push((*args_end, *args_end, b")".to_vec()));
+                }
+                Some(ArlFix::WrapWhole(start, end)) => {
+                    self.fixes.push((*start, *start, b"(".to_vec()));
+                    self.fixes.push((*end, *end, b")".to_vec()));
+                }
+                Some(ArlFix::AppendParens(pos)) => {
+                    self.fixes.push((*pos, *pos, b"()".to_vec()));
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+/// The autocorrect shape for one ambiguous-regexp offense, mirroring
+/// `Util#add_parentheses`'s three live branches (the fourth, `args_type?`,
+/// only applies to `...`-forwarding param lists and never to a call node):
+/// - `ArgsParen(after_selector, after_last_arg)`: the found node HAS
+///   arguments — replace the 1-byte gap right after the method name with
+///   `(` and insert `)` right after the last argument (`args_begin`/
+///   `args_end` in `util.rb`, ported without ever touching a possibly
+///   block-swallowing `node.source_range` — see `ArlFrame::own_end`).
+/// - `WrapWhole(start, end)`: the found node does NOT `respond_to?(:arguments)`
+///   upstream — the `/regexp/ =~ var` "match-with-lvasgn" special case ONLY
+///   (a plain `=~` call whose receiver is a literal regexp gets demoted out
+///   of `:send` by whitequark's builder, so generic `Node#receiver` — a
+///   node-pattern matcher — returns `nil` for it and the recursion stops
+///   there). Plain `corrector.wrap`: parens go around the node's own source,
+///   no whitespace surgery.
+/// - `AppendParens(after_node)`: the found node has NO arguments at all
+///   (`node.arguments.empty?`) — append a bare `()`. Structurally
+///   unreachable from a real ambiguous-slash warning (there is always an
+///   enclosing bare command call with at least the regexp as an argument),
+///   kept only so the port is total over `add_parentheses`'s branches.
+enum ArlFix {
+    ArgsParen(usize, usize),
+    WrapWhole(usize, usize),
+    AppendParens(usize),
+}
+
+/// One enclosing `CallNode`'s shape, captured while descending into its
+/// receiver/arguments — reconstructs exactly the parent-chain information
+/// `find_offense_node`'s whitequark recursion reads off `node.parent`,
+/// `node.receiver`, and `node.first_argument`, since prism nodes carry no
+/// parent pointer.
+struct ArlFrame {
+    /// End of the method-name token — `args_begin` in `util.rb` is a 1-byte
+    /// range starting here (the mandatory space `PM_WARN_AMBIGUOUS_SLASH`
+    /// itself requires between the selector and `/`).
+    message_end: usize,
+    /// Start of the receiver's source, if any — used only for `WrapWhole`.
+    receiver_start: Option<usize>,
+    /// `first_argument_is_regexp?`: this call's OWN first argument (by
+    /// TYPE, not identity — matching upstream exactly) is a regexp literal.
+    args_first_is_regexp: bool,
+    /// End of the argument list, if this call has any arguments at all —
+    /// `None` here is upstream's `node.arguments.empty?`. Never includes an
+    /// attached block: an `ArgumentsNode`'s own location never does.
+    args_end: Option<usize>,
+    /// End of this call's own content, ignoring any attached block — the
+    /// prism-vs-whitequark block trap (a prism `CallNode`'s `location()`
+    /// spans through `do...end`; the whitequark `:send` node's range never
+    /// did). Falls back through arguments → explicit closing paren →
+    /// message end.
+    own_end: usize,
+    /// Whitequark demotes a literal-regexp-receiver `=~` call out of
+    /// `:send` (`Parser::Builders::Default#match_op`'s `static_regexp_node`
+    /// branch), so generic `Node#receiver` (a node-pattern matcher scoped
+    /// to `(send $_ ...)`) returns `nil` for it even though prism's own
+    /// `CallNode` structurally has a receiver. This is that demotion.
+    is_match_special: bool,
+    /// `node.parent.send_type? && node.receiver` (the receiver-chain
+    /// ascend condition), with `is_match_special` already folded in as the
+    /// generic-`Node#receiver`-returns-`nil` case above.
+    has_effective_receiver: bool,
+}
+
+impl ArlFrame {
+    /// The fix upstream produces when THIS frame is where the recursion
+    /// stops (`add_parentheses`'s dispatch on the resolved node).
+    fn fix(&self) -> ArlFix {
+        if self.is_match_special {
+            ArlFix::WrapWhole(self.receiver_start.unwrap_or(self.message_end), self.own_end)
+        } else if let Some(args_end) = self.args_end {
+            ArlFix::ArgsParen(self.message_end, args_end)
+        } else {
+            ArlFix::AppendParens(self.own_end)
+        }
+    }
+}
+
+/// Walks `root` maintaining a stack of enclosing `ArlFrame`s (pushed/popped
+/// around each `CallNode`'s receiver/arguments/block, i.e. exactly its
+/// prism subtree), and for every regexp literal whose start offset is in
+/// `targets`, replays `find_offense_node`'s ascend loop directly against the
+/// stack from innermost outward — since a stack frame IS the enclosing
+/// node's relevant state, ascending is just walking toward index 0.
+fn arl_find_fixes(root: &ruby_prism::Node, targets: &HashSet<usize>) -> Vec<(usize, ArlFix)> {
+    struct Walker<'t> {
+        targets: &'t HashSet<usize>,
+        stack: Vec<ArlFrame>,
+        fixes: Vec<(usize, ArlFix)>,
+    }
+    impl<'t> Walker<'t> {
+        fn resolve(&mut self, off: usize) {
+            if !self.targets.contains(&off) {
+                return;
+            }
+            let mut i = self.stack.len();
+            while i > 0 {
+                i -= 1;
+                let ascend = {
+                    let f = &self.stack[i];
+                    if f.args_first_is_regexp {
+                        self.fixes.push((off, f.fix()));
+                        return;
+                    }
+                    if i == 0 {
+                        self.fixes.push((off, f.fix()));
+                        return;
+                    }
+                    f.has_effective_receiver
+                };
+                if !ascend {
+                    self.fixes.push((off, self.stack[i].fix()));
+                    return;
+                }
+            }
+        }
+    }
+    impl<'pr, 't> ruby_prism::Visit<'pr> for Walker<'t> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let pushed = if let Some(msg) = node.message_loc() {
+                let message_end = msg.end_offset();
+                let receiver = node.receiver();
+                let is_match_special = node.name().as_slice() == b"=~"
+                    && receiver.as_ref().is_some_and(|r| r.as_regular_expression_node().is_some());
+                let receiver_start = receiver.as_ref().map(|r| r.location().start_offset());
+                let has_receiver = receiver.is_some();
+                let args = node.arguments();
+                let args_first_is_regexp = args
+                    .as_ref()
+                    .and_then(|a| a.arguments().first())
+                    .is_some_and(|n| {
+                        n.as_regular_expression_node().is_some()
+                            || n.as_interpolated_regular_expression_node().is_some()
+                    });
+                let args_end = args.as_ref().map(|a| a.location().end_offset());
+                let own_end = args_end
+                    .or_else(|| node.closing_loc().map(|l| l.end_offset()))
+                    .unwrap_or(message_end);
+                self.stack.push(ArlFrame {
+                    message_end,
+                    receiver_start,
+                    args_first_is_regexp,
+                    args_end,
+                    own_end,
+                    is_match_special,
+                    has_effective_receiver: has_receiver && !is_match_special,
+                });
+                true
+            } else {
+                false
+            };
+            ruby_prism::visit_call_node(self, node);
+            if pushed {
+                self.stack.pop();
+            }
+        }
+        fn visit_regular_expression_node(&mut self, node: &ruby_prism::RegularExpressionNode<'pr>) {
+            self.resolve(node.location().start_offset());
+        }
+        fn visit_interpolated_regular_expression_node(
+            &mut self,
+            node: &ruby_prism::InterpolatedRegularExpressionNode<'pr>,
+        ) {
+            self.resolve(node.location().start_offset());
+            ruby_prism::visit_interpolated_regular_expression_node(self, node);
+        }
+    }
+    let mut w = Walker { targets, stack: Vec::new(), fixes: Vec::new() };
+    use ruby_prism::Visit;
+    w.visit(root);
+    w.fixes
+}
