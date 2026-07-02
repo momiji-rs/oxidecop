@@ -3076,7 +3076,16 @@ impl<'a> super::Cops<'a> {
         }
         let Some(body) = body_stmts.and_then(|s| s.body().iter().next()) else { return };
         let body_loc = body.location();
-        let start_line = self.idx.loc(body_loc.start_offset()).0;
+        // `node.body.multiline?` under rubocop's PRISM translation: a block
+        // body's range starts at the SELECTOR, not the receiver chain — so
+        // `a\n .bar { .. } unless c` (braces on one line) is single-line to
+        // rubocop even though the chain spans two.
+        let body_start = body
+            .as_call_node()
+            .filter(|c| c.block().and_then(|b| b.as_block_node()).is_some())
+            .and_then(|c| c.message_loc().map(|m| m.start_offset()))
+            .unwrap_or_else(|| body_loc.start_offset());
+        let start_line = self.idx.loc(body_start).0;
         let end_line = self.idx.loc(body_loc.end_offset().saturating_sub(1)).0;
         if start_line == end_line {
             return; // not `node.body.multiline?`

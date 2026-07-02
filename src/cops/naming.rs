@@ -546,8 +546,13 @@ impl<'a> super::Cops<'a> {
         }
 
         // Get the forbidden delimiters from config
-        if let Some(forbidden_list) = self.cfg.get(COP, "ForbiddenDelimiters") {
-            let forbidden_patterns = crate::config::parse_allowed_list(forbidden_list);
+        // the default is an ARRAY (not in the flat schema table) — fall back
+        // to rubocop's shipped pattern when the config doesn't set one
+        let forbidden_patterns = match self.cfg.get(COP, "ForbiddenDelimiters") {
+            Some(list) => crate::config::parse_allowed_list(list),
+            None => vec![r"(^|\s)(EO[A-Z]{1}|END)(\s|$)".to_string()],
+        };
+        {
 
             for pattern_str in forbidden_patterns {
                 // Strip Ruby regex wrappers if present
