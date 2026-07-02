@@ -78,6 +78,8 @@ pub struct Config {
     // `--only Cop1,Cop2` — when set, ONLY these cops (or departments) run,
     // regardless of Enabled flags, like rubocop's flag.
     pub only: Option<Vec<String>>,
+    // `--except Cop1,Cop2` — never run these, whatever else says so.
+    pub except: Option<Vec<String>>,
     // `inherit_from:` targets, in order (base-most first), relative to the
     // config file's directory. The runner resolves and merges them.
     pub inherits: Vec<String>,
@@ -147,7 +149,7 @@ impl Config {
             .and_then(|s| s.get("DisabledByDefault"))
             .map(|v| v == "true")
             .unwrap_or(false);
-        Config { sections, all_disabled_by_default, only: None, inherits }
+        Config { sections, all_disabled_by_default, only: None, except: None, inherits }
     }
     /// Overlay `child` on top of self (self is the inherited base). Scalar
     /// keys override; `Exclude` lists MERGE (union), matching rubocop's
@@ -179,6 +181,11 @@ impl Config {
         self.inherits = Vec::new();
     }
     pub fn enabled(&self, cop: &str) -> bool {
+        if let Some(except) = &self.except {
+            if except.iter().any(|o| o == cop || cop.starts_with(&format!("{o}/"))) {
+                return false;
+            }
+        }
         if let Some(only) = &self.only {
             return only.iter().any(|o| o == cop || cop.starts_with(&format!("{o}/")));
         }

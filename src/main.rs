@@ -111,12 +111,18 @@ fn main() {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut cfg_path: Option<String> = None;
     let mut fix = false;
+    let mut autocorrect = false;
     let mut use_cache = true;
     let mut only: Option<Vec<String>> = None;
+    let mut except: Option<Vec<String>> = None;
+    let mut format = "simple".to_string();
+    let mut stdin_path: Option<String> = None;
+    let mut color: Option<bool> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--fix" => fix = true,
+            "-a" | "--autocorrect" | "-A" | "--autocorrect-all" => autocorrect = true,
             "--no-cache" => use_cache = false,
             "--cache" => {
                 use_cache = it.next().map(|v| v == "true").unwrap_or(true);
@@ -124,21 +130,70 @@ fn main() {
             "--only" => {
                 only = it.next().map(|v| v.split(',').map(|c| c.trim().to_string()).collect());
             }
+            "--except" => {
+                except = it.next().map(|v| v.split(',').map(|c| c.trim().to_string()).collect());
+            }
+            "-f" | "--format" => {
+                if let Some(v) = it.next() {
+                    format = v.clone();
+                }
+            }
+            "--stdin" => stdin_path = it.next().cloned(),
+            "--color" => color = Some(true),
+            "--no-color" => color = Some(false),
+            "-v" | "--version" => {
+                println!("rubocop-rs {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            "-h" | "--help" => {
+                println!("usage: rubocop-rs [options] <path>...\n\
+                    \x20 --only COPS        run only the listed cops/departments\n\
+                    \x20 --except COPS      skip the listed cops/departments\n\
+                    \x20 -f, --format FMT   simple (default) | json | quiet\n\
+                    \x20 -a, --autocorrect  apply corrections in place\n\
+                    \x20 --fix              print corrected source to stdout (single file)\n\
+                    \x20 --stdin PATH       lint stdin as PATH\n\
+                    \x20 --cache true|false / --no-cache\n\
+                    \x20 --[no-]color, -v, -h");
+                return;
+            }
             // back-compat: a bare .yml positional arg is the config
             s if s.ends_with(".yml") || s.ends_with(".yaml") => cfg_path = Some(s.to_string()),
             s => paths.push(PathBuf::from(s)),
         }
     }
-    if paths.is_empty() {
-        eprintln!("usage: rubocop-rs <path>... [config.yml] [--fix]");
+    let use_color = color.unwrap_or_else(|| {
+        use std::io::IsTerminal;
+        std::io::stdout().is_terminal()
+    });
+    if paths.is_empty() && stdin_path.is_none() {
+        eprintln!("usage: rubocop-rs [options] <path>... (see --help)");
         std::process::exit(2);
     }
 
     let cfg_file = cfg_path.clone().unwrap_or_else(|| ".rubocop.yml".to_string());
     let mut cfg = load_config_chain(Path::new(&cfg_file), 0);
     cfg.only = only;
+    cfg.except = except;
     let cfg_text_for_cache = cfg.identity();
     let eng = cops::Engine::new(&cfg);
+
+    // --stdin: lint the piped source as the given path
+    if let Some(sp) = stdin_path {
+        use std::io::Read;
+        let mut src = Vec::new();
+        std::io::stdin().read_to_end(&mut src).ok();
+        let result = cops::lint(&src, &cfg, &eng, &sp);
+        if autocorrect || fix {
+            let out = apply_fixes(&src, result.fixes);
+            use std::io::Write;
+            std::io::stdout().write_all(&out).unwrap();
+            return;
+        }
+        let total = result.offenses.len();
+        print_simple(&[(sp, result.offenses)], 1, use_color);
+        std::process::exit(if total > 0 { 1 } else { 0 });
+    }
 
     let mut files: Vec<PathBuf> = Vec::new();
     for p in &paths {
@@ -168,16 +223,32 @@ fn main() {
         let src = std::fs::read(&files[0]).expect("read");
         let rel = files[0].strip_prefix("./").unwrap_or(&files[0]).to_string_lossy().replace('\\', "/");
         let result = cops::lint(&src, &cfg, &eng, &rel);
-        let mut out = src.clone();
-        let mut fixes = result.fixes;
-        fixes.sort_by(|a, b| b.0.cmp(&a.0)); // descending by start
-        for (s, e, rep) in fixes {
-            if s <= e && e <= out.len() {
-                out.splice(s..e, rep.iter().copied());
-            }
-        }
+        let out = apply_fixes(&src, result.fixes);
         use std::io::Write;
         std::io::stdout().write_all(&out).unwrap();
+        return;
+    }
+
+    // -a / --autocorrect: apply fixes in place across all files
+    if autocorrect {
+        let corrected: usize = files
+            .par_iter()
+            .map(|f| {
+                let rel = f.strip_prefix("./").unwrap_or(f).to_string_lossy().replace('\\', "/");
+                let Ok(src) = std::fs::read(f) else { return 0 };
+                let result = cops::lint(&src, &cfg, &eng, &rel);
+                if result.fixes.is_empty() {
+                    return 0;
+                }
+                let out = apply_fixes(&src, result.fixes);
+                if out != src && std::fs::write(f, &out).is_ok() {
+                    1
+                } else {
+                    0
+                }
+            })
+            .sum();
+        println!("{} file{} corrected", corrected, if corrected == 1 { "" } else { "s" });
         return;
     }
 
@@ -215,20 +286,11 @@ fn main() {
         c.flush();
     }
 
-    let mut total = 0usize;
-    let mut correctable = 0usize;
-    for (path, offenses) in &results {
-        if offenses.is_empty() {
-            continue;
-        }
-        println!("== {path} ==");
-        for o in offenses {
-            let c = if o.correctable { correctable += 1; "[Correctable] " } else { "" };
-            // Lint's default severity is warning, everything else convention.
-            let sev = if o.cop.starts_with("Lint/") { 'W' } else { 'C' };
-            println!("{sev}:{:>3}:{:>3}: {}{}: {}", o.line, o.col, c, o.cop, o.message);
-        }
-        total += offenses.len();
+    let total: usize = results.iter().map(|(_, o)| o.len()).sum();
+    match format.as_str() {
+        "json" | "j" => print_json(&results),
+        "quiet" | "q" => print_simple(&results, usize::MAX, false),
+        _ => print_simple(&results, results.len(), use_color),
     }
 
     if std::env::var_os("RUBOCOP_RS_TIMING").is_some() {
@@ -241,10 +303,111 @@ fn main() {
         eprintln!("  post   {:9.1}", ms(&cops::T_POST));
     }
 
-    let nfiles = results.len();
+    std::process::exit(if total > 0 { 1 } else { 0 });
+}
+
+/// Apply autocorrect edits right-to-left, skipping overlaps.
+fn apply_fixes(src: &[u8], mut fixes: Vec<cops::Fix>) -> Vec<u8> {
+    let mut out = src.to_vec();
+    fixes.sort_by(|a, b| b.0.cmp(&a.0)); // descending by start
+    let mut last_start = usize::MAX;
+    for (s, e, rep) in fixes {
+        if s <= e && e <= out.len() && e <= last_start {
+            out.splice(s..e, rep.iter().copied());
+            last_start = s;
+        }
+    }
+    out
+}
+
+/// rubocop's simple formatter (headers per offending file, summary line).
+/// `nfiles == usize::MAX` marks quiet mode (offenses only, no summary).
+fn print_simple(results: &[(String, Vec<cops::Offense>)], nfiles: usize, color: bool) {
+    let quiet = nfiles == usize::MAX;
+    let mut total = 0usize;
+    let mut correctable = 0usize;
+    for (path, offenses) in results {
+        if offenses.is_empty() {
+            continue;
+        }
+        println!("== {path} ==");
+        for o in offenses {
+            let c = if o.correctable { correctable += 1; "[Correctable] " } else { "" };
+            // Lint's default severity is warning, everything else convention.
+            let sev = if o.cop.starts_with("Lint/") { 'W' } else { 'C' };
+            let msg = if color {
+                // like rubocop's simple formatter: `...` spans render yellow
+                let mut out = String::new();
+                let mut inside = false;
+                for part in o.message.split('`') {
+                    if inside {
+                        out.push_str("\x1b[33m");
+                        out.push_str(part);
+                        out.push_str("\x1b[0m");
+                    } else {
+                        out.push_str(part);
+                    }
+                    inside = !inside;
+                }
+                out
+            } else {
+                o.message.clone()
+            };
+            println!("{sev}:{:>3}:{:>3}: {}{}: {}", o.line, o.col, c, o.cop, msg);
+        }
+        total += offenses.len();
+    }
+    if quiet {
+        return;
+    }
     println!("\n{nfiles} file{} inspected, {total} offense{} detected{}",
         if nfiles == 1 { "" } else { "s" },
         if total == 1 { "" } else { "s" },
         if correctable > 0 { format!(", {correctable} offense{} autocorrectable", if correctable == 1 { "" } else { "s" }) } else { String::new() });
-    std::process::exit(if total > 0 { 1 } else { 0 });
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// rubocop's JSON formatter schema (location carries the start position).
+fn print_json(results: &[(String, Vec<cops::Offense>)]) {
+    let mut files = Vec::new();
+    let mut total = 0usize;
+    for (path, offenses) in results {
+        total += offenses.len();
+        let offs: Vec<String> = offenses
+            .iter()
+            .map(|o| {
+                let sev = if o.cop.starts_with("Lint/") { "warning" } else { "convention" };
+                format!(
+                    "{{\"severity\":\"{sev}\",\"message\":\"{}\",\"cop_name\":\"{}\",\"corrected\":false,\"correctable\":{},\"location\":{{\"start_line\":{},\"start_column\":{},\"line\":{},\"column\":{}}}}}",
+                    json_escape(&o.message), o.cop, o.correctable, o.line, o.col, o.line, o.col
+                )
+            })
+            .collect();
+        files.push(format!(
+            "{{\"path\":\"{}\",\"offenses\":[{}]}}",
+            json_escape(path),
+            offs.join(",")
+        ));
+    }
+    println!(
+        "{{\"metadata\":{{\"rubocop_version\":\"{}\",\"ruby_engine\":\"rubocop-rs\"}},\"files\":[{}],\"summary\":{{\"offense_count\":{total},\"target_file_count\":{n},\"inspected_file_count\":{n}}}}}",
+        env!("CARGO_PKG_VERSION"),
+        files.join(","),
+        n = results.len()
+    );
 }
