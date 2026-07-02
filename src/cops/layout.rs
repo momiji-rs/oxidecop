@@ -559,4 +559,49 @@ impl<'a> Cops<'a> {
             }
         }
     }
+
+    /// Layout/SpaceBeforeSemicolon — a semicolon must not be preceded by space
+    /// (except after `{` when space is required per Layout/SpaceInsideBlockBraces).
+    pub(crate) fn check_space_before_semicolon(&mut self) {
+        const COP: &str = "Layout/SpaceBeforeSemicolon";
+        if !self.on(COP) || !self.src.contains(&b';') {
+            return;
+        }
+        let space_required_after_lcurly =
+            self.cfg.get("Layout/SpaceInsideBlockBraces", "EnforcedStyle") != Some("no_space");
+        for line in 1..=self.idx.starts.len() {
+            let ls = self.idx.starts[line - 1];
+            let le = self.line_end(line);
+            // a trailing comment caps the code
+            let code_end = self
+                .comments
+                .iter()
+                .find(|(l, s, _)| *l == line && *s >= ls && *s < le)
+                .map(|(_, s, _)| *s)
+                .unwrap_or(le);
+            for p in ls..code_end {
+                if self.src[p] != b';' || self.in_lit_span(p) {
+                    continue;
+                }
+                // Look back for whitespace before the semicolon
+                if p == 0 || !self.src[p - 1].is_ascii_whitespace() {
+                    continue;
+                }
+                // Find the start of the whitespace run
+                let mut ws_start = p - 1;
+                while ws_start > ls && self.src[ws_start - 1].is_ascii_whitespace() {
+                    ws_start -= 1;
+                }
+                // Check if the character before the whitespace is a {
+                // and space is required after { (the 'space' style)
+                let prev_is_lcurly = ws_start > ls && self.src[ws_start - 1] == b'{';
+                if prev_is_lcurly && space_required_after_lcurly {
+                    continue;
+                }
+                // Emit offense at the start of the whitespace and remove the space
+                self.fixes.push((ws_start, p, Vec::new()));
+                self.push(ws_start, COP, true, "Space found before semicolon.");
+            }
+        }
+    }
 }

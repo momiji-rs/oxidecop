@@ -136,7 +136,7 @@ const IMPLEMENTED: &[&str] = &[
     "Naming/ClassAndModuleCamelCase", "Naming/ConstantName", "Style/MultilineIfThen",
     "Style/Not", "Style/StderrPuts", "Style/WhileUntilDo", "Style/ColonMethodCall",
     "Lint/EmptyClass", "Lint/DeprecatedClassMethods", "Layout/EmptyLineAfterMagicComment",
-    "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon", "Style/GlobalVars", "Layout/SpaceAfterComma", "Style/DefWithParentheses",
+    "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon", "Style/GlobalVars", "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
     "Style/CharacterLiteral", "Style/EndBlock", "Style/NegatedWhile", "Style/UnlessElse",
@@ -1238,6 +1238,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     cops.check_line_length();
     cops.check_semicolon_lines();
     cops.check_space_after_comma();
+    cops.check_space_before_semicolon();
     let t = tick(&T_VISIT, t);
 
     let mut offenses = cops.offenses;
