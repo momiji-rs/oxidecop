@@ -2661,3 +2661,197 @@ fn iam_collect_private_class_method_names(node: &ruby_prism::Node, src: &[u8], o
     use ruby_prism::Visit;
     f.visit(node);
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/DeprecatedOpenSSLConstant — `OpenSSL::Cipher::ALGO.new(...)` /
+    /// `OpenSSL::Digest::ALGO.{new,digest}(...)` where `ALGO` is a bare
+    /// constant (algorithm-as-a-class-name) rather than a string argument.
+    /// Ports rubocop's `algorithm_const` node-pattern (a three-deep constant
+    /// path rooted at `OpenSSL`, with `Cipher`/`Digest` as the middle
+    /// segment) plus its `replacement_args`/`build_cipher_arguments`
+    /// algorithm-name-to-string transform, verbatim.
+    pub(crate) fn check_deprecated_open_ssl_constant(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/DeprecatedOpenSSLConstant";
+        if !self.on(COP) {
+            return;
+        }
+        // RESTRICT_ON_SEND = %i[new digest]
+        let name = node.name().as_slice();
+        if name != b"new" && name != b"digest" {
+            return;
+        }
+        // `return if node.arguments.any? { |arg| arg.variable? || arg.call_type? || arg.const_type? }`
+        // variable? == ivar/gvar/cvar/lvar (read forms); call_type? also
+        // covers safe-navigation (`&.`) since prism marks that as a flag on
+        // the same `CallNode`, not a distinct node type.
+        if let Some(args) = node.arguments() {
+            for arg in args.arguments().iter() {
+                if arg.as_local_variable_read_node().is_some()
+                    || arg.as_instance_variable_read_node().is_some()
+                    || arg.as_class_variable_read_node().is_some()
+                    || arg.as_global_variable_read_node().is_some()
+                    || arg.as_call_node().is_some()
+                    || arg.as_constant_read_node().is_some()
+                    || arg.as_constant_path_node().is_some()
+                {
+                    return;
+                }
+            }
+        }
+        let Some(receiver) = node.receiver() else { return };
+        // `return if digest_const?(node.receiver)` — checked BEFORE
+        // `algorithm_const`, so any receiver whose own outer name is
+        // `Digest` (bare `OpenSSL::Digest`, or the doubled-up
+        // `OpenSSL::Digest::Digest`) is exempted outright.
+        if openssl_digest_const_name(&receiver) {
+            return;
+        }
+        // `return unless algorithm_const(node)`
+        let Some(algo) = openssl_algorithm_const(&receiver) else { return };
+        let mid = algo.parent().expect("matched structure always has a middle segment");
+        let openssl_class = String::from_utf8_lossy(self.node_src(&mid)).into_owned();
+        let algo_full_src = String::from_utf8_lossy(self.node_src(&algo.as_node())).into_owned();
+        let name_loc = algo.name_loc();
+        let algo_name_src =
+            String::from_utf8_lossy(&self.src[name_loc.start_offset()..name_loc.end_offset()]).into_owned();
+
+        let arg_nodes: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+
+        let replacement_args = if algo_full_src == "OpenSSL::Cipher::Cipher" {
+            // `algorithm_constant.source == 'OpenSSL::Cipher::Cipher'` — keep
+            // the original first argument's source verbatim.
+            arg_nodes.first().map(|a| String::from_utf8_lossy(self.node_src(a)).into_owned()).unwrap_or_default()
+        } else {
+            let algorithm_name = openssl_algorithm_name(&algo_name_src, &openssl_class);
+            if openssl_class == "OpenSSL::Cipher" {
+                openssl_build_cipher_arguments(self.src, &arg_nodes, &algorithm_name)
+            } else {
+                let mut parts = vec![format!("'{algorithm_name}'")];
+                for a in &arg_nodes {
+                    parts.push(String::from_utf8_lossy(self.node_src(a)).into_owned());
+                }
+                parts.join(", ")
+            }
+        };
+
+        let method = node
+            .message_loc()
+            .map(|l| String::from_utf8_lossy(&self.src[l.start_offset()..l.end_offset()]).into_owned())
+            .unwrap_or_default();
+        let original = String::from_utf8_lossy(self.node_src(&node.as_node())).into_owned();
+        let message = format!("Use `{openssl_class}.{method}({replacement_args})` instead of `{original}`.");
+
+        let l = node.location();
+        self.push(l.start_offset(), COP, true, message);
+
+        // `corrector.remove(algorithm_constant.loc.double_colon)` +
+        // `corrector.remove(algorithm_constant.loc.name)` — strip `::ALGO`
+        // off the receiver, leaving `OpenSSL::Cipher`/`OpenSSL::Digest`.
+        let delim = algo.delimiter_loc();
+        self.fixes.push((delim.start_offset(), delim.end_offset(), Vec::new()));
+        self.fixes.push((name_loc.start_offset(), name_loc.end_offset(), Vec::new()));
+        // `corrector.replace(correction_range(node), "#{selector}(#{replacement_args})")`
+        if let Some(dot) = node.call_operator_loc() {
+            let replacement = format!("{method}({replacement_args})").into_bytes();
+            self.fixes.push((dot.end_offset(), l.end_offset(), replacement));
+        }
+    }
+}
+
+/// rubocop's `algorithm_const` node-pattern:
+/// `(send $(const (const (const {nil? cbase} :OpenSSL) {:Cipher :Digest}) _) ...)`
+/// — the receiver must be a three-deep constant path rooted at `OpenSSL`
+/// (bare or `::`-prefixed), with `Cipher` or `Digest` as the middle segment.
+/// Returns the innermost (algorithm-name) constant-path node.
+fn openssl_algorithm_const<'pr>(recv: &ruby_prism::Node<'pr>) -> Option<ruby_prism::ConstantPathNode<'pr>> {
+    let algo = recv.as_constant_path_node()?;
+    let mid = algo.parent()?;
+    let mid_path = mid.as_constant_path_node()?;
+    let mid_name = mid_path.name()?;
+    if mid_name.as_slice() != b"Cipher" && mid_name.as_slice() != b"Digest" {
+        return None;
+    }
+    let root = mid_path.parent()?;
+    let is_openssl_root = if let Some(cr) = root.as_constant_read_node() {
+        cr.name().as_slice() == b"OpenSSL"
+    } else if let Some(cp) = root.as_constant_path_node() {
+        cp.parent().is_none() && cp.name().is_some_and(|n| n.as_slice() == b"OpenSSL")
+    } else {
+        false
+    };
+    is_openssl_root.then_some(algo)
+}
+
+/// rubocop's `digest_const?` node-pattern: `(const _ :Digest)` — true when
+/// the receiver, at its OUTERMOST level (regardless of nesting), is itself a
+/// constant named `Digest`.
+fn openssl_digest_const_name(node: &ruby_prism::Node) -> bool {
+    if let Some(p) = node.as_constant_path_node() {
+        return p.name().is_some_and(|n| n.as_slice() == b"Digest");
+    }
+    if let Some(c) = node.as_constant_read_node() {
+        return c.name().as_slice() == b"Digest";
+    }
+    false
+}
+
+const OPENSSL_NO_ARG_ALGORITHM: &[&str] = &["BF", "DES", "IDEA", "RC4"];
+
+/// rubocop's `algorithm_name`: for `Cipher` (and not one of the no-argument
+/// algorithms), chunk the raw constant name into 3-character groups
+/// (`AES128` -> `AES-128`, trailing partial group dropped like `.scan`); for
+/// `Digest` (or a no-arg `Cipher` algorithm), use the name verbatim.
+fn openssl_algorithm_name(name: &str, openssl_class: &str) -> String {
+    if openssl_class == "OpenSSL::Cipher" && !OPENSSL_NO_ARG_ALGORITHM.contains(&name) {
+        name.as_bytes()
+            .chunks(3)
+            .filter(|c| c.len() == 3)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("-")
+    } else {
+        name.to_string()
+    }
+}
+
+/// rubocop's `sanitize_arguments`: each original call argument becomes one
+/// or more tokens — string literals contribute their unescaped VALUE, other
+/// nodes (symbols, integers, ...) contribute raw source text; `:`/`'` are
+/// stripped, then the result is split on `-` and downcased.
+fn openssl_sanitize_arguments(src: &[u8], args: &[ruby_prism::Node]) -> Vec<String> {
+    let mut out = Vec::new();
+    for arg in args {
+        let raw: String = if let Some(s) = arg.as_string_node() {
+            String::from_utf8_lossy(s.unescaped()).into_owned()
+        } else {
+            let l = arg.location();
+            String::from_utf8_lossy(&src[l.start_offset()..l.end_offset()]).into_owned()
+        };
+        let cleaned: String = raw.chars().filter(|&c| c != ':' && c != '\'').collect();
+        for part in cleaned.split('-') {
+            out.push(part.to_lowercase());
+        }
+    }
+    out
+}
+
+/// rubocop's `build_cipher_arguments`: combine the (already `-`-split,
+/// downcased) algorithm name with the sanitized call arguments — a bare
+/// no-argument algorithm called with zero arguments returns just its own
+/// name; otherwise append a `cbc` default mode only when no size/mode
+/// arguments were given, then take the first three `-`-joined parts.
+fn openssl_build_cipher_arguments(src: &[u8], args: &[ruby_prism::Node], algorithm_name: &str) -> String {
+    let algorithm_parts: Vec<String> = algorithm_name.to_lowercase().split('-').map(str::to_string).collect();
+    let no_arguments = args.is_empty();
+    let size_and_mode = openssl_sanitize_arguments(src, args);
+    if OPENSSL_NO_ARG_ALGORITHM.contains(&algorithm_parts[0].to_uppercase().as_str()) && no_arguments {
+        return format!("'{}'", algorithm_parts[0]);
+    }
+    let mut combined = algorithm_parts;
+    combined.extend(size_and_mode.iter().cloned());
+    if size_and_mode.is_empty() {
+        combined.push("cbc".to_string());
+    }
+    format!("'{}'", combined.into_iter().take(3).collect::<Vec<_>>().join("-"))
+}
