@@ -141,7 +141,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
-    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException",
+    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -937,6 +937,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(),
             node.body().is_some(), node.superclass().is_some(), false);
+        self.check_trailing_body_on_class(node.class_keyword_loc().start_offset(), l.end_offset(), node.body());
         self.check_documentation("class", node.location().start_offset(), &node.constant_path(), node.body());
         self.check_camel_case_name(&node.constant_path());
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
@@ -1052,6 +1053,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(), node.body().is_some(), false, true);
+        self.check_trailing_body_on_class(node.class_keyword_loc().start_offset(), l.end_offset(), node.body());
         // The expression (`class << HERE`) is outside the scoping context.
         self.visit(&node.expression());
         // `class << self` is a scoping context — nested defs inside are allowed.

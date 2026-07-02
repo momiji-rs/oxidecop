@@ -2320,3 +2320,81 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Style/TrailingBodyOnClass — `class Foo; body` / `class << self; body`
+    /// where the body trails the class keyword on its opening line, but the
+    /// class as a whole is multiline (`class Foo; end` on one line is fine).
+    /// Ported from rubocop's `TrailingBody` mixin + `LineBreakCorrector`.
+    /// Shared by `visit_class_node` and `visit_singleton_class_node` — this
+    /// mirrors rubocop's `on_sclass` alias of `on_class`.
+    ///
+    /// `keyword_start` is the offset of the `class` keyword (== the node's
+    /// own location start for both `ClassNode`/`SingletonClassNode`, so it
+    /// doubles as "insert before the node" for the comment-move step).
+    pub(crate) fn check_trailing_body_on_class(
+        &mut self,
+        keyword_start: usize,
+        node_end: usize,
+        body: Option<ruby_prism::Node>,
+    ) {
+        const COP: &str = "Style/TrailingBodyOnClass";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = body else { return }; // no body at all
+        // `node.multiline?`: the class...end block itself spans >1 line.
+        let start_line = self.idx.loc(keyword_start).0;
+        let end_line = self.idx.loc(node_end.saturating_sub(1)).0;
+        if start_line == end_line {
+            return;
+        }
+        // `same_line?(node, body)`: body starts on the class's first line.
+        if self.idx.loc(body.location().start_offset()).0 != start_line {
+            return;
+        }
+        // `first_part_of`: a bare statement list (`begin_type?`) offends at
+        // its first statement; anything else (e.g. a rescue/ensure wrapper)
+        // offends at the whole body.
+        let first_start = body
+            .as_statements_node()
+            .and_then(|s| s.body().iter().next())
+            .map(|n| n.location().start_offset())
+            .unwrap_or_else(|| body.location().start_offset());
+
+        self.push(first_start, COP, true, "Place the first line of class body on its own line.");
+
+        // configured_indentation_width: cop-local IndentationWidth, else
+        // Layout/IndentationWidth's Width, else 2.
+        let width: usize = self
+            .cfg
+            .param(COP, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2);
+        let keyword_col = self.idx.loc(keyword_start).1 - 1; // 0-based column
+
+        // `break_line_before`: push the first body token onto its own,
+        // freshly-indented line.
+        let indent = " ".repeat(keyword_col + width);
+        self.fixes.push((first_start, first_start, format!("\n{indent}").into_bytes()));
+
+        // `move_comment`: an EOL comment on the class's opening line moves
+        // above the class, at the class's own indentation.
+        if let Some(&(_, cs, ce)) = self.comments.iter().find(|(line, _, _)| *line == start_line) {
+            let mut ins = self.src[cs..ce].to_vec();
+            ins.push(b'\n');
+            ins.extend(std::iter::repeat(b' ').take(keyword_col));
+            self.fixes.push((keyword_start, keyword_start, ins));
+            self.fixes.push((cs, ce, Vec::new()));
+        }
+
+        // `remove_semicolon`: the `;` directly separating the class header
+        // from the trailing body (as opposed to plain whitespace).
+        if let Some(scan) = self.src.get(keyword_start..first_start) {
+            if let Some(rel) = scan.iter().rposition(|&b| b == b';') {
+                let sc = keyword_start + rel;
+                self.fixes.push((sc, sc + 1, Vec::new()));
+            }
+        }
+    }
+}
