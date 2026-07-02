@@ -1063,3 +1063,52 @@ impl<'a> Cops<'a> {
         self.fixes.push((range_start, range_end, fixed));
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/ConditionPosition — condition on a different line than if/unless/while/until.
+    pub(crate) fn check_condition_position(&mut self, keyword: &[u8], keyword_off: usize, predicate: &ruby_prism::Node) {
+        const COP: &str = "Layout/ConditionPosition";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Get the line numbers
+        let (kw_line, _) = self.idx.loc(keyword_off);
+        let pred_loc = predicate.location();
+        let (pred_line, _) = self.idx.loc(pred_loc.start_offset());
+
+        // Skip if condition is on the same line as keyword
+        if kw_line == pred_line {
+            return;
+        }
+
+        // Report offense on the predicate
+        let message = format!("Place the condition on the same line as `{}`.", String::from_utf8_lossy(keyword));
+        self.push(pred_loc.start_offset(), COP, true, message);
+
+        // Autocorrect: move the condition to the same line as the keyword
+        // Get the bytes of the predicate
+        let pred_start = pred_loc.start_offset();
+        let pred_end = pred_loc.end_offset();
+        let pred_bytes = &self.src[pred_start..pred_end];
+        let pred_src = String::from_utf8_lossy(pred_bytes);
+
+        // Find the whole line of the predicate to remove it (including leading whitespace and trailing newline)
+        let pred_line_start = self.idx.starts[pred_line - 1];
+        let pred_line_end = self.line_end(pred_line);
+
+        // Include the newline after the condition line in the removal range
+        let removal_end = if pred_line_end < self.src.len() && self.src[pred_line_end] == b'\n' {
+            pred_line_end + 1
+        } else {
+            pred_line_end
+        };
+
+        // Insert the predicate after the keyword, with a leading space
+        let kw_end = keyword_off + keyword.len();
+        self.fixes.push((kw_end, kw_end, format!(" {}", pred_src).into_bytes()));
+
+        // Remove the entire predicate line
+        self.fixes.push((pred_line_start, removal_end, Vec::new()));
+    }
+}

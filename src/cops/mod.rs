@@ -142,6 +142,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire", "Lint/TrailingCommaInAttributeDeclaration",
+    "Layout/ConditionPosition",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -697,6 +698,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                     node.statements().map(|s| s.location().start_offset()),
                     kw_text,
                 );
+                // ternaries have no keyword; modifiers have no end keyword
+                if node.end_keyword_loc().is_some() {
+                    self.check_condition_position(kw.as_slice(), kw.start_offset(), &node.predicate());
+                }
             }
         }
         self.cond_depth += 1;
@@ -719,6 +724,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.statements().map(|s| s.location().start_offset()),
             "unless",
         );
+        if node.end_keyword_loc().is_some() {
+            self.check_condition_position(b"unless", node.keyword_loc().start_offset(), &node.predicate());
+        }
         self.cond_depth += 1;
         ruby_prism::visit_unless_node(self, node);
         self.cond_depth -= 1;
@@ -825,6 +833,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
+        if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
+            self.check_condition_position(b"while", node.keyword_loc().start_offset(), &node.predicate());
+        }
         self.check_while_until_do(&node.predicate(), node.do_keyword_loc(), node.location(),
             node.statements().map(|s| s.location().start_offset()), "while");
         self.cond_depth += 1;
@@ -833,6 +844,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
+        if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
+            self.check_condition_position(b"until", node.keyword_loc().start_offset(), &node.predicate());
+        }
         self.check_while_until_do(&node.predicate(), node.do_keyword_loc(), node.location(),
             node.statements().map(|s| s.location().start_offset()), "until");
         self.cond_depth += 1;
