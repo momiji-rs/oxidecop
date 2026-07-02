@@ -1397,3 +1397,55 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((pos, pos + 1, Vec::new()));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/NestedPercentLiteral — a percent-literal array (`%i`, `%w`, `%I`,
+    /// `%W`, `%q`, `%Q`, `%r`, `%s`, `%x`, or the bare `%`) whose elements'
+    /// raw source *look* like the start of another percent literal (e.g.
+    /// `%w[%w(a) b]`). Because `%i`/`%w`-family literals split their body on
+    /// whitespace with no awareness of nested delimiters, such a nested
+    /// literal is parsed as plain tokens rather than as a real nested array —
+    /// almost certainly not what was intended. No autocorrect (rubocop's
+    /// original has none either).
+    pub(crate) fn check_nested_percent_literal(&mut self, node: &ruby_prism::ArrayNode<'_>) {
+        const COP: &str = "Lint/NestedPercentLiteral";
+        if !self.on(COP) {
+            return;
+        }
+        // rubocop's `PercentLiteral#percent_literal?` + `type` check: only
+        // arrays actually opened with a `%`-prefixed literal (`%i`, `%w`,
+        // `%I`, `%W`, ...) are in scope — `[a, b]` or `%(a b)` (a *string*,
+        // not an array) never reach here.
+        let Some(opening) = node.opening_loc() else { return };
+        if !opening.as_slice().starts_with(b"%") {
+            return;
+        }
+
+        let re = {
+            static RE: OnceLock<regex::Regex> = OnceLock::new();
+            RE.get_or_init(|| {
+                // PERCENT_LITERAL_TYPES = %w[% %i %I %q %Q %r %s %w %W %x];
+                // REGEXES = types.map { |t| /\A#{t}\W/ } — any element whose
+                // raw source starts with one of these percent-literal
+                // openers immediately followed by a delimiter character.
+                regex::Regex::new(r"^(?:%i|%I|%q|%Q|%r|%s|%w|%W|%x|%)\W").unwrap()
+            })
+        };
+
+        let contains_nested = node.elements().iter().any(|el| {
+            let src = self.node_src(&el);
+            re.is_match(&String::from_utf8_lossy(src))
+        });
+        if !contains_nested {
+            return;
+        }
+
+        let l = node.location();
+        self.push(
+            l.start_offset(),
+            COP,
+            false,
+            "Within percent literals, nested percent literals do not function and may be unwanted in the result.",
+        );
+    }
+}

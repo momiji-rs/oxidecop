@@ -142,7 +142,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire", "Lint/TrailingCommaInAttributeDeclaration",
-    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars",
+    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -933,6 +933,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_parentheses_node(self, node);
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+        self.check_nested_percent_literal(node);
         if self.ll_active {
             let heredoc_arg_index = node
                 .elements()
