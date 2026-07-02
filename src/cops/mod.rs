@@ -141,6 +141,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
+    "Layout/LeadingEmptyLines",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -1279,6 +1280,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     cops.check_empty_file();
     cops.check_trailing_empty_lines();
     cops.check_initial_indentation(first_code_off);
+    cops.check_leading_empty_lines(first_code_off);
     let t = tick(&T_TEXT, t);
 
     // ---- AST-based cops ----

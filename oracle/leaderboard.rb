@@ -51,6 +51,7 @@ COPS = {
   'Lint/DuplicateCaseCondition'      => 'lint/duplicate_case_condition',
   'Lint/DuplicateElsifCondition'     => 'lint/duplicate_elsif_condition',
   'Style/ColonMethodDefinition'      => 'style/colon_method_definition',
+  'Layout/LeadingEmptyLines'         => 'layout/leading_empty_lines',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

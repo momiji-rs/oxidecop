@@ -784,3 +784,33 @@ impl<'a> Cops<'a> {
         self.fixes.push((space_pos, lparen_start, Vec::new()));
     }
 }
+
+impl<'a> Cops<'a> {
+
+    /// Layout/LeadingEmptyLines — the file must not have blank lines at the
+    /// very start before the first code or comment.
+    pub(crate) fn check_leading_empty_lines(&mut self, first_code_off: Option<usize>) {
+        const COP: &str = "Layout/LeadingEmptyLines";
+        if !self.on(COP) {
+            return;
+        }
+        // The first token is either the first comment or the first code statement
+        let first_comment_off = self.comments.first().map(|(_, s, _)| *s);
+        let first_off = match (first_comment_off, first_code_off) {
+            (Some(c), Some(d)) => Some(c.min(d)),
+            (Some(c), None) => Some(c),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
+        };
+        let Some(off) = first_off else { return };
+        let (line, _) = self.idx.loc(off);
+        if line <= 1 {
+            return;
+        }
+        // There are leading blank lines. The offense anchors on the first token.
+        self.push(off, COP, true, "Unnecessary blank line at the beginning of the source.");
+        // Fix: remove everything from byte 0 to the start of the line containing the first token
+        let line_start = self.idx.starts[line - 1];
+        self.fixes.push((0, line_start, Vec::new()));
+    }
+}
