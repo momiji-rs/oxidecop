@@ -1379,3 +1379,92 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/EmptyLinesAroundMethodBody — ported from rubocop's
+    /// `EmptyLinesAroundMethodBody` cop + its `EmptyLinesAroundBody` mixin.
+    /// `style` is hardcoded to `:no_empty_lines`
+    /// (`EmptyLinesAroundMethodBody#style`) — this cop never allows the
+    /// "require a blank line" styles the mixin also supports for other body
+    /// kinds (class/module).
+    ///
+    /// For a regular (non-endless) `def`, the "beginning" line anchors on
+    /// the SIGNATURE's last line — `node.rparen_loc()`'s line when the
+    /// params are parenthesized (a multiline parameter list shifts this
+    /// down, per the spec's "empty lines and arguments spanning multiple
+    /// lines" examples), or the `def` keyword's own line otherwise —
+    /// mirroring rubocop's `node.arguments.source_range&.last_line`. The
+    /// "end" line anchors on the line right before the `end` keyword,
+    /// exactly like `check_empty_lines_around_begin_body`, including that
+    /// sibling's dedup for the single-blank-line-body case (`def foo\n\nend`)
+    /// where the "beginning" and "end" lines coincide — verified against
+    /// rubocop 1.88.0 directly, since the spec fixture doesn't cover it.
+    /// Single-line defs (`node.single_line?`) are exempt.
+    ///
+    /// Endless defs (`def foo = quux`) have no `end` keyword to anchor an
+    /// "end" check on, so rubocop special-cases them entirely
+    /// (`offending_endless_method?` / `register_offense_for_endless_method`):
+    /// only a blank line right after the `=` — when the body starts more
+    /// than one line down from it — is ever flagged, always as "beginning".
+    pub(crate) fn check_empty_lines_around_method_body(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Layout/EmptyLinesAroundMethodBody";
+        if !self.on(COP) {
+            return;
+        }
+
+        // A strictly empty line (rubocop's `String#empty?` on
+        // `processed_source.lines[n]` — whitespace-only lines do NOT count
+        // as blank).
+        fn is_blank_line(c: &super::Cops, line: usize) -> bool {
+            match c.idx.starts.get(line - 1) {
+                Some(&s) => c.line_end(line) == s,
+                None => false,
+            }
+        }
+        // Flags a blank line: offense anchors on its (empty) content — a
+        // 1-byte range at column 0 that is really just the line's own
+        // newline — and the fix removes that newline, deleting the line.
+        let flag = |c: &mut Self, line: usize, desc: &str| {
+            let off = c.idx.starts[line - 1];
+            c.fixes.push((off, off + 1, Vec::new()));
+            c.push(off, COP, true, format!("Extra empty line detected at method body {desc}."));
+        };
+
+        if let Some(equal_loc) = node.equal_loc() {
+            // Endless method: `def foo = quux`. No `end` keyword — only the
+            // "beginning" side can ever be checked.
+            let Some(body) = node.body() else { return };
+            let assignment_line = self.idx.loc(equal_loc.start_offset()).0;
+            let body_first_line = self.idx.loc(body.location().start_offset()).0;
+            if body_first_line > assignment_line + 1 && is_blank_line(self, assignment_line + 1) {
+                flag(self, assignment_line + 1, "beginning");
+            }
+            return;
+        }
+
+        let Some(end_loc) = node.end_keyword_loc() else { return };
+        let def_line = self.idx.loc(node.def_keyword_loc().start_offset()).0;
+        let end_line = self.idx.loc(end_loc.start_offset()).0;
+        if def_line == end_line {
+            return; // single-line def — exempt, like `node.single_line?`
+        }
+
+        let first_line = match node.rparen_loc() {
+            Some(rparen) => self.idx.loc(rparen.start_offset()).0,
+            None => def_line,
+        };
+        let after_line = first_line + 1;
+        let before_end_line = end_line - 1;
+
+        let after_blank = is_blank_line(self, after_line);
+        if after_blank {
+            flag(self, after_line, "beginning");
+        }
+        if before_end_line == after_line && after_blank {
+            return;
+        }
+        if is_blank_line(self, before_end_line) {
+            flag(self, before_end_line, "end");
+        }
+    }
+}
