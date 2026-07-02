@@ -94,6 +94,7 @@ COPS = {
   'Style/ClassVars'                  => 'style/class_vars',
   'Lint/NestedPercentLiteral'        => 'lint/nested_percent_literal',
   'Lint/PercentSymbolArray'          => 'lint/percent_symbol_array',
+  'Style/MinMax'                     => 'style/min_max',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

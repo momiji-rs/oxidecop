@@ -3179,3 +3179,80 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Style/MinMax on an array literal (or bracket-less implicit array,
+    /// e.g. the RHS of `bar = foo.min, foo.max`) — ports rubocop's
+    /// `min_max_candidate` node-matcher applied to `on_array`:
+    /// `(array (send [$_receiver !nil?] :min) (send [$_receiver !nil?] :max))`.
+    /// The offense/replacement range is the array node's own `source_range`,
+    /// which already excludes the brackets when `opening_loc` is absent.
+    pub(crate) fn check_min_max_array(&mut self, node: &ruby_prism::ArrayNode) {
+        if !self.on("Style/MinMax") {
+            return;
+        }
+        let elements = node.elements();
+        if elements.iter().count() != 2 {
+            return;
+        }
+        let mut it = elements.iter();
+        let first = it.next().unwrap();
+        let last = it.next().unwrap();
+        let l = node.location();
+        self.check_min_max_pair(&first, &last, l.start_offset(), l.end_offset());
+    }
+
+    /// Style/MinMax on `return foo.min, foo.max` — rubocop aliases `on_return`
+    /// to the same matcher (`{array return}` in the pattern), but the offense
+    /// range there is `argument_range` (first arg's start .. last arg's end),
+    /// NOT the return node's own source range (which would include `return`).
+    pub(crate) fn check_min_max_return(&mut self, node: &ruby_prism::ReturnNode) {
+        if !self.on("Style/MinMax") {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let arguments = args.arguments();
+        if arguments.iter().count() != 2 {
+            return;
+        }
+        let mut it = arguments.iter();
+        let first = it.next().unwrap();
+        let last = it.next().unwrap();
+        let start = first.location().start_offset();
+        let end = last.location().end_offset();
+        self.check_min_max_pair(&first, &last, start, end);
+    }
+
+    /// Shared matcher body: `first`/`last` must be bare (no args, no block,
+    /// not safe-navigation) `.min`/`.max` calls on an EXPLICIT and IDENTICAL
+    /// receiver (compared by source bytes, like `Lint/DuplicateHashKey`).
+    fn check_min_max_pair(&mut self, first: &ruby_prism::Node, last: &ruby_prism::Node, start: usize, end: usize) {
+        const COP: &str = "Style/MinMax";
+        let Some(first_call) = first.as_call_node() else { return };
+        let Some(last_call) = last.as_call_node() else { return };
+        if first_call.name().as_slice() != b"min" || last_call.name().as_slice() != b"max" {
+            return;
+        }
+        if first_call.arguments().is_some() || last_call.arguments().is_some() {
+            return;
+        }
+        if first_call.block().is_some() || last_call.block().is_some() {
+            return;
+        }
+        if first_call.is_safe_navigation() || last_call.is_safe_navigation() {
+            return;
+        }
+        let Some(recv1) = first_call.receiver() else { return };
+        let Some(recv2) = last_call.receiver() else { return };
+        let recv1_src = self.node_src(&recv1);
+        if recv1_src != self.node_src(&recv2) {
+            return;
+        }
+        let offender = String::from_utf8_lossy(&self.src[start..end]).into_owned();
+        let receiver = String::from_utf8_lossy(recv1_src).into_owned();
+        self.push(start, COP, true, format!("Use `{receiver}.minmax` instead of `{offender}`."));
+        let mut replacement = recv1_src.to_vec();
+        replacement.extend_from_slice(b".minmax");
+        self.fixes.push((start, end, replacement));
+    }
+}
