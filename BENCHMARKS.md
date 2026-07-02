@@ -28,12 +28,23 @@ offenses are wrong).
 
 Speed only matters if the answers are right. Offense counts on the exact same
 corpora, with working RuboCop (project config, plugin `require`s stripped so it
-can run) as ground truth:
+can run) as ground truth. For rubocop-rs, "match" means the diff of normalized
+offense lines (file:line:col + full message) is empty — not just equal counts:
 
-| Corpus | RuboCop (truth) | rubocop-rs | oxicop |
-|---|--:|--:|--:|
-| Jekyll | **0** | **0** | **6,504** |
-| RuboCop repo | **0** | **0** | **2,665** |
+| Corpus | RuboCop (truth) | rubocop-rs | nitrocop | oxicop |
+|---|--:|--:|--:|--:|
+| Jekyll | **0** | **0** | 0 | 6,504 |
+| RuboCop repo | **0** | **0** | 0 | 2,665 |
+| rubygems.org | **0** | **0** | 0 | — |
+| Mastodon | **2,100** | **2,100** (0-diff) | 2,100 | 2,915 |
+| Rails | **393** | **393** (0-diff) | **1** | — |
+
+Mastodon exercises `inherit_from` chains, `DisplayStyleGuide` message
+suffixes, `rubocop:disable all -- reason` trailers, and shebang-only `bin/*`
+executables — all reproduced byte-for-byte. Rails (`DisabledByDefault: true`)
+exposes that nitrocop's `--only` does not force-enable cops the way RuboCop's
+does: it reports 1 offense where RuboCop reports 393; rubocop-rs matches all
+393 byte-for-byte.
 
 oxicop's offenses on Jekyll are 6,499 × `Style/StringLiterals` false positives:
 it applies the default `single_quotes` style to a codebase whose `.rubocop.yml`
