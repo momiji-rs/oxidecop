@@ -4,9 +4,9 @@ A fast, native, **RuboCop-compatible** Ruby linter — written in Rust, over the
 official [Prism](https://github.com/ruby/prism) parser. Think *ruff, but for
 Ruby, and bug-compatible with the RuboCop everyone already uses.*
 
-> **Status: early / experimental.** The core idea is proven — the 17
+> **Status: early / experimental.** The core idea is proven — the 22
 > implemented cops pass **100% of RuboCop's own representable spec examples**
-> (687/687, see below) — but 17 cops is not a shippable linter yet.
+> (716/716, see below) — but 22 cops is not a shippable linter yet.
 
 ---
 
@@ -109,12 +109,17 @@ Naming/MethodName                        29     49    29/29       29/29      100
 Style/NumericLiterals                    28      0    28/28       28/28      100%
 Layout/TrailingWhitespace                19      0    19/19       19/19      100%
 Style/EvenOdd                            18      0    18/18       18/18      100%
+Lint/UriRegexp                           10      0    10/10       10/10      100%
 Lint/BooleanSymbol                       10      0    10/10       10/10      100%
 Style/NilComparison                       8      0     8/8         8/8       100%
+Style/StringChars                         8      0     8/8         8/8       100%
 Style/ArrayJoin                           5      0     5/5         5/5       100%
+Style/Dir                                 4      0     4/4         4/4       100%
+Style/NestedFileDirname                   4      1     4/4         4/4       100%
+Lint/BigDecimalNew                        3      0     3/3         3/3       100%
 Lint/RandOne                              0      1     0/0         0/0          —
 ────────────────────────────────────────────────────────────────────────────
-TOTAL (representable examples)          687    127                687/687     100%
+TOTAL (representable examples)          716    128                716/716     100%
 ```
 
 **Read this honestly:** the score is over *representable* examples only. RuboCop's

@@ -21,6 +21,10 @@ pub const DECLARATIVE: &[(&str, &str, &str, Anchor, Option<&str>)] = &[
     // ArrayJoin — rubocop's join_candidate? pattern; fixed message, offense on
     // the `*` selector.
     ("(send array :* str)", "Style/ArrayJoin", "Favor `Array#join` over `Array#*`.", Anchor::Op, None),
+
+    // BigDecimalNew — deprecation with a fixed message, offense on `new`.
+    ("(send (const {nil? cbase} :BigDecimal) :new ...)",
+     "Lint/BigDecimalNew", "`BigDecimal.new()` is deprecated. Use `BigDecimal()` instead.", Anchor::Op, None),
 ];
 
 /// Where a declarative offense points. Per-cop metadata, since rubocop's cops

@@ -648,6 +648,91 @@ impl<'a> Cops<'a> {
         self.fixes.push((l.start_offset(), l.end_offset(), format!("{}.{method}?", caps[0]).into_bytes()));
     }
 
+    /// Style/Dir — `File.expand_path(File.dirname(__FILE__))` and
+    /// `File.dirname(File.realpath(__FILE__))` → `__dir__`.
+    pub(crate) fn check_dir(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/Dir";
+        if !self.on(COP) {
+            return;
+        }
+        static PAT: OnceLock<Pat> = OnceLock::new();
+        let pat = matcher(&PAT,
+            "{(send (const {nil? cbase} :File) :expand_path (send (const {nil? cbase} :File) :dirname $_)) \
+              (send (const {nil? cbase} :File) :dirname (send (const {nil? cbase} :File) :realpath $_))}");
+        let Some(caps) = nodepattern::matches(pat, &node.as_node(), self.src) else { return };
+        // rubocop's #file_keyword?: the inner argument must be literally __FILE__
+        if caps[0] != "__FILE__" {
+            return;
+        }
+        let l = node.location();
+        self.push(l.start_offset(), COP, true,
+            "Use `__dir__` to get an absolute path to the current file's directory.");
+        self.fixes.push((l.start_offset(), l.end_offset(), b"__dir__".to_vec()));
+    }
+
+    /// Style/StringChars — `split('')` / `split("")` / `split(//)` → `chars`.
+    pub(crate) fn check_string_chars(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/StringChars";
+        if !self.on(COP) || node.name().as_slice() != b"split" {
+            return;
+        }
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.len() != 1 || !matches!(self.node_src(&args[0]), b"//" | b"''" | b"\"\"") {
+            return;
+        }
+        let Some(sel) = node.message_loc() else { return };
+        let (start, end) = (sel.start_offset(), node.location().end_offset());
+        let cur = String::from_utf8_lossy(&self.src[start..end]).into_owned();
+        self.push(start, COP, true, format!("Use `chars` instead of `{cur}`."));
+        self.fixes.push((start, end, b"chars".to_vec()));
+    }
+
+    /// Style/NestedFileDirname — `File.dirname(File.dirname(path))` →
+    /// `File.dirname(path, 2)`. Fires on the OUTERMOST of a dirname chain
+    /// (rubocop guards on `node.parent`; we mark the inner calls instead).
+    pub(crate) fn check_nested_file_dirname(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/NestedFileDirname";
+        // rubocop: minimum_target_ruby_version 3.1
+        if !self.on(COP) || self.cfg.target_ruby() < 3.1 {
+            return;
+        }
+        static PAT: OnceLock<Pat> = OnceLock::new();
+        let pat = matcher(&PAT, "(send (const {cbase nil?} :File) :dirname ...)");
+        let l = node.location();
+        if self.dirname_ignore.contains(&l.start_offset()) {
+            return;
+        }
+        let is_dirname = |n: &ruby_prism::Node| nodepattern::matches(pat, n, self.src).is_some();
+        if !is_dirname(&node.as_node()) {
+            return;
+        }
+        let Some(arg) = first_call_arg(node) else { return };
+        if !is_dirname(&arg) {
+            return;
+        }
+        // walk the chain, claiming inner dirname calls and counting levels
+        let mut level = 1;
+        let mut cur = arg;
+        loop {
+            self.dirname_ignore.push(cur.location().start_offset());
+            level += 1;
+            let inner = cur.as_call_node().and_then(|c| first_call_arg(&c));
+            match inner {
+                Some(i) if is_dirname(&i) => cur = i,
+                Some(i) => {
+                    let path = String::from_utf8_lossy(self.node_src(&i)).into_owned();
+                    let Some(sel) = node.message_loc() else { return };
+                    let (start, end) = (sel.start_offset(), l.end_offset());
+                    self.push(start, COP, true, format!("Use `dirname({path}, {level})` instead."));
+                    self.fixes.push((start, end, format!("dirname({path}, {level})").into_bytes()));
+                    return;
+                }
+                None => return,
+            }
+        }
+    }
+
     /// Lint/BooleanSymbol — `:true` / `:false` literals (outside `%i[]`).
     pub(crate) fn check_boolean_symbol(&mut self, node: &ruby_prism::SymbolNode) {
         const COP: &str = "Lint/BooleanSymbol";
@@ -923,6 +1008,11 @@ fn include_statements_only(body: &ruby_prism::Node) -> bool {
                     && (args[0].as_constant_read_node().is_some() || args[0].as_constant_path_node().is_some())
             })
     })
+}
+
+/// The first positional argument of a call.
+fn first_call_arg<'pr>(c: &ruby_prism::CallNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    c.arguments().and_then(|a| a.arguments().iter().next())
 }
 
 // ---- Style/ZeroLengthPredicate helper ----

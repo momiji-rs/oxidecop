@@ -39,7 +39,12 @@ COPS = {
   'Style/EvenOdd'                    => 'style/even_odd',
   'Lint/RandOne'                     => 'lint/rand_one',
   'Style/ArrayJoin'                  => 'style/array_join',
-  'Lint/BooleanSymbol'               => 'lint/boolean_symbol'
+  'Lint/BooleanSymbol'               => 'lint/boolean_symbol',
+  'Lint/BigDecimalNew'               => 'lint/big_decimal_new',
+  'Style/Dir'                        => 'style/dir',
+  'Style/StringChars'                => 'style/string_chars',
+  'Style/NestedFileDirname'          => 'style/nested_file_dirname',
+  'Lint/UriRegexp'                   => 'lint/uri_regexp'
 }.freeze
 
 FileUtils.mkdir_p(DIR)

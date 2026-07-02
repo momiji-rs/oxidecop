@@ -90,6 +90,8 @@ pub(crate) struct Cops<'a> {
     pub(crate) num_ignore: Vec<usize>,
     // Spans of `%i[...]`/`%I[...]` arrays — Lint/BooleanSymbol skips those.
     pub(crate) percent_sym_spans: Vec<(usize, usize)>,
+    // Inner `File.dirname` calls claimed by an outer chain (NestedFileDirname).
+    pub(crate) dirname_ignore: Vec<usize>,
     // Heredoc BODIES as (first line, last line, delimiter) — terminator
     // excluded. Layout/TrailingWhitespace and Layout/LineLength consult these.
     pub(crate) heredoc_lines: Vec<(usize, usize, Vec<u8>)>,
@@ -325,6 +327,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.check_zero_length(node);
         self.check_even_odd(node);
+        self.check_dir(node);
+        self.check_string_chars(node);
+        self.check_nested_file_dirname(node);
+        self.check_uri_regexp(node);
         // Style/RedundantReturn also fires for method-defining blocks
         // (rubocop's RESTRICT_ON_SEND: define_method & friends, lambda).
         if self.on("Style/RedundantReturn")
@@ -452,6 +458,7 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         str_ignore: Vec::new(),
         num_ignore: Vec::new(),
         percent_sym_spans: Vec::new(),
+        dirname_ignore: Vec::new(),
         heredoc_lines,
         data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
         class_children_stack: Vec::new(),
