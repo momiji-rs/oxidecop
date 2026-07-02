@@ -87,6 +87,7 @@ COPS = {
   'Layout/ConditionPosition'         => 'layout/condition_position',
   'Naming/HeredocDelimiterNaming'    => 'naming/heredoc_delimiter_naming',
   'Style/MultilineWhenThen'          => 'style/multiline_when_then',
+  'Naming/MethodParameterName'       => 'naming/method_parameter_name',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

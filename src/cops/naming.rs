@@ -570,3 +570,152 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+/// Naming/MethodParameterName's default `AllowedNames` (config/default.yml) —
+/// unlike Naming/BlockParameterName, this default is non-empty, and array
+/// defaults don't live in the generated `SCHEMA` table (only scalars do), so
+/// it's hardcoded here.
+const DEFAULT_METHOD_PARAMETER_ALLOWED_NAMES: &[&str] =
+    &["as", "at", "by", "cc", "db", "id", "if", "in", "io", "ip", "of", "on", "os", "pp", "to"];
+
+impl<'a> Cops<'a> {
+    /// Naming/MethodParameterName — the UncommunicativeName mixin (checks
+    /// length, case, forbidden names, and number endings) applied to `def`/
+    /// `def self.` parameters. Same logic as `check_block_parameter_name`
+    /// above, applied to a `DefNode`'s parameters instead of a block's.
+    pub(crate) fn check_method_parameter_name(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Naming/MethodParameterName";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(pn) = node.parameters() else {
+            return;
+        };
+
+        let min_length = self.cfg.param(COP, "MinNameLength")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3);
+        // cfg.get falls back to the schema default (true for this cop);
+        // param() is user-config-only and silently reads false here
+        let allow_nums = self.cfg.get(COP, "AllowNamesEndingInNumbers") != Some("false");
+        let allowed_names: Vec<String> = self.cfg.param(COP, "AllowedNames")
+            .map(crate::config::parse_allowed_list)
+            .unwrap_or_else(|| {
+                DEFAULT_METHOD_PARAMETER_ALLOWED_NAMES.iter().map(|s| s.to_string()).collect()
+            });
+        let forbidden_names: Vec<String> = self.cfg.param(COP, "ForbiddenNames")
+            .map(crate::config::parse_allowed_list)
+            .unwrap_or_default();
+
+        // Process required parameters
+        for param in pn.requireds().iter() {
+            if let Some(rp) = param.as_required_parameter_node() {
+                self.check_method_param(rp.name().as_slice(), rp.location().start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            }
+        }
+
+        // Process optional parameters
+        for param in pn.optionals().iter() {
+            if let Some(op) = param.as_optional_parameter_node() {
+                self.check_method_param(op.name().as_slice(), op.location().start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            }
+        }
+
+        // Process rest parameter
+        if let Some(rest) = pn.rest() {
+            if let Some(rp) = rest.as_rest_parameter_node() {
+                if let Some(name) = rp.name() {
+                    let loc = rp.location();
+                    self.check_method_param(name.as_slice(), loc.start_offset(),
+                        min_length, allow_nums, &allowed_names, &forbidden_names);
+                }
+            }
+        }
+
+        // Process post parameters
+        for param in pn.posts().iter() {
+            if let Some(pp) = param.as_required_parameter_node() {
+                self.check_method_param(pp.name().as_slice(), pp.location().start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            }
+        }
+
+        // Process keyword parameters
+        for param in pn.keywords().iter() {
+            if let Some(kp) = param.as_optional_keyword_parameter_node() {
+                self.check_method_param(kp.name().as_slice(), kp.location().start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            } else if let Some(kp) = param.as_required_keyword_parameter_node() {
+                self.check_method_param(kp.name().as_slice(), kp.location().start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            }
+        }
+
+        // Process keyword rest parameter
+        if let Some(kwrest) = pn.keyword_rest() {
+            if let Some(kw) = kwrest.as_keyword_rest_parameter_node() {
+                if let Some(name) = kw.name() {
+                    let loc = kw.location();
+                    self.check_method_param(name.as_slice(), loc.start_offset(),
+                        min_length, allow_nums, &allowed_names, &forbidden_names);
+                }
+            }
+        }
+
+        // Process block parameter
+        if let Some(bp) = pn.block() {
+            if let Some(name) = bp.name() {
+                let loc = bp.location();
+                self.check_method_param(name.as_slice(), loc.start_offset(),
+                    min_length, allow_nums, &allowed_names, &forbidden_names);
+            }
+        }
+    }
+
+    /// Applies the UncommunicativeName mixin's checks to a single `def`
+    /// parameter. Unlike `check_block_param`'s early `return` after a
+    /// forbidden-name hit, the real mixin (`issue_offenses`) evaluates every
+    /// condition independently — a name can register more than one offense
+    /// (e.g. both forbidden AND uppercase) — so this doesn't short-circuit.
+    fn check_method_param(&mut self, name_bytes: &[u8], start_off: usize,
+                          min_length: usize, allow_nums: bool, allowed_names: &[String],
+                          forbidden_names: &[String]) {
+        const COP: &str = "Naming/MethodParameterName";
+
+        // Argument names might be "_" or prefixed with "_" to indicate they
+        // are unused. Trim away this prefix and only analyse the basename.
+        let full_name = String::from_utf8_lossy(name_bytes).into_owned();
+        if full_name == "_" {
+            return;
+        }
+        let name = full_name.trim_start_matches('_');
+
+        // allowed_names/forbidden_names match against the underscore-trimmed
+        // name, not the full (possibly `_`-prefixed) name.
+        if allowed_names.iter().any(|n| n == name) {
+            return;
+        }
+
+        if forbidden_names.iter().any(|n| n == name) {
+            self.push(start_off, COP, false,
+                format!("Do not use {name} as a name for a method parameter."));
+        }
+        if name.chars().any(|c| c.is_uppercase()) {
+            self.push(start_off, COP, false,
+                "Only use lowercase characters for method parameter.".to_string());
+        }
+        if name.chars().count() < min_length {
+            self.push(start_off, COP, false,
+                format!("Method parameter must be at least {min_length} characters long."));
+        }
+        if allow_nums {
+            return;
+        }
+        if name.chars().last().is_some_and(|c| c.is_ascii_digit()) {
+            self.push(start_off, COP, false,
+                "Do not end method parameter with a number.".to_string());
+        }
+    }
+}
