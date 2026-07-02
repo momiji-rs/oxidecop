@@ -1653,3 +1653,171 @@ fn char_width(c: char) -> usize {
     );
     if wide { 2 } else { 1 }
 }
+impl<'a> Cops<'a> {
+    /// Layout/SpaceInsidePercentLiteralDelimiters — checks for unnecessary
+    /// additional spaces inside the delimiters of %i/%w/%x literals.
+    pub(crate) fn check_space_inside_percent_literal_delimiters_array(
+        &mut self,
+        node: &ruby_prism::ArrayNode<'_>,
+    ) {
+        const COP: &str = "Layout/SpaceInsidePercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is a percent literal array
+        let Some(opening) = node.opening_loc() else { return };
+        let opening_bytes = opening.as_slice();
+
+        // Must start with %
+        if !opening_bytes.starts_with(b"%") || opening_bytes.len() < 2 {
+            return;
+        }
+
+        // Check for %i, %I, %w, %W
+        let literal_type = opening_bytes[1];
+        if !matches!(literal_type, b'i' | b'I' | b'w' | b'W') {
+            return;
+        }
+
+        let Some(closing) = node.closing_loc() else { return };
+        self.check_percent_literal_delimiters_content(opening, closing);
+    }
+
+    /// Layout/SpaceInsidePercentLiteralDelimiters — checks for unnecessary
+    /// additional spaces inside the delimiters of %x literals.
+    pub(crate) fn check_space_inside_percent_literal_delimiters_xstr(
+        &mut self,
+        node: &ruby_prism::XStringNode<'_>,
+    ) {
+        const COP: &str = "Layout/SpaceInsidePercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is a percent literal
+        let opening = node.opening_loc();
+        let opening_bytes = opening.as_slice();
+
+        // Must start with %
+        if !opening_bytes.starts_with(b"%") || opening_bytes.len() < 2 {
+            return;
+        }
+
+        // Check for %x
+        let literal_type = opening_bytes[1];
+        if literal_type != b'x' {
+            return;
+        }
+
+        let closing = node.closing_loc();
+        self.check_percent_literal_delimiters_content(opening, closing);
+    }
+
+    /// Check the content between opening and closing delimiters for
+    /// unnecessary spaces. Handles both blank content and leading/trailing spaces.
+    fn check_percent_literal_delimiters_content(
+        &mut self,
+        opening: ruby_prism::Location,
+        closing: ruby_prism::Location,
+    ) {
+        const COP: &str = "Layout/SpaceInsidePercentLiteralDelimiters";
+        const MSG: &str = "Do not use spaces inside percent literal delimiters.";
+
+        let open_end = opening.end_offset();
+        let close_start = closing.start_offset();
+
+        // Get the body range (from end of opening delimiter to start of closing delimiter)
+        if open_end >= close_start {
+            return;
+        }
+
+        let body_slice = &self.src[open_end..close_start];
+
+        // Check for blank content (only spaces and/or newlines)
+        let is_blank = body_slice.iter().all(|&b| b == b' ' || b == b'\n' || b == b'\r');
+
+        if is_blank {
+            // If content is all whitespace, report the entire body range for removal
+            if !body_slice.is_empty() {
+                self.push(open_end, COP, true, MSG);
+                self.fixes.push((open_end, close_start, vec![]));
+            }
+            return;
+        }
+
+        // Check for single-line literals with unnecessary leading/trailing spaces
+        if !body_slice.contains(&b'\n') {
+            // Single-line: check for leading and trailing spaces
+            self.check_leading_spaces(open_end, close_start);
+            self.check_trailing_spaces(open_end, close_start);
+        }
+    }
+
+    /// Check for leading spaces after the opening delimiter (single-line only).
+    fn check_leading_spaces(&mut self, start: usize, end: usize) {
+        const COP: &str = "Layout/SpaceInsidePercentLiteralDelimiters";
+        const MSG: &str = "Do not use spaces inside percent literal delimiters.";
+
+        // Match leading spaces (but not escaped spaces)
+        let mut pos = start;
+        while pos < end && self.src[pos] == b' ' {
+            pos += 1;
+        }
+
+        // If we found leading spaces, report them
+        if pos > start {
+            self.push(start, COP, true, MSG);
+            self.fixes.push((start, pos, vec![]));
+        }
+    }
+
+    /// Check for trailing spaces before the closing delimiter (single-line only).
+    fn check_trailing_spaces(&mut self, start: usize, end: usize) {
+        const COP: &str = "Layout/SpaceInsidePercentLiteralDelimiters";
+        const MSG: &str = "Do not use spaces inside percent literal delimiters.";
+
+        // Scan backwards from the end to find trailing spaces
+        let mut pos = end;
+        while pos > start && self.src[pos - 1] == b' ' {
+            pos -= 1;
+        }
+
+        // If we found trailing spaces, check which ones should be reported
+        if pos < end {
+            // We found trailing spaces. Check the character before them.
+            let char_before_spaces = if pos > start { self.src[pos - 1] } else { b'\n' };
+
+            // If preceded by a backslash, we need special handling
+            if char_before_spaces == b'\\' {
+                // Check if the backslash itself is escaped by counting preceding backslashes
+                let mut backslash_count = 0;
+                let mut check_pos = pos - 1;
+                while check_pos > start && self.src[check_pos] == b'\\' {
+                    backslash_count += 1;
+                    check_pos = check_pos.saturating_sub(1);
+                }
+
+                // If there's an odd number of backslashes, the first space after them is escaped
+                if backslash_count % 2 == 1 {
+                    // The first space after the backslash is escaped.
+                    // But if there are multiple spaces, the ones after the first might not be escaped.
+                    // Count spaces: if there's more than one, report the ones after the first.
+                    let space_count = end - pos;
+                    if space_count > 1 {
+                        // Report all but the first space (which is escaped)
+                        self.push(pos + 1, COP, true, MSG);
+                        self.fixes.push((pos + 1, end, vec![]));
+                    }
+                    // If there's only one space and it's escaped, don't report
+                    return;
+                }
+            }
+
+            // If not preceded by a backslash (or even number of backslashes), report all trailing spaces
+            self.push(pos, COP, true, MSG);
+            self.fixes.push((pos, end, vec![]));
+        }
+    }
+}
+
