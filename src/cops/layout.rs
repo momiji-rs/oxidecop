@@ -1191,3 +1191,92 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/EmptyLinesAroundBlockBody — ported from rubocop's
+    /// `EmptyLinesAroundBlockBody` cop + its `EmptyLinesAroundBody` mixin.
+    /// Only two `EnforcedStyle`s apply to blocks (`no_empty_lines` default,
+    /// `empty_lines`) — the mixin's namespace/deferred/beginning_only/
+    /// ending_only branches are for other body kinds (class/module/method)
+    /// and never reached from `on_block`.
+    ///
+    /// The mixin checks TWO fixed lines regardless of style: the line right
+    /// after the opening (`do`/`{`) — call it `begin_line` — and the line
+    /// right before the closing (`end`/`}`) — call it `pre_end_line`. Style
+    /// controls (a) whether blank is required or forbidden there, and (b)
+    /// where the offense/fix is anchored: `no_empty_lines` anchors both at
+    /// the tested line itself (and removes it); `empty_lines` anchors the
+    /// beginning at `begin_line` (inserts a newline before it) but anchors
+    /// the END at the CLOSER's own line (`close_line`, one past
+    /// `pre_end_line`) — this is rubocop's `offset = 2` special case in
+    /// `check_source` for `:empty_lines` + an "end." message.
+    ///
+    /// Only multi-line blocks reach this (mirrors `node.single_line?`); a
+    /// nil body under `empty_lines` style is exempt entirely (rubocop's
+    /// `valid_body_style?`) since neither presence nor absence of a blank
+    /// line can be enforced on nothing.
+    pub(crate) fn check_empty_lines_around_block_body(&mut self, block: &ruby_prism::BlockNode<'_>) {
+        const COP: &str = "Layout/EmptyLinesAroundBlockBody";
+        if !self.on(COP) {
+            return;
+        }
+        let open_off = block.opening_loc().start_offset();
+        let close_off = block.closing_loc().start_offset();
+        let open_line = self.idx.loc(open_off).0;
+        let close_line = self.idx.loc(close_off).0;
+        if close_line <= open_line {
+            return; // single-line block — exempt, like `node.single_line?`
+        }
+        let style_empty = self.cfg.get(COP, "EnforcedStyle") == Some("empty_lines");
+        if style_empty && block.body().is_none() {
+            return; // `valid_body_style?`: nil body under empty_lines is exempt
+        }
+        let nlines = self.idx.starts.len();
+        let is_blank = |c: &Self, line: usize| -> bool {
+            if line < 1 || line > nlines {
+                return false;
+            }
+            let s = c.idx.starts[line - 1];
+            c.line_end(line) == s
+        };
+        let line_start = |c: &Self, line: usize| c.idx.starts[line - 1];
+        // Delete the WHOLE line (through its trailing newline) — matches
+        // rubocop's `corrector.remove(range)` on a zero-content blank line.
+        let remove_line = |c: &mut Self, line: usize| {
+            let s = line_start(c, line);
+            let e = c.idx.starts.get(line).copied().unwrap_or_else(|| c.line_end(line));
+            c.fixes.push((s, e, Vec::new()));
+        };
+
+        let begin_line = open_line + 1;
+        let pre_end_line = close_line - 1;
+        let begin_blank = is_blank(self, begin_line);
+        let pre_end_blank = is_blank(self, pre_end_line);
+
+        if !style_empty {
+            if begin_blank {
+                let off = line_start(self, begin_line);
+                self.push(off, COP, true, "Extra empty line detected at block body beginning.");
+                remove_line(self, begin_line);
+            }
+            if pre_end_blank {
+                let off = line_start(self, pre_end_line);
+                self.push(off, COP, true, "Extra empty line detected at block body end.");
+                remove_line(self, pre_end_line);
+            }
+        } else {
+            if !begin_blank {
+                let off = line_start(self, begin_line);
+                self.push(off, COP, true, "Empty line missing at block body beginning.");
+                self.fixes.push((off, off, b"\n".to_vec()));
+            }
+            if !pre_end_blank {
+                // Anchored one line further down than the tested line — the
+                // closer's own line — per rubocop's offset-2 special case.
+                let off = line_start(self, close_line);
+                self.push(off, COP, true, "Empty line missing at block body end.");
+                self.fixes.push((off, off, b"\n".to_vec()));
+            }
+        }
+    }
+}
