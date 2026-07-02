@@ -141,7 +141,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
-    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless",
+    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -1045,6 +1045,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.bare_arg_frames.push((first, spans));
         }
         if let Some(b) = node.block() {
+            if let Some(bn) = b.as_block_node() {
+                self.check_empty_block_parameter(&bn);
+            }
             let has_args = node.arguments().is_some_and(|a| a.arguments().iter().count() > 0);
             let last_end = if node.lparen_loc().is_some() {
                 node.arguments().and_then(|a| a.arguments().iter().last().map(|n| n.location().end_offset()))
@@ -1062,6 +1065,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
         if let Some(b) = node.block() {
+            self.check_empty_block_parameter(&b);
             if let Some((off, msg)) = self.symbol_proc_super(&b.as_node(), false, None) {
                 self.push(off, "Style/SymbolProc", true, msg);
             }
@@ -1242,6 +1246,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         if let Some(b) = node.block() {
+            if let Some(bn) = b.as_block_node() {
+                self.check_empty_block_parameter(&bn);
+            }
             // A block is "scoping" (allows nested defs) if it's a class
             // constructor, an (instance|class|module)_(eval|exec), or its method
             // is in AllowedMethods.

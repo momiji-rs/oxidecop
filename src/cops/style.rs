@@ -2567,3 +2567,42 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((body_start, body_start, prefix));
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Style/EmptyBlockParameter — `foo { || bar }` / `foo do || bar end`.
+    /// Empty pipes on a block declare no parameters, so they're redundant.
+    /// Ported from rubocop's `EmptyBlockParameter` + its `EmptyParameter`
+    /// mixin. Note rubocop's node pattern `(block _ $(args) _)` only
+    /// captures an `args` node with ZERO children — i.e. non-empty pipes
+    /// (`|x|`) or block-locals (`|; x|`) never match — then
+    /// `empty_and_without_delimiters?` (`loc.expression.nil?`) filters out
+    /// the case with no pipes at all. Ported to prism: offend only when
+    /// `block.parameters()` is a `BlockParametersNode` (pipes present) whose
+    /// own `parameters()` is absent and `locals()` is empty.
+    ///
+    /// Arrow lambdas (`-> () { }`) are `LambdaNode` in prism, not a
+    /// `CallNode` with a block, so they never reach this hook — mirroring
+    /// rubocop's own `send_node.lambda_literal?` guard in `on_block`. A
+    /// brace/do-end block on the `lambda` METHOD (`lambda { || }`) is a
+    /// plain `CallNode` + `BlockNode` and DOES match, per the spec.
+    pub(crate) fn check_empty_block_parameter(&mut self, block: &ruby_prism::BlockNode<'_>) {
+        const COP: &str = "Style/EmptyBlockParameter";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(params) = block.parameters().and_then(|p| p.as_block_parameters_node()) else {
+            return;
+        };
+        if params.parameters().is_some() || params.locals().iter().next().is_some() {
+            return;
+        }
+        let loc = params.location();
+        let (start, end) = (loc.start_offset(), loc.end_offset());
+        self.push(start, COP, true, "Omit pipes for the empty block parameters.");
+        // `range_between(block.loc.begin.end_pos, node.source_range.end_pos)`:
+        // remove everything from right after the opening `{`/`do` through
+        // the closing pipe — this eats the space before `||` too, but
+        // leaves any space/text after the closing pipe untouched.
+        let remove_start = block.opening_loc().end_offset();
+        self.fixes.push((remove_start, end, Vec::new()));
+    }
+}

@@ -70,6 +70,7 @@ COPS = {
   'Style/EmptyLambdaParameter'       => 'style/empty_lambda_parameter',
   'Layout/SpaceInsideArrayPercentLiteral' => 'layout/space_inside_array_percent_literal',
   'Style/IfUnlessModifierOfIfUnless' => 'style/if_unless_modifier_of_if_unless',
+  'Style/EmptyBlockParameter'        => 'style/empty_block_parameter',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
