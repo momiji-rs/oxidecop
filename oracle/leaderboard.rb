@@ -93,6 +93,7 @@ COPS = {
   'Layout/EmptyLinesAroundBlockBody' => 'layout/empty_lines_around_block_body',
   'Style/ClassVars'                  => 'style/class_vars',
   'Lint/NestedPercentLiteral'        => 'lint/nested_percent_literal',
+  'Lint/PercentSymbolArray'          => 'lint/percent_symbol_array',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

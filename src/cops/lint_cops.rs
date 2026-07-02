@@ -1449,3 +1449,69 @@ impl<'a> super::Cops<'a> {
         );
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/PercentSymbolArray — detects colons and commas in %i/%I arrays,
+    /// which are likely unintended. For example, `%i(:foo, :bar)` should be
+    /// `%i(foo bar)`.
+    pub(crate) fn check_percent_symbol_array(&mut self, node: &ruby_prism::ArrayNode) {
+        const COP: &str = "Lint/PercentSymbolArray";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is a %i or %I array
+        let Some(open_loc) = node.opening_loc() else { return };
+        let open = open_loc.as_slice();
+        if !open.starts_with(b"%i") && !open.starts_with(b"%I") {
+            return;
+        }
+
+        // Check if any element has a leading : or trailing ,
+        let mut has_issue = false;
+        for element in node.elements().iter() {
+            let src = self.node_src(&element);
+
+            // Skip non-alphanumeric literals (like $, in %i{$,})
+            if !src.iter().any(|&b| b.is_ascii_alphanumeric()) {
+                continue;
+            }
+
+            if src.starts_with(b":") || src.ends_with(b",") {
+                has_issue = true;
+                break;
+            }
+        }
+
+        if has_issue {
+            let l = node.location();
+            self.push(
+                l.start_offset(),
+                COP,
+                true,
+                "Within `%i`/`%I`, ':' and ',' are unnecessary and may be unwanted in the resulting symbols.",
+            );
+
+            // Add fixes: for each element, remove leading : and trailing ,
+            for element in node.elements().iter() {
+                let el = element.location();
+                let src = self.node_src(&element);
+
+                // Skip non-alphanumeric literals
+                if !src.iter().any(|&b| b.is_ascii_alphanumeric()) {
+                    continue;
+                }
+
+                // Remove trailing comma
+                if src.ends_with(b",") {
+                    self.fixes.push((el.end_offset() - 1, el.end_offset(), Vec::new()));
+                }
+
+                // Remove leading colon
+                if src.starts_with(b":") {
+                    self.fixes.push((el.start_offset(), el.start_offset() + 1, Vec::new()));
+                }
+            }
+        }
+    }
+}
