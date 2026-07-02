@@ -20,6 +20,7 @@ COP  = ARGV[1] or abort 'need cop name'
 SPEC = ARGV[2] or abort 'need spec file'
 
 require 'tmpdir'
+require 'fileutils'
 require 'open3'
 
 # ---- extract examples from the spec file -------------------------------------
@@ -368,6 +369,9 @@ while i < lines.length
     squiggly = Regexp.last_match(2) == '~'
     raw_heredoc = Regexp.last_match(3) == "'"
     chomp = !(l =~ /chomp:\s*true/).nil? # expect_offense(<<~RUBY, chomp: true)
+    # `expect_offense(<<~RUBY, 'config.ru')` — a positional filename the cop
+    # keys behavior on (Gemfile/config.ru rules); honor it when linting.
+    fname = l[/RUBY'?,\s*['"]([^'"]+)['"]/, 1]
     body = []
     i += 1
     until lines[i].strip == 'RUBY'
@@ -378,7 +382,8 @@ while i < lines.length
     src = src.chomp if chomp
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
                   sections: cur_sec, override: cur_ovr, ruby: cur_rb, raw: raw_heredoc,
-                  lets: cur_lets.dup, other_cops: cur_oc, src: src, expected: expected }
+                  lets: cur_lets.dup, other_cops: cur_oc, src: src, expected: expected,
+                  filename: fname }
   elsif l =~ /expect_correction\(<<([~-])('?)RUBY\2\s*[,)]/ && examples.any? && examples.last[:kind] == :offense
     squiggly = Regexp.last_match(1) == '~'
     raw_heredoc = Regexp.last_match(2) == "'"
@@ -552,9 +557,10 @@ def build_cfg(cop, cfg_hash, as_val = nil, extra_sections = [], replace: false, 
   lines.join("\n") + "\n"
 end
 
-def run_poc(poc, src, cfg)
+def run_poc(poc, src, cfg, filename = nil)
   Dir.mktmpdir do |d|
-    rb = File.join(d, 'ex.rb')
+    rb = File.join(d, filename || 'ex.rb')
+    FileUtils.mkdir_p(File.dirname(rb))
     yml = File.join(d, 'c.yml')
     File.write(rb, src)
     File.write(yml, cfg)
@@ -575,9 +581,10 @@ end
 # interpolation in the SOURCE); they're excluded from loc/full/total.
 groups = Hash.new { |h, k| h[k] = { loc: 0, full: 0, total: 0, skipped: 0 } }
 fails = []
-def run_fix(poc, src, cfg, once: false)
+def run_fix(poc, src, cfg, filename = nil, once: false)
   Dir.mktmpdir do |d|
-    rb = File.join(d, 'ex.rb')
+    rb = File.join(d, filename || 'ex.rb')
+    FileUtils.mkdir_p(File.dirname(rb))
     yml = File.join(d, 'c.yml')
     File.write(rb, src)
     File.write(yml, cfg)
@@ -658,7 +665,7 @@ examples.each_with_index do |ex, n|
     next
   end
 
-  actual = run_poc(POC, src, build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace, ruby: ex[:ruby]))
+  actual = run_poc(POC, src, build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace, ruby: ex[:ruby]), ex[:filename])
   exp = ex[:expected].map { |l, c, m| [l, c, resolve_interp(m, cfg_hash, ex[:lets] || {})] }
   g[:total] += 1
 
@@ -682,13 +689,13 @@ examples.each_with_index do |ex, n|
   if (want = ex[:correction])
     fix_total += 1
     yml = build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace, ruby: ex[:ruby])
-    got = run_fix(POC, src, yml)
+    got = run_fix(POC, src, yml, ex[:filename])
     want_text = want == :none ? src : resolve_interp(want, cfg_hash, ex[:lets] || {}, raw: ex[:correction_raw])
     # expect_correction iterates with ONE cop instance, so `ignore_node`
     # suppressions persist structurally across rounds; a fresh `rubocop -a`
     # (our --fix) iterates with fresh instances and corrects more. Both are
     # rubocop behaviors — accept the single-pass result as the fallback.
-    got = run_fix(POC, src, yml, once: true) if got != want_text
+    got = run_fix(POC, src, yml, ex[:filename], once: true) if got != want_text
     if got == want_text
       fix_pass += 1
     else
