@@ -1817,3 +1817,149 @@ fn empty_lit_const(node: &ruby_prism::Node) -> Option<String> {
     }
     None
 }
+
+impl<'a> super::Cops<'a> {
+    /// Whether a byte offset sits inside a literal's content (string/regex/
+    /// symbol text) — semicolons there are data.
+    fn in_literal(&self, pos: usize) -> bool {
+        let i = self.lit_spans.partition_point(|(s, _)| *s <= pos);
+        i > 0 && pos < self.lit_spans[i - 1].1
+    }
+
+    fn semicolon_offense(&mut self, off: usize, remove: bool) {
+        if !self.semi_flagged.insert(off) {
+            return;
+        }
+        if remove {
+            // an endless range before the `;` must gain parens, or removal
+            // changes parsing (rubocop wraps the range node)
+            let before = self.src[..off].iter().rposition(|b| !b.is_ascii_whitespace());
+            if let Some(b) = before {
+                if self.src[b] == b'.' {
+                    if let Some((rs, re)) = self.range_spans.iter().find(|(_, e)| *e == b + 1).copied() {
+                        self.fixes.push((rs, rs, b"(".to_vec()));
+                        self.fixes.push((re, re, b")".to_vec()));
+                    }
+                }
+                // a value-omission label: parenthesize the kwargs and drop
+                // the space after the selector (`m key:;` -> `m(key:)`)
+                if self.src[b] == b':' {
+                    if let Some((ks, ke, sel_end)) = self.vo_kwargs.iter().find(|(_, e, _)| *e == b + 1).copied() {
+                        self.fixes.push((sel_end, ks, b"(".to_vec()));
+                        self.fixes.push((ke, ke, b")".to_vec()));
+                    }
+                }
+            }
+            self.fixes.push((off, off + 1, Vec::new()));
+        }
+        self.push(off, "Style/Semicolon", true, "Do not use semicolons to terminate expressions.");
+    }
+
+    /// Style/Semicolon part 1 (rubocop's on_begin): statements sequences with
+    /// multiple expressions ending on one line — every raw `;` on such a line
+    /// is an offense (yes, rubocop scans the raw line).
+    pub(crate) fn check_semicolon_separators(&mut self, node: &ruby_prism::StatementsNode) {
+        const COP: &str = "Style/Semicolon";
+        if !self.on(COP) || self.cfg.get(COP, "AllowAsExpressionSeparator") == Some("true") {
+            return;
+        }
+        let exprs: Vec<_> = node.body().iter().collect();
+        if exprs.len() < 2 {
+            return;
+        }
+        let l = node.location();
+        if !self.src[l.start_offset()..l.end_offset()].contains(&b';') {
+            return;
+        }
+        let mut last_lines: Vec<usize> = exprs
+            .iter()
+            .map(|e| self.idx.loc(e.location().end_offset().saturating_sub(1)).0)
+            .collect();
+        last_lines.sort_unstable();
+        let mut i = 0;
+        while i < last_lines.len() {
+            let line = last_lines[i];
+            let mut j = i;
+            while j < last_lines.len() && last_lines[j] == line {
+                j += 1;
+            }
+            if j - i > 1 {
+                let (ls, le) = (self.idx.starts[line - 1], self.line_end(line));
+                // a heredoc OPENED before the semicolon suppresses the
+                // line-break fix (breaking would orphan the body)
+                let heredoc_here = self.heredoc_lines.iter().any(|(hs, _, _, _)| hs.saturating_sub(1) == line);
+                for p in ls..le {
+                    if self.src[p] == b';' {
+                        if !self.semi_flagged.insert(p) {
+                            continue;
+                        }
+                        let opened_before = heredoc_here
+                            && self.src[ls..p].windows(2).any(|w| w == b"<<")
+                            && !self.in_literal(p);
+                        if !opened_before {
+                            self.fixes.push((p, p + 1, b"\n".to_vec()));
+                        }
+                        self.push(p, "Style/Semicolon", true,
+                            "Do not use semicolons to terminate expressions.");
+                    }
+                }
+            }
+            i = j;
+        }
+    }
+
+    /// Style/Semicolon part 2: line terminators and openers — a `;` that ends
+    /// a line (comments aside), starts one, or hugs a brace.
+    pub(crate) fn check_semicolon_lines(&mut self) {
+        const COP: &str = "Style/Semicolon";
+        if !self.on(COP) || !self.src.contains(&b';') {
+            return;
+        }
+        for line in 1..=self.idx.starts.len() {
+            let ls = self.idx.starts[line - 1];
+            let le = self.line_end(line);
+            // strip a trailing comment: code ends at the comment start
+            let code_end = self
+                .comments
+                .iter()
+                .find(|(l, s, _)| *l == line && *s >= ls && *s < le)
+                .map(|(_, s, _)| *s)
+                .unwrap_or(le);
+            let code = &self.src[ls..code_end];
+            let semis: Vec<usize> = code
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b == b';' && !self.in_literal(ls + i))
+                .map(|(i, _)| ls + i)
+                .collect();
+            let Some(&last) = semis.last() else { continue };
+            let first = semis[0];
+            // trailing: nothing but whitespace after the last semicolon
+            if self.src[last + 1..code_end].iter().all(|b| b.is_ascii_whitespace()) {
+                self.semicolon_offense(last, true);
+                continue;
+            }
+            // line opener: `;` is the first non-whitespace on the line
+            if self.src[ls..first].iter().all(|b| b.is_ascii_whitespace()) {
+                self.semicolon_offense(first, true);
+                continue;
+            }
+            // `; }` before a closing brace at end of line — or before an
+            // interpolation's `}` followed only by the string's closing quote
+            if let Some(p) = semis.iter().rev().find(|p| {
+                let rest = &self.src[**p + 1..code_end];
+                let t: Vec<u8> = rest.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+                t == b"}" || t == b"}\"" || t == b"}'"
+            }) {
+                self.semicolon_offense(*p, true);
+                continue;
+            }
+            // `{ ;` right after an opening brace
+            if let Some(p) = semis.iter().find(|p| {
+                self.src[ls..**p].iter().rev().find(|b| !b.is_ascii_whitespace()) == Some(&b'{')
+            }) {
+                self.semicolon_offense(*p, true);
+            }
+        }
+    }
+}

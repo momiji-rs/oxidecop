@@ -92,6 +92,7 @@ pub struct Engine {
 /// a plain field read in the hot loop.
 #[derive(Default, Clone)]
 pub(crate) struct Hot {
+    pub(crate) semicolon: bool,
     pub(crate) empty_literal: bool,
     pub(crate) string_literals: bool,
     /// 1 = single_quotes, 2 = double_quotes, 0 = anything else
@@ -135,7 +136,7 @@ const IMPLEMENTED: &[&str] = &[
     "Naming/ClassAndModuleCamelCase", "Naming/ConstantName", "Style/MultilineIfThen",
     "Style/Not", "Style/StderrPuts", "Style/WhileUntilDo", "Style/ColonMethodCall",
     "Lint/EmptyClass", "Lint/DeprecatedClassMethods", "Layout/EmptyLineAfterMagicComment",
-    "Layout/EmptyLines", "Style/EmptyLiteral",
+    "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
     "Style/CharacterLiteral", "Style/EndBlock", "Style/NegatedWhile", "Style/UnlessElse",
@@ -244,6 +245,7 @@ impl Engine {
         };
 
         let hot = Hot {
+            semicolon: is_on("Style/Semicolon"),
             empty_literal: is_on("Style/EmptyLiteral"),
             string_literals: is_on("Style/StringLiterals"),
             string_style: match cfg.enforced_style("Style/StringLiterals") {
@@ -410,6 +412,12 @@ pub(crate) struct Cops<'a> {
     pub(crate) multiline_str_lines: Vec<(usize, usize)>,
     // the file's frozen_string_literal magic-comment value, if any
     pub(crate) fsl_enabled: Option<bool>,
+    // sorted literal content spans + already-flagged semicolon offsets
+    pub(crate) lit_spans: Vec<(usize, usize)>,
+    pub(crate) semi_flagged: HashSet<usize>,
+    // range-literal spans and value-omission kwarg spans (Style/Semicolon fixes)
+    pub(crate) range_spans: Vec<(usize, usize)>,
+    pub(crate) vo_kwargs: Vec<(usize, usize, usize)>,
     // spans of unparenthesized call argument lists being visited
     // (first arg start, all arg spans) — Style/EmptyLiteral's Hash fix
     pub(crate) bare_arg_frames: Vec<(usize, Vec<(usize, usize)>)>,
@@ -680,7 +688,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         );
         ruby_prism::visit_unless_node(self, node);
     }
+    fn visit_range_node(&mut self, node: &ruby_prism::RangeNode<'pr>) {
+        if self.hot.semicolon {
+            let l = node.location();
+            self.range_spans.push((l.start_offset(), l.end_offset()));
+        }
+        ruby_prism::visit_range_node(self, node);
+    }
     fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        self.check_semicolon_separators(node);
         self.ll_check_semicolons(node);
         self.stmts_stack.push(node.location().start_offset());
         ruby_prism::visit_statements_node(self, node);
@@ -1025,6 +1041,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
             self.visit(&r);
         }
+        if self.hot.semicolon {
+            if let (Some(a), Some(sel)) = (node.arguments(), node.message_loc()) {
+                if let Some(kw) = a.arguments().iter().last().and_then(|x| x.as_keyword_hash_node()) {
+                    let omission = kw.elements().iter().any(|e| {
+                        e.as_assoc_node().is_some_and(|p| p.value().as_implicit_node().is_some())
+                    });
+                    if omission {
+                        let kl = kw.location();
+                        self.vo_kwargs.push((kl.start_offset(), kl.end_offset(), sel.end_offset()));
+                    }
+                }
+            }
+        }
         if let Some(a) = node.arguments() {
             // Style/EmptyLiteral's Hash fix needs the enclosing bare arg list
             let framed = node.opening_loc().is_none() && self.hot.empty_literal;
@@ -1105,10 +1134,12 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
 
     // Heredoc body line ranges, for Layout/TrailingWhitespace; multi-line
     // plain strings ride along (Layout/EmptyLines treats them as tokens).
-    let mut hd = HeredocFinder { idx: &idx, ranges: Vec::new(), str_lines: Vec::new() };
+    let mut hd = HeredocFinder { idx: &idx, ranges: Vec::new(), str_lines: Vec::new(), lit_spans: Vec::new() };
     hd.visit(&result.node());
     let heredoc_lines = hd.ranges;
     let multiline_str_lines = hd.str_lines;
+    let mut lit_spans = hd.lit_spans;
+    lit_spans.sort_unstable();
 
     let (hot, file_disabled) = eng.file_view(rel_path);
     let mut cops = Cops {
@@ -1148,6 +1179,10 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         heredoc_lines,
         multiline_str_lines,
         fsl_enabled,
+        lit_spans,
+        semi_flagged: HashSet::new(),
+        range_spans: Vec::new(),
+        vo_kwargs: Vec::new(),
         bare_arg_frames: Vec::new(),
         data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
         class_children_stack: Vec::new(),
@@ -1177,6 +1212,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     cops.visit(&result.node());
     // needs the breakable nominations the walk collected
     cops.check_line_length();
+    cops.check_semicolon_lines();
     let t = tick(&T_VISIT, t);
 
     let mut offenses = cops.offenses;
@@ -1193,6 +1229,9 @@ struct HeredocFinder<'a> {
     ranges: Vec<(usize, usize, Vec<u8>, bool)>,
     // multi-line NON-heredoc string spans (start line, end line)
     str_lines: Vec<(usize, usize)>,
+    // every literal CONTENT byte span (string/regex/symbol text) — semicolons
+    // inside are data, not statement separators
+    lit_spans: Vec<(usize, usize)>,
 }
 impl<'a> HeredocFinder<'a> {
     fn add_span(&mut self, start: usize, end: usize, closing: Option<ruby_prism::Location>, stat: bool) {
@@ -1220,6 +1259,8 @@ impl<'a> HeredocFinder<'a> {
 }
 impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
+        let c = node.content_loc();
+        self.lit_spans.push((c.start_offset(), c.end_offset()));
         if let Some(o) = node.opening_loc() {
             if o.as_slice().starts_with(b"<<") {
                 let stat = o.as_slice().contains(&b'\'');
@@ -1230,7 +1271,18 @@ impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
             }
         }
     }
+    fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
+        if let Some(v) = node.value_loc() {
+            self.lit_spans.push((v.start_offset(), v.end_offset()));
+        }
+    }
+    fn visit_regular_expression_node(&mut self, node: &ruby_prism::RegularExpressionNode<'pr>) {
+        let c = node.content_loc();
+        self.lit_spans.push((c.start_offset(), c.end_offset()));
+    }
     fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
+        let c = node.content_loc();
+        self.lit_spans.push((c.start_offset(), c.end_offset()));
         if node.opening_loc().as_slice().starts_with(b"<<") {
             let c = node.content_loc();
             self.add_span(c.start_offset(), c.end_offset(), Some(node.closing_loc()), false);

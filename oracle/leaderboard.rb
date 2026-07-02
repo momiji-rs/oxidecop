@@ -73,6 +73,7 @@ COPS = {
   'Layout/EmptyLineAfterMagicComment' => 'layout/empty_line_after_magic_comment',
   'Layout/EmptyLines'                => 'layout/empty_lines',
   'Style/EmptyLiteral'               => 'style/empty_literal',
+  'Style/Semicolon'                  => 'style/semicolon',
   'Style/WhileUntilDo'               => 'style/while_until_do',
   'Style/MultilineIfThen'            => 'style/multiline_if_then',
   'Style/Not'                        => 'style/not'
