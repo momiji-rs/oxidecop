@@ -3019,3 +3019,123 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((start, then_end, Vec::new()));
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Style/MultilineIfModifier — a modifier `if`/`unless` whose BODY spans
+    /// more than one line (`{ ... } if cond`, `begin ... end if cond`, or any
+    /// multiline expression used as the body). Ported from rubocop's `on_if`
+    /// (`StatementModifier`/`Alignment` mixins): `node.modifier_form? &&
+    /// node.body.multiline?` — note it's the BODY's own multiline-ness that
+    /// matters, not the whole node's (a one-line body with a multiline
+    /// CONDITION, e.g. `run if cond &&\n       cond2`, is NOT an offense).
+    ///
+    /// Ported to prism: `node.body` (rubocop's single AST child; wraps
+    /// multiple statements in an implicit `begin` node) is
+    /// `node.statements().body().first()` here — modifier form always
+    /// carries exactly one top-level statement, itself a `BeginNode` for the
+    /// explicit `begin...end` form.
+    ///
+    /// Autocorrect ports `to_normal_if`/`indented_body` verbatim: reindent
+    /// each body line by replacing its leading `offset(node)`-width prefix
+    /// (in bytes: `node`'s own column) with `indentation(node)` (that column
+    /// plus `Layout/IndentationWidth`'s `Width`, default 2), then wrap
+    /// `keyword cond\n<reindented body>\nend` (the `end` reindented to the
+    /// node's own original column, since the corrector replaces the node's
+    /// ENTIRE source range — the node's original leading whitespace on its
+    /// source line is untouched, outside the replaced range).
+    ///
+    /// Nested modifiers (`body if inner if outer`): both the inner and outer
+    /// `If`/`UnlessNode` share the exact same start offset (the body's own
+    /// start), since a modifier node's location begins at its body, not its
+    /// keyword. Called PRE-order (before recursing into children) so the
+    /// OUTER node is checked first — matching rubocop's real traversal order
+    /// (outer's `on_if` fires before the nested inner one, and
+    /// `ignore_node`/`part_of_ignored_node?` suppresses the inner's OFFENSE
+    /// for that round). `multiline_if_mod_seen` reproduces that suppression:
+    /// only the first (outermost) node visited at a given start offset gets
+    /// an offense pushed. The FIX is pushed for every eligible node
+    /// regardless — rubocop's own `expect_correction` loops the cop to a
+    /// fixed point (`RuboCop::RSpec::ExpectOffense#expect_correction`'s
+    /// `loop: true` default), and so does oxidecop's `apply_fixes_iter`;
+    /// each round's overlap-guard in `apply_fixes` applies only ONE of the
+    /// overlapping (same-start) fixes per pass (whichever was pushed first —
+    /// here, the outer's, matching rubocop's round 1), leaving the untouched
+    /// inner "if inner" suffix attached as plain text to be picked up as a
+    /// fresh top-level modifier on the NEXT round — converging to the same
+    /// fully-nested `if outer\n  if inner\n    ...\n  end\nend` result
+    /// rubocop reaches after 2 rounds of its own loop.
+    pub(crate) fn check_multiline_if_modifier(
+        &mut self,
+        keyword: &str,
+        node_loc: ruby_prism::Location,
+        cond: ruby_prism::Node,
+        body_stmts: Option<ruby_prism::StatementsNode>,
+    ) {
+        const COP: &str = "Style/MultilineIfModifier";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = body_stmts.and_then(|s| s.body().iter().next()) else { return };
+        let body_loc = body.location();
+        let start_line = self.idx.loc(body_loc.start_offset()).0;
+        let end_line = self.idx.loc(body_loc.end_offset().saturating_sub(1)).0;
+        if start_line == end_line {
+            return; // not `node.body.multiline?`
+        }
+
+        let node_start = node_loc.start_offset();
+        let node_end = node_loc.end_offset();
+        if self.multiline_if_mod_seen.insert(node_start) {
+            self.push(
+                node_start,
+                COP,
+                true,
+                format!("Favor a normal {keyword}-statement over a modifier clause in a multiline statement."),
+            );
+        }
+
+        let cond_src = self.node_src(&cond).to_vec();
+        let body_src = self.node_src(&body).to_vec();
+        let offset_len = self.idx.loc(node_start).1 - 1;
+        let width = self.cfg.int("Layout/IndentationWidth", "Width");
+        let indentation_len = offset_len + width;
+
+        let mut replacement = Vec::new();
+        replacement.extend_from_slice(keyword.as_bytes());
+        replacement.push(b' ');
+        replacement.extend_from_slice(&cond_src);
+        replacement.push(b'\n');
+        replacement.extend(reindent_body(&body_src, offset_len, indentation_len));
+        replacement.push(b'\n');
+        replacement.extend(std::iter::repeat_n(b' ', offset_len));
+        replacement.extend_from_slice(b"end");
+
+        self.fixes.push((node_start, node_end, replacement));
+    }
+}
+
+/// Ports `MultilineIfModifier#indented_body`: prepend `node`'s own column of
+/// spaces to `body`'s raw source (rubocop's `body.source` starts flush — the
+/// FIRST line has no leading whitespace of its own, since the body node's
+/// range begins right at its first non-space character), then replace each
+/// line's leading `offset_len`-byte whitespace run with `indentation_len`
+/// spaces. Ruby's `/^\s{#{offset_len}}/` with `offset_len == 0` matches a
+/// zero-width prefix unconditionally — i.e. every line just gets
+/// `indentation_len` spaces PREPENDED, whatever its existing indentation.
+fn reindent_body(body_src: &[u8], offset_len: usize, indentation_len: usize) -> Vec<u8> {
+    let mut body_source = vec![b' '; offset_len];
+    body_source.extend_from_slice(body_src);
+    let mut out = Vec::new();
+    for line in body_source.split_inclusive(|&b| b == b'\n') {
+        if line == b"\n" {
+            out.extend_from_slice(line);
+            continue;
+        }
+        if line.len() >= offset_len && line[..offset_len].iter().all(|&b| b == b' ') {
+            out.extend(std::iter::repeat_n(b' ', indentation_len));
+            out.extend_from_slice(&line[offset_len..]);
+        } else {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}

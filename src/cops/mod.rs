@@ -156,7 +156,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/NumericLiterals", "Style/NumericPredicate", "Style/RandomWithOffset",
     "Style/RedundantReturn", "Style/StringChars", "Style/StringLiterals",
     "Style/SymbolProc", "Style/UnpackFirst", "Style/ZeroLengthPredicate",
-    "Lint/RegexpAsCondition",
+    "Lint/RegexpAsCondition", "Style/MultilineIfModifier",
 ];
 
 impl Engine {
@@ -473,6 +473,13 @@ pub(crate) struct Cops<'a> {
     // call — the later direct visit of the literal skips these so it isn't
     // double-flagged (rubocop's `ignore_node`).
     pub(crate) regexp_bang_ignore: Vec<usize>,
+    // Style/MultilineIfModifier: start offsets of modifier if/unless nodes
+    // already offended-on — a nested chain (`body if inner if outer`) shares
+    // ONE start offset across every level (a modifier node's location begins
+    // at its body, not its keyword), so only the first (outermost, visited
+    // pre-order) one gets an offense (rubocop's `ignore_node`/
+    // `part_of_ignored_node?`). Every eligible level still gets a FIX pushed.
+    pub(crate) multiline_if_mod_seen: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -710,6 +717,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        // pre-order (before recursion): a nested modifier chain
+        // (`body if inner if outer`) needs the OUTER node checked first, so
+        // it claims the shared start offset before the inner one is visited
+        // (see check_multiline_if_modifier's doc comment).
+        if node.end_keyword_loc().is_none() && node.if_keyword_loc().is_some() {
+            self.check_multiline_if_modifier("if", node.location(), node.predicate(), node.statements());
+        }
         self.cond_depth += 1;
         ruby_prism::visit_if_node(self, node);
         self.cond_depth -= 1;
@@ -732,6 +746,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         );
         if node.end_keyword_loc().is_some() {
             self.check_condition_position(b"unless", node.keyword_loc().start_offset(), &node.predicate());
+        }
+        // pre-order: nested modifiers dedup via multiline_if_mod_seen.
+        if node.end_keyword_loc().is_none() {
+            self.check_multiline_if_modifier("unless", node.location(), node.predicate(), node.statements());
         }
         self.cond_depth += 1;
         ruby_prism::visit_unless_node(self, node);
@@ -1402,6 +1420,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         nodoc_all_stack: Vec::new(),
         cond_depth: 0,
         regexp_bang_ignore: Vec::new(),
+        multiline_if_mod_seen: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);
