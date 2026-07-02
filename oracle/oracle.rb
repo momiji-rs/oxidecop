@@ -152,6 +152,10 @@ end
 # with the inherited context's config — emulate by concatenating the pair
 # lists (parse_cfg lets later keys win, like Hash#merge).
 def resolve_cop_config_text(body, cfg_stack)
+  # a bare identifier referencing a group-level `name = { ... }` local
+  if (id = body.strip[/\A\w+\z/]) && LOCAL_HASHES.key?(id)
+    return LOCAL_HASHES[id]
+  end
   if (m = body.match(/super\(\)\s*\.merge\(\s*(.*?)\s*\)\s*\z/m))
     inner = m[1].sub(/\A\{\s*/, '').sub(/\s*\}\z/, '')
     parent = cfg_stack.last[1]
@@ -195,7 +199,13 @@ def parse_config_sections(joined)
 end
 
 examples = []
+# `name = { ... }` locals at example-group level — some specs stash the
+# cop_config hash in one and reference it from the let.
+LOCAL_HASHES = {}
 lines = File.readlines(SPEC, chomp: true)
+lines.each do |l|
+  LOCAL_HASHES[Regexp.last_match(1)] = Regexp.last_match(2) if l =~ /^\s*(\w+)\s*=\s*(\{.*\})\s*\z/
+end
 i = 0
 cur_ctx = ''
 # cop_config is scoped like RSpec `let`: defined in a context, it applies to that
