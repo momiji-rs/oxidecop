@@ -698,15 +698,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
         self.check_documentation(node.location().start_offset(), "class", &node.constant_path());
-        if let Some(b) = node.body() {
-            self.visit(&b);
-        }
+        // Default walk — covers the superclass expression too, not just the body.
+        ruby_prism::visit_class_node(self, node);
     }
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
         self.check_documentation(node.location().start_offset(), "module", &node.constant_path());
-        if let Some(b) = node.body() {
-            self.visit(&b);
-        }
+        ruby_prism::visit_module_node(self, node);
     }
     fn visit_integer_node(&mut self, node: &ruby_prism::IntegerNode<'pr>) {
         if self.on("Style/NumericLiterals") {
@@ -766,20 +763,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
-        // Descend into the body as one deeper def level (for nested-def detection).
+        // Default walk (receiver, params, body) one def level deeper — matches
+        // rubocop's each_ancestor(:def) semantics, and covers offenses in
+        // parameter default values, which a body-only walk silently skipped.
         self.def_depth += 1;
-        if let Some(b) = node.body() {
-            self.visit(&b);
-        }
+        ruby_prism::visit_def_node(self, node);
         self.def_depth -= 1;
     }
     fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
         if let Some((off, msg)) = self.symbol_proc_lambda(node) {
             self.push(off, "Style/SymbolProc", true, msg);
         }
-        if let Some(b) = node.body() {
-            self.visit(&b);
-        }
+        ruby_prism::visit_lambda_node(self, node);
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
         if let Some(b) = node.block() {
@@ -788,25 +783,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.push(off, "Style/SymbolProc", true, msg);
             }
         }
-        if let Some(a) = node.arguments() {
-            for arg in a.arguments().iter() {
-                self.visit(&arg);
-            }
-        }
-        if let Some(b) = node.block() {
-            self.visit(&b);
-        }
+        ruby_prism::visit_super_node(self, node);
     }
     fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
         if let Some(b) = node.block() {
-            let b = b.as_node();
-            if let Some((off, msg)) = self.symbol_proc_super(&b, false) {
+            if let Some((off, msg)) = self.symbol_proc_super(&b.as_node(), false) {
                 self.push(off, "Style/SymbolProc", true, msg);
             }
-            self.visit(&b);
         }
+        ruby_prism::visit_forwarding_super_node(self, node);
     }
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        // The expression (`class << HERE`) is outside the scoping context.
+        self.visit(&node.expression());
         // `class << self` is a scoping context — nested defs inside are allowed.
         self.scoping_depth += 1;
         if let Some(b) = node.body() {
@@ -825,6 +814,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        ruby_prism::visit_alias_method_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
         // Naming/MethodName also names methods through macros. Check the relevant
