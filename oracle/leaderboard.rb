@@ -122,6 +122,7 @@ COPS = {
   'Metrics/CyclomaticComplexity'     => 'metrics/cyclomatic_complexity',
   'Metrics/PerceivedComplexity'      => 'metrics/perceived_complexity',
   'Metrics/AbcSize'                  => 'metrics/abc_size',
+  'Layout/EmptyLinesAroundAttributeAccessor' => 'layout/empty_lines_around_attribute_accessor',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

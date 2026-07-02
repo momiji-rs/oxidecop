@@ -2585,3 +2585,115 @@ impl<'a> Cops<'a> {
         None
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/EmptyLinesAroundAttributeAccessor — ported from rubocop's cop
+    /// of the same name (`on_send` + a handful of private helpers).
+    ///
+    /// Upstream needs `node.right_sibling` plus a `return if
+    /// node.parent.if_type?` guard, because whitequark leaves a SOLE
+    /// statement inside an `if`/`unless` branch un-wrapped (its `parent` is
+    /// the `if` node itself, whose OTHER child — the other branch — would
+    /// otherwise leak in as a false "sibling"). Prism never does that: every
+    /// branch (then/else/elsif), every `def`/`class`/`module`/block body, and
+    /// the top-level program each get their OWN `StatementsNode`, so "the
+    /// next element in the immediately-enclosing statement list" is already
+    /// exactly upstream's guarded `next_line_node` — no parent/if-type check
+    /// needed. That's why this runs entirely inside `visit_statements_node`
+    /// instead of a generic per-node parent/sibling walk.
+    pub(crate) fn check_empty_lines_around_attribute_accessor(&mut self, stmts: &ruby_prism::StatementsNode<'_>) {
+        const COP: &str = "Layout/EmptyLinesAroundAttributeAccessor";
+        if !self.on(COP) {
+            return;
+        }
+        let body: Vec<_> = stmts.body().iter().collect();
+        for i in 0..body.len() {
+            let Some(call) = body[i].as_call_node() else { continue };
+            if !Self::el_attr_is_accessor_call(&call) {
+                continue;
+            }
+            let loc = call.location();
+            let last_line = self.idx.loc(loc.end_offset().saturating_sub(1)).0;
+            if self.el_attr_next_lines_ok(last_line) {
+                continue;
+            }
+            if !self.el_attr_requires_empty_line(COP, body.get(i + 1)) {
+                continue;
+            }
+            self.push(loc.start_offset(), COP, true, "Add an empty line after attribute accessor.");
+            // `autocorrect`: normally insert right after the accessor's own
+            // last line; but if THAT line's follower is a `# rubocop:enable`
+            // directive comment, the corrector swaps in the comment's own
+            // range instead — the blank line lands after the directive, not
+            // between the accessor and it.
+            let pos = self
+                .el_attr_comment_at(last_line + 1)
+                .filter(|_| self.el_attr_enable_directive_at(last_line + 1))
+                .map(|(_, e)| e)
+                .unwrap_or_else(|| self.line_end(last_line));
+            self.fixes.push((pos, pos, b"\n".to_vec()));
+        }
+    }
+
+    /// `SendNode#attribute_accessor?`: an implicit-receiver call to
+    /// `attr_reader`/`attr_writer`/`attr_accessor`/`attr` with at least one
+    /// argument (a bare `attr_accessor` with no args does NOT match — prism
+    /// only builds an `ArgumentsNode` when there's ≥1 argument).
+    fn el_attr_is_accessor_call(call: &ruby_prism::CallNode<'_>) -> bool {
+        call.receiver().is_none()
+            && matches!(call.name().as_slice(), b"attr_reader" | b"attr_writer" | b"attr_accessor" | b"attr")
+            && call.arguments().is_some()
+    }
+
+    /// `next_line_empty_or_enable_directive_comment?`: the line right after
+    /// `last_line` is blank (or past EOF), OR it's a `# rubocop:enable ...`
+    /// directive AND the line after THAT is blank (or past EOF).
+    fn el_attr_next_lines_ok(&self, last_line: usize) -> bool {
+        if self.el_attr_line_blank(last_line + 1) {
+            return true;
+        }
+        self.el_attr_enable_directive_at(last_line + 1) && self.el_attr_line_blank(last_line + 2)
+    }
+
+    /// `next_line_empty?`: `processed_source[line]` is `nil` (past EOF) or
+    /// blank (empty / all whitespace) — NOT the same as the stricter
+    /// zero-length check other `EmptyLinesAround*` cops use here, since
+    /// upstream calls Ruby's `String#blank?` (whitespace-only counts).
+    fn el_attr_line_blank(&self, line: usize) -> bool {
+        match self.idx.starts.get(line - 1) {
+            None => true,
+            Some(&s) => self.src[s..self.line_end(line)].iter().all(|b| b.is_ascii_whitespace()),
+        }
+    }
+
+    /// The comment (start, end) whose own line is `line`, if any.
+    fn el_attr_comment_at(&self, line: usize) -> Option<(usize, usize)> {
+        self.comments.iter().find(|(l, _, _)| *l == line).map(|&(_, s, e)| (s, e))
+    }
+
+    /// `next_line_enable_directive_comment?` — `DirectiveComment#enabled?`:
+    /// specifically the `enable` verb (not `disable`/`todo`).
+    fn el_attr_enable_directive_at(&self, line: usize) -> bool {
+        let Some((s, e)) = self.el_attr_comment_at(line) else { return false };
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = RE.get_or_init(|| regex::Regex::new(r"^#\s*rubocop\s*:\s*(disable|todo|enable)\s+\S").unwrap());
+        let t = String::from_utf8_lossy(&self.src[s..e]);
+        re.captures(&t).is_some_and(|c| &c[1] == "enable")
+    }
+
+    /// `require_empty_line?`: no next statement → false. `alias foo bar` /
+    /// `alias $a $b` → allowed (thus no empty line required) when
+    /// `AllowAliasSyntax` (default true). Otherwise: required UNLESS the next
+    /// statement is itself a send whose `AllowedMethods` (default
+    /// `alias_method`, `public`, `protected`, `private`) covers it, or is
+    /// itself another attribute accessor.
+    fn el_attr_requires_empty_line(&self, cop: &str, next: Option<&ruby_prism::Node<'_>>) -> bool {
+        let Some(next) = next else { return false };
+        let is_alias = next.as_alias_method_node().is_some() || next.as_alias_global_variable_node().is_some();
+        if is_alias {
+            return self.cfg.get(cop, "AllowAliasSyntax") == Some("false");
+        }
+        let Some(call) = next.as_call_node() else { return true };
+        !(Self::el_attr_is_accessor_call(&call) || self.allowed(cop, call.name().as_slice()))
+    }
+}
