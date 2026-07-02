@@ -422,7 +422,7 @@ impl<'a> Cops<'a> {
     }
 
     /// End offset of 1-based `line` (the position of its `\n`, or EOF).
-    fn line_end(&self, line: usize) -> usize {
+    pub(crate) fn line_end(&self, line: usize) -> usize {
         self.idx.starts.get(line).map_or(self.src.len(), |s| s - 1)
     }
 
@@ -1614,7 +1614,7 @@ fn encoding_re() -> &'static regex::Regex {
 /// one. Mirrors rubocop's `MagicComment.parse`: the emacs `-*- k: v; ... -*-`
 /// form, vim comments (which cannot specify it), then the simple form — which
 /// only counts when it is the whole comment.
-fn fsl_value(line: &str) -> Option<String> {
+pub(crate) fn fsl_value(line: &str) -> Option<String> {
     static EMACS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static EMACS_TOK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static VIM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -1682,4 +1682,138 @@ fn predicate_for(op: &[u8], inverted: bool) -> &'static str {
         b"<" => "negative?",
         _ => "",
     }
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/ColonMethodCall — `Foo::bar` method calls (camel-case "methods"
+    /// and the JRuby `Java::` interop tree are fine).
+    pub(crate) fn check_colon_method_call(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/ColonMethodCall";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(dot) = node.call_operator_loc() else { return };
+        if dot.as_slice() != b"::" || node.receiver().is_none() {
+            return;
+        }
+        // a "camel-case method" (Array::Integer(...)-style casts) is allowed
+        if node.name().as_slice().first().is_some_and(u8::is_ascii_uppercase) {
+            return;
+        }
+        // walk the receiver chain to its root; a bare `Java` root is interop
+        let mut root = node.receiver().unwrap();
+        while let Some(c) = root.as_call_node() {
+            match c.receiver() {
+                Some(r) => root = r,
+                None => break,
+            }
+        }
+        if root.as_constant_read_node().is_some_and(|c| c.name().as_slice() == b"Java") {
+            return;
+        }
+        self.fixes.push((dot.start_offset(), dot.end_offset(), b".".to_vec()));
+        self.push(dot.start_offset(), COP, true, "Do not use `::` for method calls.");
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/EmptyLiteral — `Array.new`/`Hash.new`/`String.new`/`Array[]`/
+    /// `Hash[]`/`Array([])`/`Hash([])` → literal `[]`/`{}`/`''`.
+    pub(crate) fn check_empty_literal(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/EmptyLiteral";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !matches!(name, b"new" | b"[]" | b"Array" | b"Hash") {
+            return;
+        }
+        let recv_const = node.receiver().and_then(|r| empty_lit_const(&r));
+        let argc = node.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0);
+        let empty_array_arg = argc == 1
+            && node.arguments().is_some_and(|a| {
+                a.arguments()
+                    .iter()
+                    .next()
+                    .and_then(|x| x.as_array_node().map(|arr| arr.elements().iter().count() == 0))
+                    .unwrap_or(false)
+            });
+        let has_block = node.block().is_some();
+
+        enum Kind { Array, Hash, Str }
+        let kind = match (recv_const.as_deref(), name) {
+            (Some("Array"), b"new") if (argc == 0 || empty_array_arg) && !has_block => Kind::Array,
+            (Some("Array"), b"[]") if argc == 0 => Kind::Array,
+            (None, b"Array") if empty_array_arg && node.receiver().is_none() => Kind::Array,
+            (Some("Hash"), b"new") if argc == 0 && !has_block => Kind::Hash,
+            (Some("Hash"), b"[]") if argc == 0 => Kind::Hash,
+            (None, b"Hash") if empty_array_arg && node.receiver().is_none() => Kind::Hash,
+            (Some("String"), b"new") if argc == 0 && !self.frozen_strings() => Kind::Str,
+            _ => return,
+        };
+        let l = node.location();
+        let current = String::from_utf8_lossy(&self.src[l.start_offset()..l.end_offset()]).into_owned();
+        let (msg, lit) = match kind {
+            Kind::Array => (format!("Use array literal `[]` instead of `{current}`."), "[]".to_string()),
+            Kind::Hash => (format!("Use hash literal `{{}}` instead of `{current}`."), "{}".to_string()),
+            Kind::Str => {
+                let prefer = self.preferred_string_literal();
+                (format!("Use string literal `{prefer}` instead of `String.new`."), prefer)
+            }
+        };
+        // A Hash literal opening an unparenthesized argument list would parse
+        // as a block — rewrite the whole list with parens (rubocop verbatim).
+        if matches!(kind, Kind::Hash) {
+            if let Some((first_start, spans)) = self.bare_arg_frames.last() {
+                if *first_start == l.start_offset() {
+                    let rest: Vec<String> = std::iter::once("{}".to_string())
+                        .chain(spans.iter().skip(1).map(|(s, e)| {
+                            String::from_utf8_lossy(&self.src[*s..*e]).into_owned()
+                        }))
+                        .collect();
+                    let last_end = spans.last().map(|(_, e)| *e).unwrap_or(l.end_offset());
+                    self.fixes.push((first_start - 1, last_end, format!("({})", rest.join(", ")).into_bytes()));
+                    self.push(l.start_offset(), COP, true, msg);
+                    return;
+                }
+            }
+        }
+        self.fixes.push((l.start_offset(), l.end_offset(), lit.into_bytes()));
+        self.push(l.start_offset(), COP, true, msg);
+    }
+
+    /// Whether string literals are frozen here (FrozenStringLiteral mixin):
+    /// the magic comment decides; absent one, an enabled FSC cop implies the
+    /// project keeps files frozen — unless StringLiteralsFrozenByDefault is
+    /// explicitly set either way.
+    fn frozen_strings(&self) -> bool {
+        match self.fsl_enabled {
+            Some(v) => v,
+            None => match self.cfg.param("AllCops", "StringLiteralsFrozenByDefault") {
+                Some(v) => v == "true",
+                None => self.on("Style/FrozenStringLiteralComment"),
+            },
+        }
+    }
+
+    fn preferred_string_literal(&self) -> String {
+        if self.cfg.get("Style/StringLiterals", "EnforcedStyle") == Some("double_quotes") {
+            "\"\"".to_string()
+        } else {
+            "''".to_string()
+        }
+    }
+}
+
+/// A bare (or ::-rooted) constant receiver's name, for Style/EmptyLiteral.
+fn empty_lit_const(node: &ruby_prism::Node) -> Option<String> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some(String::from_utf8_lossy(c.name().as_slice()).into_owned());
+    }
+    if let Some(p) = node.as_constant_path_node() {
+        if p.parent().is_none() {
+            return Some(String::from_utf8_lossy(p.name()?.as_slice()).into_owned());
+        }
+    }
+    None
 }

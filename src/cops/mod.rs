@@ -92,6 +92,7 @@ pub struct Engine {
 /// a plain field read in the hot loop.
 #[derive(Default, Clone)]
 pub(crate) struct Hot {
+    pub(crate) empty_literal: bool,
     pub(crate) string_literals: bool,
     /// 1 = single_quotes, 2 = double_quotes, 0 = anything else
     pub(crate) string_style: u8,
@@ -132,7 +133,9 @@ pub fn intern_cop(name: &str) -> Option<&'static str> {
 const IMPLEMENTED: &[&str] = &[
     "Lint/DuplicateRequire", "Naming/BinaryOperatorParameterName",
     "Naming/ClassAndModuleCamelCase", "Naming/ConstantName", "Style/MultilineIfThen",
-    "Style/Not", "Style/StderrPuts", "Style/WhileUntilDo",
+    "Style/Not", "Style/StderrPuts", "Style/WhileUntilDo", "Style/ColonMethodCall",
+    "Lint/EmptyClass", "Lint/DeprecatedClassMethods", "Layout/EmptyLineAfterMagicComment",
+    "Layout/EmptyLines", "Style/EmptyLiteral",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
     "Style/CharacterLiteral", "Style/EndBlock", "Style/NegatedWhile", "Style/UnlessElse",
@@ -241,6 +244,7 @@ impl Engine {
         };
 
         let hot = Hot {
+            empty_literal: is_on("Style/EmptyLiteral"),
             string_literals: is_on("Style/StringLiterals"),
             string_style: match cfg.enforced_style("Style/StringLiterals") {
                 "single_quotes" => 1,
@@ -402,6 +406,13 @@ pub(crate) struct Cops<'a> {
     pub(crate) stmts_stack: Vec<usize>,
     // unless/else nodes already corrected — nested ones only get offenses.
     pub(crate) unless_else_spans: Vec<(usize, usize)>,
+    // multi-line plain-string line spans (Layout/EmptyLines token lines)
+    pub(crate) multiline_str_lines: Vec<(usize, usize)>,
+    // the file's frozen_string_literal magic-comment value, if any
+    pub(crate) fsl_enabled: Option<bool>,
+    // spans of unparenthesized call argument lists being visited
+    // (first arg start, all arg spans) — Style/EmptyLiteral's Hash fix
+    pub(crate) bare_arg_frames: Vec<(usize, Vec<(usize, usize)>)>,
     // ---- Layout/LineLength breakable machinery (see breakable.rs) ----
     pub(crate) ll_active: bool,
     pub(crate) ll_max: usize,
@@ -792,6 +803,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.class_children_stack.pop();
     }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        let l = node.location();
+        self.check_empty_class(l.start_offset(), l.end_offset(),
+            node.body().is_some(), node.superclass().is_some(), false);
         self.check_documentation("class", node.location().start_offset(), &node.constant_path(), node.body());
         self.check_camel_case_name(&node.constant_path());
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
@@ -863,6 +877,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.usage_block_depth -= 1;
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+        let framed = node.lparen_loc().is_none() && self.hot.empty_literal && node.arguments().is_some();
+        if framed {
+            let spans: Vec<(usize, usize)> = node
+                .arguments()
+                .unwrap()
+                .arguments()
+                .iter()
+                .map(|x| (x.location().start_offset(), x.location().end_offset()))
+                .collect();
+            let first = spans.first().map(|(s, _)| *s).unwrap_or(0);
+            self.bare_arg_frames.push((first, spans));
+        }
         if let Some(b) = node.block() {
             let has_args = node.arguments().is_some_and(|a| a.arguments().iter().count() > 0);
             let last_end = if node.lparen_loc().is_some() {
@@ -875,6 +901,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         ruby_prism::visit_super_node(self, node);
+        if framed {
+            self.bare_arg_frames.pop();
+        }
     }
     fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
         if let Some(b) = node.block() {
@@ -885,6 +914,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_forwarding_super_node(self, node);
     }
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        let l = node.location();
+        self.check_empty_class(l.start_offset(), l.end_offset(), node.body().is_some(), false, true);
         // The expression (`class << HERE`) is outside the scoping context.
         self.visit(&node.expression());
         // `class << self` is a scoping context — nested defs inside are allowed.
@@ -920,6 +951,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.check_method_name_macros(node);
+        self.check_colon_method_call(node);
+        self.check_deprecated_class_methods(node);
+        self.check_empty_literal(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
         let n = node.as_node();
@@ -992,11 +1026,25 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.visit(&r);
         }
         if let Some(a) = node.arguments() {
+            // Style/EmptyLiteral's Hash fix needs the enclosing bare arg list
+            let framed = node.opening_loc().is_none() && self.hot.empty_literal;
+            if framed {
+                let spans: Vec<(usize, usize)> = a
+                    .arguments()
+                    .iter()
+                    .map(|x| (x.location().start_offset(), x.location().end_offset()))
+                    .collect();
+                let first = spans.first().map(|(s, _)| *s).unwrap_or(0);
+                self.bare_arg_frames.push((first, spans));
+            }
             for arg in a.arguments().iter() {
                 if track_args {
                     self.assumed_arg_offsets.insert(arg.location().start_offset());
                 }
                 self.visit(&arg);
+            }
+            if framed {
+                self.bare_arg_frames.pop();
             }
         }
         if let Some(b) = node.block() {
@@ -1048,10 +1096,19 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         .as_program_node()
         .and_then(|p| p.statements().body().iter().next().map(|n| idx.loc(n.location().start_offset()).0));
 
-    // Heredoc body line ranges, for Layout/TrailingWhitespace.
-    let mut hd = HeredocFinder { idx: &idx, ranges: Vec::new() };
+    // The file-level frozen_string_literal magic comment (leading comments).
+    let fsl_enabled = comment_data
+        .iter()
+        .take_while(|(line, _, _)| first_code_line.is_none_or(|fc| *line < fc))
+        .find_map(|(_, s, e)| crate::cops::style::fsl_value(&String::from_utf8_lossy(&src[*s..*e])))
+        .map(|v| v == "true");
+
+    // Heredoc body line ranges, for Layout/TrailingWhitespace; multi-line
+    // plain strings ride along (Layout/EmptyLines treats them as tokens).
+    let mut hd = HeredocFinder { idx: &idx, ranges: Vec::new(), str_lines: Vec::new() };
     hd.visit(&result.node());
     let heredoc_lines = hd.ranges;
+    let multiline_str_lines = hd.str_lines;
 
     let (hot, file_disabled) = eng.file_view(rel_path);
     let mut cops = Cops {
@@ -1089,6 +1146,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         usage_block_depth: 0,
         assumed_arg_offsets: HashSet::new(),
         heredoc_lines,
+        multiline_str_lines,
+        fsl_enabled,
+        bare_arg_frames: Vec::new(),
         data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
         class_children_stack: Vec::new(),
         comments: &comment_data,
@@ -1104,6 +1164,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         .as_program_node()
         .and_then(|p| p.statements().body().iter().next().map(|n| n.location().start_offset()));
     cops.check_frozen_string_literal(first_code_line);
+    cops.check_empty_line_after_magic_comment(first_code_line);
+    cops.check_empty_lines();
     cops.check_trailing_whitespace();
     cops.check_empty_file();
     cops.check_trailing_empty_lines();
@@ -1129,6 +1191,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
 struct HeredocFinder<'a> {
     idx: &'a LineIndex,
     ranges: Vec<(usize, usize, Vec<u8>, bool)>,
+    // multi-line NON-heredoc string spans (start line, end line)
+    str_lines: Vec<(usize, usize)>,
 }
 impl<'a> HeredocFinder<'a> {
     fn add_span(&mut self, start: usize, end: usize, closing: Option<ruby_prism::Location>, stat: bool) {
@@ -1146,6 +1210,14 @@ impl<'a> HeredocFinder<'a> {
         }
     }
 }
+impl<'a> HeredocFinder<'a> {
+    fn note_multiline(&mut self, l: ruby_prism::Location) {
+        let (s, e) = (self.idx.loc(l.start_offset()).0, self.idx.loc(l.end_offset().saturating_sub(1)).0);
+        if e > s {
+            self.str_lines.push((s, e));
+        }
+    }
+}
 impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
         if let Some(o) = node.opening_loc() {
@@ -1153,6 +1225,8 @@ impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
                 let stat = o.as_slice().contains(&b'\'');
                 let c = node.content_loc();
                 self.add_span(c.start_offset(), c.end_offset(), node.closing_loc(), stat);
+            } else {
+                self.note_multiline(node.location());
             }
         }
     }
@@ -1171,6 +1245,8 @@ impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
                 if let (Some(first), Some(close)) = (node.parts().iter().next(), node.closing_loc()) {
                     self.add_span(first.location().start_offset(), close.start_offset(), node.closing_loc(), stat);
                 }
+            } else {
+                self.note_multiline(node.location());
             }
         }
         // keep walking — interpolations can nest further heredocs

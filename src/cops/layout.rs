@@ -420,3 +420,99 @@ fn find_excessive_range(line: &str, m: Option<(usize, usize)>, indent_diff: usiz
     }
     Some((begin, end))
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/EmptyLineAfterMagicComment — the last leading magic comment
+    /// must be followed by a blank line.
+    pub(crate) fn check_empty_line_after_magic_comment(&mut self, first_code_line: Option<usize>) {
+        const COP: &str = "Layout/EmptyLineAfterMagicComment";
+        if !self.on(COP) {
+            return;
+        }
+        // leading comments: before the first code line (all of them if none)
+        let last_magic = self
+            .comments
+            .iter()
+            .take_while(|(line, _, _)| first_code_line.is_none_or(|fc| *line < fc))
+            .filter(|(_, s, e)| is_magic_comment(&self.src[*s..*e]))
+            .last();
+        let Some((line, _, _)) = last_magic else { return };
+        let next_start = match self.idx.starts.get(*line) {
+            Some(s) => *s,
+            None => return, // no following line at all
+        };
+        let next_end = self.line_end(line + 1);
+        if self.src[next_start..next_end].iter().all(|b| b.is_ascii_whitespace()) {
+            return;
+        }
+        self.fixes.push((next_start, next_start, b"\n".to_vec()));
+        self.push(next_start, COP, true, "Add an empty line after magic comments.");
+    }
+
+    /// Layout/EmptyLines — more than one consecutive blank line between
+    /// tokens. "Blank" is a strictly empty line (whitespace-only lines break
+    /// the run, exactly like rubocop's `.empty?`); heredoc bodies count as
+    /// token lines (their content is one token to the lexer).
+    pub(crate) fn check_empty_lines(&mut self) {
+        const COP: &str = "Layout/EmptyLines";
+        if !self.on(COP) {
+            return;
+        }
+        // cheap gate, same as rubocop's raw_source include check
+        if !self.src.windows(3).any(|w| w == b"\n\n\n") {
+            return;
+        }
+        let nlines = self.idx.starts.len();
+        let mut token = vec![false; nlines + 2];
+        for line in 1..=nlines {
+            let s = self.idx.starts[line - 1];
+            let e = self.line_end(line);
+            if self.src[s..e].iter().any(|b| !b.is_ascii_whitespace()) {
+                token[line] = true;
+            }
+        }
+        for (hs, he, _, _) in &self.heredoc_lines {
+            for l in *hs..=(*he).min(nlines) {
+                token[l] = true;
+            }
+        }
+        for (hs, he) in &self.multiline_str_lines {
+            for l in *hs..=(*he).min(nlines) {
+                token[l] = true;
+            }
+        }
+        fn is_empty(c: &Cops, line: usize) -> bool {
+            match c.idx.starts.get(line - 1) {
+                Some(s) => c.line_end(line) == *s,
+                None => false,
+            }
+        }
+        let mut prev = 1usize;
+        for cur in 1..=nlines {
+            if !token[cur] {
+                continue;
+            }
+            if cur > prev && cur - prev > 2 {
+                for line in prev + 1..cur {
+                    if is_empty(self, line) && line >= 2 && is_empty(self, line - 1) {
+                        let off = self.idx.starts[line - 1];
+                        self.fixes.push((off, self.idx.starts.get(line).copied().unwrap_or(off), Vec::new()));
+                        self.push(off, COP, true, "Extra blank line detected.");
+                    }
+                }
+            }
+            prev = cur;
+        }
+    }
+}
+
+/// A magic comment: frozen_string_literal / encoding / warn_indent /
+/// shareable_constant_value / typed — simple, emacs (-*-), or vim form.
+fn is_magic_comment(comment: &[u8]) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    cached(
+        &RE,
+        r"(?i)^#\s*(?:-\*-.*-\*-\s*$|(?:(?:frozen[_-]string[_-]literal)\s*:\s*(?:true|false)\b|(?:encoding|coding|warn[_-]indent|shareable[_-]constant[_-]value|typed)\s*:|rbs_inline\s*:\s*(?:enabled|disabled)\b)|vim:\s*(?:set\s+)?(?:ft|filetype|fileencoding|fenc)\s*[=:])",
+    )
+    .is_match(&String::from_utf8_lossy(comment))
+}

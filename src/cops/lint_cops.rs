@@ -330,3 +330,106 @@ pub(crate) fn is_class_constructor(node: &ruby_prism::CallNode, src: &[u8]) -> b
         _ => false,
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/EmptyClass — a class with no superclass and no body, or an empty
+    /// metaclass. AllowComments accepts a comment inside the span as a body.
+    pub(crate) fn check_empty_class(&mut self, node_start: usize, node_end: usize,
+                                    has_body: bool, has_superclass: bool, metaclass: bool) {
+        const COP: &str = "Lint/EmptyClass";
+        if !self.on(COP) || has_body || (!metaclass && has_superclass) {
+            return;
+        }
+        if self.cfg.get(COP, "AllowComments") == Some("true")
+            && self.comments.iter().any(|(_, s, _)| *s >= node_start && *s < node_end)
+        {
+            return;
+        }
+        let msg = if metaclass { "Empty metaclass detected." } else { "Empty class detected." };
+        self.push(node_start, COP, false, msg);
+    }
+
+    /// Lint/DeprecatedClassMethods — ENV.clone/dup/freeze, File/Dir.exists?,
+    /// Socket.gethostby*, bare `attr name, bool`, bare `iterator?`.
+    pub(crate) fn check_deprecated_class_methods(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/DeprecatedClassMethods";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        // receiver constant name (bare or ::-rooted), if any
+        let recv_const = node.receiver().and_then(|r| const_name_root(&r));
+        let l = node.location();
+        let sel = node.message_loc().map(|m| (m.start_offset(), m.end_offset()));
+        let argc = node.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0);
+        enum Kind { DirEnvFile, Socket, Attr, Iterator }
+        let kind = match (recv_const.as_deref(), name) {
+            (Some("ENV"), b"clone" | b"dup" | b"freeze") if argc == 0 => Kind::DirEnvFile,
+            (Some("File" | "Dir"), b"exists?") if argc == 1 => Kind::DirEnvFile,
+            (Some("Socket"), b"gethostbyaddr" | b"gethostbyname") => Kind::Socket,
+            (None, b"attr") if argc == 2 && node.receiver().is_none() => {
+                let args: Vec<_> = node.arguments().unwrap().arguments().iter().collect();
+                if args[1].as_true_node().is_some() || args[1].as_false_node().is_some() {
+                    Kind::Attr
+                } else {
+                    return;
+                }
+            }
+            (None, b"iterator?") if argc == 0 && node.receiver().is_none() => Kind::Iterator,
+            _ => return,
+        };
+        let (rs, re) = match kind {
+            Kind::DirEnvFile | Kind::Socket => (l.start_offset(), sel.map(|(_, e)| e).unwrap_or(l.end_offset())),
+            Kind::Attr => (l.start_offset(), l.end_offset()),
+            Kind::Iterator => sel.unwrap_or((l.start_offset(), l.end_offset())),
+        };
+        let current = String::from_utf8_lossy(&self.src[rs..re]).into_owned();
+        let prefer = match kind {
+            Kind::Attr => {
+                let args: Vec<_> = node.arguments().unwrap().arguments().iter().collect();
+                let attr_name = String::from_utf8_lossy(self.node_src(&args[0])).into_owned();
+                let m = if args[1].as_true_node().is_some() { "attr_accessor" } else { "attr_reader" };
+                format!("{m} {attr_name}")
+            }
+            Kind::DirEnvFile => {
+                // rubocop interpolates the receiver SOURCE (`::File` keeps its `::`)
+                let recv = node
+                    .receiver()
+                    .map(|r| String::from_utf8_lossy(self.node_src(&r)).into_owned())
+                    .unwrap_or_default();
+                match name {
+                    b"clone" | b"dup" => format!("{recv}.to_h"),
+                    b"exists?" => format!("{recv}.exist?"),
+                    _ => "ENV".to_string(), // freeze has no method replacement
+                }
+            }
+            Kind::Socket => {
+                if name == b"gethostbyaddr" { "Addrinfo#getnameinfo".into() } else { "Addrinfo.getaddrinfo".into() }
+            }
+            Kind::Iterator => "block_given?".to_string(),
+        };
+        let correctable = !matches!(kind, Kind::Socket);
+        if correctable {
+            if name == b"freeze" {
+                self.fixes.push((l.start_offset(), l.end_offset(), b"ENV".to_vec()));
+            } else {
+                self.fixes.push((rs, re, prefer.clone().into_bytes()));
+            }
+        }
+        self.push(rs, COP, correctable,
+            format!("`{current}` is deprecated in favor of `{prefer}`."));
+    }
+}
+
+/// The receiver as a root constant name: `Foo` or `::Foo` (nothing deeper).
+fn const_name_root(node: &ruby_prism::Node) -> Option<String> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some(String::from_utf8_lossy(c.name().as_slice()).into_owned());
+    }
+    if let Some(p) = node.as_constant_path_node() {
+        if p.parent().is_none() {
+            return Some(String::from_utf8_lossy(p.name()?.as_slice()).into_owned());
+        }
+    }
+    None
+}
