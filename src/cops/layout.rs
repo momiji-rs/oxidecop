@@ -642,6 +642,52 @@ impl<'a> Cops<'a> {
             }
         }
     }
+
+    /// Layout/SpaceAfterSemicolon — a semicolon must be followed by whitespace
+    /// (closing parens, brackets, pipes, and string interpolation ends are exempt).
+    pub(crate) fn check_space_after_semicolon(&mut self) {
+        const COP: &str = "Layout/SpaceAfterSemicolon";
+        if !self.on(COP) || !self.src.contains(&b';') {
+            return;
+        }
+        let rcurly_no_space =
+            self.cfg.get("Layout/SpaceInsideBlockBraces", "EnforcedStyle") == Some("no_space");
+        for line in 1..=self.idx.starts.len() {
+            let ls = self.idx.starts[line - 1];
+            let le = self.line_end(line);
+            // a trailing comment caps the code
+            let code_end = self
+                .comments
+                .iter()
+                .find(|(l, s, _)| *l == line && *s >= ls && *s < le)
+                .map(|(_, s, _)| *s)
+                .unwrap_or(le);
+            for p in ls..code_end {
+                if self.src[p] != b';' || self.in_lit_span(p) {
+                    continue;
+                }
+                let Some(next) = self.src.get(p + 1) else { continue };
+                if next.is_ascii_whitespace() {
+                    continue;
+                }
+                // semicolon sequences (;;) are allowed
+                if *next == b';' {
+                    continue;
+                }
+                // rubocop's allowed_type?: `)`, `]`, `|` (and interpolation
+                // ends) never need a space after a semicolon; `}` only when
+                // block-brace style allows no_space
+                if matches!(*next, b')' | b']' | b'|') {
+                    continue;
+                }
+                if *next == b'}' && rcurly_no_space {
+                    continue;
+                }
+                self.fixes.push((p + 1, p + 1, b" ".to_vec()));
+                self.push(p, COP, true, "Space missing after semicolon.");
+            }
+        }
+    }
 }
 
 impl<'a> Cops<'a> {

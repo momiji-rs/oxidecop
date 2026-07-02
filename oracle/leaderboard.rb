@@ -87,6 +87,7 @@ COPS = {
   'Lint/DuplicateHashKey'            => 'lint/duplicate_hash_key',
   'Security/MarshalLoad'             => 'security/marshal_load',
   'Layout/SpaceAfterMethodName'      => 'layout/space_after_method_name',
+  'Layout/SpaceAfterSemicolon'       => 'layout/space_after_semicolon',
   'Style/DefWithParentheses'         => 'style/def_with_parentheses',
   'Style/WhileUntilDo'               => 'style/while_until_do',
   'Style/MultilineIfThen'            => 'style/multiline_if_then',
