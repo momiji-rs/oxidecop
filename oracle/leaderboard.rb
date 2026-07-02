@@ -49,6 +49,7 @@ COPS = {
   'Lint/FlipFlop'                    => 'lint/flip_flop',
   'Style/Proc'                       => 'style/proc',
   'Lint/DuplicateCaseCondition'      => 'lint/duplicate_case_condition',
+  'Lint/DuplicateElsifCondition'     => 'lint/duplicate_elsif_condition',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -688,3 +688,46 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/DuplicateElsifCondition — an `elsif` whose condition repeats (by
+    /// source text) an earlier condition in the same `if`/`elsif` chain.
+    ///
+    /// rubocop's `on_if` walks `while node.if? || node.elsif?`, starting
+    /// fresh from whichever `if`-type node it's handed — including each
+    /// nested elsif IfNode, since `elsif` is just `else_branch` chaining to
+    /// another IfNode and the AST walker visits it too. rubocop doesn't guard
+    /// against that double-visiting: `add_offense`'s same-range dedup quietly
+    /// absorbs the redundant reports, and re-walking from partway through the
+    /// chain can only ever re-find a duplicate that walking from the head
+    /// already found (a mid-chain start only shrinks the `previous` list).
+    /// We don't have that dedup, so instead we skip starting the walk at an
+    /// elsif node's own visit — detected via `if_keyword_loc` reading
+    /// `elsif` rather than `if` — and only ever walk once, from the head.
+    pub(crate) fn check_duplicate_elsif_condition(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Lint/DuplicateElsifCondition";
+        if !self.on(COP) {
+            return;
+        }
+        if node.if_keyword_loc().is_some_and(|kw| kw.as_slice() == b"elsif") {
+            return;
+        }
+        let mut previous: Vec<&'a [u8]> = vec![self.node_src(&node.predicate())];
+        let mut next = node.subsequent();
+        while let Some(n) = next {
+            let Some(elsif) = n.as_if_node() else { break };
+            let condition = elsif.predicate();
+            let src = self.node_src(&condition);
+            if previous.contains(&src) {
+                self.push(
+                    condition.location().start_offset(),
+                    COP,
+                    false,
+                    "Duplicate `elsif` condition detected.",
+                );
+            }
+            previous.push(src);
+            next = elsif.subsequent();
+        }
+    }
+}
