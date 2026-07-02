@@ -2124,3 +2124,32 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((pos, pos + 1, b" then".to_vec()));
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Style/Proc — `Proc.new { ... }` (block form, any block shape) →
+    /// `proc { ... }`. Verbatim matcher:
+    /// `(any_block $(send (const {nil? cbase} :Proc) :new) ...)`.
+    pub(crate) fn check_proc_new(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/Proc";
+        if !self.on(COP) {
+            return;
+        }
+        if node.name().as_slice() != b"new" || node.arguments().is_some() {
+            return;
+        }
+        let Some(recv) = node.receiver() else { return };
+        if empty_lit_const(&recv).as_deref() != Some("Proc") {
+            return;
+        }
+        // Only a literal block (curly/do-end, incl. numbered-params and `it`
+        // blocks — prism represents those as ordinary BlockNodes) counts.
+        if node.block().and_then(|b| b.as_block_node()).is_none() {
+            return;
+        }
+        let Some(msg_loc) = node.message_loc() else { return };
+        let start = recv.location().start_offset();
+        let end = msg_loc.end_offset();
+        self.fixes.push((start, end, b"proc".to_vec()));
+        self.push(start, COP, true, "Use `proc` instead of `Proc.new`.");
+    }
+}
+

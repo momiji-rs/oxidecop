@@ -47,6 +47,7 @@ COPS = {
   'Lint/UriRegexp'                   => 'lint/uri_regexp',
   'Lint/UnifiedInteger'              => 'lint/unified_integer',
   'Lint/FlipFlop'                    => 'lint/flip_flop',
+  'Style/Proc'                       => 'style/proc',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
