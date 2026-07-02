@@ -160,6 +160,24 @@ wired to the method name for `Naming/MethodName`, the source line for
 call-name stack) for `Style/NumericPredicate`; adding it to another cop is a
 one-line guard. No plugin/require support yet.
 
+## Performance
+
+`bench/run.sh` (hyperfine; fetches a real rubocop source file as corpus, and a
+10× concatenation of it for scaling):
+
+```
+corpus                       rubocop-rs      rubocop --only <same 13 cops>
+medium.rb  (404 lines)       2.4 ms          657 ms          ~276× faster
+big.rb    (4040 lines)       5.7 ms          865 ms          ~151× faster
+```
+
+Read the caveats in `bench/run.sh`: this is single-shot CLI latency on ONE
+file (there is no multi-file runner yet). rubocop's number includes
+interpreter + gem boot — which is real (editor save-hooks, pre-commit on one
+file pay it every time), but on a whole repo rubocop amortizes boot across
+files, so the honest multi-file ratio will be smaller. It is also not an
+offense-fidelity comparison — that's the oracle's job.
+
 ## Repo layout
 
 ```
