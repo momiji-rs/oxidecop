@@ -1338,8 +1338,19 @@ impl<'a> HeredocFinder<'a> {
 }
 impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
-        let c = node.content_loc();
-        self.lit_spans.push((c.start_offset(), c.end_offset()));
+        // delimiters included: `%q;...;` uses `;` as its fence, and token-
+        // aware text cops must not read fences as punctuation. A heredoc's
+        // location() is just its opener — the body is content_loc.
+        match node.opening_loc() {
+            Some(o) if !o.as_slice().starts_with(b"<<") => {
+                let l = node.location();
+                self.lit_spans.push((l.start_offset(), l.end_offset()));
+            }
+            _ => {
+                let c = node.content_loc();
+                self.lit_spans.push((c.start_offset(), c.end_offset()));
+            }
+        }
         if let Some(o) = node.opening_loc() {
             if o.as_slice().starts_with(b"<<") {
                 let stat = o.as_slice().contains(&b'\'');
@@ -1351,15 +1362,16 @@ impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
         }
     }
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
-        if let Some(v) = node.value_loc() {
-            self.lit_spans.push((v.start_offset(), v.end_offset()));
-        }
+        let l = node.location();
+        self.lit_spans.push((l.start_offset(), l.end_offset()));
     }
     fn visit_regular_expression_node(&mut self, node: &ruby_prism::RegularExpressionNode<'pr>) {
-        let c = node.content_loc();
-        self.lit_spans.push((c.start_offset(), c.end_offset()));
+        let l = node.location();
+        self.lit_spans.push((l.start_offset(), l.end_offset()));
     }
     fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
+        let l = node.location();
+        self.lit_spans.push((l.start_offset(), l.end_offset()));
         let c = node.content_loc();
         self.lit_spans.push((c.start_offset(), c.end_offset()));
         if node.opening_loc().as_slice().starts_with(b"<<") {
@@ -1367,7 +1379,22 @@ impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
             self.add_span(c.start_offset(), c.end_offset(), Some(node.closing_loc()), false);
         }
     }
+    fn visit_interpolated_regular_expression_node(&mut self, node: &ruby_prism::InterpolatedRegularExpressionNode<'pr>) {
+        let o = node.opening_loc();
+        self.lit_spans.push((o.start_offset(), o.end_offset()));
+        let c = node.closing_loc();
+        self.lit_spans.push((c.start_offset(), c.end_offset()));
+        ruby_prism::visit_interpolated_regular_expression_node(self, node);
+    }
     fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
+        if let Some(o) = node.opening_loc() {
+            if !o.as_slice().starts_with(b"<<") {
+                self.lit_spans.push((o.start_offset(), o.end_offset()));
+                if let Some(cl) = node.closing_loc() {
+                    self.lit_spans.push((cl.start_offset(), cl.end_offset()));
+                }
+            }
+        }
         // prism represents MULTI-LINE heredocs as interpolated containers even
         // when they're pure text — the single-quote form is still static.
         if let Some(o) = node.opening_loc() {
