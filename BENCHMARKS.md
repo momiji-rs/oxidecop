@@ -14,9 +14,12 @@ Style/StringLiterals, Style/NegatedIf, Lint/Debugger, Naming/MethodName`.
 | Corpus | files | rubocop-rs | oxicop | vs oxicop | RuboCop (cached) | RuboCop (no cache) |
 |---|--:|--:|--:|--:|--:|--:|
 | Jekyll | 163 | **14 ms** | 24 ms | 1.7× | 841 ms | 1.78 s |
-| RuboCop repo | 1,710 | **44 ms** | 121 ms | 2.8× | 1.51 s | 14.9 s |
-| Mastodon | ~3,000 | **83 ms** | 149 ms | 1.8× | — | — |
-| Rails | ~3,400 | **103 ms** | 265 ms | 2.6× | — | — |
+| RuboCop repo | 1,710 | **26 ms** | 119 ms | 4.7× | 1.51 s | 14.9 s |
+| Mastodon | ~3,200 | **52 ms** | 150 ms | 2.9× | — | — |
+| Rails | ~3,400 | **57 ms** | 262 ms | 4.6× | — | — |
+
+(Re-measured 2026-07 after the parity/autocorrect hardening; the engine got
+faster, not slower, while adding the fix machinery.)
 
 The engine profile (RUBOCOP_RS_TIMING=1): prism parse now dominates (~63% of
 cpu time), the visitor is ~15% — i.e. the overhead over "just parsing Ruby
@@ -38,6 +41,12 @@ offense lines (file:line:col + full message) is empty — not just equal counts:
 | rubygems.org | **0** | **0** | 0 | — |
 | Mastodon | **2,100** | **2,100** (0-diff) | 2,100 | 2,915 |
 | Rails | **393** | **393** (0-diff) | **1** | — |
+
+Since first measured, the parity protocol got STRICTER — both sides now run
+`--only` with the full 47-cop list (which RuboCop force-enables even under
+`DisabledByDefault`), and the diff covers messages and columns. Current
+byte-identical totals: **Rails 12,271 / Mastodon 4,123 / rubygems.org 772 /
+RuboCop repo 0-vs-0** offense lines.
 
 Mastodon exercises `inherit_from` chains, `DisplayStyleGuide` message
 suffixes, `rubocop:disable all -- reason` trailers, and shebang-only `bin/*`
@@ -79,10 +88,48 @@ Speed (same 6-cop protocol, median of 7):
 | Rails | **103 ms** | 1,603 ms | 16× |
 | rubygems.org | **31 ms** | 417 ms | 14× |
 
-nitrocop's warm-cache path on the RuboCop repo still measures 981 ms here —
-its fixed per-run overhead (config resolution across 915 cops) dominates at
-this cop count. Its own README reports 279 ms uncached on rubygems.org; on
-this machine, this protocol, we measure what the table shows.
+Under this protocol nitrocop's `--only` doesn't force-enable cops that a
+`DisabledByDefault` config leaves off, so on some corpora it reports 0
+offenses in ~3 ms — a no-op, not a fast lint. The drop-in comparison below is
+the fairer one.
+
+## Drop-in run vs nitrocop (full project config, 2026-07)
+
+`rubocop-rs .` vs `nitrocop .` — no `--only`, each tool reading the corpus's
+own `.rubocop.yml`, median of 7 (hyperfine). This is the command a developer
+actually types. Cop coverage differs (we implement 47 cops, nitrocop 915), so
+offense counts aren't directly comparable — what IS comparable is agreement
+with RuboCop where verified:
+
+| Corpus | rubocop-rs (no cache) | nitrocop (no cache) | vs | rubocop-rs offenses | nitrocop offenses |
+|---|--:|--:|--:|--:|--:|
+| Rails | **93 ms** | 2,899 ms | 31× | 1 † | 3 |
+| Mastodon | **290 ms** | 1,285 ms | 4.4× | 2,115 | 2,197 |
+| RuboCop repo | **82 ms** | 2,211 ms | 27× | **0** (= truth) | **17,174** ‡ |
+| rubygems.org | **57 ms** | 1,478 ms | 26× | 1 † | 28 |
+
+† Verified against RuboCop 1.88 directly: it reports the SAME single offense,
+same line:col and message (a latent `Lint/Debugger` `save_page` in Rails, a
+`Style/SymbolProc` in rubygems.org).
+
+‡ RuboCop's own repo is kept at zero offenses by its CI. nitrocop's 17,174 are
+dominated by 16,396 × `RSpec/NoExpectationExample` false positives plus
+hundreds more — its config handling collapses on exactly the repo whose
+behavior both tools are trying to clone.
+
+Warm cache (second run, nothing changed):
+
+| Corpus | rubocop-rs | nitrocop |
+|---|--:|--:|
+| Rails | **29 ms** | 3.5 ms |
+| Mastodon | **27 ms** | 3.8 ms |
+
+nitrocop's warm path is genuinely excellent (lockfile + stat, no reads, no
+walk). Ours now skips file reads on a stat match (mtime+len) — 55 ms → 29 ms —
+with the remaining cost being the directory walk we still do every run.
+Honest scorecard: they win the no-change warm rerun by ~25 ms; we win every
+run where anything changed, by 4–31×, and we're the only one of the two whose
+output matches RuboCop byte-for-byte wherever we've checked.
 
 ## A note on oxicop's published RuboCop baseline
 
