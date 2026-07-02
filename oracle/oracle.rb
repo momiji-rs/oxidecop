@@ -32,13 +32,54 @@ def dedent(lines)
   lines.map { |l| l[min..] || '' }
 end
 
-def parse_block(raw_lines)
-  # raw_lines: the heredoc body (already the interior). Dedent, then split
-  # source lines from caret-annotation lines.
-  lines = dedent(raw_lines)
+# Resolve double-quoted-string escape sequences the way Ruby renders an
+# UNQUOTED heredoc (`<<~RUBY`): \\ \t \s \n \uXXXX \u{...} \# etc. The specs
+# rely on this (`x = 0\t`, `　`) because editors strip literal trailing
+# whitespace; reading the file statically we must render them ourselves.
+# Unknown escapes yield the bare char, like Ruby (`\z` -> `z`).
+def unescape_dq(s)
+  out = +''
+  i = 0
+  while i < s.length
+    c = s[i]
+    if c == '\\' && i + 1 < s.length
+      n = s[i + 1]
+      case n
+      when '\\' then out << '\\'
+      when 'n' then out << "\n"
+      when 't' then out << "\t"
+      when 's' then out << ' '
+      when 'e' then out << "\e"
+      when 'u'
+        if (m = s[i..].match(/\A\\u(?:\{([0-9a-fA-F]+)\}|([0-9a-fA-F]{4}))/))
+          out << (m[1] || m[2]).to_i(16).chr(Encoding::UTF_8)
+          i += m[0].length
+          next
+        else
+          out << n
+        end
+      else out << n # \# -> #, \" -> ", \z -> z, ...
+      end
+      i += 2
+    else
+      out << c
+      i += 1
+    end
+  end
+  out
+end
+
+def parse_block(raw_lines, raw_heredoc)
+  # raw_lines: the heredoc body (already the interior). Dedent (matches `<<~`,
+  # computed on the literal lines), render escapes unless the heredoc was the
+  # quoted `<<~'RUBY'` form (raw — no escape processing), THEN split source
+  # lines from caret-annotation lines. Escape-rendering before the split is
+  # what RSpec sees: a `\n` inside a line legitimately becomes two lines.
+  text = dedent(raw_lines).join("\n")
+  text = unescape_dq(text) unless raw_heredoc
   src = []
   expected = []
-  lines.each do |ln|
+  text.split("\n", -1).each do |ln|
     if ln =~ /\A(\s*)(\^+)(.*)\z/
       # annotation for the most recent source line
       col = Regexp.last_match(1).length + 1
@@ -117,18 +158,27 @@ while i < lines.length
   cur_cfg = cfg_stack.any? ? cfg_stack.last[1] : 'default'
   cur_skip = cfg_stack.any? ? cfg_stack.last[2] : false
   cur_as = cfg_stack.any? ? cfg_stack.last[3] : nil
-  if l =~ /expect_(offense|no_offenses)\(<<[~-]RUBY\)/
+  # Heredoc examples, all forms: `<<~RUBY` (escapes render), `<<~'RUBY'` (raw),
+  # `<<-RUBY`, and trailing keyword args (`, identifier: identifier` — those
+  # substitute `%{key}` in the body; unresolvable statically, so they fall into
+  # the skip column below instead of being silently dropped).
+  if l =~ /expect_(offense|no_offenses)\(<<[~-]('?)RUBY\2\s*[,)]/
     kind = Regexp.last_match(1) == 'offense' ? :offense : :no_offense
+    raw_heredoc = Regexp.last_match(2) == "'"
     body = []
     i += 1
     until lines[i].strip == 'RUBY'
       body << lines[i]
       i += 1
     end
-    src, expected = parse_block(body)
+    src, expected = parse_block(body, raw_heredoc)
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as, src: src, expected: expected }
   elsif l =~ /expect_no_offenses\((['"])(.*?)\1\)/
-    examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as, src: Regexp.last_match(2) + "\n", expected: [] }
+    quote, body = Regexp.last_match(1), Regexp.last_match(2)
+    # A plain string arg renders by its quote's rules: double-quoted like a
+    # heredoc; single-quoted only interprets \\ and \'.
+    body = quote == '"' ? unescape_dq(body) : body.gsub(/\\([\\'])/, '\1')
+    examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as, src: body + "\n", expected: [] }
   end
   i += 1
 end
@@ -282,9 +332,10 @@ examples.each_with_index do |ex, n|
   src = resolve_interp(ex[:src], cfg_hash)
 
   # Unrepresentable: source still interpolates a value we can't resolve
-  # statically (loop vars like #{keyword}, #{args}, …). Linting the literal
-  # `#{...}` text would be meaningless, so exclude rather than score as a miss.
-  if src =~ /\#\{/
+  # statically — `#{keyword}`-style RSpec loop vars, or `%{identifier}`
+  # expect_offense keyword substitutions. Linting the literal text would be
+  # meaningless, so exclude rather than score as a miss.
+  if src =~ /\#\{|%\{/
     g[:skipped] += 1
     next
   end
