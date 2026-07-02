@@ -93,6 +93,10 @@ pub(crate) struct Cops<'a> {
     pub(crate) heredoc_lines: Vec<(usize, usize)>,
     // The `__END__` line — nothing at or after it is lintable text.
     pub(crate) data_line: Option<usize>,
+    // Per enclosing body (program/class/module/def), the names of classes
+    // defined as its direct children — Naming/MethodName's "class emitter
+    // method" exemption consults this.
+    pub(crate) class_children_stack: Vec<Vec<Vec<u8>>>,
 }
 impl<'a> Cops<'a> {
     pub(crate) fn on(&self, cop: &str) -> bool {
@@ -131,6 +135,19 @@ impl<'a> Cops<'a> {
         let l = n.location();
         &self.src[l.start_offset()..l.end_offset()]
     }
+    /// Names of `class` nodes that are direct children of `body`.
+    fn direct_child_classes(body: &Option<ruby_prism::Node>) -> Vec<Vec<u8>> {
+        body.as_ref()
+            .and_then(|b| b.as_statements_node())
+            .map(|stmts| {
+                stmts
+                    .body()
+                    .iter()
+                    .filter_map(|n| n.as_class_node().map(|c| c.name().as_slice().to_vec()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     /// AllowComments guard: skip when enabled and a comment sits inside the block
     /// body (opening line through the line before the closer, so a trailing
     /// `end # comment` doesn't count).
@@ -156,14 +173,23 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_embedded_statements_node(self, node);
         self.interp_depth -= 1;
     }
+    fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
+        self.class_children_stack.push(Self::direct_child_classes(&Some(node.statements().as_node())));
+        ruby_prism::visit_program_node(self, node);
+        self.class_children_stack.pop();
+    }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
         self.check_documentation(node.location().start_offset(), "class", &node.constant_path());
+        self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         // Default walk — covers the superclass expression too, not just the body.
         ruby_prism::visit_class_node(self, node);
+        self.class_children_stack.pop();
     }
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
         self.check_documentation(node.location().start_offset(), "module", &node.constant_path());
+        self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         ruby_prism::visit_module_node(self, node);
+        self.class_children_stack.pop();
     }
     fn visit_integer_node(&mut self, node: &ruby_prism::IntegerNode<'pr>) {
         if !self.num_ignore.contains(&node.location().start_offset()) {
@@ -183,7 +209,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
         // parameter default values, which a body-only walk silently skipped.
         self.def_depth += 1;
+        self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         ruby_prism::visit_def_node(self, node);
+        self.class_children_stack.pop();
         self.def_depth -= 1;
     }
     fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
@@ -397,6 +425,7 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         num_ignore: Vec::new(),
         heredoc_lines,
         data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
+        class_children_stack: Vec::new(),
     };
 
     // ---- text-based cops ----

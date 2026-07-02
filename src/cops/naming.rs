@@ -10,6 +10,19 @@ impl<'a> Cops<'a> {
         }
         let style = self.cfg.enforced_style("Naming/MethodName");
         let name = node.name().as_slice();
+        // Operator methods (`def +`, `def []=`, `def ~@`) are exempt.
+        if matches!(name.first(), Some(c) if c.is_ascii_punctuation()) {
+            return;
+        }
+        // rubocop's class_emitter_method?: a singleton method (`def x.Start`)
+        // named after a class defined in an enclosing body is a factory and
+        // exempt. (rubocop checks exactly the nearest non-def ancestor body;
+        // we scan the whole scope stack — a slight over-acceptance.)
+        if node.receiver().is_some()
+            && self.class_children_stack.iter().any(|f| f.iter().any(|c| c == name))
+        {
+            return;
+        }
         if !name_matches_style(name, style) && !self.allowed("Naming/MethodName", name) {
             self.push(node.name_loc().start_offset(), "Naming/MethodName", false,
                 format!("Use {style} for method names."));
@@ -73,27 +86,20 @@ impl<'a> Cops<'a> {
     }
 }
 
-/// Strip a trailing `?`/`!`/`=` (predicate/bang/setter) from a method name.
-fn name_core(s: &[u8]) -> &[u8] {
-    match s.last() {
-        Some(b'?') | Some(b'!') | Some(b'=') => &s[..s.len() - 1],
-        _ => s,
-    }
-}
-fn is_snake_case(s: &[u8]) -> bool {
-    !name_core(s).iter().any(|&c| c.is_ascii_uppercase())
-}
-fn is_camel_case(s: &[u8]) -> bool {
-    // camelCase: no underscores, and doesn't start with an uppercase letter.
-    let core = name_core(s);
-    !core.contains(&b'_') && core.first().map(|&c| !c.is_ascii_uppercase()).unwrap_or(true)
-}
 /// Does `name` conform to the active `Naming/MethodName` EnforcedStyle?
+/// rubocop's ConfigurableNaming::FORMATS verbatim — Unicode-aware, so
+/// `última_vista` is valid snake_case.
 fn name_matches_style(name: &[u8], style: &str) -> bool {
-    match style {
-        "camelCase" => is_camel_case(name),
-        _ => is_snake_case(name),
-    }
+    static SNAKE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static CAMEL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = match style {
+        "camelCase" => CAMEL.get_or_init(|| {
+            regex::Regex::new(r"^@{0,2}(?:_|_?\p{Ll}[\d\p{Ll}\p{Lu}]*)[!?=]?$").unwrap()
+        }),
+        _ => SNAKE
+            .get_or_init(|| regex::Regex::new(r"^@{0,2}[\d\p{Ll}_]+[!?=]?$").unwrap()),
+    };
+    re.is_match(&String::from_utf8_lossy(name))
 }
 
 /// A method name introduced by a macro argument (attr/alias_method/Struct member):

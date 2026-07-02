@@ -120,13 +120,23 @@ cfg_stack = []
 while i < lines.length
   l = lines[i]
   indent = l[/\A */].length
-  if l =~ /^\s*(context|describe)\s/
+  if l =~ /^\s*(context|describe|shared_examples)\s/
     cur_ctx = l.strip
     cfg_stack.pop while cfg_stack.any? && cfg_stack.last[0] >= indent
     inh_cfg  = cfg_stack.any? ? cfg_stack.last[1] : 'default'
     inh_skip = cfg_stack.any? ? cfg_stack.last[2] : false
     inh_as   = cfg_stack.any? ? cfg_stack.last[3] : nil
-    cfg_stack.push([indent, inh_cfg, inh_skip || l.include?('unsupported_on: :prism'), inh_as])
+    # A parameterized shared_examples group (`do |style|`) runs differently
+    # per caller — its inline examples are not statically representable.
+    parameterized = !(l =~ /^\s*shared_examples\b.*do\s*\|/).nil?
+    cfg_stack.push([indent, inh_cfg,
+                    inh_skip || l.include?('unsupported_on: :prism') || parameterized,
+                    inh_as])
+  elsif l =~ /^\s*(it|specify)\b/
+    # An `it` at indent N means every context defined at indent >= N has
+    # closed — without this, a trailing top-level example would inherit the
+    # previous sibling context's cop_config.
+    cfg_stack.pop while cfg_stack.any? && cfg_stack.last[0] >= indent
   end
   # `let(:cop_config)` in either single-line `{ {...} }` or multi-line `do..end`
   # form. Capture the raw hash text (quotes preserved, whitespace collapsed) so
@@ -252,6 +262,11 @@ def normalize_pattern(item)
   end
 end
 
+# Sentinel prefix marking a value that was an UNQUOTED bare word in the spec —
+# an RSpec `let` variable (e.g. `'EnforcedStyle' => enforced_style`), whose
+# value varies per loop iteration and cannot be resolved statically.
+VAR_SENTINEL = " VAR:"
+
 def parse_val(v)
   v = v.strip
   if v.start_with?('[')
@@ -259,9 +274,29 @@ def parse_val(v)
     split_top(inner).map { |item| normalize_pattern(item) }
   elsif (m = v.match(/\A%[wi]\[(.*)\]\z/m)) # %w[a b] / %i[a b] word/symbol arrays
     m[1].split(/\s+/).reject(&:empty?)
+  elsif v =~ /\A(['"])(.*)\1\z/m
+    Regexp.last_match(2)
+  elsif v =~ /\A[a-z_][A-Za-z0-9_.]*\z/ && !%w[true false nil].include?(v)
+    VAR_SENTINEL + v
   else
-    v.sub(/\A(['"])(.*)\1\z/m, '\2')
+    v
   end
+end
+
+# Config keys whose value is an RSpec variable are dropped — the engine then
+# uses the cop's default, and the example's annotations must hold for every
+# loop value anyway (value-dependent expectations interpolate `#{...}` into
+# the source or message and are skipped by those checks). EnforcedStyle is the
+# exception: the STYLE decides which names/quotes/etc. flag at all, so an
+# example with a variable style is genuinely unrepresentable.
+def resolve_cfg_variables!(h)
+  h.each do |k, v|
+    next unless v.is_a?(String) && v.start_with?(VAR_SENTINEL)
+    return nil if k == 'EnforcedStyle'
+
+    h.delete(k)
+  end
+  h
 end
 
 # `ex[:cfg]` is the raw `let(:cop_config)` hash text (quotes preserved), e.g.
@@ -330,7 +365,15 @@ examples.each_with_index do |ex, n|
     next
   end
 
-  cfg_hash = parse_cfg(ex[:cfg])
+  cfg_hash = resolve_cfg_variables!(parse_cfg(ex[:cfg]))
+
+  # A variable EnforcedStyle varies per loop run — unrepresentable statically,
+  # like interpolated source.
+  if cfg_hash.nil?
+    g[:skipped] += 1
+    next
+  end
+
   src = resolve_interp(ex[:src], cfg_hash)
 
   # Unrepresentable: source still interpolates a value we can't resolve
