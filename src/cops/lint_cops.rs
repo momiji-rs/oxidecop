@@ -1576,3 +1576,91 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/BinaryOperatorWithIdenticalOperands — checks for binary operators
+    /// with identical operands (except for simple arithmetic: +, *, **, <<, >>).
+    pub(crate) fn check_binary_operator_with_identical_operands(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/BinaryOperatorWithIdenticalOperands";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is one of the operators we care about
+        let op_bytes = node.name().as_slice();
+        if !matches!(
+            op_bytes,
+            b"==" | b"!=" | b"===" | b"<=>" | b"=~" | b">" | b">=" | b"<" | b"<=" | b"|" | b"^"
+        ) {
+            return;
+        }
+
+        // Get the receiver
+        let Some(receiver) = node.receiver() else { return };
+
+        // Get the first argument
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.len() != 1 {
+            return;
+        }
+        let arg = &args[0];
+
+        // Compare source representations
+        let recv_src = self.node_src(&receiver);
+        let arg_src = self.node_src(arg);
+
+        if recv_src == arg_src {
+            let op_str = String::from_utf8_lossy(op_bytes);
+            let l = node.location();
+            self.push(
+                l.start_offset(),
+                COP,
+                false,
+                format!("Binary operator `{}` has identical operands.", op_str),
+            );
+        }
+    }
+
+    /// Lint/BinaryOperatorWithIdenticalOperands for && operator (and_node).
+    pub(crate) fn check_and_with_identical_operands(&mut self, node: &ruby_prism::AndNode) {
+        const COP: &str = "Lint/BinaryOperatorWithIdenticalOperands";
+        if !self.on(COP) {
+            return;
+        }
+
+        let left_src = self.node_src(&node.left());
+        let right_src = self.node_src(&node.right());
+
+        if left_src == right_src {
+            let l = node.location();
+            self.push(
+                l.start_offset(),
+                COP,
+                false,
+                "Binary operator `&&` has identical operands.".to_string(),
+            );
+        }
+    }
+
+    /// Lint/BinaryOperatorWithIdenticalOperands for || operator (or_node).
+    pub(crate) fn check_or_with_identical_operands(&mut self, node: &ruby_prism::OrNode) {
+        const COP: &str = "Lint/BinaryOperatorWithIdenticalOperands";
+        if !self.on(COP) {
+            return;
+        }
+
+        let left_src = self.node_src(&node.left());
+        let right_src = self.node_src(&node.right());
+
+        if left_src == right_src {
+            let l = node.location();
+            self.push(
+                l.start_offset(),
+                COP,
+                false,
+                "Binary operator `||` has identical operands.".to_string(),
+            );
+        }
+    }
+}

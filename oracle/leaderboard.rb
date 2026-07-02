@@ -102,6 +102,7 @@ COPS = {
   'Style/NestedTernaryOperator'      => 'style/nested_ternary_operator',
   'Layout/AssignmentIndentation'     => 'layout/assignment_indentation',
   'Lint/CircularArgumentReference'   => 'lint/circular_argument_reference',
+  'Lint/BinaryOperatorWithIdenticalOperands' => 'lint/binary_operator_with_identical_operands',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
