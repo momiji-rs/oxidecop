@@ -141,7 +141,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
-    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator",
+    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -659,6 +659,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if self.ll_active {
             self.ll_str_skip.insert(node.value().location().start_offset());
         }
+        self.check_space_after_colon_kwoptarg(node);
         ruby_prism::visit_optional_keyword_parameter_node(self, node);
     }
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
@@ -919,6 +920,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.ll_str_skip.insert(node.key().location().start_offset());
             self.ll_str_skip.insert(node.value().location().start_offset());
         }
+        self.check_space_after_colon_pair(node);
         ruby_prism::visit_assoc_node(self, node);
     }
     fn visit_embedded_variable_node(&mut self, node: &ruby_prism::EmbeddedVariableNode<'pr>) {

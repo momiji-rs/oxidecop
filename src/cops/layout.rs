@@ -814,3 +814,56 @@ impl<'a> Cops<'a> {
         self.fixes.push((0, line_start, Vec::new()));
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/SpaceAfterColon — a colon in shorthand hash syntax (key:) or
+    /// optional keyword parameters must be followed by whitespace. Note: the
+    /// colon is not followed by space in Ruby 3.1+ value omission syntax (key:,).
+    pub(crate) fn check_space_after_colon_pair(&mut self, node: &ruby_prism::AssocNode) {
+        const COP: &str = "Layout/SpaceAfterColon";
+        if !self.on(COP) {
+            return;
+        }
+        // For shorthand syntax (key:), operator_loc is None
+        if node.operator_loc().is_some() {
+            return;
+        }
+        let key_loc = node.key().location();
+        // The colon is the last byte of the key location
+        let colon_pos = key_loc.end_offset() - 1;
+        let after_colon_pos = key_loc.end_offset();
+        // In Ruby 3.1+, hash value omission (key:, y:) has no value following
+        // the colon. Check if the next byte is a comma or closing bracket.
+        if let Some(&b) = self.src.get(after_colon_pos) {
+            if matches!(b, b',' | b'}' | b')') {
+                // Value omission syntax, skip this
+                return;
+            }
+        }
+        // Check if the next byte is whitespace
+        if let Some(&b) = self.src.get(after_colon_pos) {
+            if !b.is_ascii_whitespace() {
+                self.push(colon_pos, COP, true, "Space missing after colon.");
+                self.fixes.push((after_colon_pos, after_colon_pos, b" ".to_vec()));
+            }
+        }
+    }
+
+    /// Layout/SpaceAfterColon — check optional keyword parameter (def foo(bar:baz))
+    pub(crate) fn check_space_after_colon_kwoptarg(&mut self, node: &ruby_prism::OptionalKeywordParameterNode) {
+        const COP: &str = "Layout/SpaceAfterColon";
+        if !self.on(COP) {
+            return;
+        }
+        let name_loc = node.name_loc();
+        // In prism, name_loc includes the colon, so the colon is at end_offset() - 1
+        let colon_pos = name_loc.end_offset() - 1;
+        // Check if the next byte after the colon is whitespace
+        if let Some(&b) = self.src.get(colon_pos + 1) {
+            if !b.is_ascii_whitespace() {
+                self.push(colon_pos, COP, true, "Space missing after colon.");
+                self.fixes.push((colon_pos + 1, colon_pos + 1, b" ".to_vec()));
+            }
+        }
+    }
+}

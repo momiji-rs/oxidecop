@@ -65,6 +65,7 @@ COPS = {
   'Style/RedundantCapitalW'          => 'style/redundant_capital_w',
   'Lint/HashCompareByIdentity'       => 'lint/hash_compare_by_identity',
   'Lint/NextWithoutAccumulator'      => 'lint/next_without_accumulator',
+  'Layout/SpaceAfterColon'           => 'layout/space_after_colon',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
