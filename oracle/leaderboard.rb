@@ -77,6 +77,7 @@ COPS = {
   'Style/ClassCheck'                 => 'style/class_check',
   'Naming/BlockParameterName'        => 'naming/block_parameter_name',
   'Style/ClassMethods'               => 'style/class_methods',
+  'Style/TrailingBodyOnMethodDefinition' => 'style/trailing_body_on_method_definition',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -2748,3 +2748,83 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((start, end, b"self".to_vec()));
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Style/TrailingBodyOnMethodDefinition — a multiline method definition
+    /// (`def foo; body` / `def self.foo; body`) whose body trails on the
+    /// `def` keyword's own line. Endless defs (`def foo = body`) are always
+    /// on one line as far as this cop cares and are skipped by the caller
+    /// (`node.endless?`) before this runs.
+    /// Ported from rubocop's `TrailingBody` mixin + `LineBreakCorrector`,
+    /// the same shape as `check_trailing_body_on_class` above but keyed off
+    /// the `def` keyword instead of `class`/`module`.
+    pub(crate) fn check_trailing_body_on_method_definition(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/TrailingBodyOnMethodDefinition";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = node.body() else { return }; // no body at all
+        let keyword = node.def_keyword_loc();
+        let keyword_start = keyword.start_offset();
+        let node_end = node.location().end_offset();
+        // `node.multiline?`: the def...end block itself spans >1 line.
+        let start_line = self.idx.loc(keyword_start).0;
+        let end_line = self.idx.loc(node_end.saturating_sub(1)).0;
+        if start_line == end_line {
+            return;
+        }
+        // `same_line?(node, body)`: body starts on the def's first line.
+        if self.idx.loc(body.location().start_offset()).0 != start_line {
+            return;
+        }
+        // `first_part_of`: a bare statement list (`begin_type?`) offends at
+        // its first statement; anything else (e.g. a rescue/ensure wrapper)
+        // offends at the whole body.
+        let first_start = body
+            .as_statements_node()
+            .and_then(|s| s.body().iter().next())
+            .map(|n| n.location().start_offset())
+            .unwrap_or_else(|| body.location().start_offset());
+
+        self.push(
+            first_start,
+            COP,
+            true,
+            "Place the first line of a multi-line method definition's body on its own line.",
+        );
+
+        // configured_indentation_width: cop-local IndentationWidth, else
+        // Layout/IndentationWidth's Width, else 2.
+        let width: usize = self
+            .cfg
+            .param(COP, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2);
+        let keyword_col = self.idx.loc(keyword_start).1 - 1; // 0-based column
+
+        // `break_line_before`: push the first body token onto its own,
+        // freshly-indented line.
+        let indent = " ".repeat(keyword_col + width);
+        self.fixes.push((first_start, first_start, format!("\n{indent}").into_bytes()));
+
+        // `move_comment`: an EOL comment on the def's opening line moves
+        // above the def, at the def's own indentation.
+        if let Some(&(_, cs, ce)) = self.comments.iter().find(|(line, _, _)| *line == start_line) {
+            let mut ins = self.src[cs..ce].to_vec();
+            ins.push(b'\n');
+            ins.extend(std::iter::repeat(b' ').take(keyword_col));
+            self.fixes.push((keyword_start, keyword_start, ins));
+            self.fixes.push((cs, ce, Vec::new()));
+        }
+
+        // `remove_semicolon`: the `;` directly separating the def header
+        // from the trailing body (as opposed to plain whitespace).
+        if let Some(scan) = self.src.get(keyword_start..first_start) {
+            if let Some(rel) = scan.iter().rposition(|&b| b == b';') {
+                let sc = keyword_start + rel;
+                self.fixes.push((sc, sc + 1, Vec::new()));
+            }
+        }
+    }
+}
+
