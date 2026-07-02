@@ -134,29 +134,72 @@ impl<'a> Cops<'a> {
         self.str_ignore.push((l.start_offset(), l.end_offset()));
     }
 
-    /// Style/NumericLiterals — decimal literals over MinDigits want `_` grouping.
-    pub(crate) fn check_numeric_literals(&mut self, node: &ruby_prism::IntegerNode) {
-        if !self.on("Style/NumericLiterals") {
+    /// Style/NumericLiterals — int and float literals over MinDigits want `_`
+    /// thousands grouping. rubocop's check verbatim: judge the INTEGER PART
+    /// (sign stripped, before any `.`/`e`); skip 0-prefixed (non-decimal)
+    /// literals, AllowedNumbers, and anchored AllowedPatterns; flag ungrouped
+    /// runs, any 4-digit run, and short groups (`_\d{1,2}_`, or trailing too
+    /// under Strict).
+    pub(crate) fn check_numeric_literals(&mut self, node: &ruby_prism::Node) {
+        const COP: &str = "Style/NumericLiterals";
+        if !self.on(COP) {
             return;
         }
-        let s = self.node_src(&node.as_node());
-        // decimal only, no existing underscore, > configured digit count
-        let digits = s.iter().filter(|c| c.is_ascii_digit()).count();
-        let min = self.cfg.int("Style/NumericLiterals", "MinDigits");
-        if !s.contains(&b'_') && !s.starts_with(b"0x") && !s.starts_with(b"0b") && !s.starts_with(b"0o") && digits >= min {
-            self.push(node.location().start_offset(), "Style/NumericLiterals", true,
-                "Use underscores(_) as thousands separator and separate every 3 digits with them.".to_string());
-            // fix: group digits in threes from the right (`1000000` -> `1_000_000`)
-            let ds: Vec<u8> = s.to_vec();
-            let mut grouped = Vec::new();
-            for (i, c) in ds.iter().enumerate() {
-                if i > 0 && (ds.len() - i) % 3 == 0 {
-                    grouped.push(b'_');
-                }
-                grouped.push(*c);
+        let s = String::from_utf8_lossy(self.node_src(node)).into_owned();
+        let unsigned = s.trim_start_matches(['+', '-']);
+        let int_part = unsigned.split(['e', 'E', '.']).next().unwrap_or("");
+        if int_part.starts_with('0') {
+            return; // 0x/0b/0o/octal/plain zero — rubocop punts on non-decimal
+        }
+        if let Some(v) = self.cfg.get(COP, "AllowedNumbers") {
+            if crate::config::parse_allowed_list(v).iter().any(|n| n == int_part) {
+                return;
             }
-            let l = node.location();
-            self.fixes.push((l.start_offset(), l.end_offset(), grouped));
+        }
+        // NumericLiterals anchors its AllowedPatterns (`\A...\z`), unlike the
+        // generic mixin — compiled here, on the rare configs that set them.
+        if let Some(v) = self.cfg.get(COP, "AllowedPatterns") {
+            for p in crate::config::parse_allowed_list(v) {
+                if regex::Regex::new(&format!(r"\A(?:{p})\z")).is_ok_and(|re| re.is_match(int_part)) {
+                    return;
+                }
+            }
+        }
+        if int_part.len() < self.cfg.int(COP, "MinDigits") {
+            return;
+        }
+        let ungrouped = int_part.bytes().all(|b| b.is_ascii_digit());
+        let four_run = int_part.as_bytes().windows(4).any(|w| w.iter().all(|b| b.is_ascii_digit()));
+        let strict = self.cfg.param(COP, "Strict") == Some("true");
+        let short_group = {
+            let groups: Vec<&str> = int_part.split('_').collect();
+            // `_\d{1,2}_` — an inner group of 1-2 digits; Strict also rejects
+            // a short FINAL group (`_\d{1,2}$`).
+            let inner = groups.len() > 2
+                && groups[1..groups.len() - 1].iter().any(|g| !g.is_empty() && g.len() <= 2);
+            let last = groups.len() > 1 && groups.last().is_some_and(|g| !g.is_empty() && g.len() <= 2);
+            inner || (strict && last)
+        };
+        if !(ungrouped || four_run || short_group) {
+            return;
+        }
+        let l = node.location();
+        self.push(l.start_offset(), COP, true,
+            "Use underscores(_) as thousands separator and separate every 3 digits with them.");
+        // fix (rubocop's format_number): regroup the integer part, keep the
+        // rest (`.`/`e` suffix) verbatim.
+        if let Ok(v) = int_part.replace('_', "").parse::<i128>() {
+            let digits = v.abs().to_string();
+            let mut grouped = String::new();
+            for (i, c) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i) % 3 == 0 {
+                    grouped.push('_');
+                }
+                grouped.push(c);
+            }
+            let sign = if s.starts_with('-') { "-" } else { "" };
+            let rest = &unsigned[int_part.len()..];
+            self.fixes.push((l.start_offset(), l.end_offset(), format!("{sign}{grouped}{rest}").into_bytes()));
         }
     }
 

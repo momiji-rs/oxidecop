@@ -86,6 +86,8 @@ pub(crate) struct Cops<'a> {
     // Node spans claimed by a multiline string-concat check (rubocop's
     // `ignore_node`): individual strings inside are exempt from on_str.
     pub(crate) str_ignore: Vec<(usize, usize)>,
+    // Numeric literals already checked as part of a folded `-@` call.
+    pub(crate) num_ignore: Vec<usize>,
 }
 impl<'a> Cops<'a> {
     pub(crate) fn on(&self, cop: &str) -> bool {
@@ -159,7 +161,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_module_node(self, node);
     }
     fn visit_integer_node(&mut self, node: &ruby_prism::IntegerNode<'pr>) {
-        self.check_numeric_literals(node);
+        if !self.num_ignore.contains(&node.location().start_offset()) {
+            self.check_numeric_literals(&node.as_node());
+        }
+    }
+    fn visit_float_node(&mut self, node: &ruby_prism::FloatNode<'pr>) {
+        if !self.num_ignore.contains(&node.location().start_offset()) {
+            self.check_numeric_literals(&node.as_node());
+        }
     }
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
         self.check_method_name_def(node);
@@ -216,6 +225,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_alias_method_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // The parser gem folds unary minus into a numeric literal; prism keeps
+        // the `-@` call when the sign is separated from the digits. Emulate
+        // the fold so the offense span starts at the `-`.
+        if node.name().as_slice() == b"-@" && node.arguments().is_none() {
+            if let Some(r) = node.receiver() {
+                if r.as_integer_node().is_some() || r.as_float_node().is_some() {
+                    self.check_numeric_literals(&node.as_node());
+                    self.num_ignore.push(r.location().start_offset());
+                }
+            }
+        }
         self.check_method_name_macros(node);
         // Run every DECLARATIVE send-pattern against this call. The cop is data.
         let n = node.as_node();
@@ -364,6 +384,7 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         scoping_depth: 0,
         interp_depth: 0,
         str_ignore: Vec::new(),
+        num_ignore: Vec::new(),
     };
 
     // ---- text-based cops ----
@@ -374,8 +395,81 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
     // ---- AST-based cops ----
     cops.visit(&result.node());
 
-    cops.offenses.sort_by(|a, b| (a.line, a.col, a.cop).cmp(&(b.line, b.col, b.cop)));
-    LintResult { offenses: cops.offenses, fixes: cops.fixes }
+    let mut offenses = cops.offenses;
+    apply_disable_directives(&mut offenses, &comment_data, src, &idx);
+    offenses.sort_by(|a, b| (a.line, a.col, a.cop).cmp(&(b.line, b.col, b.cop)));
+    LintResult { offenses, fixes: cops.fixes }
+}
+
+/// Honor `# rubocop:disable Cop[, Cop…]` / `rubocop:todo` / `rubocop:enable`
+/// comments: a trailing directive covers its own line; a standalone one opens
+/// a range until the matching `enable` (inclusive) or EOF. `all` and bare
+/// department names (`Style`) are supported.
+fn apply_disable_directives(
+    offenses: &mut Vec<Offense>,
+    comments: &[(usize, usize, Vec<u8>)],
+    src: &[u8],
+    idx: &LineIndex,
+) {
+    let re = {
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        RE.get_or_init(|| regex::Regex::new(r"^#\s*rubocop\s*:\s*(disable|todo|enable)\s+(\S.*?)\s*$").unwrap())
+    };
+    // (cops: None = all, from, to)
+    let mut ranges: Vec<(Option<Vec<String>>, usize, usize)> = Vec::new();
+    let mut open: Vec<(Option<Vec<String>>, usize)> = Vec::new();
+    let eof = idx.starts.len();
+    for (line, off, text) in comments {
+        let t = String::from_utf8_lossy(text);
+        let Some(c) = re.captures(&t) else { continue };
+        let list: Option<Vec<String>> = if c[2].trim() == "all" {
+            None
+        } else {
+            Some(c[2].split(',').map(|s| s.trim().to_string()).collect())
+        };
+        let standalone = src[idx.starts[line - 1]..*off].iter().all(|b| b.is_ascii_whitespace());
+        match &c[1] {
+            "enable" => {
+                // Close every open range this enable covers.
+                let mut i = 0;
+                while i < open.len() {
+                    let covered = match (&list, &open[i].0) {
+                        (None, _) => true,
+                        (Some(en), None) => en.iter().any(|e| e == "all"),
+                        (Some(en), Some(dis)) => dis.iter().all(|d| en.contains(d)),
+                    };
+                    if covered {
+                        let (cops_list, from) = open.remove(i);
+                        ranges.push((cops_list, from, *line));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                // disable | todo
+                if standalone {
+                    open.push((list, *line));
+                } else {
+                    ranges.push((list, *line, *line));
+                }
+            }
+        }
+    }
+    for (list, from) in open {
+        ranges.push((list, from, eof));
+    }
+    if ranges.is_empty() {
+        return;
+    }
+    let covers = |entry: &str, cop: &str| entry == cop || cop.starts_with(&format!("{entry}/"));
+    offenses.retain(|o| {
+        !ranges.iter().any(|(cops_list, from, to)| {
+            o.line >= *from
+                && o.line <= *to
+                && cops_list.as_ref().is_none_or(|cs| cs.iter().any(|c| covers(c, o.cop)))
+        })
+    });
 }
 
 #[cfg(test)]
