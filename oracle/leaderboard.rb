@@ -59,6 +59,7 @@ COPS = {
   'Lint/EachWithObjectArgument'      => 'lint/each_with_object_argument',
   'Style/TrailingBodyOnModule'       => 'style/trailing_body_on_module',
   'Lint/RegexpAsCondition'           => 'lint/regexp_as_condition',
+  'Lint/DuplicateRescueException'    => 'lint/duplicate_rescue_exception',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

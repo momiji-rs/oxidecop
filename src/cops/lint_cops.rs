@@ -922,3 +922,47 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/DuplicateRescueException — the same exception class listed in
+    /// more than one `rescue` clause of a single begin/rescue chain.
+    ///
+    /// Prism represents a rescue chain as a linked list of `RescueNode`s
+    /// reachable via `.subsequent()`, whose head is a `BeginNode`'s
+    /// `.rescue_clause()` — this covers both an explicit
+    /// `begin ... rescue ... end` and an implicit `def`-body rescue, since
+    /// prism wraps a rescuing method body in a `BeginNode` too. Hooking
+    /// `visit_begin_node` (rather than `visit_rescue_node`, which the default
+    /// walk also recurses into for every tail clause) means each chain is
+    /// walked exactly once, from the head — mirroring rubocop's `on_rescue`,
+    /// which fires once per begin/rescue and iterates all of its
+    /// `resbody_branches`. Exceptions (including splats) are compared by
+    /// source text standing in for rubocop's node equality, accumulating a
+    /// `previous` set across the whole chain exactly like rubocop's
+    /// `Set#add?`: the first occurrence of a given exception seeds the set,
+    /// every later occurrence — whether in the same or a different clause —
+    /// is flagged, anchored on the duplicate exception node itself.
+    pub(crate) fn check_duplicate_rescue_exception(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Lint/DuplicateRescueException";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(head) = node.rescue_clause() else { return };
+        let mut previous: HashSet<&'a [u8]> = HashSet::new();
+        let mut clause = Some(head);
+        while let Some(resbody) = clause {
+            for exception in resbody.exceptions().iter() {
+                let src = self.node_src(&exception);
+                if !previous.insert(src) {
+                    self.push(
+                        exception.location().start_offset(),
+                        COP,
+                        false,
+                        "Duplicate `rescue` exception detected.",
+                    );
+                }
+            }
+            clause = resbody.subsequent();
+        }
+    }
+}
