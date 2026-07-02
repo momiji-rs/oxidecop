@@ -1352,3 +1352,48 @@ fn collect_void_context_returns(node: &ruby_prism::Node, out: &mut Vec<usize>) {
     use ruby_prism::Visit;
     f.visit(node);
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/TrailingCommaInAttributeDeclaration — `attr_reader :foo,` swallows
+    /// the following `def` as another argument (a bare `def` evaluates to its
+    /// method name symbol), silently defining a getter that shadows it. Flags
+    /// + strips the trailing comma between the last real attribute and the
+    /// `def` argument.
+    pub(crate) fn check_trailing_comma_in_attribute_declaration(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/TrailingCommaInAttributeDeclaration";
+        if !self.on(COP) {
+            return;
+        }
+        // rubocop's `attribute_accessor?` matcher: bare (nil receiver) send.
+        if node.receiver().is_some() {
+            return;
+        }
+        if !matches!(node.name().as_slice(), b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor") {
+            return;
+        }
+        let Some(args_node) = node.arguments() else { return };
+        let args: Vec<ruby_prism::Node> = args_node.arguments().iter().collect();
+        // A lone `def` argument (e.g. `attr_reader def foo; end`) has no
+        // preceding attribute, so there is no trailing comma to flag.
+        if args.len() <= 1 {
+            return;
+        }
+        let Some(last) = args.last() else { return };
+        if last.as_def_node().is_none() {
+            return;
+        }
+        // `range_with_surrounding_space(..., side: :right).end.resize(1)`:
+        // from the end of the last real attribute, skip horizontal
+        // whitespace, and the next byte is the comma to remove.
+        let prev_end = args[args.len() - 2].location().end_offset();
+        let mut pos = prev_end;
+        while matches!(self.src.get(pos), Some(b' ' | b'\t')) {
+            pos += 1;
+        }
+        if self.src.get(pos) != Some(&b',') {
+            return;
+        }
+        self.push(pos, COP, true, "Avoid leaving a trailing comma in attribute declarations.");
+        self.fixes.push((pos, pos + 1, Vec::new()));
+    }
+}
