@@ -583,3 +583,63 @@ fn is_recursive_basic_literal(node: &ruby_prism::Node) -> bool {
         || node.as_rational_node().is_some()
         || node.as_imaginary_node().is_some()
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/UnifiedInteger — bare or ::rooted Fixnum/Bignum constants
+    /// should use Integer instead.
+    pub(crate) fn check_unified_integer(&mut self, klass: &[u8], node_start: usize, node_end: usize) {
+        const COP: &str = "Lint/UnifiedInteger";
+        if !self.on(COP) {
+            return;
+        }
+        let klass_str = String::from_utf8_lossy(klass);
+        let msg = format!("Use `Integer` instead of `{klass_str}`.");
+        let correctable = self.cfg.target_ruby() >= 2.4;
+        self.push(node_start, COP, correctable, msg);
+        if correctable {
+            let src = &self.src[node_start..node_end];
+            // Determine the replacement: preserve :: prefix if present
+            let replacement = if src.starts_with(b"::") {
+                b"::Integer".to_vec()
+            } else {
+                b"Integer".to_vec()
+            };
+            self.fixes.push((node_start, node_end, replacement));
+        }
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// Security/MarshalLoad — `Marshal.load` / `Marshal.restore` on a bare or
+    /// ::-rooted Marshal receiver; the `Marshal.load(Marshal.dump(...))`
+    /// deep-copy idiom is exempt.
+    pub(crate) fn check_marshal_load(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Security/MarshalLoad";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !matches!(name, b"load" | b"restore") {
+            return;
+        }
+        let recv_const = node.receiver().and_then(|r| const_name_root(&r));
+        if recv_const.as_deref() != Some("Marshal") {
+            return;
+        }
+        if let Some(args) = node.arguments() {
+            if let Some(first_arg) = args.arguments().iter().next() {
+                if let Some(call) = first_arg.as_call_node() {
+                    if call.name().as_slice() == b"dump"
+                        && call.receiver().and_then(|r| const_name_root(&r)).as_deref() == Some("Marshal")
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(sel) = node.message_loc() {
+            let method = String::from_utf8_lossy(name);
+            self.push(sel.start_offset(), COP, false, format!("Avoid using `Marshal.{method}`."));
+        }
+    }
+}

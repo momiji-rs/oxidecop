@@ -687,4 +687,29 @@ impl<'a> Cops<'a> {
             }
         }
     }
+
+    /// Layout/SpaceAfterMethodName — space between method name and opening parenthesis in def
+    pub(crate) fn check_space_after_method_name(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Layout/SpaceAfterMethodName";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(lparen_loc) = node.lparen_loc() else { return };
+
+        // Check if there's a space before the opening paren
+        let lparen_start = lparen_loc.start_offset();
+        if lparen_start == 0 {
+            return;
+        }
+
+        let space_pos = lparen_start - 1;
+        if self.src.get(space_pos) != Some(&b' ') {
+            return;
+        }
+
+        // Report the offense at the space position
+        self.push(space_pos, COP, true, "Do not put a space between a method name and the opening parenthesis.");
+        // Fix: remove the space
+        self.fixes.push((space_pos, lparen_start, Vec::new()));
+    }
 }

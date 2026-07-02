@@ -140,6 +140,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Layout/SpaceBeforeComma",
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
+    "Security/MarshalLoad", "Layout/SpaceAfterMethodName",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -147,7 +148,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/LineLength", "Layout/TrailingWhitespace", "Lint/BigDecimalNew",
     "Lint/BooleanSymbol", "Lint/Debugger", "Lint/EmptyEnsure", "Lint/EmptyExpression",
     "Lint/NestedMethodDefinition", "Lint/RandOne", "Lint/UriEscapeUnescape",
-    "Lint/UriRegexp", "Naming/MethodName", "Style/ArrayJoin", "Style/Dir",
+    "Lint/UriRegexp", "Lint/UnifiedInteger", "Naming/MethodName", "Style/ArrayJoin", "Style/Dir",
     "Style/Documentation", "Style/EvenOdd", "Style/FrozenStringLiteralComment",
     "Style/NegatedIf", "Style/NestedFileDirname", "Style/NilComparison",
     "Style/NumericLiterals", "Style/NumericPredicate", "Style/RandomWithOffset",
@@ -670,6 +671,25 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         ruby_prism::visit_constant_path_write_node(self, node);
     }
+    fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+        let klass = node.name().as_slice();
+        if matches!(klass, b"Fixnum" | b"Bignum") {
+            let l = node.location();
+            self.check_unified_integer(klass, l.start_offset(), l.end_offset());
+        }
+    }
+    fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+        // Only check if parent is None (bare ::rooted constant, not namespaced)
+        if node.parent().is_none() {
+            if let Some(name) = node.name() {
+                let klass = name.as_slice();
+                if matches!(klass, b"Fixnum" | b"Bignum") {
+                    let l = node.location();
+                    self.check_unified_integer(klass, l.start_offset(), l.end_offset());
+                }
+            }
+        }
+    }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
         self.check_negated_if(node);
         if let Some(kw) = node.if_keyword_loc() {
@@ -890,6 +910,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
         self.check_def_with_parentheses(node);
+        self.check_space_after_method_name(node);
         self.check_method_name_def(node);
         self.check_binary_operator_parameter(node);
         self.check_nested_method_definition(node);
@@ -1008,6 +1029,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_method_name_macros(node);
         self.check_colon_method_call(node);
         self.check_deprecated_class_methods(node);
+        self.check_marshal_load(node);
         self.check_empty_literal(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
