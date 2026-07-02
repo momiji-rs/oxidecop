@@ -5,10 +5,11 @@ official [Prism](https://github.com/ruby/prism) parser. Think *ruff, but for
 Ruby, and bug-compatible with the RuboCop everyone already uses.*
 
 > **Status: early / experimental.** The core idea is proven — the 47
-> implemented cops pass **100% of RuboCop's own representable spec examples**
-> (1040/1040, see below) and match RuboCop **byte-for-byte on real repos**
-> (Rails, Mastodon, rubygems.org — see BENCHMARKS.md) — but 39 cops is not a
-> shippable linter yet.
+> implemented cops pass **100% of RuboCop's own representable spec examples**,
+> detection (1051/1051) *and* autocorrection (477/477, `--fix`), and match
+> RuboCop **byte-for-byte on real repos** (Rails, Mastodon, rubygems.org,
+> RuboCop's own source — see BENCHMARKS.md) — but 47 cops is not a shippable
+> linter yet.
 
 ---
 
@@ -97,9 +98,16 @@ de-annotated source through the `rubocop-rs` binary under *the example's own*
 Current leaderboard (`ruby oracle/leaderboard.rb`), against RuboCop v1.88.0:
 
 ```
-47 cops implemented — every one at 100% FULL match.
-TOTAL (representable examples)         1040    119               1040/1040    100%
+47 cops implemented — every one at 100% FULL match, 100% FIX (autocorrect).
+TOTAL (representable examples)         1051    108               1051/1051    100%   FIX 477/477
 ```
+
+The **FIX** column is the autocorrection oracle: each example's
+`expect_correction` / `expect_no_corrections` block is compared against the
+binary's `--fix` output. (Where the two rubocop behaviors differ — the
+expect_correction DSL iterates one cop instance, a fresh `rubocop -a` run
+corrects more — the binary matches `-a` byte-for-byte and the oracle accepts
+either.)
 
 (The full per-cop table is one command away: `ruby oracle/leaderboard.rb`.)
 
@@ -111,8 +119,10 @@ The oracle renders what is static (heredoc escapes per Ruby's quoting rules,
 the known-constant helpers like `trailing_whitespace`, `#{enforced_style}` from
 the active config) and **skips** anything still-dynamic rather than scoring a
 harness limitation as a cop miss — hence the `skip` column. (`Lint/RandOne`'s
-spec is ENTIRELY parameterized shared_examples, so the oracle scores nothing;
-its cases are covered verbatim by `cargo test` instead.)
+spec is ENTIRELY shared_examples — which run at their `it_behaves_like` call
+sites with the caller's config, so their textual position lies about the
+active configuration and the oracle skips them; its cases are covered verbatim
+by `cargo test` instead.)
 
 Each example runs under its own `let(:cop_config)`, translated to `.rubocop.yml`.
 So a `LineLength` example with `Max: 30, AllowURI: true` is tested at that `Max` —
@@ -185,11 +195,13 @@ files — rubocop-rs finishes in **0.05s** against rubocop's 4.7s with the same
 cops (~90×, with rubocop's boot amortized across all files).
 
 And the offense sets match: `tools/parity.sh <ruby-tree>` lints a tree with
-both linters (rubocop restricted to the implemented cops) and diffs the
-normalized offense lists. On rubocop's own 916-file tree both report zero;
-on `diff-lcs` (a gem with real offenses) both report the **same 157 offense
-lines, byte-identical** — the end-to-end check the per-example oracle can't
-give.
+both linters (both under `--only` with the implemented cop list, which rubocop
+force-enables) and diffs the normalized offense lists. Byte-identical on all
+four corpora: **Rails (12,271 offense lines), Mastodon (4,123),
+rubygems.org (772), and rubocop's own 1,712-file source tree (0 vs 0)** — the
+end-to-end check the per-example oracle can't give. CI
+(`.github/workflows/ci.yml`) re-verifies the oracle at 100% and the
+rubocop-src parity on every push.
 
 ## Repo layout
 
