@@ -419,6 +419,29 @@ impl<'a> super::Cops<'a> {
         self.push(rs, COP, correctable,
             format!("`{current}` is deprecated in favor of `{prefer}`."));
     }
+
+    /// Lint/FloatOutOfRange — float literals with magnitude exceeding Float range
+    /// (they parse to Infinity or underflow to 0.0).
+    pub(crate) fn check_float_out_of_range(&mut self, node: &ruby_prism::FloatNode) {
+        const COP: &str = "Lint/FloatOutOfRange";
+        if !self.on(COP) {
+            return;
+        }
+        let value = node.value();
+        // Overflow case: value is infinite
+        if value.is_infinite() {
+            self.push(node.location().start_offset(), COP, false, "Float out of range.");
+            return;
+        }
+        // Underflow case: value is zero but source contains a non-zero digit
+        if value == 0.0 {
+            let src = self.node_src(&node.as_node());
+            // Check if source contains any digit 1-9 (indicating an underflow)
+            if src.iter().any(|&b| b >= b'1' && b <= b'9') {
+                self.push(node.location().start_offset(), COP, false, "Float out of range.");
+            }
+        }
+    }
 }
 
 /// The receiver as a root constant name: `Foo` or `::Foo` (nothing deeper).

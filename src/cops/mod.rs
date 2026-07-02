@@ -138,7 +138,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/EmptyClass", "Lint/DeprecatedClassMethods", "Layout/EmptyLineAfterMagicComment",
     "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon", "Style/GlobalVars",
     "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Layout/SpaceBeforeComma",
-    "Layout/SpaceBeforeComment",
+    "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -872,6 +872,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_float_node(&mut self, node: &ruby_prism::FloatNode<'pr>) {
+        self.check_float_out_of_range(node);
         if !self.num_ignore.contains(&node.location().start_offset()) {
             self.check_numeric_literals(&node.as_node());
         }
