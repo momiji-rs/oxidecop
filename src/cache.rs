@@ -19,7 +19,11 @@ pub struct Cache {
     salt: String,
     // content-hash -> serialized offense lines, loaded once
     entries: std::collections::HashMap<u128, String>,
-    fresh: std::sync::Mutex<Vec<(u128, String)>>,
+    // path -> (content key, mtime ns, len): a stat match lets a warm run
+    // skip reading the file entirely (nitrocop-style; falls back to the
+    // content hash when the stat changed but the bytes didn't)
+    paths: std::collections::HashMap<String, (u128, u64, u64)>,
+    fresh: std::sync::Mutex<Vec<(u128, String, Option<(String, u64, u64)>)>>,
 }
 
 impl Cache {
@@ -54,16 +58,24 @@ impl Cache {
         // flushed once — thousands of per-entry files cost more in syscalls
         // than the linting they save.
         let mut entries = std::collections::HashMap::new();
+        let mut paths = std::collections::HashMap::new();
         if let Ok(text) = std::fs::read_to_string(&file) {
             for rec in text.split('\u{0}') {
-                if let Some((k, v)) = rec.split_once('\u{1}') {
-                    if let Ok(key) = u128::from_str_radix(k, 16) {
-                        entries.insert(key, v.to_string());
+                if let Some((head, v)) = rec.split_once('\u{1}') {
+                    // head = key[\u{2}mtime\u{2}len\u{2}path]
+                    let mut it = head.split('\u{2}');
+                    let Some(k) = it.next() else { continue };
+                    let Ok(key) = u128::from_str_radix(k, 16) else { continue };
+                    if let (Some(mt), Some(ln), Some(pa)) = (it.next(), it.next(), it.next()) {
+                        if let (Ok(mt), Ok(ln)) = (mt.parse(), ln.parse()) {
+                            paths.insert(pa.to_string(), (key, mt, ln));
+                        }
                     }
+                    entries.insert(key, v.to_string());
                 }
             }
         }
-        Some(Cache { file, salt, entries, fresh: std::sync::Mutex::new(Vec::new()) })
+        Some(Cache { file, salt, entries, paths, fresh: std::sync::Mutex::new(Vec::new()) })
     }
 
     fn key(&self, src: &[u8]) -> u128 {
@@ -74,9 +86,22 @@ impl Cache {
         ((h1 as u128) << 64) | h2 as u128
     }
 
+    /// Warm-path hit: the path's recorded (mtime, len) still match, so the
+    /// cached result applies without reading the file at all.
+    pub fn get_by_meta(&self, path: &str, mtime: u64, len: u64) -> Option<Vec<Offense>> {
+        let (key, mt, ln) = self.paths.get(path)?;
+        if *mt != mtime || *ln != len {
+            return None;
+        }
+        Self::parse_entry(self.entries.get(key)?)
+    }
+
     /// Cached offenses for this source, if present and well-formed.
     pub fn get(&self, src: &[u8]) -> Option<Vec<Offense>> {
-        let text = self.entries.get(&self.key(src))?;
+        Self::parse_entry(self.entries.get(&self.key(src))?)
+    }
+
+    fn parse_entry(text: &str) -> Option<Vec<Offense>> {
         let mut out = Vec::new();
         for line in text.lines() {
             let mut it = line.splitn(5, '\t');
@@ -91,7 +116,7 @@ impl Cache {
     }
 
     /// Record a fresh result (kept in memory until `flush`).
-    pub fn put(&self, src: &[u8], offenses: &[Offense]) {
+    pub fn put(&self, src: &[u8], offenses: &[Offense], meta: Option<(&str, u64, u64)>) {
         let mut text = String::new();
         for o in offenses {
             let msg = o.message.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
@@ -99,7 +124,7 @@ impl Cache {
                 u8::from(o.correctable), msg));
         }
         if let Ok(mut f) = self.fresh.lock() {
-            f.push((self.key(src), text));
+            f.push((self.key(src), text, meta.map(|(p, mt, ln)| (p.to_string(), mt, ln))));
         }
     }
 
@@ -109,12 +134,24 @@ impl Cache {
         if fresh.is_empty() {
             return;
         }
-        for (k, v) in fresh {
+        for (k, v, meta) in fresh {
             self.entries.insert(k, v);
+            if let Some((p, mt, ln)) = meta {
+                self.paths.insert(p, (k, mt, ln));
+            }
+        }
+        let mut by_key: std::collections::HashMap<u128, (u64, u64, &str)> = std::collections::HashMap::new();
+        for (p, (k, mt, ln)) in &self.paths {
+            by_key.insert(*k, (*mt, *ln, p));
         }
         let mut out = String::new();
         for (k, v) in &self.entries {
-            out.push_str(&format!("{k:032x}\u{1}{v}\u{0}"));
+            match by_key.get(k) {
+                Some((mt, ln, p)) => {
+                    out.push_str(&format!("{k:032x}\u{2}{mt}\u{2}{ln}\u{2}{p}\u{1}{v}\u{0}"));
+                }
+                None => out.push_str(&format!("{k:032x}\u{1}{v}\u{0}")),
+            }
         }
         let tmp = self.file.with_extension("tmp");
         if std::fs::write(&tmp, out).is_ok() {

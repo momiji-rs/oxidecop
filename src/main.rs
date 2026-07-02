@@ -109,7 +109,7 @@ fn load_config_chain(path: &Path, depth: usize) -> config::Config {
     }
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut base: Option<config::Config> = None;
-    let mut absorb = |sub: config::Config, base: &mut Option<config::Config>| match base {
+    let absorb = |sub: config::Config, base: &mut Option<config::Config>| match base {
         None => *base = Some(sub),
         Some(b) => b.merge_child(sub),
     };
@@ -401,10 +401,30 @@ fn main() {
                     (&cfg, &eng, rel)
                 }
             };
+            // nested-config files skip the cache: its key is salted with the
+            // ROOT config only
+            let meta = if nested.is_none() && cache.is_some() {
+                std::fs::metadata(f).ok().map(|m| {
+                    let mt = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    (mt, m.len())
+                })
+            } else {
+                None
+            };
+            // warm path: an unchanged (mtime, len) stat reuses the cached
+            // result without reading the file
+            if let (Some(c), Some((mt, ln))) = (&cache, meta) {
+                if let Some(hit) = c.get_by_meta(&rel, mt, ln) {
+                    return (display, hit);
+                }
+            }
             match std::fs::read(f) {
                 Ok(src) => {
-                    // nested-config files skip the cache: its key is salted
-                    // with the ROOT config only
                     if nested.is_none() {
                         if let Some(c) = &cache {
                             if let Some(hit) = c.get(&src) {
@@ -415,7 +435,7 @@ fn main() {
                     let offenses = cops::lint(&src, the_cfg, the_eng, &rel).offenses;
                     if nested.is_none() {
                         if let Some(c) = &cache {
-                            c.put(&src, &offenses);
+                            c.put(&src, &offenses, meta.map(|(mt, ln)| (rel.as_str(), mt, ln)));
                         }
                     }
                     (display, offenses)
