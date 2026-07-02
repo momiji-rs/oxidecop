@@ -1185,6 +1185,26 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Style/SymbolLiteral — `:"foo"` where the quoted content is itself a
+    /// plain word-like symbol (rubocop's `/\A:["'][A-Za-z_]\w*["']\z/`) → `:foo`.
+    pub(crate) fn check_symbol_literal(&mut self, node: &ruby_prism::SymbolNode) {
+        const COP: &str = "Style/SymbolLiteral";
+        if !self.on(COP) {
+            return;
+        }
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = re(&RE, r#"\A:["'][A-Za-z_]\w*["']\z"#);
+        let l = node.location();
+        let src = &self.src[l.start_offset()..l.end_offset()];
+        let Ok(text) = std::str::from_utf8(src) else { return };
+        if !re.is_match(text) {
+            return;
+        }
+        self.push(l.start_offset(), COP, true, "Do not use strings for word-like symbol literals.");
+        let replacement: Vec<u8> = src.iter().copied().filter(|&b| b != b'\'' && b != b'"').collect();
+        self.fixes.push((l.start_offset(), l.end_offset(), replacement));
+    }
+
     /// Style/NumericPredicate: under `predicate` style flag `x {==,>,<} 0` (and
     /// inverted) → suggest `x.zero?/positive?/negative?`; under `comparison`
     /// style flag those predicates → suggest the comparison. Returns the offense

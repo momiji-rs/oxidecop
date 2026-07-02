@@ -80,6 +80,7 @@ COPS = {
   'Layout/SpaceBeforeComma'          => 'layout/space_before_comma',
   'Layout/SpaceBeforeComment'        => 'layout/space_before_comment',
   'Lint/FloatOutOfRange'             => 'lint/float_out_of_range',
+  'Style/SymbolLiteral'              => 'style/symbol_literal',
   'Style/DefWithParentheses'         => 'style/def_with_parentheses',
   'Style/WhileUntilDo'               => 'style/while_until_do',
   'Style/MultilineIfThen'            => 'style/multiline_if_then',

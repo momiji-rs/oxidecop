@@ -138,7 +138,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/EmptyClass", "Lint/DeprecatedClassMethods", "Layout/EmptyLineAfterMagicComment",
     "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon", "Style/GlobalVars",
     "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Layout/SpaceBeforeComma",
-    "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange",
+    "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -619,6 +619,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
         self.check_boolean_symbol(node);
+        self.check_symbol_literal(node);
     }
     fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
         if self.ll_active {
