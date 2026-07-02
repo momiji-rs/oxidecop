@@ -141,7 +141,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
-    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument",
+    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -1046,6 +1046,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_colon_method_call(node);
         self.check_deprecated_class_methods(node);
         self.check_marshal_load(node);
+        self.check_security_eval(node);
         self.check_proc_new(node);
         self.check_strip(node);
         self.check_space_after_not(node);

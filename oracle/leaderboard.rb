@@ -54,6 +54,7 @@ COPS = {
   'Layout/LeadingEmptyLines'         => 'layout/leading_empty_lines',
   'Style/Strip'                      => 'style/strip',
   'Lint/TopLevelReturnWithArgument'  => 'lint/top_level_return_with_argument',
+  'Security/Eval'                    => 'security/eval',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

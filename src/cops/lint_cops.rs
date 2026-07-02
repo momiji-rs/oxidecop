@@ -755,3 +755,74 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((l.start_offset(), l.end_offset(), b"return".to_vec()));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Security/Eval — `eval` and related calls with dynamic strings
+    /// are flagged as a security risk. Literal strings and interpolated
+    /// strings with only literal interpolations are exempt.
+    pub(crate) fn check_security_eval(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Security/Eval";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if method is "eval"
+        if node.name().as_slice() != b"eval" {
+            return;
+        }
+
+        // Check the receiver: nil (direct call), binding method, or Kernel constant
+        let valid_receiver = if let Some(recv) = node.receiver() {
+            // Check for Kernel constant (bare or ::rooted)
+            if let Some("Kernel") = const_name_root(&recv).as_deref() {
+                true
+            } else if let Some(call) = recv.as_call_node() {
+                // binding method call: binding.eval(...)
+                call.name().as_slice() == b"binding" && call.receiver().is_none()
+            } else {
+                false
+            }
+        } else {
+            // nil receiver (direct eval call)
+            true
+        };
+
+        if !valid_receiver {
+            return;
+        }
+
+        // Get the first argument
+        let args: Vec<ruby_prism::Node> = node
+            .arguments()
+            .map(|a| a.arguments().iter().collect())
+            .unwrap_or_default();
+
+        if args.is_empty() {
+            return;
+        }
+
+        let first_arg = &args[0];
+
+        // Allow literal strings
+        if first_arg.as_string_node().is_some() {
+            return;
+        }
+
+        // Allow interpolated strings where all parts are recursive literals
+        if let Some(istr) = first_arg.as_interpolated_string_node() {
+            if istr.parts().iter().all(|p| is_recursive_basic_literal(&p)) {
+                return;
+            }
+        }
+
+        // Flag the offense at the method location
+        if let Some(sel) = node.message_loc() {
+            self.push(
+                sel.start_offset(),
+                COP,
+                false,
+                "The use of `eval` is a serious security risk.",
+            );
+        }
+    }
+}
