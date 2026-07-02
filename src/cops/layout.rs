@@ -518,6 +518,44 @@ fn is_magic_comment(comment: &[u8]) -> bool {
 }
 
 impl<'a> Cops<'a> {
+    /// Layout/SpaceBeforeComment — inline comments must have a space before the
+    /// `#`; leading comments are fine, and doc comments (=begin/=end) are skipped.
+    pub(crate) fn check_space_before_comment(&mut self) {
+        const COP: &str = "Layout/SpaceBeforeComment";
+        if !self.on(COP) {
+            return;
+        }
+        for (line, comment_start, _comment_end) in self.comments {
+            // Skip doc comments (=begin/=end)
+            if comment_start + 1 < self.src.len() && self.src[*comment_start] == b'#' {
+                if self.src[*comment_start + 1] == b'=' {
+                    continue; // This is =begin or =end
+                }
+            }
+
+            // Check if the comment starts at the line's first non-whitespace position
+            let ls = self.idx.starts[line - 1];
+            let line_start_non_ws = self.src[ls..].iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(0);
+            let first_non_ws_offset = ls + line_start_non_ws;
+
+            // If the comment is at the start of the line (ignoring whitespace), it's fine
+            if *comment_start == first_non_ws_offset {
+                continue;
+            }
+
+            // Check if the byte immediately before the `#` is whitespace
+            if *comment_start > 0 {
+                let prev_byte = self.src[*comment_start - 1];
+                if !prev_byte.is_ascii_whitespace() {
+                    // Offense: no space before comment
+                    self.push(*comment_start, COP, true, "Put a space before an end-of-line comment.");
+                    // Fix: insert a space before the comment
+                    self.fixes.push((*comment_start, *comment_start, b" ".to_vec()));
+                }
+            }
+        }
+    }
+
     /// Layout/SpaceAfterComma — a comma must be followed by whitespace
     /// (semicolons after and `}` under no_space hash style are exempt).
     pub(crate) fn check_space_after_comma(&mut self) {

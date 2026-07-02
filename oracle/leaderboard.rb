@@ -78,6 +78,7 @@ COPS = {
   'Layout/SpaceAfterComma'           => 'layout/space_after_comma',
   'Layout/SpaceBeforeSemicolon'      => 'layout/space_before_semicolon',
   'Layout/SpaceBeforeComma'          => 'layout/space_before_comma',
+  'Layout/SpaceBeforeComment'        => 'layout/space_before_comment',
   'Style/DefWithParentheses'         => 'style/def_with_parentheses',
   'Style/WhileUntilDo'               => 'style/while_until_do',
   'Style/MultilineIfThen'            => 'style/multiline_if_then',
