@@ -2404,3 +2404,62 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/RedundantCapitalW — `%W[...]` / `%W(...)` with no interpolation
+    /// and no special escapes → use `%w`. Fix downcases the W in the opening
+    /// delimiter (e.g., `%W[cat dog]` → `%w[cat dog]`).
+    pub(crate) fn check_redundant_capital_w(&mut self, node: &ruby_prism::ArrayNode) {
+        const COP: &str = "Style/RedundantCapitalW";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if opening delimiter is %W
+        let Some(open_loc) = node.opening_loc() else { return };
+        if !open_loc.as_slice().starts_with(b"%W") {
+            return;
+        }
+
+        // Check if any element requires interpolation (is interpolated or has escapes)
+        for element in node.elements().iter() {
+            // If it's an interpolated string (has #{...}), we need %W
+            if element.as_interpolated_string_node().is_some() {
+                return;
+            }
+
+            // If it's a string node, check if its source requires double quotes
+            // (i.e., has escape sequences that only %W would preserve)
+            if let Some(str_node) = element.as_string_node() {
+                let l = str_node.location();
+                let raw_src = &self.src[l.start_offset()..l.end_offset()];
+                if double_quotes_required(raw_src) {
+                    return;
+                }
+            }
+        }
+
+        // If we get here, no interpolation and no escapes, so %w would work
+        let l = node.location();
+        self.push(
+            l.start_offset(),
+            COP,
+            true,
+            "Do not use `%W` unless interpolation is needed. If not, use `%w`.",
+        );
+
+        // Fix: replace W with w in opening delimiter
+        let open_start = open_loc.start_offset();
+        let open_end = open_loc.end_offset();
+        let open_src = &self.src[open_start..open_end];
+        let mut replacement = open_src.to_vec();
+        // Replace the first occurrence of 'W' with 'w'
+        for byte in &mut replacement {
+            if *byte == b'W' {
+                *byte = b'w';
+                break;
+            }
+        }
+        self.fixes.push((open_start, open_end, replacement));
+    }
+}
