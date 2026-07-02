@@ -176,6 +176,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if let Some((off, msg)) = self.symbol_proc_lambda(node) {
             self.push(off, "Style/SymbolProc", true, msg);
         }
+        // `->` is a lambda literal — rubocop reaches it via the `lambda` send.
+        if self.on("Style/RedundantReturn") {
+            if let Some(b) = node.body() {
+                self.rr_branch(&b);
+            }
+        }
         ruby_prism::visit_lambda_node(self, node);
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
@@ -242,6 +248,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.check_zero_length(node);
+        // Style/RedundantReturn also fires for method-defining blocks
+        // (rubocop's RESTRICT_ON_SEND: define_method & friends, lambda).
+        if self.on("Style/RedundantReturn")
+            && matches!(node.name().as_slice(), b"define_method" | b"define_singleton_method" | b"lambda")
+        {
+            if let Some(body) = node.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) {
+                self.rr_branch(&body);
+            }
+        }
         // Style/NumericPredicate (imperative: message interpolates a constructed
         // suggestion). Uses call_stack for AllowedMethods-on-ancestor + negation.
         if let Some((off, msg)) = self.numeric_predicate(node) {

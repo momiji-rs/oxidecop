@@ -288,17 +288,117 @@ impl<'a> Cops<'a> {
         self.fixes.push((self.idx.starts[line - 1], self.line_end(line), rep.to_vec()));
     }
 
-    /// Style/RedundantReturn — the def body's last statement is a bare `return x`.
+    /// Style/RedundantReturn — a `return` in tail position of a def (or a
+    /// `define_method`/`lambda` block). rubocop's `check_branch` walks tail
+    /// positions recursively: the last statement, both arms of a non-ternary
+    /// if/unless, every case/when + else, rescue clauses (+ else, or the body
+    /// when no else), and through begin groupings.
     pub(crate) fn check_redundant_return(&mut self, node: &ruby_prism::DefNode) {
         if !self.on("Style/RedundantReturn") {
             return;
         }
-        if let Some(stmts) = node.body().and_then(|b| b.as_statements_node()) {
+        if let Some(b) = node.body() {
+            self.rr_branch(&b);
+        }
+    }
+    pub(crate) fn rr_branch(&mut self, node: &ruby_prism::Node) {
+        if let Some(stmts) = node.as_statements_node() {
             if let Some(last) = stmts.body().iter().last() {
-                if let Some(ret) = last.as_return_node() {
-                    self.push(ret.location().start_offset(), "Style/RedundantReturn", true,
-                        "Redundant `return` detected.");
+                self.rr_branch(&last);
+            }
+        } else if let Some(ret) = node.as_return_node() {
+            self.rr_return(&ret);
+        } else if let Some(c) = node.as_case_node() {
+            for w in c.conditions().iter() {
+                if let Some(s) = w.as_when_node().and_then(|w| w.statements()) {
+                    self.rr_branch(&s.as_node());
                 }
+            }
+            if let Some(s) = c.else_clause().and_then(|e| e.statements()) {
+                self.rr_branch(&s.as_node());
+            }
+        } else if let Some(c) = node.as_case_match_node() {
+            for i in c.conditions().iter() {
+                if let Some(s) = i.as_in_node().and_then(|i| i.statements()) {
+                    self.rr_branch(&s.as_node());
+                }
+            }
+            if let Some(s) = c.else_clause().and_then(|e| e.statements()) {
+                self.rr_branch(&s.as_node());
+            }
+        } else if let Some(i) = node.as_if_node() {
+            if i.if_keyword_loc().is_none() {
+                return; // ternary
+            }
+            if let Some(s) = i.statements() {
+                self.rr_branch(&s.as_node());
+            }
+            if let Some(sub) = i.subsequent() {
+                self.rr_branch(&sub); // ElseNode, or an elsif IfNode
+            }
+        } else if let Some(u) = node.as_unless_node() {
+            if let Some(s) = u.statements() {
+                self.rr_branch(&s.as_node());
+            }
+            if let Some(s) = u.else_clause().and_then(|e| e.statements()) {
+                self.rr_branch(&s.as_node());
+            }
+        } else if let Some(e) = node.as_else_node() {
+            if let Some(s) = e.statements() {
+                self.rr_branch(&s.as_node());
+            }
+        } else if let Some(b) = node.as_begin_node() {
+            if let Some(r) = b.rescue_clause() {
+                let mut cur = Some(r);
+                while let Some(rn) = cur {
+                    if let Some(s) = rn.statements() {
+                        self.rr_branch(&s.as_node());
+                    }
+                    cur = rn.subsequent();
+                }
+                // rescue-else is a branch; the main body is a tail only when
+                // there is no else (rubocop's `unless node.else?`).
+                if let Some(s) = b.else_clause().and_then(|e| e.statements()) {
+                    self.rr_branch(&s.as_node());
+                } else if let Some(s) = b.statements() {
+                    self.rr_branch(&s.as_node());
+                }
+            } else if let Some(s) = b.statements() {
+                self.rr_branch(&s.as_node());
+            }
+        }
+    }
+    fn rr_return(&mut self, ret: &ruby_prism::ReturnNode) {
+        const COP: &str = "Style/RedundantReturn";
+        let args: Vec<ruby_prism::Node> =
+            ret.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let multi = args.len() > 1;
+        let allow_multi = self.cfg.param(COP, "AllowMultipleReturnValues") == Some("true");
+        if allow_multi && multi {
+            return;
+        }
+        let kw = ret.keyword_loc();
+        self.push(kw.start_offset(), COP, true, if multi {
+            "Redundant `return` detected. To return multiple values, use an array."
+        } else {
+            "Redundant `return` detected."
+        });
+        let l = ret.location();
+        if args.is_empty() {
+            // bare `return` -> `nil`
+            self.fixes.push((l.start_offset(), l.end_offset(), b"nil".to_vec()));
+        } else {
+            // drop the keyword (+ trailing space); bracket multiple values
+            let mut kw_end = kw.end_offset();
+            while kw_end < self.src.len() && matches!(self.src[kw_end], b' ' | b'\t') {
+                kw_end += 1;
+            }
+            self.fixes.push((kw.start_offset(), kw_end, Vec::new()));
+            if multi {
+                let s = args.first().unwrap().location().start_offset();
+                let e = args.last().unwrap().location().end_offset();
+                self.fixes.push((s, s, b"[".to_vec()));
+                self.fixes.push((e, e, b"]".to_vec()));
             }
         }
     }
