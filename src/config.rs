@@ -83,6 +83,8 @@ pub struct Config {
     pub only: Option<Vec<String>>,
     // `--except Cop1,Cop2` — never run these, whatever else says so.
     pub except: Option<Vec<String>>,
+    // `inherit_gem:` targets: (gem name, config paths inside the gem).
+    pub inherit_gems: Vec<(String, Vec<String>)>,
     // `inherit_from:` targets, in order (base-most first), relative to the
     // config file's directory. The runner resolves and merges them.
     pub inherits: Vec<String>,
@@ -93,7 +95,10 @@ impl Config {
         let mut cur: Option<String> = None;
         let mut cur_list_key: Option<String> = None;
         let mut inherits: Vec<String> = Vec::new();
+        let mut inherit_gems: Vec<(String, Vec<String>)> = Vec::new();
         let mut in_inherit_list = false;
+        let mut in_inherit_gem = false;
+        let mut cur_gem: Option<String> = None;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or(""); // strip comments
             if line.trim().is_empty() {
@@ -104,9 +109,17 @@ impl Config {
             if !indented {
                 cur_list_key = None;
                 in_inherit_list = false;
+                in_inherit_gem = false;
+                cur_gem = None;
                 // `inherit_from:` — scalar or block list of config paths
                 if t == "inherit_from:" {
                     in_inherit_list = true;
+                    cur = None;
+                    continue;
+                }
+                // `inherit_gem:` — nested map of gem name -> path(s)
+                if t == "inherit_gem:" {
+                    in_inherit_gem = true;
                     cur = None;
                     continue;
                 }
@@ -126,6 +139,18 @@ impl Config {
             } else if in_inherit_list {
                 if let Some(item) = t.strip_prefix("- ") {
                     inherits.push(item.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+                }
+            } else if in_inherit_gem {
+                if let Some(item) = t.strip_prefix("- ") {
+                    if let Some((_, paths)) = cur_gem.as_ref().and_then(|g| inherit_gems.iter_mut().find(|(n, _)| n == g)) {
+                        paths.push(item.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+                    }
+                } else if let Some((g, v)) = t.split_once(':') {
+                    let g = g.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+                    let v = v.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+                    let paths = if v.is_empty() { Vec::new() } else { vec![v] };
+                    cur_gem = Some(g.clone());
+                    inherit_gems.push((g, paths));
                 }
             } else if let Some(item) = t.strip_prefix("- ") {
                 // a block-list item under the last seen key: accumulate into
@@ -152,7 +177,7 @@ impl Config {
             .and_then(|s| s.get("DisabledByDefault"))
             .map(|v| v == "true")
             .unwrap_or(false);
-        Config { sections, all_disabled_by_default, only: None, except: None, inherits }
+        Config { sections, all_disabled_by_default, only: None, except: None, inherits, inherit_gems }
     }
     /// Overlay `child` on top of self (self is the inherited base). Scalar
     /// keys override; `Exclude` lists MERGE (union), matching rubocop's
@@ -182,6 +207,7 @@ impl Config {
             .map(|v| v == "true")
             .unwrap_or(false);
         self.inherits = Vec::new();
+        self.inherit_gems = Vec::new();
     }
     pub fn enabled(&self, cop: &str) -> bool {
         if let Some(except) = &self.except {
@@ -258,6 +284,26 @@ impl Config {
             .and_then(|s| s.get("TargetRubyVersion"))
             .and_then(|v| v.parse().ok())
             .unwrap_or(2.7)
+    }
+    /// The AllCops Include patterns (compiled), when the config sets any.
+    /// rubocop UNIONS these with its defaults — they only ever add files.
+    pub fn include_matchers(&self) -> Vec<regex::Regex> {
+        let Some(v) = self.sections.get("AllCops").and_then(|s| s.get("Include")) else {
+            return Vec::new();
+        };
+        parse_allowed_list(v).iter().filter_map(|p| exclude_regex(p)).collect()
+    }
+    /// A cop's severity name: the config's `Severity` param, else the
+    /// department default (Lint & Security warn, the rest are conventions).
+    pub fn severity_word(&self, cop: &str) -> &str {
+        if let Some(v) = self.sections.get(cop).and_then(|s| s.get("Severity")) {
+            return v;
+        }
+        if cop.starts_with("Lint/") || cop.starts_with("Security/") {
+            "warning"
+        } else {
+            "convention"
+        }
     }
     /// The AllCops Exclude patterns, compiled once. Patterns are
     /// rubocop-style globs (`**` spans directories, `*` doesn't) or

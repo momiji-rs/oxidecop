@@ -20,7 +20,12 @@ use std::path::{Path, PathBuf};
 /// `AllCops: Include`), skipping the directories it excludes by default.
 /// Directory levels fan out on the rayon pool; the shebang probe on
 /// extensionless files is I/O and parallelizes with them.
-fn collect_files(path: &Path, depth: usize) -> Vec<PathBuf> {
+fn collect_files(
+    path: &Path,
+    depth: usize,
+    includes: &[regex::Regex],
+    cfg_dirs: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+) -> Vec<PathBuf> {
     if path.is_dir() {
         let skip = path
             .file_name()
@@ -32,18 +37,35 @@ fn collect_files(path: &Path, depth: usize) -> Vec<PathBuf> {
         let entries: Vec<PathBuf> = std::fs::read_dir(path)
             .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
             .unwrap_or_default();
+        // note nested configs in passing — nearest-config discovery then
+        // needs no extra stat sweep
+        if entries.iter().any(|e| e.file_name().is_some_and(|n| n == ".rubocop.yml")) {
+            if let Ok(mut set) = cfg_dirs.lock() {
+                set.insert(path.to_path_buf());
+            }
+        }
         // fan out only near the root — deep levels have too few entries to
         // pay rayon's task overhead
         if depth < 2 {
-            entries.par_iter().flat_map(|e| collect_files(e, depth + 1)).collect()
+            entries.par_iter().flat_map(|e| collect_files(e, depth + 1, includes, cfg_dirs)).collect()
         } else {
-            entries.iter().flat_map(|e| collect_files(e, depth + 1)).collect()
+            entries.iter().flat_map(|e| collect_files(e, depth + 1, includes, cfg_dirs)).collect()
         }
-    } else if is_ruby_file(path) || ruby_shebang(path) {
+    } else if is_ruby_file(path) || included_by_config(path, includes) || ruby_shebang(path) {
         vec![path.to_path_buf()]
     } else {
         Vec::new()
     }
+}
+
+/// A file the config's own `AllCops: Include` globs pull in (rubocop unions
+/// user Include with its defaults; ours only ever ADD files too).
+fn included_by_config(path: &Path, includes: &[regex::Regex]) -> bool {
+    if includes.is_empty() {
+        return false;
+    }
+    let rel = path.strip_prefix("./").unwrap_or(path).to_string_lossy().replace('\\', "/");
+    includes.iter().any(|re| re.is_match(&rel))
 }
 
 /// rubocop's TargetFinder also picks up extensionless executables whose first
@@ -82,20 +104,31 @@ fn is_ruby_file(path: &Path) -> bool {
 fn load_config_chain(path: &Path, depth: usize) -> config::Config {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let child = config::Config::parse(&text);
-    if child.inherits.is_empty() || depth > 8 {
+    if (child.inherits.is_empty() && child.inherit_gems.is_empty()) || depth > 8 {
         return child;
     }
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut base: Option<config::Config> = None;
+    let mut absorb = |sub: config::Config, base: &mut Option<config::Config>| match base {
+        None => *base = Some(sub),
+        Some(b) => b.merge_child(sub),
+    };
+    // inherit_gem first (lowest precedence), best-effort via RubyGems
+    for (gem, paths) in &child.inherit_gems {
+        let Some(gdir) = gem_dir(gem) else { continue };
+        let paths: Vec<String> =
+            if paths.is_empty() { vec![".rubocop.yml".into()] } else { paths.clone() };
+        for rel in paths {
+            let sub = load_config_chain(&Path::new(&gdir).join(rel), depth + 1);
+            absorb(sub, &mut base);
+        }
+    }
     for inh in &child.inherits {
         if inh.starts_with("http://") || inh.starts_with("https://") {
             continue; // remote configs unsupported
         }
         let sub = load_config_chain(&dir.join(inh), depth + 1);
-        match &mut base {
-            None => base = Some(sub),
-            Some(b) => b.merge_child(sub),
-        }
+        absorb(sub, &mut base);
     }
     match base {
         Some(mut b) => {
@@ -104,6 +137,29 @@ fn load_config_chain(path: &Path, depth: usize) -> config::Config {
         }
         None => child,
     }
+}
+
+/// A gem's installation dir, via RubyGems (one subprocess per distinct gem,
+/// memoized; None when ruby or the gem is unavailable).
+fn gem_dir(gem: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
+    let mut guard = CACHE.lock().ok()?;
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(v) = map.get(gem) {
+        return v.clone();
+    }
+    let out = std::process::Command::new("ruby")
+        .arg("-e")
+        .arg(format!("print Gem::Specification.find_by_name({gem:?}).gem_dir"))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .filter(|s| !s.is_empty());
+    map.insert(gem.to_string(), out.clone());
+    out
 }
 
 fn main() {
@@ -204,19 +260,25 @@ fn main() {
             return;
         }
         let total = result.offenses.len();
-        print_simple(&[(sp, result.offenses)], 1, use_color);
+        print_simple(&[(sp, result.offenses)], 1, use_color, &cfg);
         std::process::exit(if total > 0 { 1 } else { 0 });
     }
 
+    let includes = cfg.include_matchers();
+    let cfg_dirs = std::sync::Mutex::new(std::collections::HashSet::new());
     let mut files: Vec<PathBuf> = Vec::new();
     for p in &paths {
         // an explicitly named file is linted regardless of extension
         if p.is_dir() {
-            files.extend(collect_files(p, 0));
+            files.extend(collect_files(p, 0, &includes, &cfg_dirs));
         } else {
             files.push(p.clone());
         }
     }
+    let cfg_dirs = cfg_dirs.into_inner().unwrap_or_default();
+    // dirs the walker covered — explicit file args outside them need a stat
+    // probe for nearest-config instead
+    let walked_roots: Vec<PathBuf> = paths.iter().filter(|p| p.is_dir()).cloned().collect();
     // honor AllCops: Exclude (paths made config-relative, i.e. CWD-relative)
     let excludes = cfg.exclude_matchers();
     if !excludes.is_empty() {
@@ -268,22 +330,93 @@ fn main() {
     // Result cache: keyed by (binary identity, config, --only set, content).
     let cache = if use_cache { cache::Cache::open(&cfg_text_for_cache, &cfg.only) } else { None };
 
+    // Nearest-config discovery (rubocop's per-file rule): a `.rubocop.yml` in
+    // a subdirectory governs the files beneath it INSTEAD of the root config.
+    // Only when the user didn't pin a config explicitly.
+    let mut nested_engines: Vec<(PathBuf, config::Config, cops::Engine, Vec<regex::Regex>)> = Vec::new();
+    let file_cfg: Vec<usize> = if cfg_path.is_none() {
+        let mut dir_cfg: std::collections::HashMap<PathBuf, Option<usize>> = std::collections::HashMap::new();
+        files
+            .iter()
+            .map(|f| {
+                let mut dir = f.parent().unwrap_or(Path::new("."));
+                loop {
+                    // the CWD's own config is the root engine
+                    if dir.as_os_str().is_empty() || dir == Path::new(".") || dir == Path::new("/") {
+                        return usize::MAX;
+                    }
+                    if let Some(hit) = dir_cfg.get(dir) {
+                        match hit {
+                            Some(i) => return *i,
+                            None => {}
+                        }
+                    } else if cfg_dirs.contains(dir)
+                        || (!walked_roots.iter().any(|r| dir.starts_with(r))
+                            && dir.join(".rubocop.yml").is_file())
+                    {
+                        let cf = dir.join(".rubocop.yml");
+                        let mut sub = load_config_chain(&cf, 0);
+                        sub.only = cfg.only.clone();
+                        sub.except = cfg.except.clone();
+                        let e = cops::Engine::new(&sub);
+                        let ex = sub.exclude_matchers();
+                        nested_engines.push((dir.to_path_buf(), sub, e, ex));
+                        let i = nested_engines.len() - 1;
+                        dir_cfg.insert(dir.to_path_buf(), Some(i));
+                        return i;
+                    } else {
+                        dir_cfg.insert(dir.to_path_buf(), None);
+                    }
+                    match dir.parent() {
+                        Some(p) => dir = p,
+                        None => return usize::MAX,
+                    }
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Lint in parallel; report in deterministic (sorted) file order.
     let mut results: Vec<(String, Vec<cops::Offense>)> = files
         .par_iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(fi, f)| {
             let display = f.display().to_string();
-            let rel = f.strip_prefix("./").unwrap_or(f).to_string_lossy().replace('\\', "/");
+            let nested = file_cfg.get(fi).copied().filter(|i| *i != usize::MAX);
+            let (the_cfg, the_eng, rel) = match nested {
+                Some(i) => {
+                    let (dir, c, e, ex) = &nested_engines[i];
+                    let rel = f.strip_prefix(dir).unwrap_or(f).to_string_lossy().replace('\\', "/");
+                    // the nested config's own AllCops Exclude (root excludes
+                    // were applied during collection)
+                    if ex.iter().any(|re| re.is_match(&rel)) {
+                        return (display, Vec::new());
+                    }
+                    (c, e, rel)
+                }
+                None => {
+                    let rel = f.strip_prefix("./").unwrap_or(f).to_string_lossy().replace('\\', "/");
+                    (&cfg, &eng, rel)
+                }
+            };
             match std::fs::read(f) {
                 Ok(src) => {
-                    if let Some(c) = &cache {
-                        if let Some(hit) = c.get(&src) {
-                            return (display, hit);
+                    // nested-config files skip the cache: its key is salted
+                    // with the ROOT config only
+                    if nested.is_none() {
+                        if let Some(c) = &cache {
+                            if let Some(hit) = c.get(&src) {
+                                return (display, hit);
+                            }
                         }
                     }
-                    let offenses = cops::lint(&src, &cfg, &eng, &rel).offenses;
-                    if let Some(c) = &cache {
-                        c.put(&src, &offenses);
+                    let offenses = cops::lint(&src, the_cfg, the_eng, &rel).offenses;
+                    if nested.is_none() {
+                        if let Some(c) = &cache {
+                            c.put(&src, &offenses);
+                        }
                     }
                     (display, offenses)
                 }
@@ -301,9 +434,9 @@ fn main() {
 
     let total: usize = results.iter().map(|(_, o)| o.len()).sum();
     match format.as_str() {
-        "json" | "j" => print_json(&results),
-        "quiet" | "q" => print_simple(&results, usize::MAX, false),
-        _ => print_simple(&results, results.len(), use_color),
+        "json" | "j" => print_json(&results, &cfg),
+        "quiet" | "q" => print_simple(&results, usize::MAX, false, &cfg),
+        _ => print_simple(&results, results.len(), use_color, &cfg),
     }
 
     if std::env::var_os("RUBOCOP_RS_TIMING").is_some() {
@@ -353,7 +486,7 @@ fn apply_fixes(src: &[u8], mut fixes: Vec<cops::Fix>) -> Vec<u8> {
 
 /// rubocop's simple formatter (headers per offending file, summary line).
 /// `nfiles == usize::MAX` marks quiet mode (offenses only, no summary).
-fn print_simple(results: &[(String, Vec<cops::Offense>)], nfiles: usize, color: bool) {
+fn print_simple(results: &[(String, Vec<cops::Offense>)], nfiles: usize, color: bool, cfg: &config::Config) {
     let quiet = nfiles == usize::MAX;
     let mut total = 0usize;
     let mut correctable = 0usize;
@@ -364,8 +497,7 @@ fn print_simple(results: &[(String, Vec<cops::Offense>)], nfiles: usize, color: 
         println!("== {path} ==");
         for o in offenses {
             let c = if o.correctable { correctable += 1; "[Correctable] " } else { "" };
-            // Lint's default severity is warning, everything else convention.
-            let sev = if o.cop.starts_with("Lint/") { 'W' } else { 'C' };
+            let sev = severity_letter(cfg.severity_word(o.cop));
             let msg = if color {
                 // like rubocop's simple formatter: `...` spans render yellow
                 let mut out = String::new();
@@ -414,7 +546,18 @@ fn json_escape(s: &str) -> String {
 }
 
 /// rubocop's JSON formatter schema (location carries the start position).
-fn print_json(results: &[(String, Vec<cops::Offense>)]) {
+fn severity_letter(word: &str) -> char {
+    match word {
+        "info" => 'I',
+        "refactor" => 'R',
+        "warning" => 'W',
+        "error" => 'E',
+        "fatal" => 'F',
+        _ => 'C',
+    }
+}
+
+fn print_json(results: &[(String, Vec<cops::Offense>)], cfg: &config::Config) {
     let mut files = Vec::new();
     let mut total = 0usize;
     for (path, offenses) in results {
@@ -422,7 +565,7 @@ fn print_json(results: &[(String, Vec<cops::Offense>)]) {
         let offs: Vec<String> = offenses
             .iter()
             .map(|o| {
-                let sev = if o.cop.starts_with("Lint/") { "warning" } else { "convention" };
+                let sev = cfg.severity_word(o.cop);
                 format!(
                     "{{\"severity\":\"{sev}\",\"message\":\"{}\",\"cop_name\":\"{}\",\"corrected\":false,\"correctable\":{},\"location\":{{\"start_line\":{},\"start_column\":{},\"line\":{},\"column\":{}}}}}",
                     json_escape(&o.message), o.cop, o.correctable, o.line, o.col, o.line, o.col
