@@ -1714,6 +1714,24 @@ impl<'a> Cops<'a> {
         self.check_percent_literal_delimiters_content(opening, closing);
     }
 
+    // `%x( #{cmd} ... )` with interpolation is an InterpolatedXStringNode,
+    // not an XStringNode — same geometry, same check.
+    pub(crate) fn check_space_inside_percent_literal_delimiters_ixstr(
+        &mut self,
+        node: &ruby_prism::InterpolatedXStringNode<'_>,
+    ) {
+        const COP: &str = "Layout/SpaceInsidePercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+        let opening = node.opening_loc();
+        let opening_bytes = opening.as_slice();
+        if !opening_bytes.starts_with(b"%") || opening_bytes.len() < 2 || opening_bytes[1] != b'x' {
+            return;
+        }
+        self.check_percent_literal_delimiters_content(opening, node.closing_loc());
+    }
+
     /// Check the content between opening and closing delimiters for
     /// unnecessary spaces. Handles both blank content and leading/trailing spaces.
     fn check_percent_literal_delimiters_content(

@@ -706,6 +706,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_boolean_symbol(node);
         self.check_symbol_literal(node);
     }
+    fn visit_interpolated_x_string_node(&mut self, node: &ruby_prism::InterpolatedXStringNode<'pr>) {
+        self.check_space_inside_percent_literal_delimiters_ixstr(node);
+        ruby_prism::visit_interpolated_x_string_node(self, node);
+    }
     fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
         self.check_heredoc_delimiter_naming(Some(node.opening_loc()), Some(node.closing_loc()));
         self.check_space_inside_percent_literal_delimiters_xstr(node);
