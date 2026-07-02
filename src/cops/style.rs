@@ -109,11 +109,118 @@ impl<'a> Cops<'a> {
     }
 
     /// Style/FrozenStringLiteralComment — text-based, runs once per file.
-    pub(crate) fn check_frozen_string_literal(&mut self, has_frozen: bool) {
-        if self.on("Style/FrozenStringLiteralComment") && !has_frozen {
-            self.push(0, "Style/FrozenStringLiteralComment", true, "Missing frozen string literal comment.");
-            self.fixes.push((0, 0, b"# frozen_string_literal: true\n\n".to_vec()));
+    /// Three styles (rubocop's cop verbatim): `always` wants a valid magic
+    /// comment among the leading comment lines; `never` forbids one;
+    /// `always_true` demands it be literally `true`.
+    /// `comments` are all comments (line, offset, text); `first_code_line`
+    /// bounds the "leading" region (comments strictly before the first code).
+    pub(crate) fn check_frozen_string_literal(&mut self, comments: &[(usize, usize, Vec<u8>)], first_code_line: Option<usize>) {
+        const COP: &str = "Style/FrozenStringLiteralComment";
+        if !self.on(COP) {
+            return;
         }
+        // rubocop bails on a token-less file (empty / whitespace-only).
+        if comments.is_empty() && first_code_line.is_none() {
+            return;
+        }
+        let vals: Vec<(usize, usize, Option<String>)> = comments
+            .iter()
+            .map(|(l, off, t)| (*l, *off, fsl_value(&String::from_utf8_lossy(t))))
+            .collect();
+        let is_leading = |l: usize| first_code_line.is_none_or(|fc| l < fc);
+        // The first LEADING comment that specifies frozen_string_literal (any
+        // value, even an invalid one) decides always_true's enabled/disabled.
+        let first_specified = vals
+            .iter()
+            .filter(|(l, _, _)| is_leading(*l))
+            .filter_map(|(_, _, v)| v.as_deref())
+            .next();
+        // "Comment exists" (always/never) counts only VALID values (true/false).
+        let exists_valid = vals
+            .iter()
+            .filter(|(l, _, _)| is_leading(*l))
+            .any(|(_, _, v)| matches!(v.as_deref(), Some("true" | "false")));
+        // The unnecessary/disabled offense anchors on the first token ANYWHERE
+        // whose text specifies frozen_string_literal (rubocop scans all tokens).
+        let specified_off = vals.iter().find(|(_, _, v)| v.is_some()).map(|(_, off, _)| *off);
+        match self.cfg.enforced_style(COP) {
+            "never" => {
+                if exists_valid {
+                    if let Some(off) = specified_off {
+                        self.push(off, COP, true, "Unnecessary frozen string literal comment.");
+                        self.remove_comment_fix(off);
+                    }
+                }
+            }
+            "always_true" => match first_specified {
+                Some("true") => {}
+                Some(_) => {
+                    if let Some(off) = specified_off {
+                        self.push(off, COP, true, "Frozen string literal comment must be set to `true`.");
+                        self.replace_line_fix(off, b"# frozen_string_literal: true");
+                    }
+                }
+                None => {
+                    self.push(0, COP, true, "Missing magic comment `# frozen_string_literal: true`.");
+                    self.insert_fsl_fix(comments, first_code_line);
+                }
+            },
+            _ => {
+                // "always" (default)
+                if !exists_valid {
+                    self.push(0, COP, true, "Missing frozen string literal comment.");
+                    self.insert_fsl_fix(comments, first_code_line);
+                }
+            }
+        }
+    }
+
+    /// End offset of 1-based `line` (the position of its `\n`, or EOF).
+    fn line_end(&self, line: usize) -> usize {
+        self.idx.starts.get(line).map_or(self.src.len(), |s| s - 1)
+    }
+
+    /// Insert `# frozen_string_literal: true` below the last special comment
+    /// (shebang, then an encoding comment — rubocop's `last_special_comment`),
+    /// or at the very top when there is none.
+    fn insert_fsl_fix(&mut self, comments: &[(usize, usize, Vec<u8>)], first_code_line: Option<usize>) {
+        let is_leading = |l: usize| first_code_line.is_none_or(|fc| l < fc);
+        let mut special: Option<usize> = None; // its line
+        let mut next = 0; // index of the token to test for an encoding comment
+        if let Some((l, _, t)) = comments.first() {
+            if is_leading(*l) && t.starts_with(b"#!") {
+                special = Some(*l);
+                next = 1;
+            }
+        }
+        if let Some((l, _, t)) = comments.get(next) {
+            if is_leading(*l) && encoding_re().is_match(&String::from_utf8_lossy(t)) {
+                special = Some(*l);
+            }
+        }
+        match special {
+            Some(line) => {
+                let pos = self.line_end(line);
+                self.fixes.push((pos, pos, b"\n# frozen_string_literal: true".to_vec()));
+            }
+            None => self.fixes.push((0, 0, b"# frozen_string_literal: true\n".to_vec())),
+        }
+    }
+
+    /// Remove a comment starting at `off` plus the whitespace after it
+    /// (rubocop's `range_with_surrounding_space(..., side: :right)`).
+    fn remove_comment_fix(&mut self, off: usize) {
+        let mut end = self.line_end(self.idx.loc(off).0);
+        while end < self.src.len() && matches!(self.src[end], b' ' | b'\t' | b'\r' | b'\n') {
+            end += 1;
+        }
+        self.fixes.push((off, end, Vec::new()));
+    }
+
+    /// Replace the whole line containing `off` with `rep`.
+    fn replace_line_fix(&mut self, off: usize, rep: &[u8]) {
+        let line = self.idx.loc(off).0;
+        self.fixes.push((self.idx.starts[line - 1], self.line_end(line), rep.to_vec()));
     }
 
     /// Style/RedundantReturn — the def body's last statement is a bare `return x`.
@@ -337,6 +444,39 @@ impl<'a> Cops<'a> {
             node.opening_loc().start_offset(),
             format!("Pass `&:{method}` as an argument to `lambda` instead of a block."),
         ))
+    }
+}
+
+// ---- Style/FrozenStringLiteralComment helpers: MagicComment parsing ----
+fn re(cell: &'static std::sync::OnceLock<regex::Regex>, pat: &str) -> &'static regex::Regex {
+    cell.get_or_init(|| regex::Regex::new(pat).unwrap())
+}
+/// rubocop's `Encoding::ENCODING_PATTERN` (used to place the autocorrect
+/// insertion below an encoding comment).
+fn encoding_re() -> &'static regex::Regex {
+    static ENC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    re(&ENC, r"#.*coding\s?[:=]\s?(?:UTF|utf)-8")
+}
+/// The `frozen_string_literal` value a magic-comment line specifies, lowercased
+/// (`"true"`/`"false"`/anything else), or None when the line doesn't specify
+/// one. Mirrors rubocop's `MagicComment.parse`: the emacs `-*- k: v; ... -*-`
+/// form, vim comments (which cannot specify it), then the simple form — which
+/// only counts when it is the whole comment.
+fn fsl_value(line: &str) -> Option<String> {
+    static EMACS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static EMACS_TOK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static VIM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SIMPLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if let Some(c) = re(&EMACS, r"-\*-(.+)-\*-").captures(line) {
+        let tok = re(&EMACS_TOK, r"(?i)^frozen[_-]string[_-]literal\s*:\s*([[:alnum:]_-]+)$");
+        c[1].split(';')
+            .find_map(|t| tok.captures(t.trim()).map(|c| c[1].to_lowercase()))
+    } else if re(&VIM, r"#\s*vim:\s*\S").is_match(line) {
+        None
+    } else {
+        re(&SIMPLE, r"(?i)^\s*#\s*frozen[_-]string[_-]literal:\s*([[:alnum:]_-]+)\s*$")
+            .captures(line)
+            .map(|c| c[1].to_lowercase())
     }
 }
 

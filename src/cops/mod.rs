@@ -259,15 +259,21 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
     let idx = LineIndex::new(src);
 
     let mut comment_lines = HashSet::new();
-    let mut has_frozen = false;
+    // Every comment as (line, start_offset, text) in source order — the
+    // "comment tokens" FrozenStringLiteralComment reasons about.
+    let mut comment_data: Vec<(usize, usize, Vec<u8>)> = Vec::new();
     for c in result.comments() {
         let l = c.location();
-        comment_lines.insert(idx.loc(l.start_offset()).0);
-        let t = &src[l.start_offset()..l.end_offset()];
-        if t.windows(22).any(|w| w == b"frozen_string_literal:") {
-            has_frozen = true;
-        }
+        let line = idx.loc(l.start_offset()).0;
+        comment_lines.insert(line);
+        comment_data.push((line, l.start_offset(), src[l.start_offset()..l.end_offset()].to_vec()));
     }
+    // The line of the first real code token — comments before it are the
+    // "leading comment lines" magic comments live in (rubocop's mixin).
+    let first_code_line = result
+        .node()
+        .as_program_node()
+        .and_then(|p| p.statements().body().iter().next().map(|n| idx.loc(n.location().start_offset()).0));
 
     let decl: Vec<(Pat, &'static str, &'static str, Anchor, Option<&'static str>)> = DECLARATIVE
         .iter()
@@ -314,7 +320,7 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
     };
 
     // ---- text-based cops ----
-    cops.check_frozen_string_literal(has_frozen);
+    cops.check_frozen_string_literal(&comment_data, first_code_line);
     cops.check_line_length();
     cops.check_trailing_whitespace();
 

@@ -80,7 +80,9 @@ def parse_block(raw_lines, raw_heredoc)
   src = []
   expected = []
   text.split("\n", -1).each do |ln|
-    if ln =~ /\A(\s*)(\^+)(.*)\z/
+    # `^{}` marks a zero-width offense range (e.g. FrozenStringLiteralComment
+    # anchoring at 1:1); the `{}` is annotation syntax, not message text.
+    if ln =~ /\A(\s*)(\^+)(?:\{\})?(.*)\z/
       # annotation for the most recent source line
       col = Regexp.last_match(1).length + 1
       msg = Regexp.last_match(3).strip
