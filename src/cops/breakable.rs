@@ -24,33 +24,33 @@ pub(crate) fn is_heredoc_node(node: &ruby_prism::Node<'_>) -> bool {
     opening.is_some_and(|o| o.as_slice().starts_with(b"<<"))
 }
 
-/// Elements + call facts for the breakable-collection hook: rubocop's
-/// process_args (a trailing braceless hash contributes its pairs), the
-/// parenthesization, whether the first raw argument is a heredoc, the first
-/// heredoc's index among the processed elements, and whether the receiver
-/// chain contains a heredoc (which disables the hook entirely).
-pub(crate) fn call_break_info<'a>(node: &ruby_prism::CallNode<'a>) -> (Vec<(usize, usize)>, LlCallInfo) {
-    let mut elements = Vec::new();
+/// Cheap facts for the breakable-collection hook: the processed element
+/// count (rubocop's process_args — a trailing braceless hash contributes its
+/// pairs), the parenthesization, whether the first raw argument is a heredoc,
+/// the first heredoc's index among processed elements, and whether the
+/// receiver chain contains a heredoc (which disables the hook entirely). No
+/// allocation — call_elements() builds the spans only when actually needed.
+pub(crate) fn call_break_facts(node: &ruby_prism::CallNode<'_>) -> (usize, LlCallInfo) {
+    let mut count = 0;
     let mut heredoc_arg_index = None;
     let mut first_arg_heredoc = false;
     if let Some(args) = node.arguments() {
-        let list: Vec<_> = args.arguments().iter().collect();
-        first_arg_heredoc = list.first().is_some_and(is_heredoc_node);
+        let list = args.arguments();
+        let n = list.iter().count();
         for (i, a) in list.iter().enumerate() {
-            if i + 1 == list.len() {
+            if i == 0 {
+                first_arg_heredoc = is_heredoc_node(&a);
+            }
+            if i + 1 == n {
                 if let Some(kw) = a.as_keyword_hash_node() {
-                    for e in kw.elements().iter() {
-                        let l = e.location();
-                        elements.push((l.start_offset(), l.end_offset()));
-                    }
+                    count += kw.elements().iter().count();
                     continue;
                 }
             }
-            if heredoc_arg_index.is_none() && is_heredoc_node(a) {
-                heredoc_arg_index = Some(elements.len());
+            if heredoc_arg_index.is_none() && is_heredoc_node(&a) {
+                heredoc_arg_index = Some(count);
             }
-            let l = a.location();
-            elements.push((l.start_offset(), l.end_offset()));
+            count += 1;
         }
     }
     let mut skip_hook = false;
@@ -68,7 +68,41 @@ pub(crate) fn call_break_info<'a>(node: &ruby_prism::CallNode<'a>) -> (Vec<(usiz
         heredoc_arg_index,
         skip_hook,
     };
-    (elements, info)
+    (count, info)
+}
+
+/// The processed element spans for a call (see call_break_facts).
+pub(crate) fn call_elements(node: &ruby_prism::CallNode<'_>) -> Vec<(usize, usize)> {
+    let mut elements = Vec::new();
+    if let Some(args) = node.arguments() {
+        let list = args.arguments();
+        let n = list.iter().count();
+        for (i, a) in list.iter().enumerate() {
+            if i + 1 == n {
+                if let Some(kw) = a.as_keyword_hash_node() {
+                    for e in kw.elements().iter() {
+                        let l = e.location();
+                        elements.push((l.start_offset(), l.end_offset()));
+                    }
+                    continue;
+                }
+            }
+            let l = a.location();
+            elements.push((l.start_offset(), l.end_offset()));
+        }
+    }
+    elements
+}
+
+/// A def's parameter count, without building the span list.
+pub(crate) fn param_count(p: &ruby_prism::ParametersNode<'_>) -> usize {
+    p.requireds().iter().count()
+        + p.optionals().iter().count()
+        + usize::from(p.rest().is_some())
+        + p.posts().iter().count()
+        + p.keywords().iter().count()
+        + usize::from(p.keyword_rest().is_some())
+        + usize::from(p.block().is_some())
 }
 
 /// A def's parameters as (start, end) spans, in source order.
@@ -161,13 +195,6 @@ impl<'a> Cops<'a> {
 
     // ---- collections (send/csend/def/array/hash) ----
 
-    /// `breakable_collection?`: bracketed (always true except braceless hash,
-    /// which prism models as KeywordHashNode and never reaches here) with at
-    /// least two elements.
-    fn ll_breakable_collection(elements: &[(usize, usize)]) -> bool {
-        elements.len() >= 2
-    }
-
     /// `children_could_be_broken_up?`
     fn ll_could_break(&self, elements: &[(usize, usize)]) -> bool {
         if elements.is_empty() {
@@ -189,13 +216,15 @@ impl<'a> Cops<'a> {
     }
 
     /// Enter a collection node: push its ancestor frame, and nominate a break
-    /// position if it qualifies. `elements` are (start, end) byte spans.
-    /// Returns true so callers can pop symmetrically.
+    /// position if it qualifies. The element list is built lazily — the frame
+    /// itself needs only the node span and element count, so the common case
+    /// (short lines) allocates nothing.
     pub(crate) fn ll_enter_collection(
         &mut self,
         node_start: usize,
         node_end: usize,
-        elements: Vec<(usize, usize)>,
+        count: usize,
+        build: impl FnOnce() -> Vec<(usize, usize)>,
         kind: LlKind,
         extra: LlCallInfo,
     ) {
@@ -203,8 +232,17 @@ impl<'a> Cops<'a> {
             return;
         }
         let first_line = self.ll_line_of(node_start);
-        let breakable = Self::ll_breakable_collection(&elements);
-        let could_break = breakable && self.ll_could_break(&elements);
+        let last_line = self.ll_line_of(node_end.saturating_sub(1).max(node_start));
+        let breakable = count >= 2;
+        let node_multiline = first_line != last_line;
+        let mut build = Some(build);
+        let mut elements: Option<Vec<(usize, usize)>> = None;
+        // children_could_be_broken_up? — trivially false when the whole node
+        // sits on one line
+        let could_break = breakable && node_multiline && {
+            let els = elements.get_or_insert_with(|| build.take().unwrap()());
+            self.ll_could_break(els)
+        };
         // hook body — rubocop's check_for_breakable_node
         'hook: {
             if extra.skip_hook || !breakable || !self.ll_is_long(first_line) || self.line_has_comment(first_line) {
@@ -213,6 +251,13 @@ impl<'a> Cops<'a> {
             if self.ll_break.contains_key(&first_line) || self.ll_semi.contains_key(&first_line) || self.ll_block.contains_key(&first_line) {
                 break 'hook;
             }
+            let elements = match elements.as_ref() {
+                Some(e) => e,
+                None => {
+                    elements = Some(build.take().unwrap()());
+                    elements.as_ref().unwrap()
+                }
+            };
             // safe_to_ignore?
             let multiline = match kind {
                 // def: signature counts, not the body
@@ -220,7 +265,7 @@ impl<'a> Cops<'a> {
                     let last = elements.last().map(|(_, e)| self.ll_line_of(e.saturating_sub(1))).unwrap_or(first_line);
                     first_line != last
                 }
-                _ => first_line != self.ll_line_of(node_end.saturating_sub(1).max(node_start)),
+                _ => node_multiline,
             };
             if multiline {
                 break 'hook;
@@ -241,7 +286,7 @@ impl<'a> Cops<'a> {
                 }
             }
             // extract_first_element_over_column_limit
-            let mut elems: &[(usize, usize)] = &elements;
+            let mut elems: &[(usize, usize)] = elements;
             if matches!(kind, LlKind::Call) && !extra.parenthesized && !extra.first_arg_heredoc {
                 elems = &elems[1..];
             }

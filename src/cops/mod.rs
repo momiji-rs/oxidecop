@@ -599,16 +599,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
         if self.ll_active {
-            let elements: Vec<(usize, usize)> = node
-                .elements()
-                .iter()
-                .map(|e| (e.location().start_offset(), e.location().end_offset()))
-                .collect();
             let l = node.location();
             self.ll_enter_collection(
                 l.start_offset(),
                 l.end_offset(),
-                elements,
+                node.elements().iter().count(),
+                || node
+                    .elements()
+                    .iter()
+                    .map(|e| (e.location().start_offset(), e.location().end_offset()))
+                    .collect(),
                 breakable::LlKind::Hash,
                 breakable::LlCallInfo::default(),
             );
@@ -724,23 +724,25 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
         if self.ll_active {
-            let elements: Vec<(usize, usize)> = node
-                .elements()
-                .iter()
-                .map(|e| (e.location().start_offset(), e.location().end_offset()))
-                .collect();
             let heredoc_arg_index = node
                 .elements()
                 .iter()
                 .position(|e| breakable::is_heredoc_node(&e));
-            for e in node.elements().iter() {
-                self.ll_str_skip.insert(e.location().start_offset());
+            if self.ll_split {
+                for e in node.elements().iter() {
+                    self.ll_str_skip.insert(e.location().start_offset());
+                }
             }
             let l = node.location();
             self.ll_enter_collection(
                 l.start_offset(),
                 l.end_offset(),
-                elements,
+                node.elements().iter().count(),
+                || node
+                    .elements()
+                    .iter()
+                    .map(|e| (e.location().start_offset(), e.location().end_offset()))
+                    .collect(),
                 breakable::LlKind::Array,
                 breakable::LlCallInfo { heredoc_arg_index, ..Default::default() },
             );
@@ -827,12 +829,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
         // parameter default values, which a body-only walk silently skipped.
         if self.ll_active {
-            let elements = breakable::def_param_spans(node);
             let l = node.location();
+            let count = node.parameters().map(|p| breakable::param_count(&p)).unwrap_or(0);
             self.ll_enter_collection(
                 l.start_offset(),
                 l.end_offset(),
-                elements,
+                count,
+                || breakable::def_param_spans(node),
                 breakable::LlKind::Def,
                 breakable::LlCallInfo::default(),
             );
@@ -897,10 +900,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
         if self.ll_active {
-            let (elements, info) = breakable::call_break_info(node);
+            let (count, info) = breakable::call_break_facts(node);
             let l = node.location();
-            self.ll_enter_collection(l.start_offset(), l.end_offset(), elements,
-                breakable::LlKind::Call, info);
+            self.ll_enter_collection(l.start_offset(), l.end_offset(), count,
+                || breakable::call_elements(node), breakable::LlKind::Call, info);
             if let Some(b) = node.block().and_then(|b| b.as_block_node()) {
                 self.ll_check_block(node, &b);
             }
