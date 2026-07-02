@@ -57,6 +57,7 @@ COPS = {
   'Security/Eval'                    => 'security/eval',
   'Style/VariableInterpolation'      => 'style/variable_interpolation',
   'Lint/EachWithObjectArgument'      => 'lint/each_with_object_argument',
+  'Style/TrailingBodyOnModule'       => 'style/trailing_body_on_module',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

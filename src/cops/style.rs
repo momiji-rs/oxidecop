@@ -2249,3 +2249,74 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((node_loc.start_offset(), node_loc.end_offset(), replacement));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/TrailingBodyOnModule — a multiline `module` whose body trails on
+    /// the `module` keyword's own line (`module Foo; body`,
+    /// `module Foo extend self`, `module Foo body`, `module Foo def bar; end`).
+    /// Ports RuboCop's `TrailingBody` mixin (`trailing_body?`/`first_part_of`)
+    /// plus `LineBreakCorrector.correct_trailing_body`.
+    ///
+    /// Note on `first_part_of`: whitequark's AST leaves a lone body statement
+    /// unwrapped and only introduces a `begin` node once there are >= 2
+    /// top-level statements, so the mixin special-cases `begin_type?` to grab
+    /// just the first child. Prism always wraps a module's body in a
+    /// `StatementsNode`, single statement or not, so "first element of the
+    /// body list" is the uniform equivalent of both branches here.
+    pub(crate) fn check_trailing_body_on_module(&mut self, node: &ruby_prism::ModuleNode) {
+        const COP: &str = "Style/TrailingBodyOnModule";
+        if !self.on(COP) {
+            return;
+        }
+        let nl = node.location();
+        let node_start = nl.start_offset();
+        let node_end = nl.end_offset();
+        let start_line = self.idx.loc(node_start).0;
+        let end_line = self.idx.loc(node_end.saturating_sub(1)).0;
+        if start_line == end_line {
+            return; // not `node.multiline?`
+        }
+        let Some(body) = node.body() else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        let Some(first_stmt) = stmts.body().iter().next() else { return };
+        let fl = first_stmt.location();
+        if self.idx.loc(fl.start_offset()).0 != start_line {
+            return; // body doesn't trail on the module's own line
+        }
+        let range_start = fl.start_offset();
+
+        self.push(range_start, COP, true, "Place the first line of module body on its own line.");
+
+        // --- autocorrect: LineBreakCorrector.correct_trailing_body ---
+        let keyword = node.module_keyword_loc();
+        let keyword_col = self.idx.loc(keyword.start_offset()).1 - 1;
+        let width = self.cfg.int("Layout/IndentationWidth", "Width");
+
+        // An end-of-line comment on the module's own line moves above the
+        // `module` line entirely (LineBreakCorrector#move_comment), indented
+        // to the module's own column.
+        if let Some(&(_, cstart, cend)) =
+            self.comments.iter().find(|(line, _, _)| *line == start_line)
+        {
+            let mut ins = self.src[cstart..cend].to_vec();
+            ins.push(b'\n');
+            ins.extend(std::iter::repeat_n(b' ', keyword_col));
+            self.fixes.push((node_start, node_start, ins));
+            self.fixes.push((cstart, cend, Vec::new()));
+        }
+
+        // Break the line before the first body statement, indented one step
+        // past the `module` keyword (LineBreakCorrector#break_line_before).
+        let mut brk = vec![b'\n'];
+        brk.extend(std::iter::repeat_n(b' ', keyword_col + width));
+        self.fixes.push((range_start, range_start, brk));
+
+        // The `;` separating the module header from the body, if any. Only
+        // scanning the header span (before the body starts) means a `;`
+        // *inside* the first statement itself (`def bar; end`) is untouched.
+        if let Some(rel) = self.src[node_start..range_start].iter().position(|&b| b == b';') {
+            let pos = node_start + rel;
+            self.fixes.push((pos, pos + 1, Vec::new()));
+        }
+    }
+}
