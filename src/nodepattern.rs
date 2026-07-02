@@ -14,6 +14,7 @@ pub enum Pat {
     Sym(String),     // :foo  (a method-name symbol)
     Node { ty: String, children: Vec<Pat> }, // (ty c...)
     Int(i64),        // 0, 42
+    Float(f64),      // 1.0, -1.0
     Union(Vec<Pat>), // {a b c}  — any alternative matches
     Capture(Box<Pat>), // $pat  — on match, records the matched text (left-to-right)
     Rest,            // ...  — any remaining children (a send's method+args, or args)
@@ -51,6 +52,11 @@ fn tokenize(s: &str) -> Vec<String> {
     out
 }
 
+/// Bare words that are node-TYPE matches (rubocop writes `$array`, `str`);
+/// everything else bare stays a method-name shorthand for back-compat.
+const TYPE_ATOMS: &[&str] =
+    &["array", "str", "sym", "hash", "int", "float", "nil", "begin", "const", "send", "csend", "call"];
+
 fn atom(s: &str) -> Pat {
     match s {
         "_" => Pat::Any,
@@ -59,6 +65,8 @@ fn atom(s: &str) -> Pat {
         "cbase" => Pat::Cbase,
         _ if s.starts_with(':') => Pat::Sym(s[1..].to_string()),
         _ if s.parse::<i64>().is_ok() => Pat::Int(s.parse().unwrap()),
+        _ if s.contains('.') && s.parse::<f64>().is_ok() => Pat::Float(s.parse().unwrap()),
+        _ if TYPE_ATOMS.contains(&s) => Pat::Node { ty: s.to_string(), children: Vec::new() },
         _ => Pat::Sym(s.to_string()),
     }
 }
@@ -115,6 +123,10 @@ fn m(pat: &Pat, node: &Node, src: &[u8], caps: &mut Vec<String>) -> bool {
             .as_integer_node()
             .map(|i| int_of(&i.as_node(), src) == Some(*n))
             .unwrap_or(false),
+        Pat::Float(f) => node
+            .as_float_node()
+            .map(|n| float_of(&n.as_node(), src) == Some(*f))
+            .unwrap_or(false),
         Pat::Sym(_) => false, // a bare sym only meaningful as a send's :meth slot
         Pat::Rest | Pat::Cbase => false, // positional/scope-only; handled by parents
         Pat::Union(alts) => union(alts, caps, |p, caps| m(p, node, src, caps)),
@@ -145,6 +157,26 @@ fn union(alts: &[Pat], caps: &mut Vec<String>, mut f: impl FnMut(&Pat, &mut Vec<
     })
 }
 
+/// Match a send's receiver slot, where the receiver may be ABSENT: `nil?`
+/// matches absence, and a union like `{(const nil? :Kernel) nil?}` needs the
+/// absence case threaded through the alternation.
+fn match_recv(pat: &Pat, recv: Option<&Node>, src: &[u8], caps: &mut Vec<String>) -> bool {
+    match pat {
+        Pat::Any => true,
+        Pat::NilRecv => recv.is_none(),
+        Pat::Union(alts) => union(alts, caps, |p, caps| match_recv(p, recv, src, caps)),
+        Pat::Capture(inner) => {
+            if match_recv(inner, recv, src, caps) {
+                caps.push(recv.map(|r| node_text(r, src)).unwrap_or_default());
+                true
+            } else {
+                false
+            }
+        }
+        p => recv.map(|r| m(p, r, src, caps)).unwrap_or(false),
+    }
+}
+
 /// Match a `:meth` slot (Sym / Union-of-Syms / a `$`capture of either).
 fn match_meth(pat: &Pat, name: &[u8], caps: &mut Vec<String>) -> bool {
     match pat {
@@ -164,6 +196,15 @@ fn match_meth(pat: &Pat, name: &[u8], caps: &mut Vec<String>) -> bool {
 }
 
 fn int_of(n: &Node, src: &[u8]) -> Option<i64> {
+    let l = n.location();
+    std::str::from_utf8(&src[l.start_offset()..l.end_offset()])
+        .ok()?
+        .replace('_', "")
+        .parse()
+        .ok()
+}
+
+fn float_of(n: &Node, src: &[u8]) -> Option<f64> {
     let l = n.location();
     std::str::from_utf8(&src[l.start_offset()..l.end_offset()])
         .ok()?
@@ -208,12 +249,7 @@ fn match_typed(ty: &str, children: &[Pat], node: &Node, src: &[u8], caps: &mut V
             if children.is_empty() {
                 return false;
             }
-            let recv_ok = match &children[0] {
-                Pat::NilRecv => call.receiver().is_none(),
-                Pat::Any => true,
-                p => call.receiver().map(|r| m(p, &r, src, caps)).unwrap_or(false),
-            };
-            if !recv_ok {
+            if !match_recv(&children[0], call.receiver().as_ref(), src, caps) {
                 return false;
             }
             // method slot: `...` here matches any method + any args.
@@ -249,6 +285,41 @@ fn match_typed(ty: &str, children: &[Pat], node: &Node, src: &[u8], caps: &mut V
                 node.as_integer_node().is_some() && m(p, node, src, caps)
             } else {
                 node.as_integer_node().is_some()
+            }
+        }
+        "float" => {
+            if let Some(p) = children.first() {
+                node.as_float_node().is_some() && m(p, node, src, caps)
+            } else {
+                node.as_float_node().is_some()
+            }
+        }
+        "str" => node.as_string_node().is_some(),
+        "array" => node.as_array_node().is_some(),
+        "hash" => node.as_hash_node().is_some(),
+        // `(sym :name)` / `(sym {:a :b})` — the child matches the symbol VALUE.
+        "sym" => {
+            let Some(sy) = node.as_symbol_node() else { return false };
+            match children.first() {
+                None => true,
+                Some(p) => sy
+                    .value_loc()
+                    .is_some_and(|v| match_meth(p, &src[v.start_offset()..v.end_offset()], caps)),
+            }
+        }
+        // parser's `(begin X)` — a parenthesized expression wrapping X.
+        "begin" => {
+            let Some(pn) = node.as_parentheses_node() else { return false };
+            match children.first() {
+                None => true,
+                Some(p) => pn
+                    .body()
+                    .and_then(|b| b.as_statements_node())
+                    .and_then(|st| {
+                        let stmts: Vec<Node> = st.body().iter().collect();
+                        (stmts.len() == 1).then(|| m(p, &stmts[0], src, caps))
+                    })
+                    .unwrap_or(false),
             }
         }
         // `(const SCOPE :Name)` — scope: `nil?` (bare `Foo`), `cbase` (`::Foo`),
