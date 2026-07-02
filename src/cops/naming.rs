@@ -46,7 +46,13 @@ impl<'a> Cops<'a> {
     /// Naming/MethodName through macros: check the relevant symbol/string args
     /// of attr*, alias_method, and Struct/Data member lists.
     pub(crate) fn check_method_name_macros(&mut self, node: &ruby_prism::CallNode) {
-        if !self.on("Naming/MethodName") {
+        // cheap name prefilter BEFORE the config lookups and arg collection —
+        // this runs for every call node in the file
+        if !matches!(
+            node.name().as_slice(),
+            b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor" | b"alias_method" | b"new" | b"define"
+        ) || !self.on("Naming/MethodName")
+        {
             return;
         }
         let style = self.cfg.enforced_style("Naming/MethodName").to_string();

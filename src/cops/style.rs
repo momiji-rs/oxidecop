@@ -861,7 +861,10 @@ impl<'a> Cops<'a> {
         let name = node.name().as_slice();
         // AllowedMethods/Patterns: the offending method OR any ancestor call/block.
         if self.allowed("Style/NumericPredicate", name)
-            || self.call_stack.iter().any(|n| self.allowed("Style/NumericPredicate", n))
+            || self
+                .call_stack
+                .iter()
+                .any(|sp| self.allowed("Style/NumericPredicate", &self.src[sp.0..sp.1]))
         {
             return None;
         }
@@ -885,7 +888,7 @@ impl<'a> Cops<'a> {
                     _ => return None,
                 };
                 let rsrc = String::from_utf8_lossy(self.node_src(&r));
-                let negated = self.call_stack.last().is_some_and(|n| n.as_slice() == b"!");
+                let negated = self.call_stack.last().is_some_and(|sp| &self.src[sp.0..sp.1] == b"!");
                 if negated {
                     format!("({rsrc} {op} 0)")
                 } else {

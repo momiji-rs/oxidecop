@@ -73,6 +73,7 @@ fn main() {
         .unwrap_or_default();
     let mut cfg = config::Config::parse(&cfg_text);
     cfg.only = only;
+    let eng = cops::Engine::new(&cfg);
 
     let mut files: Vec<PathBuf> = Vec::new();
     for p in &paths {
@@ -100,7 +101,7 @@ fn main() {
             std::process::exit(2);
         }
         let src = std::fs::read(&files[0]).expect("read");
-        let result = cops::lint(&src, &cfg);
+        let result = cops::lint(&src, &cfg, &eng);
         let mut out = src.clone();
         let mut fixes = result.fixes;
         fixes.sort_by(|a, b| b.0.cmp(&a.0)); // descending by start
@@ -120,7 +121,7 @@ fn main() {
         .map(|f| {
             let display = f.display().to_string();
             match std::fs::read(f) {
-                Ok(src) => (display, cops::lint(&src, &cfg).offenses),
+                Ok(src) => (display, cops::lint(&src, &cfg, &eng).offenses),
                 Err(e) => {
                     eprintln!("rubocop-rs: cannot read {display}: {e}");
                     (display, Vec::new())
@@ -144,6 +145,16 @@ fn main() {
             println!("{sev}:{:>3}:{:>3}: {}{}: {}", o.line, o.col, c, o.cop, o.message);
         }
         total += offenses.len();
+    }
+
+    if std::env::var_os("RUBOCOP_RS_TIMING").is_some() {
+        let ms = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        eprintln!("timing (cpu-ms summed across threads):");
+        eprintln!("  parse  {:9.1}", ms(&cops::T_PARSE));
+        eprintln!("  prep   {:9.1}", ms(&cops::T_PREP));
+        eprintln!("  text   {:9.1}", ms(&cops::T_TEXT));
+        eprintln!("  visit  {:9.1}", ms(&cops::T_VISIT));
+        eprintln!("  post   {:9.1}", ms(&cops::T_POST));
     }
 
     let nfiles = results.len();

@@ -11,10 +11,18 @@ Style/StringLiterals, Style/NegatedIf, Lint/Debugger, Naming/MethodName`.
 
 ## Speed (median of 5)
 
-| Corpus | files | rubocop-rs | oxicop | RuboCop (cached) | RuboCop (no cache) |
-|---|--:|--:|--:|--:|--:|
-| Jekyll | 163 | **35 ms** | 42 ms | 841 ms | 1.78 s |
-| RuboCop repo | 1,710 | 203 ms | **158 ms** | 1.51 s | 14.9 s |
+| Corpus | files | rubocop-rs | oxicop | vs oxicop | RuboCop (cached) | RuboCop (no cache) |
+|---|--:|--:|--:|--:|--:|--:|
+| Jekyll | 163 | **17 ms** | 29 ms | 1.7× | 841 ms | 1.78 s |
+| RuboCop repo | 1,710 | **67 ms** | 162 ms | 2.4× | 1.51 s | 14.9 s |
+| Mastodon | ~3,000 | **123 ms** | 230 ms | 1.9× | — | — |
+| Rails | ~3,400 | **184 ms** | 361 ms | 2.0× | — | — |
+
+The engine profile (RUBOCOP_RS_TIMING=1) after the per-run Engine refactor:
+prism parse now dominates (~55% of cpu time), the visitor is ~30% — i.e. the
+overhead over "just parsing Ruby correctly" is small, while oxicop skips
+parsing entirely (its Cargo.toml has NO Ruby parser dependency — it is
+regex/line-based, which is also why its offenses are wrong).
 
 ## Correctness on the same runs
 

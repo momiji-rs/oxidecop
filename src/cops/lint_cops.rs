@@ -85,19 +85,14 @@ impl<'a> Cops<'a> {
     /// flattened); `require 'debug/open'`-style entries via DebuggerRequires.
     pub(crate) fn check_debugger(&mut self, node: &ruby_prism::CallNode) {
         const COP: &str = "Lint/Debugger";
-        if !self.on(COP) {
+        if !self.eng.debugger_on() {
             return;
         }
-        const DEFAULT_METHODS: &[&str] = &[
-            "binding.irb", "Kernel.binding.irb", "byebug", "remote_byebug", "Kernel.byebug",
-            "Kernel.remote_byebug", "page.save_and_open_page", "page.save_and_open_screenshot",
-            "page.save_page", "page.save_screenshot", "save_and_open_page",
-            "save_and_open_screenshot", "save_page", "save_screenshot", "binding.b",
-            "binding.break", "Kernel.binding.b", "Kernel.binding.break", "binding.pry",
-            "binding.remote_pry", "binding.pry_remote", "Kernel.binding.pry",
-            "Kernel.binding.remote_pry", "Kernel.binding.pry_remote", "Pry.rescue", "pry",
-            "debugger", "Kernel.debugger", "jard", "binding.console",
-        ];
+        // prefilter: the call's own name must be a possible FINAL segment of
+        // a listed method — otherwise skip before any allocation
+        if !self.eng.debugger_last_match(node.name().as_slice()) {
+            return;
+        }
         const DEFAULT_REQUIRES: &[&str] = &["debug/open", "debug/start"];
         let args: Vec<ruby_prism::Node> =
             node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
@@ -125,7 +120,7 @@ impl<'a> Cops<'a> {
             let chained = chained_method_name(node, self.src);
             match self.cfg.param(COP, "DebuggerMethods").map(crate::config::parse_allowed_list) {
                 Some(list) => list.iter().any(|m| *m == chained),
-                None => DEFAULT_METHODS.contains(&chained.as_str()),
+                None => DEFAULT_DEBUGGER_METHODS.contains(&chained.as_str()),
             }
         };
         if hit {
@@ -168,6 +163,18 @@ impl<'a> Cops<'a> {
              Instead, use {replacements} depending on your specific use case."));
     }
 }
+
+/// rubocop's default DebuggerMethods (the grouped default.yml list, flattened).
+pub(crate) const DEFAULT_DEBUGGER_METHODS: &[&str] = &[
+    "binding.irb", "Kernel.binding.irb", "byebug", "remote_byebug", "Kernel.byebug",
+    "Kernel.remote_byebug", "page.save_and_open_page", "page.save_and_open_screenshot",
+    "page.save_page", "page.save_screenshot", "save_and_open_page",
+    "save_and_open_screenshot", "save_page", "save_screenshot", "binding.b",
+    "binding.break", "Kernel.binding.b", "Kernel.binding.break", "binding.pry",
+    "binding.remote_pry", "binding.pry_remote", "Kernel.binding.pry",
+    "Kernel.binding.remote_pry", "Kernel.binding.pry_remote", "Pry.rescue", "pry",
+    "debugger", "Kernel.debugger", "jard", "binding.console",
+];
 
 /// rubocop's `chained_method_name`: the dispatch name prefixed by its
 /// receiver chain of send/const names (`Kernel.binding.irb`).

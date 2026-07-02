@@ -11,6 +11,22 @@ use crate::declarative::{render, Anchor, DECLARATIVE};
 use crate::nodepattern::{self, Pat};
 use ruby_prism::Visit;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Nanosecond tallies per phase, summed across threads — printed by the
+/// runner when RUBOCOP_RS_TIMING is set. Loads/stores are relaxed; this is
+/// diagnostics, not synchronization.
+pub static T_PARSE: AtomicU64 = AtomicU64::new(0);
+pub static T_PREP: AtomicU64 = AtomicU64::new(0);
+pub static T_TEXT: AtomicU64 = AtomicU64::new(0);
+pub static T_VISIT: AtomicU64 = AtomicU64::new(0);
+pub static T_POST: AtomicU64 = AtomicU64::new(0);
+
+fn tick(slot: &AtomicU64, since: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    slot.fetch_add(now.duration_since(since).as_nanos() as u64, Ordering::Relaxed);
+    now
+}
 
 pub struct Offense {
     pub line: usize,
@@ -45,6 +61,132 @@ impl LineIndex {
 /// An autocorrect edit: (start_byte, end_byte, replacement).
 pub type Fix = (usize, usize, Vec<u8>);
 
+/// Per-RUN state derived from the Config once — parsed patterns, resolved
+/// enablement, compiled exemption maps. lint() is called per file; nothing
+/// here should be rebuilt per file.
+pub struct Engine {
+    // DECLARATIVE rows that are enabled AND match their style gate, patterns
+    // parsed — the per-node loop touches nothing else.
+    decl: Vec<(Pat, &'static str, &'static str, Anchor)>,
+    // (cop, enabled) sorted by cop — on() binary-searches instead of hashing.
+    enabled: Vec<(&'static str, bool)>,
+    allowed_patterns: HashMap<String, Vec<regex::Regex>>,
+    allowed_methods: HashMap<String, Vec<String>>,
+    // Lint/Debugger: is the cop live, and the FINAL segments of its method
+    // list (`irb` for `Kernel.binding.irb`) — a cheap prefilter that avoids
+    // building the chained name for every call node.
+    debugger_on: bool,
+    debugger_last: Vec<Vec<u8>>,
+}
+
+/// Every cop name the engine implements — enablement resolves once per run.
+const IMPLEMENTED: &[&str] = &[
+    "Layout/LineLength", "Layout/TrailingWhitespace", "Lint/BigDecimalNew",
+    "Lint/BooleanSymbol", "Lint/Debugger", "Lint/EmptyEnsure", "Lint/EmptyExpression",
+    "Lint/NestedMethodDefinition", "Lint/RandOne", "Lint/UriEscapeUnescape",
+    "Lint/UriRegexp", "Naming/MethodName", "Style/ArrayJoin", "Style/Dir",
+    "Style/Documentation", "Style/EvenOdd", "Style/FrozenStringLiteralComment",
+    "Style/NegatedIf", "Style/NestedFileDirname", "Style/NilComparison",
+    "Style/NumericLiterals", "Style/NumericPredicate", "Style/RandomWithOffset",
+    "Style/RedundantReturn", "Style/StringChars", "Style/StringLiterals",
+    "Style/SymbolProc", "Style/UnpackFirst", "Style/ZeroLengthPredicate",
+];
+
+impl Engine {
+    pub fn new(cfg: &Config) -> Engine {
+        // rubocop raises on an EnforcedStyle outside SupportedStyles and the
+        // file yields no offenses; the closest equivalent is disabling the cop.
+        let live = |c: &str| {
+            if !cfg.enabled(c) {
+                return false;
+            }
+            if let Some(v) = cfg.param(c, "EnforcedStyle") {
+                if let Some(sch) = crate::config::schema(c) {
+                    if !sch.styles.is_empty() && !sch.styles.contains(&v) {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
+        let mut enabled: Vec<(&'static str, bool)> =
+            IMPLEMENTED.iter().map(|c| (*c, live(c))).collect();
+        enabled.sort_by_key(|(c, _)| *c);
+        let is_on = |cop: &str| {
+            enabled
+                .binary_search_by(|(c, _)| (*c).cmp(cop))
+                .map(|i| enabled[i].1)
+                .unwrap_or(false)
+        };
+        // style-gate + enablement resolved NOW; the visitor loop just matches
+        let decl = DECLARATIVE
+            .iter()
+            .filter(|(_, cop, _, _, style)| {
+                is_on(cop) && style.is_none_or(|st| cfg.enforced_style(cop) == st)
+            })
+            .map(|(p, cop, msg, a, _)| (nodepattern::parse(p), *cop, *msg, *a))
+            .collect();
+
+        let mut allowed_patterns: HashMap<String, Vec<regex::Regex>> = HashMap::new();
+        let mut allowed_methods: HashMap<String, Vec<String>> = HashMap::new();
+        for (sec, kv) in &cfg.sections {
+            if let Some(v) = kv.get("AllowedPatterns") {
+                let pats = parse_allowed_list(v)
+                    .into_iter()
+                    .filter_map(|p| regex::Regex::new(&p).ok())
+                    .collect();
+                allowed_patterns.insert(sec.clone(), pats);
+            }
+            if let Some(v) = kv.get("AllowedMethods") {
+                allowed_methods.insert(sec.clone(), parse_allowed_list(v));
+            }
+        }
+        // Seed schema-default AllowedMethods for cops the config didn't set
+        // them on — unless the section replaces defaults outright.
+        for s in SCHEMA {
+            if !s.allowed_methods.is_empty()
+                && !allowed_methods.contains_key(s.cop)
+                && !cfg.replaces_defaults(s.cop)
+            {
+                allowed_methods
+                    .insert(s.cop.to_string(), s.allowed_methods.iter().map(|m| m.to_string()).collect());
+            }
+        }
+
+        let debugger_on = is_on("Lint/Debugger");
+        let debugger_last = if debugger_on {
+            let listed = cfg.param("Lint/Debugger", "DebuggerMethods").map(parse_allowed_list);
+            let names: Vec<String> = match listed {
+                Some(l) => l,
+                None => crate::cops::lint_cops::DEFAULT_DEBUGGER_METHODS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            };
+            let mut last: Vec<Vec<u8>> = names
+                .iter()
+                .map(|n| n.rsplit('.').next().unwrap_or(n).as_bytes().to_vec())
+                .collect();
+            last.push(b"require".to_vec());
+            last.sort();
+            last.dedup();
+            last
+        } else {
+            Vec::new()
+        };
+
+        Engine { decl, enabled, allowed_patterns, allowed_methods, debugger_on, debugger_last }
+    }
+    pub(crate) fn debugger_on(&self) -> bool {
+        self.debugger_on
+    }
+    /// Could `name` be the final segment of a listed debugger method (or
+    /// `require`)? Sorted-list binary search.
+    pub(crate) fn debugger_last_match(&self, name: &[u8]) -> bool {
+        self.debugger_last.binary_search_by(|x| x.as_slice().cmp(name)).is_ok()
+    }
+}
+
 pub struct LintResult {
     pub offenses: Vec<Offense>,
     pub fixes: Vec<Fix>,
@@ -60,20 +202,15 @@ pub(crate) struct Cops<'a> {
     // exactly how rubocop's Corrector composes source rewrites off the AST
     // source-ranges.
     pub(crate) fixes: Vec<Fix>,
-    // DECLARATIVE cops: (parsed pattern, cop name, message). Built once from
-    // the DECLARATIVE table — the cop "logic" is entirely in the pattern.
-    pub(crate) decl: Vec<(Pat, &'static str, &'static str, Anchor, Option<&'static str>)>,
-    // Cross-cutting exemptions, mirroring rubocop's `AllowedMethods` mixin: a cop
-    // consults `allowed(cop, text)` to suppress an offense whose relevant string
-    // (a method name, a source line, …) is either an exact `AllowedMethods` entry
-    // or matches an `AllowedPatterns` regex.
-    pub(crate) allowed_patterns: HashMap<String, Vec<regex::Regex>>,
-    pub(crate) allowed_methods: HashMap<String, Vec<String>>,
-    // Enclosing call/block method names (outermost first), maintained around the
-    // manual recursion in `visit_call_node`. Lets cops consult ancestors (e.g.
-    // Style/NumericPredicate's AllowedMethods on a wrapping `where(...)`, and its
-    // `!x.zero?` negation) without a parent pointer.
-    pub(crate) call_stack: Vec<Vec<u8>>,
+    // Per-run engine state: parsed+prefiltered patterns, resolved enablement,
+    // compiled exemption maps.
+    pub(crate) eng: &'a Engine,
+    // Enclosing call/block method-name SPANS (outermost first), maintained
+    // around the manual recursion in `visit_call_node`. Lets cops consult
+    // ancestors (e.g. Style/NumericPredicate's AllowedMethods on a wrapping
+    // `where(...)`, and its `!x.zero?` negation) without a parent pointer.
+    // Spans index into src — no per-node allocation.
+    pub(crate) call_stack: Vec<(usize, usize)>,
     // Ancestor counters for Lint/NestedMethodDefinition: how many enclosing
     // `def`s, and how many enclosing "scoping" blocks/sclass (Class.new,
     // instance_eval, class << self, AllowedMethods, …). A nested def is an
@@ -116,33 +253,32 @@ pub(crate) struct Cops<'a> {
     pub(crate) nodoc_all_stack: Vec<bool>,
 }
 impl<'a> Cops<'a> {
+    /// Resolved once per run in Engine::new — this is a binary search over a
+    /// short static list, called on every node for every check.
     pub(crate) fn on(&self, cop: &str) -> bool {
-        if !self.cfg.enabled(cop) {
-            return false;
-        }
-        // rubocop raises on an EnforcedStyle outside SupportedStyles and the
-        // file yields no offenses; the closest equivalent is disabling the cop.
-        if let Some(v) = self.cfg.param(cop, "EnforcedStyle") {
-            if let Some(s) = crate::config::schema(cop) {
-                if !s.styles.is_empty() && !s.styles.contains(&v) {
-                    return false;
-                }
-            }
-        }
-        true
+        self.eng
+            .enabled
+            .binary_search_by(|(c, _)| (*c).cmp(cop))
+            .map(|i| self.eng.enabled[i].1)
+            .unwrap_or(false)
     }
     /// Is `text` exempt for `cop` via AllowedMethods (exact) or AllowedPatterns?
     pub(crate) fn allowed(&self, cop: &str, text: &[u8]) -> bool {
-        let s = String::from_utf8_lossy(text);
         let by_name = self
+            .eng
             .allowed_methods
             .get(cop)
             .is_some_and(|names| names.iter().any(|n| n.as_bytes() == text));
-        let by_pattern = self
+        if by_name {
+            return true;
+        }
+        self.eng
             .allowed_patterns
             .get(cop)
-            .is_some_and(|pats| pats.iter().any(|re| re.is_match(&s)));
-        by_name || by_pattern
+            .is_some_and(|pats| {
+                let s = String::from_utf8_lossy(text);
+                pats.iter().any(|re| re.is_match(&s))
+            })
     }
     pub(crate) fn push(&mut self, off: usize, cop: &'static str, correctable: bool, msg: impl Into<String>) {
         let (line, col) = self.idx.loc(off);
@@ -215,15 +351,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let l = node.location();
             self.percent_sym_spans.push((l.start_offset(), l.end_offset()));
         }
-        for e in node.elements().iter() {
-            self.assumed_arg_offsets.insert(e.location().start_offset());
+        if self.eng.debugger_on {
+            for e in node.elements().iter() {
+                self.assumed_arg_offsets.insert(e.location().start_offset());
+            }
         }
         ruby_prism::visit_array_node(self, node);
     }
     fn visit_assoc_node(&mut self, node: &ruby_prism::AssocNode<'pr>) {
         // both sides of a hash pair are "assumed arguments"
-        self.assumed_arg_offsets.insert(node.key().location().start_offset());
-        self.assumed_arg_offsets.insert(node.value().location().start_offset());
+        if self.eng.debugger_on {
+            self.assumed_arg_offsets.insert(node.key().location().start_offset());
+            self.assumed_arg_offsets.insert(node.value().location().start_offset());
+        }
         ruby_prism::visit_assoc_node(self, node);
     }
     fn visit_embedded_statements_node(&mut self, node: &ruby_prism::EmbeddedStatementsNode<'pr>) {
@@ -334,32 +474,22 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.check_method_name_macros(node);
-        // Run every DECLARATIVE send-pattern against this call. The cop is data.
+        // Run every ACTIVE declarative pattern against this call (enablement
+        // and style gates were resolved when the Engine was built).
         let n = node.as_node();
         let node_off = node.location().start_offset();
-        let op_off = node.message_loc().map(|l| l.start_offset()).unwrap_or(node_off);
-        let recv_op_off = node
-            .receiver()
-            .and_then(|r| r.as_call_node().and_then(|c| c.message_loc()))
-            .map(|l| l.start_offset())
-            .unwrap_or(node_off);
-        for i in 0..self.decl.len() {
-            let (pat, cop, msg, anchor, style) = &self.decl[i];
-            if !self.on(cop) {
-                continue;
-            }
-            // EnforcedStyle gate: a style-specific row fires only under its style.
-            if let Some(s) = style {
-                if self.cfg.enforced_style(cop) != *s {
-                    continue;
-                }
-            }
+        for i in 0..self.eng.decl.len() {
+            let (pat, cop, msg, anchor) = &self.eng.decl[i];
             if let Some(caps) = nodepattern::matches(pat, &n, self.src) {
                 let (cop, msg) = (*cop, *msg);
                 let off = match anchor {
-                    Anchor::Op => op_off,
+                    Anchor::Op => node.message_loc().map(|l| l.start_offset()).unwrap_or(node_off),
                     Anchor::Node => node_off,
-                    Anchor::RecvOp => recv_op_off,
+                    Anchor::RecvOp => node
+                        .receiver()
+                        .and_then(|r| r.as_call_node().and_then(|c| c.message_loc()))
+                        .map(|l| l.start_offset())
+                        .unwrap_or(node_off),
                 };
                 self.push(off, cop, false, render(msg, &caps));
             }
@@ -392,15 +522,24 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.push(off, "Style/SymbolProc", true, msg);
         }
         // recurse into children (we've overridden the default walk). Push this
-        // call's name so descendants can see it as an ancestor.
-        self.call_stack.push(node.name().as_slice().to_vec());
+        // call's name SPAN so descendants can see it as an ancestor.
+        let name_span = node
+            .message_loc()
+            .map(|l| (l.start_offset(), l.end_offset()))
+            .unwrap_or((node_off, node_off));
+        self.call_stack.push(name_span);
+        let track_args = self.eng.debugger_on;
         if let Some(r) = node.receiver() {
-            self.assumed_arg_offsets.insert(r.location().start_offset());
+            if track_args {
+                self.assumed_arg_offsets.insert(r.location().start_offset());
+            }
             self.visit(&r);
         }
         if let Some(a) = node.arguments() {
             for arg in a.arguments().iter() {
-                self.assumed_arg_offsets.insert(arg.location().start_offset());
+                if track_args {
+                    self.assumed_arg_offsets.insert(arg.location().start_offset());
+                }
                 self.visit(&arg);
             }
         }
@@ -429,8 +568,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
 /// Lint one file: run the text-based cops and the AST visitor, return sorted
 /// offenses + autocorrect edits. Pure — no I/O; the caller owns file reading,
 /// config discovery, and output formatting.
-pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
+pub fn lint(src: &[u8], cfg: &Config, eng: &Engine) -> LintResult {
+    let t0 = std::time::Instant::now();
     let result = ruby_prism::parse(src);
+    let t = tick(&T_PARSE, t0);
     let idx = LineIndex::new(src);
 
     let mut comment_lines = HashSet::new();
@@ -450,39 +591,6 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         .as_program_node()
         .and_then(|p| p.statements().body().iter().next().map(|n| idx.loc(n.location().start_offset()).0));
 
-    let decl: Vec<(Pat, &'static str, &'static str, Anchor, Option<&'static str>)> = DECLARATIVE
-        .iter()
-        .map(|(p, cop, msg, a, style)| (nodepattern::parse(p), *cop, *msg, *a, *style))
-        .collect();
-
-    // Compile each cop's AllowedPatterns once (invalid regexes dropped); collect
-    // AllowedMethods as exact-name lists. Both back `Cops::allowed`.
-    let mut allowed_patterns: HashMap<String, Vec<regex::Regex>> = HashMap::new();
-    let mut allowed_methods: HashMap<String, Vec<String>> = HashMap::new();
-    for (sec, kv) in &cfg.sections {
-        if let Some(v) = kv.get("AllowedPatterns") {
-            let pats = parse_allowed_list(v)
-                .into_iter()
-                .filter_map(|p| regex::Regex::new(&p).ok())
-                .collect();
-            allowed_patterns.insert(sec.clone(), pats);
-        }
-        if let Some(v) = kv.get("AllowedMethods") {
-            allowed_methods.insert(sec.clone(), parse_allowed_list(v));
-        }
-    }
-    // Seed schema-default AllowedMethods for cops the config didn't set them on
-    // (rubocop's config/default.yml ships some, e.g. Style/SymbolProc) —
-    // unless the section replaces defaults outright.
-    for s in SCHEMA {
-        if !s.allowed_methods.is_empty()
-            && !allowed_methods.contains_key(s.cop)
-            && !cfg.replaces_defaults(s.cop)
-        {
-            allowed_methods.insert(s.cop.to_string(), s.allowed_methods.iter().map(|m| m.to_string()).collect());
-        }
-    }
-
     // Heredoc body line ranges, for Layout/TrailingWhitespace.
     let mut hd = HeredocFinder { idx: &idx, ranges: Vec::new() };
     hd.visit(&result.node());
@@ -495,9 +603,7 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         comment_lines,
         offenses: Vec::new(),
         fixes: Vec::new(),
-        decl,
-        allowed_patterns,
-        allowed_methods,
+        eng,
         call_stack: Vec::new(),
         def_depth: 0,
         scoping_depth: 0,
@@ -516,17 +622,22 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         nodoc_all_stack: Vec::new(),
     };
 
+    let t = tick(&T_PREP, t);
+
     // ---- text-based cops ----
     cops.check_frozen_string_literal(first_code_line);
     cops.check_line_length();
     cops.check_trailing_whitespace();
+    let t = tick(&T_TEXT, t);
 
     // ---- AST-based cops ----
     cops.visit(&result.node());
+    let t = tick(&T_VISIT, t);
 
     let mut offenses = cops.offenses;
     apply_disable_directives(&mut offenses, &comment_data, src, &idx);
     offenses.sort_by(|a, b| (a.line, a.col, a.cop).cmp(&(b.line, b.col, b.cop)));
+    tick(&T_POST, t);
     LintResult { offenses, fixes: cops.fixes }
 }
 
@@ -653,7 +764,8 @@ mod tests {
 
     fn offenses(src: &str, cfg: &str) -> Vec<(usize, usize, &'static str)> {
         let cfg = Config::parse(cfg);
-        lint(src.as_bytes(), &cfg)
+        let eng = Engine::new(&cfg);
+        lint(src.as_bytes(), &cfg, &eng)
             .offenses
             .iter()
             .map(|o| (o.line, o.col, o.cop))
