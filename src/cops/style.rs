@@ -17,7 +17,7 @@ impl<'a> Cops<'a> {
     /// openings and fall through untouched; strings inside `#{}` interpolation
     /// and strings claimed by a multiline-concat check are exempt.
     pub(crate) fn check_string_literals(&mut self, node: &ruby_prism::StringNode) {
-        if !self.on("Style/StringLiterals") || self.interp_depth > 0 {
+        if !self.eng.hot.string_literals || self.interp_depth > 0 {
             return;
         }
         let l = node.location();
@@ -27,8 +27,8 @@ impl<'a> Cops<'a> {
         let Some(open) = node.opening_loc() else { return };
         let src = self.node_src(&node.as_node());
         let c = node.content_loc().as_slice();
-        match self.cfg.enforced_style("Style/StringLiterals") {
-            "single_quotes" if open.as_slice() == b"\"" => {
+        match self.eng.hot.string_style {
+            1 if open.as_slice() == b"\"" => {
                 if !double_quotes_required(src) {
                     self.push(l.start_offset(), "Style/StringLiterals", true, MSG_SINGLE);
                     // fix: `"c"` -> `'c'`, unescaping `\"` -> `"` (`\\` stays)
@@ -50,7 +50,7 @@ impl<'a> Cops<'a> {
                     self.fixes.push((l.start_offset(), l.end_offset(), rep));
                 }
             }
-            "double_quotes" if open.as_slice() == b"'" => {
+            2 if open.as_slice() == b"'" => {
                 if !single_quotes_required(src) {
                     self.push(l.start_offset(), "Style/StringLiterals", true, MSG_DOUBLE);
                     // fix: `'c'` -> `"c"`, unescaping `\'` -> `'` (`\\` stays)
@@ -81,7 +81,7 @@ impl<'a> Cops<'a> {
     /// parts are claimed (rubocop's `ignore_node`) so `on_str` skips them.
     pub(crate) fn check_string_concat(&mut self, node: &ruby_prism::InterpolatedStringNode) {
         const COP: &str = "Style/StringLiterals";
-        if !self.on(COP) || self.cfg.param(COP, "ConsistentQuotesInMultiline") != Some("true") {
+        if !self.eng.hot.string_literals || !self.eng.hot.consistent_quotes {
             return;
         }
         // Heredocs keep their parts.
@@ -105,7 +105,7 @@ impl<'a> Cops<'a> {
         if openings.iter().any(|o| o.is_none()) || parts.is_empty() {
             return;
         }
-        let style = self.cfg.enforced_style(COP);
+        let style = self.eng.hot.string_style;
         let l = node.location();
         let mut quotes: Vec<&[u8]> = openings.iter().map(|o| o.as_deref().unwrap()).filter(|q| !q.is_empty()).collect();
         quotes.dedup();
@@ -113,13 +113,13 @@ impl<'a> Cops<'a> {
         quotes.dedup();
         let offense = if quotes.len() > 1 {
             Some("Inconsistent quote style.".to_string())
-        } else if quotes == [b"'" as &[u8]] && style == "double_quotes" {
+        } else if quotes == [b"'" as &[u8]] && style == 2 {
             // All parts must be wrong for the node to be an offense.
             parts
                 .iter()
                 .all(|p| !single_quotes_required(self.node_src(p)))
                 .then(|| MSG_DOUBLE.to_string())
-        } else if quotes == [b"\"" as &[u8]] && style == "single_quotes" {
+        } else if quotes == [b"\"" as &[u8]] && style == 1 {
             // Accepted if ANY part is interpolated or genuinely needs `"`.
             let accept = parts.iter().any(|p| {
                 p.as_interpolated_string_node().is_some() || double_quotes_required(self.node_src(p))
@@ -142,7 +142,7 @@ impl<'a> Cops<'a> {
     /// under Strict).
     pub(crate) fn check_numeric_literals(&mut self, node: &ruby_prism::Node) {
         const COP: &str = "Style/NumericLiterals";
-        if !self.on(COP) {
+        if !self.eng.hot.numeric_literals {
             return;
         }
         let s = String::from_utf8_lossy(self.node_src(node)).into_owned();
@@ -165,12 +165,12 @@ impl<'a> Cops<'a> {
                 }
             }
         }
-        if int_part.len() < self.cfg.int(COP, "MinDigits") {
+        if int_part.len() < self.eng.hot.min_digits {
             return;
         }
         let ungrouped = int_part.bytes().all(|b| b.is_ascii_digit());
         let four_run = int_part.as_bytes().windows(4).any(|w| w.iter().all(|b| b.is_ascii_digit()));
-        let strict = self.cfg.param(COP, "Strict") == Some("true");
+        let strict = self.eng.hot.numeric_strict;
         let short_group = {
             let groups: Vec<&str> = int_part.split('_').collect();
             // `_\d{1,2}_` — an inner group of 1-2 digits; Strict also rejects
@@ -441,7 +441,7 @@ impl<'a> Cops<'a> {
     /// if/unless, every case/when + else, rescue clauses (+ else, or the body
     /// when no else), and through begin groupings.
     pub(crate) fn check_redundant_return(&mut self, node: &ruby_prism::DefNode) {
-        if !self.on("Style/RedundantReturn") {
+        if !self.eng.hot.redundant_return {
             return;
         }
         if let Some(b) = node.body() {
@@ -556,7 +556,7 @@ impl<'a> Cops<'a> {
     /// (comparison/predicate) node; messages interpolate the captured pieces.
     pub(crate) fn check_zero_length(&mut self, node: &ruby_prism::CallNode) {
         const COP: &str = "Style/ZeroLengthPredicate";
-        if !self.on(COP) {
+        if !self.eng.hot.zero_length {
             return;
         }
         let n = node.as_node();
@@ -632,7 +632,7 @@ impl<'a> Cops<'a> {
     /// verbatim; which predicate depends on the operator and the compared int.
     pub(crate) fn check_even_odd(&mut self, node: &ruby_prism::CallNode) {
         const COP: &str = "Style/EvenOdd";
-        if !self.on(COP) {
+        if !self.eng.hot.even_odd {
             return;
         }
         static PAT: OnceLock<Pat> = OnceLock::new();
@@ -654,7 +654,7 @@ impl<'a> Cops<'a> {
     /// `File.dirname(File.realpath(__FILE__))` → `__dir__`.
     pub(crate) fn check_dir(&mut self, node: &ruby_prism::CallNode) {
         const COP: &str = "Style/Dir";
-        if !self.on(COP) {
+        if !self.eng.hot.dir {
             return;
         }
         static PAT: OnceLock<Pat> = OnceLock::new();
@@ -675,7 +675,7 @@ impl<'a> Cops<'a> {
     /// Style/StringChars — `split('')` / `split("")` / `split(//)` → `chars`.
     pub(crate) fn check_string_chars(&mut self, node: &ruby_prism::CallNode) {
         const COP: &str = "Style/StringChars";
-        if !self.on(COP) || node.name().as_slice() != b"split" {
+        if !self.eng.hot.string_chars || node.name().as_slice() != b"split" {
             return;
         }
         let args: Vec<ruby_prism::Node> =
@@ -695,8 +695,8 @@ impl<'a> Cops<'a> {
     /// (rubocop guards on `node.parent`; we mark the inner calls instead).
     pub(crate) fn check_nested_file_dirname(&mut self, node: &ruby_prism::CallNode) {
         const COP: &str = "Style/NestedFileDirname";
-        // rubocop: minimum_target_ruby_version 3.1
-        if !self.on(COP) || self.cfg.target_ruby() < 3.1 {
+        // rubocop: minimum_target_ruby_version 3.1 (folded into the flag)
+        if !self.eng.hot.nested_file_dirname {
             return;
         }
         static PAT: OnceLock<Pat> = OnceLock::new();
@@ -789,18 +789,18 @@ impl<'a> Cops<'a> {
     /// a single `!` on the condition, no else branch, style-gated on the
     /// modifier form).
     pub(crate) fn check_negated_if(&mut self, node: &ruby_prism::IfNode) {
-        const COP: &str = "Style/NegatedIf";
-        if !self.on(COP) {
+        if !self.eng.hot.negated_if {
             return;
         }
+        const COP: &str = "Style/NegatedIf";
         let Some(kw) = node.if_keyword_loc() else { return }; // ternary
         if kw.as_slice() != b"if" || node.subsequent().is_some() {
             return; // elsif, or an else/elsif branch exists
         }
         let modifier = node.end_keyword_loc().is_none();
-        match self.cfg.enforced_style(COP) {
-            "prefix" if modifier => return,
-            "postfix" if !modifier => return,
+        match self.eng.hot.negated_if_style {
+            1 if modifier => return,
+            2 if !modifier => return,
             _ => {}
         }
         // unwrap parens (taking the last statement), bail on empty `()`
@@ -831,7 +831,7 @@ impl<'a> Cops<'a> {
     /// Lint/BooleanSymbol — `:true` / `:false` literals (outside `%i[]`).
     pub(crate) fn check_boolean_symbol(&mut self, node: &ruby_prism::SymbolNode) {
         const COP: &str = "Lint/BooleanSymbol";
-        if !self.on(COP) {
+        if !self.eng.hot.boolean_symbol {
             return;
         }
         let l = node.location();
@@ -857,7 +857,7 @@ impl<'a> Cops<'a> {
     /// style flag those predicates → suggest the comparison. Returns the offense
     /// (whole-node offset, rendered message) or None. Verbatim rubocop logic.
     pub(crate) fn numeric_predicate(&self, node: &ruby_prism::CallNode) -> Option<(usize, String)> {
-        if !self.on("Style/NumericPredicate") {
+        if !self.eng.hot.numeric_predicate {
             return None;
         }
         let name = node.name().as_slice();
@@ -876,8 +876,8 @@ impl<'a> Cops<'a> {
         let node_off = node.location().start_offset();
         let current = String::from_utf8_lossy(self.node_src(&node.as_node())).into_owned();
 
-        let prefer = match self.cfg.enforced_style("Style/NumericPredicate") {
-            "comparison" => {
+        let prefer = match self.eng.hot.numeric_pred_comparison {
+            true => {
                 // flag `x.zero?/positive?/negative?` (receiver, no args)
                 let r = recv?;
                 if !args.is_empty() {
@@ -897,7 +897,7 @@ impl<'a> Cops<'a> {
                     format!("{rsrc} {op} 0")
                 }
             }
-            _ => {
+            false => {
                 // predicate style: flag `x {==,>,<} 0` and the inverted `0 {..} x`
                 if args.len() != 1 {
                     return None;
@@ -974,7 +974,7 @@ impl<'a> Cops<'a> {
     /// Style/SymbolProc for a method-call block `recv.m { |x| x.meth }` →
     /// `recv.m(&:meth)`. Offense range is the block (`{`..`}`).
     pub(crate) fn symbol_proc(&self, node: &ruby_prism::CallNode) -> Option<(usize, String)> {
-        if !self.on("Style/SymbolProc") {
+        if !self.eng.hot.symbol_proc {
             return None;
         }
         let block = node.block()?.as_block_node()?;
@@ -983,7 +983,7 @@ impl<'a> Cops<'a> {
         let bm = block_method.as_slice();
         // ActiveSupport gating: `proc`/`lambda`/`Proc.new` blocks are only
         // candidates when ActiveSupportExtensionsEnabled is off (the default).
-        if self.cfg.active_support() {
+        if self.eng.hot.active_support {
             if matches!(bm, b"lambda" | b"proc") {
                 return None;
             }
@@ -1005,12 +1005,10 @@ impl<'a> Cops<'a> {
             }
         }
         // AllowMethodsWithArguments: skip when enabled and the dispatch has args.
-        if self.cfg.param("Style/SymbolProc", "AllowMethodsWithArguments") == Some("true")
-            && node.arguments().is_some()
-        {
+        if self.eng.hot.symbol_proc_allow_args && node.arguments().is_some() {
             return None;
         }
-        if self.cfg.param("Style/SymbolProc", "AllowComments") == Some("true")
+        if self.eng.hot.symbol_proc_allow_comments
             && self.block_has_inner_comment(block.opening_loc().start_offset(), block.closing_loc().start_offset())
         {
             return None;
@@ -1024,7 +1022,7 @@ impl<'a> Cops<'a> {
     /// Style/SymbolProc for a `super { |x| x.meth }` / `super(...) { … }` block →
     /// `super(&:meth)`. `super` is always a candidate (no ActiveSupport gating).
     pub(crate) fn symbol_proc_super(&self, block: &ruby_prism::Node, has_args: bool) -> Option<(usize, String)> {
-        if !self.on("Style/SymbolProc") {
+        if !self.eng.hot.symbol_proc {
             return None;
         }
         let block = block.as_block_node()?;
@@ -1033,10 +1031,10 @@ impl<'a> Cops<'a> {
             return None;
         }
         // AllowMethodsWithArguments: skip when enabled and `super` has arguments.
-        if self.cfg.param("Style/SymbolProc", "AllowMethodsWithArguments") == Some("true") && has_args {
+        if self.eng.hot.symbol_proc_allow_args && has_args {
             return None;
         }
-        if self.cfg.param("Style/SymbolProc", "AllowComments") == Some("true")
+        if self.eng.hot.symbol_proc_allow_comments
             && self.block_has_inner_comment(block.opening_loc().start_offset(), block.closing_loc().start_offset())
         {
             return None;
@@ -1050,14 +1048,14 @@ impl<'a> Cops<'a> {
     /// Style/SymbolProc for an arrow lambda literal `->(x) { x.meth }` →
     /// `lambda(&:meth)`. Only a candidate when ActiveSupport extensions are off.
     pub(crate) fn symbol_proc_lambda(&self, node: &ruby_prism::LambdaNode) -> Option<(usize, String)> {
-        if !self.on("Style/SymbolProc") || self.cfg.active_support() {
+        if !self.eng.hot.symbol_proc || self.eng.hot.active_support {
             return None;
         }
         let method = self.proc_shape(node.parameters(), node.body())?;
         if self.allowed("Style/SymbolProc", b"lambda") {
             return None;
         }
-        if self.cfg.param("Style/SymbolProc", "AllowComments") == Some("true")
+        if self.eng.hot.symbol_proc_allow_comments
             && self.block_has_inner_comment(node.opening_loc().start_offset(), node.closing_loc().start_offset())
         {
             return None;

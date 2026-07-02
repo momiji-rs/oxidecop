@@ -16,7 +16,7 @@ impl<'a> Cops<'a> {
     /// The `def_depth`/`scoping_depth` ancestor counters are maintained in
     /// `visit_def_node` / `visit_call_node` / `visit_singleton_class_node`.
     pub(crate) fn check_nested_method_definition(&mut self, node: &ruby_prism::DefNode) {
-        if !self.on("Lint/NestedMethodDefinition") {
+        if !self.eng.hot.nested_method_definition {
             return;
         }
         let exempt = node.receiver().is_some_and(|r| r.as_self_node().is_none());
@@ -32,7 +32,7 @@ impl<'a> Cops<'a> {
     /// `URI::RFC2396_PARSER.make_regexp(...)` (the modern-ruby parser name).
     pub(crate) fn check_uri_regexp(&mut self, node: &ruby_prism::CallNode) {
         const COP: &str = "Lint/UriRegexp";
-        if !self.on(COP) || node.name().as_slice() != b"regexp" {
+        if !self.eng.hot.uri_regexp || node.name().as_slice() != b"regexp" {
             return;
         }
         static PAT: OnceLock<Pat> = OnceLock::new();
@@ -141,7 +141,7 @@ impl<'a> Cops<'a> {
     pub(crate) fn check_uri_escape_unescape(&mut self, node: &ruby_prism::CallNode) {
         const COP: &str = "Lint/UriEscapeUnescape";
         let name = node.name().as_slice();
-        if !matches!(name, b"escape" | b"encode" | b"unescape" | b"decode") || !self.on(COP) {
+        if !matches!(name, b"escape" | b"encode" | b"unescape" | b"decode") || !self.eng.hot.uri_escape {
             return;
         }
         static PAT: OnceLock<Pat> = OnceLock::new();

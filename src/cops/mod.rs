@@ -77,6 +77,44 @@ pub struct Engine {
     // building the chained name for every call node.
     debugger_on: bool,
     debugger_last: Vec<Vec<u8>>,
+    // Direct enablement bits + hot per-cop config, resolved once — the
+    // per-node checks read fields instead of hashing strings.
+    pub(crate) hot: Hot,
+}
+
+/// Enablement + configuration the per-NODE checks consult. Everything here is
+/// a plain field read in the hot loop.
+#[derive(Default)]
+pub(crate) struct Hot {
+    pub(crate) string_literals: bool,
+    /// 1 = single_quotes, 2 = double_quotes, 0 = anything else
+    pub(crate) string_style: u8,
+    pub(crate) consistent_quotes: bool,
+    pub(crate) numeric_literals: bool,
+    pub(crate) min_digits: usize,
+    pub(crate) numeric_strict: bool,
+    pub(crate) method_name: bool,
+    pub(crate) method_name_style: String,
+    pub(crate) numeric_predicate: bool,
+    pub(crate) numeric_pred_comparison: bool,
+    pub(crate) symbol_proc: bool,
+    pub(crate) symbol_proc_allow_args: bool,
+    pub(crate) symbol_proc_allow_comments: bool,
+    pub(crate) active_support: bool,
+    pub(crate) zero_length: bool,
+    pub(crate) even_odd: bool,
+    pub(crate) dir: bool,
+    pub(crate) string_chars: bool,
+    pub(crate) nested_file_dirname: bool,
+    pub(crate) uri_regexp: bool,
+    pub(crate) uri_escape: bool,
+    pub(crate) random_with_offset: bool,
+    pub(crate) boolean_symbol: bool,
+    pub(crate) redundant_return: bool,
+    pub(crate) nested_method_definition: bool,
+    pub(crate) negated_if: bool,
+    /// 0 = both, 1 = prefix, 2 = postfix
+    pub(crate) negated_if_style: u8,
 }
 
 /// Every cop name the engine implements — enablement resolves once per run.
@@ -175,7 +213,46 @@ impl Engine {
             Vec::new()
         };
 
-        Engine { decl, enabled, allowed_patterns, allowed_methods, debugger_on, debugger_last }
+        let hot = Hot {
+            string_literals: is_on("Style/StringLiterals"),
+            string_style: match cfg.enforced_style("Style/StringLiterals") {
+                "single_quotes" => 1,
+                "double_quotes" => 2,
+                _ => 0,
+            },
+            consistent_quotes: cfg.param("Style/StringLiterals", "ConsistentQuotesInMultiline")
+                == Some("true"),
+            numeric_literals: is_on("Style/NumericLiterals"),
+            min_digits: cfg.int("Style/NumericLiterals", "MinDigits"),
+            numeric_strict: cfg.param("Style/NumericLiterals", "Strict") == Some("true"),
+            method_name: is_on("Naming/MethodName"),
+            method_name_style: cfg.enforced_style("Naming/MethodName").to_string(),
+            numeric_predicate: is_on("Style/NumericPredicate"),
+            numeric_pred_comparison: cfg.enforced_style("Style/NumericPredicate") == "comparison",
+            symbol_proc: is_on("Style/SymbolProc"),
+            symbol_proc_allow_args: cfg.param("Style/SymbolProc", "AllowMethodsWithArguments")
+                == Some("true"),
+            symbol_proc_allow_comments: cfg.param("Style/SymbolProc", "AllowComments") == Some("true"),
+            active_support: cfg.active_support(),
+            zero_length: is_on("Style/ZeroLengthPredicate"),
+            even_odd: is_on("Style/EvenOdd"),
+            dir: is_on("Style/Dir"),
+            string_chars: is_on("Style/StringChars"),
+            nested_file_dirname: is_on("Style/NestedFileDirname") && cfg.target_ruby() >= 3.1,
+            uri_regexp: is_on("Lint/UriRegexp"),
+            uri_escape: is_on("Lint/UriEscapeUnescape"),
+            random_with_offset: is_on("Style/RandomWithOffset"),
+            boolean_symbol: is_on("Lint/BooleanSymbol"),
+            redundant_return: is_on("Style/RedundantReturn"),
+            nested_method_definition: is_on("Lint/NestedMethodDefinition"),
+            negated_if: is_on("Style/NegatedIf"),
+            negated_if_style: match cfg.enforced_style("Style/NegatedIf") {
+                "prefix" => 1,
+                "postfix" => 2,
+                _ => 0,
+            },
+        };
+        Engine { decl, enabled, allowed_patterns, allowed_methods, debugger_on, debugger_last, hot }
     }
     pub(crate) fn debugger_on(&self) -> bool {
         self.debugger_on
@@ -421,7 +498,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.push(off, "Style/SymbolProc", true, msg);
         }
         // `->` is a lambda literal — rubocop reaches it via the `lambda` send.
-        if self.on("Style/RedundantReturn") {
+        if self.eng.hot.redundant_return {
             if let Some(b) = node.body() {
                 self.rr_branch(&b);
             }
@@ -506,7 +583,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_debugger(node);
         // Style/RedundantReturn also fires for method-defining blocks
         // (rubocop's RESTRICT_ON_SEND: define_method & friends, lambda).
-        if self.on("Style/RedundantReturn")
+        if self.eng.hot.redundant_return
             && matches!(node.name().as_slice(), b"define_method" | b"define_singleton_method" | b"lambda")
         {
             if let Some(body) = node.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) {
@@ -547,7 +624,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             // A block is "scoping" (allows nested defs) if it's a class
             // constructor, an (instance|class|module)_(eval|exec), or its method
             // is in AllowedMethods.
-            let scoping = self.on("Lint/NestedMethodDefinition")
+            let scoping = self.eng.hot.nested_method_definition
                 && (lint_cops::is_eval_exec(node)
                     || lint_cops::is_class_constructor(node, self.src)
                     || self.allowed("Lint/NestedMethodDefinition", node.name().as_slice()));
