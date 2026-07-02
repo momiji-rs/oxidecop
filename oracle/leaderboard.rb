@@ -48,6 +48,7 @@ COPS = {
   'Lint/UnifiedInteger'              => 'lint/unified_integer',
   'Lint/FlipFlop'                    => 'lint/flip_flop',
   'Style/Proc'                       => 'style/proc',
+  'Lint/DuplicateCaseCondition'      => 'lint/duplicate_case_condition',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

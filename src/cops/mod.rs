@@ -140,7 +140,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Layout/SpaceBeforeComma",
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
-    "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc",
+    "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -717,6 +717,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_global_variable_target_node(&mut self, node: &ruby_prism::GlobalVariableTargetNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
+    }
+    fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
+        self.check_duplicate_case_condition(node);
+        ruby_prism::visit_case_node(self, node);
     }
     fn visit_when_node(&mut self, node: &ruby_prism::WhenNode<'pr>) {
         self.check_when_then(node);

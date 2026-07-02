@@ -658,3 +658,33 @@ impl<'a> super::Cops<'a> {
         self.push(node.location().start_offset(), COP, false, "Avoid the use of flip-flop operators.");
     }
 }
+
+    /// Lint/DuplicateCaseCondition: within a single `case`, each `when`
+    /// condition is compared (by source text, standing in for rubocop's
+    /// node equality) against every condition seen in earlier `when`
+    /// branches of the same `case`; a repeat is flagged on each occurrence
+    /// after the first.
+
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_duplicate_case_condition(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Lint/DuplicateCaseCondition";
+        if !self.on(COP) {
+            return;
+        }
+        let mut seen: HashSet<&'a [u8]> = HashSet::new();
+        for branch in node.conditions().iter() {
+            let Some(when_node) = branch.as_when_node() else { continue };
+            for condition in when_node.conditions().iter() {
+                let src = self.node_src(&condition);
+                if !seen.insert(src) {
+                    self.push(
+                        condition.location().start_offset(),
+                        COP,
+                        false,
+                        "Duplicate `when` condition detected.",
+                    );
+                }
+            }
+        }
+    }
+}
