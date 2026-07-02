@@ -2097,3 +2097,63 @@ impl<'a> Cops<'a> {
         false
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/EmptyWhen — a `when` branch with no body. Not autocorrectable
+    /// (rubocop's cop defines no `autocorrect`).
+    ///
+    /// Offense anchor: `self.push` only carries a start offset (rubocop's
+    /// line:col derive from it; range width isn't compared), so the anchor
+    /// is simply the `when` keyword's start — verified against real
+    /// `rubocop` output (`when :baz then # nothing` reports col 1, matching
+    /// `keyword_loc.start`; whitequark's node range for this `when` node
+    /// happens to run keyword..end-of-last-condition, i.e. it never extends
+    /// through `then`, a comment, or the absent body, but that only matters
+    /// for range *width*, which we don't need to reproduce).
+    ///
+    /// AllowComments (default true): rubocop's `CommentsHelp#contains_comments?`
+    /// scans `processed_source.each_comment_in_lines(start_line...end_line)`
+    /// where `start_line` is the `when` node's own line and `end_line` is
+    /// `find_end_line` — for a plain (non-if/non-block) node that's the line
+    /// of its `right_sibling` (the next `when`, or the `else` body's first
+    /// statement) if one exists, else the enclosing node's `end` line (the
+    /// `case`'s `end` keyword). `comments_contain_disables?` (a further gate
+    /// on `rubocop:disable` comments inside the range) isn't replicated —
+    /// not exercised by the fixture.
+    pub(crate) fn check_empty_when(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Lint/EmptyWhen";
+        if !self.on(COP) {
+            return;
+        }
+        let allow_comments = self.cfg.get(COP, "AllowComments") == Some("true");
+        let branches: Vec<_> = node.conditions().iter().collect();
+        let n = branches.len();
+        for (i, branch) in branches.iter().enumerate() {
+            let Some(when_node) = branch.as_when_node() else { continue };
+            if when_node.statements().is_some() {
+                continue;
+            }
+            let start = when_node.keyword_loc().start_offset();
+
+            if allow_comments {
+                let start_line = self.idx.loc(start).0;
+                let end_line = if i + 1 < n {
+                    self.idx.loc(branches[i + 1].location().start_offset()).0
+                } else if let Some(else_node) = node.else_clause() {
+                    else_node
+                        .statements()
+                        .and_then(|s| {
+                            s.body().iter().next().map(|s| self.idx.loc(s.location().start_offset()).0)
+                        })
+                        .unwrap_or_else(|| self.idx.loc(node.end_keyword_loc().start_offset()).0)
+                } else {
+                    self.idx.loc(node.end_keyword_loc().start_offset()).0
+                };
+                if self.comments.iter().any(|(line, _, _)| *line >= start_line && *line < end_line) {
+                    continue;
+                }
+            }
+            self.push(start, COP, false, "Avoid `when` branches without a body.");
+        }
+    }
+}
