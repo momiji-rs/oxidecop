@@ -1280,3 +1280,102 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/SpaceInsideStringInterpolation — checks for whitespace within
+    /// string interpolations (`#{...}`). Two styles:
+    /// - `no_space` (default): no spaces just inside the delimiters
+    /// - `space`: requires spaces just inside the delimiters
+    pub(crate) fn check_space_inside_string_interpolation(
+        &mut self,
+        node: &ruby_prism::EmbeddedStatementsNode<'_>,
+    ) {
+        const COP: &str = "Layout/SpaceInsideStringInterpolation";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Skip empty interpolations: #{}
+        if node.statements().is_none() {
+            return;
+        }
+
+        // Skip multiline interpolations
+        let opening = node.opening_loc();
+        let closing = node.closing_loc();
+        let open_line = self.idx.loc(opening.start_offset()).0;
+        let close_line = self.idx.loc(closing.start_offset()).0;
+        if open_line != close_line {
+            return;
+        }
+
+        let open_end = opening.end_offset();
+        let close_start = closing.start_offset();
+
+        // Check if there's a newline or comment between opening and closing
+        // by checking if the content starts with comments/whitespace+newline
+        if let Some(stmts) = node.statements() {
+            if let Some(first_stmt) = stmts.body().iter().next() {
+                let first_loc = first_stmt.location();
+                // If the first statement's location is on a different line,
+                // treat as multiline and skip
+                if self.idx.loc(first_loc.start_offset()).0 != open_line {
+                    return;
+                }
+            }
+        }
+
+        let style_is_space = self.cfg.get(COP, "EnforcedStyle") == Some("space");
+
+        // Collect whitespace positions after opening delimiter
+        let mut after_open_end = open_end;
+        while after_open_end < close_start && self.src[after_open_end].is_ascii_whitespace() {
+            if self.src[after_open_end] == b'\n' {
+                return; // multiline, skip
+            }
+            after_open_end += 1;
+        }
+
+        // Collect whitespace positions before closing delimiter
+        let mut before_close_start = close_start;
+        while before_close_start > open_end && self.src[before_close_start - 1].is_ascii_whitespace() {
+            if self.src[before_close_start - 1] == b'\n' {
+                return; // multiline, skip
+            }
+            before_close_start -= 1;
+        }
+
+        let has_space_after_open = after_open_end > open_end;
+        let has_space_before_close = close_start > before_close_start;
+
+        if style_is_space {
+            // For "space" style: require spaces on both sides
+            if !has_space_after_open {
+                // Report offense at the position of # (opening delimiter start)
+                // opening_loc gives us the location of #{, so start_offset is the # position
+                let report_pos = if open_end >= 2 { open_end - 2 } else { opening.start_offset() };
+                self.push(report_pos, COP, true, "Use space inside string interpolation.");
+                // Apply fix: add a single space after opening delimiter
+                self.fixes.push((open_end, open_end, b" ".to_vec()));
+            }
+            if !has_space_before_close {
+                // Report offense at the position of } (closing delimiter start)
+                self.push(close_start, COP, true, "Use space inside string interpolation.");
+                // Apply fix: add a single space before closing delimiter
+                self.fixes.push((before_close_start, before_close_start, b" ".to_vec()));
+            }
+        } else {
+            // For "no_space" style: remove spaces on both sides
+            if has_space_after_open {
+                // Report all spaces after opening delimiter
+                self.push(open_end, COP, true, "Do not use space inside string interpolation.");
+                self.fixes.push((open_end, after_open_end, Vec::new()));
+            }
+            if has_space_before_close {
+                // Report all spaces before closing delimiter
+                self.push(before_close_start, COP, true, "Do not use space inside string interpolation.");
+                self.fixes.push((before_close_start, close_start, Vec::new()));
+            }
+        }
+    }
+}
