@@ -2975,3 +2975,47 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((start_offset, end_offset, Vec::new()));
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Style/MultilineWhenThen — a `then` keyword is redundant on a `when`
+    /// clause whose body sits on a following line. Verbatim RuboCop logic
+    /// (`on_when`/`require_then?`):
+    ///   - skip when there's no real `then` keyword (bare `when x` or the
+    ///     `;` form, which `Style/WhenThen` owns instead);
+    ///   - skip when the `when` conditions themselves span multiple lines
+    ///     (`then` is required there regardless of the body);
+    ///   - skip when the body starts on the same line as the `when`
+    ///     keyword (single-line `when x then body` — `then` is required);
+    ///   - otherwise flag the `then` keyword and (autocorrect) remove it
+    ///     plus any contiguous horizontal whitespace directly before it
+    ///     (`range_with_surrounding_space(side: :left, newlines: false)`).
+    pub(crate) fn check_multiline_when_then(&mut self, node: &ruby_prism::WhenNode) {
+        const COP: &str = "Style/MultilineWhenThen";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(then_loc) = node.then_keyword_loc() else { return }; // no `then` (or `;`)
+        let conditions: Vec<ruby_prism::Node> = node.conditions().iter().collect();
+        let Some(first_cond) = conditions.first() else { return };
+        let last_cond = conditions.last().unwrap();
+        let first_line = self.idx.loc(first_cond.location().start_offset()).0;
+        let last_line = self.idx.loc(last_cond.location().end_offset().saturating_sub(1)).0;
+        if first_line != last_line {
+            return; // conditions span multiple lines -> `then` required
+        }
+        if let Some(body) = node.statements() {
+            let when_line = self.idx.loc(node.location().start_offset()).0;
+            let body_line = self.idx.loc(body.location().start_offset()).0;
+            if when_line == body_line {
+                return; // body on the same line as `when` -> `then` required
+            }
+        }
+        let then_start = then_loc.start_offset();
+        let then_end = then_loc.end_offset();
+        self.push(then_start, COP, true, "Do not use `then` for multiline `when` statement.");
+        let mut start = then_start;
+        while start > 0 && matches!(self.src[start - 1], b' ' | b'\t') {
+            start -= 1;
+        }
+        self.fixes.push((start, then_end, Vec::new()));
+    }
+}
