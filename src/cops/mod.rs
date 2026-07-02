@@ -389,6 +389,8 @@ pub(crate) struct Cops<'a> {
     pub(crate) dirname_ignore: Vec<usize>,
     // Innermost statement-list span starts — Lint/DuplicateRequire scopes by it.
     pub(crate) stmts_stack: Vec<usize>,
+    // unless/else nodes already corrected — nested ones only get offenses.
+    pub(crate) unless_else_spans: Vec<(usize, usize)>,
     pub(crate) requires_seen: HashSet<String>,
     // Depth of enclosing blocks / kwbegin / lambdas — Lint/Debugger's
     // assumed-usage heuristic consults this.
@@ -463,13 +465,26 @@ impl<'a> Cops<'a> {
         match cop {
             "Style/NilComparison" => {
                 let Some(recv) = node.receiver() else { return false };
-                let recv_src = String::from_utf8_lossy(self.node_src(&recv)).into_owned();
-                let rep = if node.name().as_slice() == b"nil?" {
-                    format!("{recv_src} == nil")
+                if node.name().as_slice() == b"nil?" {
+                    // `.nil?` -> ` == nil` (dot through selector end)
+                    let (Some(dot), Some(sel)) = (node.call_operator_loc(), node.message_loc()) else {
+                        return false;
+                    };
+                    self.fixes.push((dot.start_offset(), sel.end_offset(), b" == nil".to_vec()));
                 } else {
-                    format!("{recv_src}.nil?")
-                };
-                self.fixes.push((l.start_offset(), l.end_offset(), rep.into_bytes()));
+                    // `x == nil` -> `x.nil?` (receiver end through node end)
+                    let re = recv.location().end_offset();
+                    self.fixes.push((re, l.end_offset(), b".nil?".to_vec()));
+                }
+                // parenthesize when the parent is a `!` call
+                if self
+                    .call_stack
+                    .last()
+                    .is_some_and(|sp| &self.src[sp.0..sp.1] == b"!")
+                {
+                    self.fixes.push((l.start_offset(), l.start_offset(), b"(".to_vec()));
+                    self.fixes.push((l.end_offset(), l.end_offset(), b")".to_vec()));
+                }
                 true
             }
             "Lint/BigDecimalNew" => {
@@ -739,7 +754,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
         if let Some(b) = node.block() {
             let has_args = node.arguments().is_some_and(|a| a.arguments().iter().count() > 0);
-            if let Some((off, msg)) = self.symbol_proc_super(&b, has_args) {
+            let last_end = if node.lparen_loc().is_some() {
+                node.arguments().and_then(|a| a.arguments().iter().last().map(|n| n.location().end_offset()))
+            } else {
+                None
+            };
+            if let Some((off, msg)) = self.symbol_proc_super(&b, has_args, last_end) {
                 self.push(off, "Style/SymbolProc", true, msg);
             }
         }
@@ -747,7 +767,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
         if let Some(b) = node.block() {
-            if let Some((off, msg)) = self.symbol_proc_super(&b.as_node(), false) {
+            if let Some((off, msg)) = self.symbol_proc_super(&b.as_node(), false, None) {
                 self.push(off, "Style/SymbolProc", true, msg);
             }
         }
@@ -933,6 +953,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         percent_arr_spans: Vec::new(),
         dirname_ignore: Vec::new(),
         stmts_stack: Vec::new(),
+        unless_else_spans: Vec::new(),
         requires_seen: HashSet::new(),
         usage_block_depth: 0,
         assumed_arg_offsets: HashSet::new(),

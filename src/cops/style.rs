@@ -38,18 +38,40 @@ impl<'a> Cops<'a> {
             1 if open.as_slice() == b"\"" => {
                 if !double_quotes_required(src) {
                     self.push(l.start_offset(), "Style/StringLiterals", true, MSG_SINGLE);
-                    // fix: `"c"` -> `'c'`, unescaping `\"` -> `"` (`\\` stays)
-                    let mut rep = vec![b'\''];
+                    if c.contains(&b'\n') {
+                        return; // whitequark sees multi-line literals as dstr: no fix
+                    }
+                    // rubocop's to_string_literal on the RUNTIME string:
+                    // unescape (only \\ and \" can occur here), then
+                    // backslashes double and `\"` collapses to `"`.
+                    let mut runtime = Vec::new();
                     let mut i = 0;
                     while i < c.len() {
-                        if c[i] == b'\\' && matches!(c.get(i + 1), Some(b'"')) {
-                            rep.push(b'"');
-                            i += 2;
-                        } else if c[i] == b'\\' && matches!(c.get(i + 1), Some(b'\\')) {
-                            rep.extend_from_slice(b"\\\\");
+                        if c[i] == b'\\' && matches!(c.get(i + 1), Some(b'"') | Some(b'\\')) {
+                            runtime.push(c[i + 1]);
                             i += 2;
                         } else {
-                            rep.push(c[i]);
+                            runtime.push(c[i]);
+                            i += 1;
+                        }
+                    }
+                    let mut esc = Vec::new();
+                    for b in &runtime {
+                        if *b == b'\\' {
+                            esc.extend_from_slice(b"\\\\");
+                        } else {
+                            esc.push(*b);
+                        }
+                    }
+                    // gsub('\"', '"') — literal backslash-quote collapses
+                    let mut rep = vec![b'\''];
+                    let mut i = 0;
+                    while i < esc.len() {
+                        if esc[i] == b'\\' && esc.get(i + 1) == Some(&b'"') {
+                            rep.push(b'"');
+                            i += 2;
+                        } else {
+                            rep.push(esc[i]);
                             i += 1;
                         }
                     }
@@ -193,8 +215,10 @@ impl<'a> Cops<'a> {
         let l = node.location();
         self.push(l.start_offset(), COP, true,
             "Use underscores(_) as thousands separator and separate every 3 digits with them.");
-        // fix (rubocop's format_number): regroup the integer part, keep the
-        // rest (`.`/`e` suffix) verbatim.
+        // fix (rubocop's format_number): whitespace stripped (a folded
+        // `-\n 123` join), regroup the integer part, keep the suffix.
+        let int_clean: String = int_part.chars().filter(|c| !c.is_whitespace()).collect();
+        let int_part = int_clean.as_str();
         if let Ok(v) = int_part.replace('_', "").parse::<i128>() {
             let digits = v.abs().to_string();
             let mut grouped = String::new();
@@ -205,7 +229,11 @@ impl<'a> Cops<'a> {
                 grouped.push(c);
             }
             let sign = if s.starts_with('-') { "-" } else { "" };
-            let rest = &unsigned[int_part.len()..];
+            let rest: String = unsigned
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .skip(int_part.len())
+                .collect();
             self.fixes.push((l.start_offset(), l.end_offset(), format!("{sign}{grouped}{rest}").into_bytes()));
         }
     }
@@ -436,10 +464,25 @@ impl<'a> Cops<'a> {
         self.fixes.push((off, end, Vec::new()));
     }
 
-    /// Replace the whole line containing `off` with `rep`.
+    /// Replace the whole line containing `off` with `rep` — except an emacs
+    /// magic comment, whose VALUE token is rewritten in place.
     fn replace_line_fix(&mut self, off: usize, rep: &[u8]) {
         let line = self.idx.loc(off).0;
-        self.fixes.push((self.idx.starts[line - 1], self.line_end(line), rep.to_vec()));
+        let (ls, le) = (self.idx.starts[line - 1], self.line_end(line));
+        let text = String::from_utf8_lossy(&self.src[ls..le]).into_owned();
+        if text.contains("-*-") {
+            static VAL: OnceLock<regex::Regex> = OnceLock::new();
+            let re = VAL.get_or_init(|| {
+                regex::Regex::new(r"(?i)(frozen[_-]string[_-]literal\s*:\s*)[[:alnum:]_-]+").unwrap()
+            });
+            if let Some(m) = re.captures(&text) {
+                let g = m.get(0).unwrap();
+                let pre = m.get(1).unwrap().as_str().len();
+                self.fixes.push((ls + g.start() + pre, ls + g.end(), b"true".to_vec()));
+                return;
+            }
+        }
+        self.fixes.push((ls, le, rep.to_vec()));
     }
 
     /// Style/RedundantReturn — a `return` in tail position of a def (or a
@@ -542,12 +585,23 @@ impl<'a> Cops<'a> {
             // bare `return` -> `nil`
             self.fixes.push((l.start_offset(), l.end_offset(), b"nil".to_vec()));
         } else {
-            // drop the keyword (+ trailing space); bracket multiple values
+            // drop the keyword (+ trailing space); bracket multiple values;
+            // a single splat loses its `*`
             let mut kw_end = kw.end_offset();
             while kw_end < self.src.len() && matches!(self.src[kw_end], b' ' | b'\t') {
                 kw_end += 1;
             }
             self.fixes.push((kw.start_offset(), kw_end, Vec::new()));
+            if !multi {
+                if let Some(sp) = args[0].as_splat_node() {
+                    let s0 = sp.location().start_offset();
+                    self.fixes.push((s0, s0 + 1, Vec::new()));
+                } else if args[0].as_keyword_hash_node().is_some() {
+                    let al = args[0].location();
+                    self.fixes.push((al.start_offset(), al.start_offset(), b"{".to_vec()));
+                    self.fixes.push((al.end_offset(), al.end_offset(), b"}".to_vec()));
+                }
+            }
             if multi {
                 let s = args.first().unwrap().location().start_offset();
                 let e = args.last().unwrap().location().end_offset();
@@ -942,8 +996,17 @@ impl<'a> Cops<'a> {
             return;
         }
         let Some(else_clause) = node.else_clause() else { return };
-        self.push(node.location().start_offset(), COP, true,
+        let nl = node.location();
+        let nested = self
+            .unless_else_spans
+            .iter()
+            .any(|(s, e)| nl.start_offset() >= *s && nl.start_offset() < *e);
+        self.push(nl.start_offset(), COP, !nested,
             "Do not use `unless` with `else`. Rewrite these with the positive case first.");
+        if nested {
+            return; // rubocop's ignore_node: only the outermost gets corrected
+        }
+        self.unless_else_spans.push((nl.start_offset(), nl.end_offset()));
         // swap keyword to `if` and exchange the two bodies
         let kw = node.keyword_loc();
         self.fixes.push((kw.start_offset(), kw.end_offset(), b"if".to_vec()));
@@ -1036,9 +1099,9 @@ impl<'a> Cops<'a> {
         }
         self.push(then_kw.start_offset(), COP, true,
             format!("Do not use `then` for multi-line `{keyword}`."));
-        // remove `then` plus the space before it
+        // remove `then` plus surrounding space to the left (newlines too)
         let mut s = then_kw.start_offset();
-        while s > 0 && matches!(self.src[s - 1], b' ' | b'\t') {
+        while s > 0 && matches!(self.src[s - 1], b' ' | b'\t' | b'\n' | b'\r') {
             s -= 1;
         }
         self.fixes.push((s, then_kw.end_offset(), Vec::new()));
@@ -1299,11 +1362,27 @@ impl<'a> Cops<'a> {
         let bl = block.location();
         let node_end = node.location().end_offset();
         if let Some(cl) = node.closing_loc() {
-            // existing parens: `m(a) { block }` -> `m(a, &:x)`
-            let insert_at = cl.start_offset();
-            let args_present = node.arguments().is_some();
-            let rep = if args_present { format!(", &:{method}") } else { format!("&:{method}") };
-            self.fixes.push((insert_at, insert_at, rep.into_bytes()));
+            match node.arguments().and_then(|a| a.arguments().iter().last()) {
+                Some(last) => {
+                    // insert after the last arg (reusing its trailing comma)
+                    let mut at = last.location().end_offset();
+                    let rep = if self.src.get(at) == Some(&b',') {
+                        at += 1;
+                        format!(" &:{method}")
+                    } else {
+                        format!(", &:{method}")
+                    };
+                    self.fixes.push((at, at, rep.into_bytes()));
+                }
+                None => {
+                    // `m(   )` -> `m(&:x)`: rewrite the whole paren group
+                    let (os, oe) = (
+                        node.opening_loc().map(|o| o.start_offset()).unwrap_or(cl.start_offset()),
+                        cl.end_offset(),
+                    );
+                    self.fixes.push((os, oe, format!("(&:{method})").into_bytes()));
+                }
+            }
             // remove the block plus the space before it
             let mut bs = bl.start_offset();
             while bs > 0 && self.src[bs - 1] == b' ' {
@@ -1322,7 +1401,12 @@ impl<'a> Cops<'a> {
 
     /// Style/SymbolProc for a `super { |x| x.meth }` / `super(...) { … }` block →
     /// `super(&:meth)`. `super` is always a candidate (no ActiveSupport gating).
-    pub(crate) fn symbol_proc_super(&mut self, block: &ruby_prism::Node, has_args: bool) -> Option<(usize, String)> {
+    pub(crate) fn symbol_proc_super(
+        &mut self,
+        block: &ruby_prism::Node,
+        has_args: bool,
+        last_arg_end: Option<usize>,
+    ) -> Option<(usize, String)> {
         if !self.hot.symbol_proc {
             return None;
         }
@@ -1340,12 +1424,21 @@ impl<'a> Cops<'a> {
         {
             return None;
         }
-        // fix: `super { |x| x.m }` -> `super(&:m)` (args keep their parens)
+        // fix: `super { |x| x.m }` -> `super(&:m)`;
+        // with args, `&:m` joins the existing paren list
         let mut bs = block.opening_loc().start_offset();
         while bs > 0 && self.src[bs - 1] == b' ' {
             bs -= 1;
         }
-        self.fixes.push((bs, block.closing_loc().end_offset(), format!("(&:{method})").into_bytes()));
+        match last_arg_end {
+            Some(at) => {
+                self.fixes.push((at, at, format!(", &:{method}").into_bytes()));
+                self.fixes.push((bs, block.closing_loc().end_offset(), Vec::new()));
+            }
+            None => {
+                self.fixes.push((bs, block.closing_loc().end_offset(), format!("(&:{method})").into_bytes()));
+            }
+        }
         Some((
             block.opening_loc().start_offset(),
             format!("Pass `&:{method}` as an argument to `super` instead of a block."),
