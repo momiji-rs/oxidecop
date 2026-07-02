@@ -18,24 +18,31 @@ use std::path::{Path, PathBuf};
 
 /// Ruby files rubocop inspects by default (a pragmatic subset of its
 /// `AllCops: Include`), skipping the directories it excludes by default.
-fn collect_files(path: &Path, out: &mut Vec<PathBuf>) {
+/// Directory levels fan out on the rayon pool; the shebang probe on
+/// extensionless files is I/O and parallelizes with them.
+fn collect_files(path: &Path, depth: usize) -> Vec<PathBuf> {
     if path.is_dir() {
         let skip = path
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with('.') || matches!(n, "vendor" | "node_modules" | "tmp"));
         if skip {
-            return;
+            return Vec::new();
         }
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
+        let entries: Vec<PathBuf> = std::fs::read_dir(path)
             .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
             .unwrap_or_default();
-        entries.sort();
-        for e in entries {
-            collect_files(&e, out);
+        // fan out only near the root — deep levels have too few entries to
+        // pay rayon's task overhead
+        if depth < 2 {
+            entries.par_iter().flat_map(|e| collect_files(e, depth + 1)).collect()
+        } else {
+            entries.iter().flat_map(|e| collect_files(e, depth + 1)).collect()
         }
     } else if is_ruby_file(path) || ruby_shebang(path) {
-        out.push(path.to_path_buf());
+        vec![path.to_path_buf()]
+    } else {
+        Vec::new()
     }
 }
 
@@ -137,7 +144,7 @@ fn main() {
     for p in &paths {
         // an explicitly named file is linted regardless of extension
         if p.is_dir() {
-            collect_files(p, &mut files);
+            files.extend(collect_files(p, 0));
         } else {
             files.push(p.clone());
         }
