@@ -2642,3 +2642,40 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Style/ClassCheck — enforces consistent use of `Object#is_a?` /
+    /// `Object#kind_of?` per the `EnforcedStyle` config (default `is_a?`).
+    /// Ported from rubocop's `ClassCheck`: `RESTRICT_ON_SEND = %i[is_a?
+    /// kind_of?]`, offends when the call's method name doesn't match the
+    /// configured style, anchored on the selector (`node.loc.selector`),
+    /// and the fix simply renames the selector to the other spelling.
+    /// Applies identically to `.` and `&.` calls (rubocop aliases
+    /// `on_csend` to `on_send`); prism represents both as `CallNode` so no
+    /// extra dispatch is needed here.
+    pub(crate) fn check_class_check(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/ClassCheck";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        let is_a = name == b"is_a?";
+        let kind_of = name == b"kind_of?";
+        if !is_a && !kind_of {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        if (style == "is_a?" && is_a) || (style == "kind_of?" && kind_of) {
+            return;
+        }
+        let Some(sel) = node.message_loc() else { return };
+        let (prefer, current, replacement) =
+            if is_a { ("kind_of?", "is_a?", "kind_of?") } else { ("is_a?", "kind_of?", "is_a?") };
+        self.push(
+            sel.start_offset(),
+            COP,
+            true,
+            format!("Prefer `Object#{prefer}` over `Object#{current}`."),
+        );
+        self.fixes.push((sel.start_offset(), sel.end_offset(), replacement.as_bytes().to_vec()));
+    }
+}

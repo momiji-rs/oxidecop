@@ -74,6 +74,7 @@ COPS = {
   'Lint/IdentityComparison'          => 'lint/identity_comparison',
   'Layout/SpaceInsideRangeLiteral'   => 'layout/space_inside_range_literal',
   'Style/DoubleCopDisableDirective'  => 'style/double_cop_disable_directive',
+  'Style/ClassCheck'                 => 'style/class_check',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
