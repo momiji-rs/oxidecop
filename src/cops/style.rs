@@ -2504,3 +2504,66 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((remove_start, close_end, Vec::new()));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/IfUnlessModifierOfIfUnless — a modifier `if`/`unless` whose body
+    /// is itself an if/unless/ternary conditional: `cond ? a : b if x`,
+    /// `raise if y if x`, `(if a; b; end) if x`. Ported from rubocop's
+    /// `on_if` — rubocop's parser AST unifies `if`/`unless`/ternary under a
+    /// single `:if` node type, so a single handler covers all three body
+    /// shapes via `node.body.if_type?`. Prism keeps `IfNode`/`UnlessNode`
+    /// distinct, so `visit_if_node` and `visit_unless_node` both call in
+    /// here once they've confirmed modifier form; a ternary body is still
+    /// just an `IfNode` (with `if_keyword_loc` absent), so no extra case is
+    /// needed to recognize it.
+    ///
+    /// Autocorrect mirrors rubocop's corrector exactly:
+    ///   corrector.wrap(node.if_branch, "#{keyword} #{condition}\n", "\nend")
+    ///   corrector.remove(if_branch.source_range.end.join(condition.source_range.end))
+    /// i.e. wrap the body in a real `keyword condition ... end` block and
+    /// drop the now-redundant trailing modifier annotation.
+    ///
+    /// Push order within a single node matters for `main.rs`'s fix-applier
+    /// (stable sort, descending by start offset; same-start ties keep
+    /// vector order): the removal (body_end, cond_end) must be pushed
+    /// before the zero-width suffix insert at body_end, so it's applied
+    /// first and doesn't get skipped by the `e <= last_start` guard.
+    ///
+    /// This check is called from `visit_if_node`/`visit_unless_node` AFTER
+    /// recursing into children (post-order). For doubly-nested modifiers
+    /// (`a if inner if outer`), that ensures the inner node's zero-width
+    /// prefix-insert (at the shared body-start offset 0) is pushed before
+    /// the outer node's — so the outer's insert is applied last and ends up
+    /// outermost (`if outer\nif inner\n...`), matching rubocop's
+    /// insert-before semantics (first-registered ends up leftmost).
+    pub(crate) fn check_if_unless_modifier_of_if_unless(
+        &mut self,
+        keyword: &str,
+        kw_loc: ruby_prism::Location,
+        cond: ruby_prism::Node,
+        body_stmts: Option<ruby_prism::StatementsNode>,
+    ) {
+        const COP: &str = "Style/IfUnlessModifierOfIfUnless";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = body_stmts.and_then(|s| s.body().iter().next()) else { return };
+        if body.as_if_node().is_none() && body.as_unless_node().is_none() {
+            return;
+        }
+        self.push(kw_loc.start_offset(), COP, true,
+            format!("Avoid modifier `{keyword}` after another conditional."));
+
+        let body_loc = body.location();
+        let (body_start, body_end) = (body_loc.start_offset(), body_loc.end_offset());
+        let cond_end = cond.location().end_offset();
+        let cond_src = self.node_src(&cond).to_vec();
+
+        self.fixes.push((body_end, cond_end, Vec::new()));
+        self.fixes.push((body_end, body_end, b"\nend".to_vec()));
+        let mut prefix = format!("{keyword} ").into_bytes();
+        prefix.extend(cond_src);
+        prefix.push(b'\n');
+        self.fixes.push((body_start, body_start, prefix));
+    }
+}

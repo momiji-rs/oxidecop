@@ -141,7 +141,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
-    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral",
+    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -702,6 +702,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth += 1;
         ruby_prism::visit_if_node(self, node);
         self.cond_depth -= 1;
+        // post-order (after recursion): nested-modifier autocorrect needs the
+        // inner node's fixes registered first (TreeRewriter insert order)
+        if node.end_keyword_loc().is_none() {
+            if let Some(kw) = node.if_keyword_loc() {
+                self.check_if_unless_modifier_of_if_unless("if", kw, node.predicate(), node.statements());
+            }
+        }
     }
     fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
         self.check_safe_navigation_with_empty(&node.predicate());
@@ -715,6 +722,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth += 1;
         ruby_prism::visit_unless_node(self, node);
         self.cond_depth -= 1;
+        // post-order: see the if-visitor note.
+        if node.end_keyword_loc().is_none() {
+            self.check_if_unless_modifier_of_if_unless("unless", node.keyword_loc(), node.predicate(), node.statements());
+        }
     }
     fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
