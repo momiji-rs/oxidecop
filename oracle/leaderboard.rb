@@ -76,6 +76,7 @@ COPS = {
   'Style/Semicolon'                  => 'style/semicolon',
   'Style/GlobalVars'                 => 'style/global_vars',
   'Layout/SpaceAfterComma'           => 'layout/space_after_comma',
+  'Style/DefWithParentheses'         => 'style/def_with_parentheses',
   'Style/WhileUntilDo'               => 'style/while_until_do',
   'Style/MultilineIfThen'            => 'style/multiline_if_then',
   'Style/Not'                        => 'style/not'

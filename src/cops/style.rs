@@ -2006,3 +2006,32 @@ impl<'a> super::Cops<'a> {
         self.push(name_start, COP, false, "Do not introduce global variables.");
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/DefWithParentheses — `def foo()` with an empty parameter list
+    /// drops the parens (kept for one-line non-endless defs and when `=`
+    /// follows, where removal changes parsing).
+    pub(crate) fn check_def_with_parentheses(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/DefWithParentheses";
+        if !self.on(COP) {
+            return;
+        }
+        let (Some(lp), Some(rp)) = (node.lparen_loc(), node.rparen_loc()) else { return };
+        if node.parameters().is_some() {
+            return;
+        }
+        let l = node.location();
+        let single_line = self.idx.loc(l.start_offset()).0
+            == self.idx.loc(l.end_offset().saturating_sub(1)).0;
+        let endless = node.equal_loc().is_some();
+        if single_line && !endless {
+            return;
+        }
+        if self.src.get(rp.end_offset()) == Some(&b'=') {
+            return;
+        }
+        self.fixes.push((lp.start_offset(), rp.end_offset(), Vec::new()));
+        self.push(lp.start_offset(), COP, true,
+            "Omit the parentheses in defs when the method doesn't accept any arguments.");
+    }
+}
