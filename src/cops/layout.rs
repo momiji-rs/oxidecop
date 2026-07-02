@@ -2125,3 +2125,129 @@ impl<'a> Cops<'a> {
         self.fixes.push((off, off, b"\n".to_vec()));
     }
 }
+impl<'a> super::Cops<'a> {
+
+    /// Layout/LeadingCommentSpace — comments must have a leading space after
+    /// the `#` denoting the start of the comment. Special syntax like `#++`,
+    /// `#--`, `#=` (sprockets), `=begin`/`=end` are exempt. Config gates:
+    /// AllowDoxygenCommentStyle (`#*`), AllowGemfileRubyComment (`#ruby` in
+    /// Gemfile), AllowRBSInlineAnnotation (`#:`, `#[...]`, `#|`),
+    /// AllowSteepAnnotation (`#$` or `#:`). Shebangs (`#!`) are exempt on
+    /// line 1 and when they continue from a previous shebang line. Rackup
+    /// options (`#\`) are exempt on line 1 of `config.ru` only.
+    pub(crate) fn check_leading_comment_space(&mut self) {
+        const COP: &str = "Layout/LeadingCommentSpace";
+        if !self.on(COP) {
+            return;
+        }
+
+        let filename = std::path::Path::new(self.rel_path).file_name().map(|f| f.to_string_lossy());
+        let is_gemfile = filename.as_ref().is_some_and(|f| f.as_ref() == "Gemfile");
+        let is_config_ru = filename.as_ref().is_some_and(|f| f.as_ref() == "config.ru");
+
+        for (line, start, end) in self.comments {
+            let comment_text = String::from_utf8_lossy(&self.src[*start..*end]);
+
+            // Check if the comment needs a space after the #
+            // Pattern: one or more # followed immediately by a non-# non-space non-= char
+            // Exclude: #++, #--, and patterns that don't match
+            if !needs_leading_space(&comment_text) {
+                continue;
+            }
+
+
+            // Skip if on first line and it's a shebang
+            if *line == 1 && comment_text.starts_with("#!") {
+                continue;
+            }
+
+            // Skip if on first line in config.ru and it's rackup options
+            if *line == 1 && is_config_ru && comment_text.starts_with("#\\") {
+                continue;
+            }
+
+            // Check for shebang continuation: #! on non-first-line but previous
+            // line also has a #! without an offense
+            if comment_text.starts_with("#!") && *line > 1 {
+                if let Some((prev_l, prev_s, prev_e)) = self.comments.iter().find(|(l, _, _)| *l == *line - 1) {
+                    let prev_text = String::from_utf8_lossy(&self.src[*prev_s..*prev_e]);
+                    if prev_text.starts_with("#!") {
+                        // Check if the previous line was marked as an offense
+                        let has_offense = self.offenses.iter().any(|off| {
+                            off.line == *prev_l && off.cop == COP
+                        });
+                        if !has_offense {
+                            // Previous line has #! without offense, so this is continuation
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Check AllowDoxygenCommentStyle
+            if self.cfg.get(COP, "AllowDoxygenCommentStyle") == Some("true") && comment_text.starts_with("#*") {
+                continue;
+            }
+
+            // Check AllowGemfileRubyComment
+            if self.cfg.get(COP, "AllowGemfileRubyComment") == Some("true")
+                && is_gemfile
+                && comment_text.starts_with("#ruby")
+            {
+                continue;
+            }
+
+            // Check AllowRBSInlineAnnotation
+            if self.cfg.get(COP, "AllowRBSInlineAnnotation") == Some("true") {
+                if comment_text.starts_with("#:") || comment_text.starts_with("#|") {
+                    continue;
+                }
+                // Check for #[...] pattern
+                if comment_text.starts_with("#[") && comment_text.contains(']') {
+                    continue;
+                }
+            }
+
+            // Check AllowSteepAnnotation
+            if self.cfg.get(COP, "AllowSteepAnnotation") == Some("true") {
+                if comment_text.starts_with("#$") || comment_text.starts_with("#:") {
+                    continue;
+                }
+            }
+
+            // Register offense and fix: insert space after the # character
+            self.push(*start, COP, true, "Missing space after `#`.");
+            self.fixes.push((*start + 1, *start + 1, b" ".to_vec()));
+        }
+    }
+}
+
+/// Check if a comment needs a leading space after #.
+/// Pattern: one or more # followed immediately by a non-# non-space non-= char.
+/// Excludes: #++, #-- (RDoc syntax).
+fn needs_leading_space(comment: &str) -> bool {
+    // Must start with #
+    if !comment.starts_with('#') {
+        return false;
+    }
+
+    // Exclude #++ and #--
+    if comment.starts_with("#++") || comment.starts_with("#--") {
+        return false;
+    }
+
+    // Count leading # characters
+    let hash_count = comment.chars().take_while(|&c| c == '#').count();
+    if hash_count == 0 {
+        return false;
+    }
+
+    // Check what comes after the # characters
+    match comment.chars().nth(hash_count) {
+        None => false, // Just # or ##... with nothing after
+        Some(c) if c == ' ' => false, // Already has a space
+        Some(c) if c == '=' => false, // Sprockets directive (#=)
+        Some(c) if c == '#' => false, // More # characters (not a match)
+        Some(_) => true, // Some other character - needs a space
+    }
+}
