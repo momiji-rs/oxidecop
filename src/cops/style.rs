@@ -2606,3 +2606,39 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((remove_start, end, Vec::new()));
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Style/DoubleCopDisableDirective — a line with two (or more)
+    /// `# rubocop:disable`/`# rubocop:todo` markers packed into ONE comment
+    /// (`code # rubocop:disable A # rubocop:disable B`): only the first
+    /// directive has any effect, so the second is dead text — usually a sign
+    /// of a stale auto-generated comment. Ported verbatim from rubocop's
+    /// `on_new_investigation`: `comment.text.scan(/# rubocop:(?:disable|todo)/)
+    /// .size > 1`. Prism gives ONE comment token for the whole trailing text,
+    /// so this is a plain per-comment scan over `self.comments` — no AST
+    /// needed, hence the standalone hook call (not tied to any node visit).
+    pub(crate) fn check_double_cop_disable_directive(&mut self) {
+        const COP: &str = "Style/DoubleCopDisableDirective";
+        if !self.on(COP) {
+            return;
+        }
+        static DIRECTIVE: OnceLock<regex::Regex> = OnceLock::new();
+        let directive =
+            DIRECTIVE.get_or_init(|| regex::Regex::new(r"# rubocop:(?:disable|todo)").unwrap());
+        // The autocorrect regex has a LEADING space (` # rubocop:...`), so it
+        // never matches the first directive (which opens the comment with no
+        // preceding space) — mirroring `corrector.replace(comment,
+        // comment.text.gsub(%r{ # rubocop:(disable|todo)}, ','))`.
+        static REPLACE: OnceLock<regex::Regex> = OnceLock::new();
+        let replace =
+            REPLACE.get_or_init(|| regex::Regex::new(r" # rubocop:(?:disable|todo)").unwrap());
+        for &(_, start, end) in self.comments {
+            let text = String::from_utf8_lossy(&self.src[start..end]);
+            if directive.find_iter(&text).count() <= 1 {
+                continue;
+            }
+            self.push(start, COP, true, "More than one disable comment on one line.");
+            let corrected = replace.replace_all(&text, ",");
+            self.fixes.push((start, end, corrected.into_owned().into_bytes()));
+        }
+    }
+}

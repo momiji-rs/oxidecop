@@ -73,6 +73,7 @@ COPS = {
   'Style/EmptyBlockParameter'        => 'style/empty_block_parameter',
   'Lint/IdentityComparison'          => 'lint/identity_comparison',
   'Layout/SpaceInsideRangeLiteral'   => 'layout/space_inside_range_literal',
+  'Style/DoubleCopDisableDirective'  => 'style/double_cop_disable_directive',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
