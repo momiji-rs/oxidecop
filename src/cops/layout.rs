@@ -832,13 +832,16 @@ impl<'a> Cops<'a> {
         // The colon is the last byte of the key location
         let colon_pos = key_loc.end_offset() - 1;
         let after_colon_pos = key_loc.end_offset();
-        // In Ruby 3.1+, hash value omission (key:, y:) has no value following
-        // the colon. Check if the next byte is a comma or closing bracket.
+        // Ruby 3.1 value omission (`key:,`) and pattern-matching phantoms
+        // (`in Foo[name:]` — prism gives the target a span overlapping the
+        // key) have nothing real after the colon.
         if let Some(&b) = self.src.get(after_colon_pos) {
-            if matches!(b, b',' | b'}' | b')') {
-                // Value omission syntax, skip this
+            if matches!(b, b',' | b'}' | b')' | b']') {
                 return;
             }
+        }
+        if node.value().location().start_offset() < after_colon_pos {
+            return;
         }
         // Check if the next byte is whitespace
         if let Some(&b) = self.src.get(after_colon_pos) {
