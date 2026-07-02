@@ -4,9 +4,9 @@ A fast, native, **RuboCop-compatible** Ruby linter — written in Rust, over the
 official [Prism](https://github.com/ruby/prism) parser. Think *ruff, but for
 Ruby, and bug-compatible with the RuboCop everyone already uses.*
 
-> **Status: early / experimental.** The core idea is proven — the 39
+> **Status: early / experimental.** The core idea is proven — the 47
 > implemented cops pass **100% of RuboCop's own representable spec examples**
-> (951/951, see below) and match RuboCop **byte-for-byte on real repos**
+> (1040/1040, see below) and match RuboCop **byte-for-byte on real repos**
 > (Rails, Mastodon, rubygems.org — see BENCHMARKS.md) — but 39 cops is not a
 > shippable linter yet.
 
@@ -97,8 +97,8 @@ de-annotated source through the `rubocop-rs` binary under *the example's own*
 Current leaderboard (`ruby oracle/leaderboard.rb`), against RuboCop v1.88.0:
 
 ```
-39 cops implemented — every one at 100% FULL match.
-TOTAL (representable examples)          951    119                951/951     100%
+47 cops implemented — every one at 100% FULL match.
+TOTAL (representable examples)         1040    119               1040/1040    100%
 ```
 
 (The full per-cop table is one command away: `ruby oracle/leaderboard.rb`.)

@@ -116,6 +116,174 @@ impl<'a> Cops<'a> {
     }
 }
 
+impl<'a> Cops<'a> {
+    /// Naming/ConstantName — constant assignments want SCREAMING_SNAKE_CASE,
+    /// unless the RHS is a method call / const / conditional-with-const
+    /// (rubocop treats those as class-factory idioms).
+    pub(crate) fn check_constant_name(&mut self, name: &[u8], name_off: usize, value: Option<&ruby_prism::Node>) {
+        const COP: &str = "Naming/ConstantName";
+        if !self.on(COP) {
+            return;
+        }
+        if String::from_utf8_lossy(name)
+            .chars()
+            .all(|c| c.is_numeric() || c.is_uppercase() || c == '_')
+        {
+            return;
+        }
+        if let Some(v) = value {
+            if constant_rhs_allowed(v) {
+                return;
+            }
+        }
+        self.push(name_off, COP, false, "Use SCREAMING_SNAKE_CASE for constants.");
+    }
+
+    /// Naming/ClassAndModuleCamelCase — no underscores in class/module names
+    /// (AllowedNames substrings removed first).
+    pub(crate) fn check_camel_case_name(&mut self, constant_path: &ruby_prism::Node) {
+        const COP: &str = "Naming/ClassAndModuleCamelCase";
+        if !self.on(COP) {
+            return;
+        }
+        // A dynamic parent (`class lvar::MyClass`) isn't part of the checked
+        // name — only constant chains are.
+        let src = if let Some(cp) = constant_path.as_constant_path_node() {
+            match cp.parent() {
+                Some(p)
+                    if p.as_constant_read_node().is_none()
+                        && p.as_constant_path_node().is_none() =>
+                {
+                    let nl = cp.name_loc();
+                    &self.src[nl.start_offset()..nl.end_offset()]
+                }
+                _ => self.node_src(constant_path),
+            }
+        } else {
+            self.node_src(constant_path)
+        };
+        if !src.contains(&b'_') {
+            return;
+        }
+        let mut name = String::from_utf8_lossy(src).into_owned();
+        if let Some(v) = self.cfg.get(COP, "AllowedNames") {
+            for allowed in crate::config::parse_allowed_list(v) {
+                name = name.replace(&allowed, "");
+            }
+        }
+        if name.contains('_') {
+            self.push(constant_path.location().start_offset(), COP, false,
+                "Use CamelCase for classes and modules.");
+        }
+    }
+
+    /// Naming/BinaryOperatorParameterName — `def ==(other)` etc. must name
+    /// the single parameter `other`.
+    pub(crate) fn check_binary_operator_parameter(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Naming/BinaryOperatorParameterName";
+        if !self.on(COP) {
+            return;
+        }
+        // rubocop's pattern matches `def` only — singleton defs (`def x.==`)
+        // are exempt.
+        if node.receiver().is_some() {
+            return;
+        }
+        let name = node.name().as_slice();
+        const EXCLUDED: &[&[u8]] = &[b"+@", b"-@", b"[]", b"[]=", b"<<", b"===", b"`", b"=~"];
+        if EXCLUDED.contains(&name) {
+            return;
+        }
+        let op_like = matches!(name, b"eql?" | b"equal?");
+        let word_start = String::from_utf8_lossy(name)
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if word_start && !op_like {
+            return;
+        }
+        // exactly one plain required parameter
+        let Some(params) = node.parameters() else { return };
+        let reqs: Vec<_> = params.requireds().iter().collect();
+        if reqs.len() != 1
+            || params.optionals().iter().next().is_some()
+            || params.rest().is_some()
+            || params.posts().iter().next().is_some()
+            || params.keywords().iter().next().is_some()
+            || params.keyword_rest().is_some()
+            || params.block().is_some()
+        {
+            return;
+        }
+        let Some(arg) = reqs[0].as_required_parameter_node() else { return };
+        let arg_name = arg.name().as_slice();
+        if matches!(arg_name, b"other" | b"_other") {
+            return;
+        }
+        let op = String::from_utf8_lossy(name);
+        self.push(arg.location().start_offset(), COP, false,
+            format!("When defining the `{op}` operator, name its argument `other`."));
+    }
+}
+
+/// rubocop's `allowed_assignment?` for Naming/ConstantName.
+fn constant_rhs_allowed(v: &ruby_prism::Node) -> bool {
+    // blocks / lambdas
+    if v.as_lambda_node().is_some() {
+        return true;
+    }
+    if let Some(c) = v.as_call_node() {
+        if c.block().is_some() {
+            return true;
+        }
+        // any method call whose receiver is absent or not a literal
+        let literal_recv = c.receiver().map(|r| {
+            let inner = r
+                .as_parentheses_node()
+                .and_then(|p| p.body().and_then(|b| b.as_statements_node()).and_then(|s| s.body().iter().last()));
+            is_literal(inner.as_ref().unwrap_or(&r))
+        });
+        return !literal_recv.unwrap_or(false);
+    }
+    // consts / further casgns
+    if v.as_constant_read_node().is_some()
+        || v.as_constant_path_node().is_some()
+        || v.as_constant_write_node().is_some()
+        || v.as_constant_path_write_node().is_some()
+    {
+        return true;
+    }
+    // a conditional with a const branch
+    if let Some(i) = v.as_if_node() {
+        let then_const = i.statements().and_then(|s| s.body().iter().last()).is_some_and(|n| is_const(&n));
+        let else_const = i
+            .subsequent()
+            .and_then(|e| e.as_else_node())
+            .and_then(|e| e.statements())
+            .and_then(|s| s.body().iter().last())
+            .is_some_and(|n| is_const(&n));
+        return then_const || else_const;
+    }
+    false
+}
+fn is_const(n: &ruby_prism::Node) -> bool {
+    n.as_constant_read_node().is_some() || n.as_constant_path_node().is_some()
+}
+fn is_literal(n: &ruby_prism::Node) -> bool {
+    n.as_integer_node().is_some()
+        || n.as_float_node().is_some()
+        || n.as_string_node().is_some()
+        || n.as_symbol_node().is_some()
+        || n.as_array_node().is_some()
+        || n.as_hash_node().is_some()
+        || n.as_true_node().is_some()
+        || n.as_false_node().is_some()
+        || n.as_nil_node().is_some()
+        || n.as_regular_expression_node().is_some()
+        || n.as_range_node().is_some()
+        || n.as_interpolated_string_node().is_some()
+}
+
 /// Does `name` conform to the active `Naming/MethodName` EnforcedStyle?
 /// rubocop's ConfigurableNaming::FORMATS verbatim — Unicode-aware, so
 /// `última_vista` is valid snake_case.

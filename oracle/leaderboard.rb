@@ -61,7 +61,15 @@ COPS = {
   'Lint/EmptyInterpolation'          => 'lint/empty_interpolation',
   'Lint/EnsureReturn'                => 'lint/ensure_return',
   'Style/EndBlock'                   => 'style/end_block',
-  'Style/BeginBlock'                 => 'style/begin_block'
+  'Style/BeginBlock'                 => 'style/begin_block',
+  'Naming/ConstantName'              => 'naming/constant_name',
+  'Naming/ClassAndModuleCamelCase'   => 'naming/class_and_module_camel_case',
+  'Naming/BinaryOperatorParameterName' => 'naming/binary_operator_parameter_name',
+  'Lint/DuplicateRequire'            => 'lint/duplicate_require',
+  'Style/StderrPuts'                 => 'style/stderr_puts',
+  'Style/WhileUntilDo'               => 'style/while_until_do',
+  'Style/MultilineIfThen'            => 'style/multiline_if_then',
+  'Style/Not'                        => 'style/not'
 }.freeze
 
 FileUtils.mkdir_p(DIR)

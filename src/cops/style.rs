@@ -876,6 +876,102 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Style/StderrPuts — `$stderr.puts x` → `warn x`.
+    pub(crate) fn check_stderr_puts(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/StderrPuts";
+        if !self.on(COP) || node.name().as_slice() != b"puts" || node.arguments().is_none() {
+            return;
+        }
+        let Some(recv) = node.receiver() else { return };
+        let recv_src = self.node_src(&recv);
+        let is_stderr = (recv.as_global_variable_read_node().is_some() && recv_src == b"$stderr")
+            || (matches!(recv_src, b"STDERR" | b"::STDERR")
+                && (recv.as_constant_read_node().is_some() || recv.as_constant_path_node().is_some()));
+        if !is_stderr {
+            return;
+        }
+        let Some(sel) = node.message_loc() else { return };
+        let (start, end) = (node.location().start_offset(), sel.end_offset());
+        let bad = format!("{}.puts", String::from_utf8_lossy(recv_src));
+        self.push(start, COP, true,
+            format!("Use `warn` instead of `{bad}` to allow such output to be disabled."));
+        self.fixes.push((start, end, b"warn".to_vec()));
+    }
+
+    /// Style/WhileUntilDo — no `do` on a multi-line while/until.
+    pub(crate) fn check_while_until_do(
+        &mut self,
+        predicate: &ruby_prism::Node,
+        do_kw: Option<ruby_prism::Location>,
+        node_loc: ruby_prism::Location,
+        body_start: Option<usize>,
+        keyword: &str,
+    ) {
+        const COP: &str = "Style/WhileUntilDo";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(do_kw) = do_kw else { return };
+        let (start_line, _) = self.idx.loc(node_loc.start_offset());
+        let (end_line, _) = self.idx.loc(node_loc.end_offset().saturating_sub(1));
+        if start_line == end_line {
+            return;
+        }
+        let do_line = self.idx.loc(do_kw.start_offset()).0;
+        if body_start.is_some_and(|b| self.idx.loc(b).0 == do_line) {
+            return;
+        }
+        self.push(do_kw.start_offset(), COP, true,
+            format!("Do not use `do` with multi-line `{keyword}`."));
+        self.fixes.push((predicate.location().end_offset(), do_kw.end_offset(), Vec::new()));
+    }
+
+    /// Style/MultilineIfThen — no `then` on a multi-line if/unless.
+    pub(crate) fn check_multiline_if_then(
+        &mut self,
+        then_kw: Option<ruby_prism::Location>,
+        end_kw: Option<ruby_prism::Location>,
+        body_start: Option<usize>,
+        keyword: &str,
+    ) {
+        const COP: &str = "Style/MultilineIfThen";
+        if !self.on(COP) {
+            return;
+        }
+        if end_kw.is_none() {
+            return; // modifier / ternary forms keep their shape
+        }
+        let Some(then_kw) = then_kw else { return };
+        if then_kw.as_slice() != b"then" {
+            return;
+        }
+        let then_line = self.idx.loc(then_kw.start_offset()).0;
+        if body_start.is_some_and(|b| self.idx.loc(b).0 == then_line) {
+            return;
+        }
+        self.push(then_kw.start_offset(), COP, true,
+            format!("Do not use `then` for multi-line `{keyword}`."));
+        // remove `then` plus the space before it
+        let mut s = then_kw.start_offset();
+        while s > 0 && matches!(self.src[s - 1], b' ' | b'\t') {
+            s -= 1;
+        }
+        self.fixes.push((s, then_kw.end_offset(), Vec::new()));
+    }
+
+    /// Style/Not — `not x` → `!x`.
+    pub(crate) fn check_not(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/Not";
+        if !self.on(COP) || node.name().as_slice() != b"!" {
+            return;
+        }
+        let Some(sel) = node.message_loc() else { return };
+        if sel.as_slice() != b"not" {
+            return;
+        }
+        self.push(sel.start_offset(), COP, true, "Use `!` instead of `not`.");
+    }
+
     /// Lint/BooleanSymbol — `:true` / `:false` literals (outside `%i[]`).
     pub(crate) fn check_boolean_symbol(&mut self, node: &ruby_prism::SymbolNode) {
         const COP: &str = "Lint/BooleanSymbol";

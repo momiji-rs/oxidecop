@@ -124,6 +124,9 @@ pub(crate) struct Hot {
 
 /// Every cop name the engine implements — enablement resolves once per run.
 const IMPLEMENTED: &[&str] = &[
+    "Lint/DuplicateRequire", "Naming/BinaryOperatorParameterName",
+    "Naming/ClassAndModuleCamelCase", "Naming/ConstantName", "Style/MultilineIfThen",
+    "Style/Not", "Style/StderrPuts", "Style/WhileUntilDo",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
     "Style/CharacterLiteral", "Style/EndBlock", "Style/NegatedWhile", "Style/UnlessElse",
@@ -379,6 +382,9 @@ pub(crate) struct Cops<'a> {
     pub(crate) percent_arr_spans: Vec<(usize, usize)>,
     // Inner `File.dirname` calls claimed by an outer chain (NestedFileDirname).
     pub(crate) dirname_ignore: Vec<usize>,
+    // Innermost statement-list span starts — Lint/DuplicateRequire scopes by it.
+    pub(crate) stmts_stack: Vec<usize>,
+    pub(crate) requires_seen: HashSet<String>,
     // Depth of enclosing blocks / kwbegin / lambdas — Lint/Debugger's
     // assumed-usage heuristic consults this.
     pub(crate) usage_block_depth: usize,
@@ -482,20 +488,68 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
         self.check_boolean_symbol(node);
     }
+    fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+        let v = node.value();
+        self.check_constant_name(node.name().as_slice(), node.name_loc().start_offset(), Some(&v));
+        ruby_prism::visit_constant_write_node(self, node);
+    }
+    fn visit_constant_or_write_node(&mut self, node: &ruby_prism::ConstantOrWriteNode<'pr>) {
+        let v = node.value();
+        self.check_constant_name(node.name().as_slice(), node.name_loc().start_offset(), Some(&v));
+        ruby_prism::visit_constant_or_write_node(self, node);
+    }
+    fn visit_constant_target_node(&mut self, node: &ruby_prism::ConstantTargetNode<'pr>) {
+        // a constant target in a multiple assignment (`A, B = 1, 2`)
+        self.check_constant_name(node.name().as_slice(), node.location().start_offset(), None);
+    }
+    fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+        let t = node.target();
+        if let Some(name) = t.name() {
+            let v = node.value();
+            self.check_constant_name(name.as_slice(), t.name_loc().start_offset(), Some(&v));
+        }
+        ruby_prism::visit_constant_path_write_node(self, node);
+    }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
         self.check_negated_if(node);
+        if let Some(kw) = node.if_keyword_loc() {
+            if matches!(kw.as_slice(), b"if" | b"elsif") {
+                let kw_text = if kw.as_slice() == b"elsif" { "elsif" } else { "if" };
+                self.check_multiline_if_then(
+                    node.then_keyword_loc(),
+                    node.end_keyword_loc(),
+                    node.statements().map(|s| s.location().start_offset()),
+                    kw_text,
+                );
+            }
+        }
         ruby_prism::visit_if_node(self, node);
     }
     fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
         self.check_unless_else(node);
+        self.check_multiline_if_then(
+            node.then_keyword_loc(),
+            node.end_keyword_loc(),
+            node.statements().map(|s| s.location().start_offset()),
+            "unless",
+        );
         ruby_prism::visit_unless_node(self, node);
+    }
+    fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        self.stmts_stack.push(node.location().start_offset());
+        ruby_prism::visit_statements_node(self, node);
+        self.stmts_stack.pop();
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
+        self.check_while_until_do(&node.predicate(), node.do_keyword_loc(), node.location(),
+            node.statements().map(|s| s.location().start_offset()), "while");
         ruby_prism::visit_while_node(self, node);
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
+        self.check_while_until_do(&node.predicate(), node.do_keyword_loc(), node.location(),
+            node.statements().map(|s| s.location().start_offset()), "until");
         ruby_prism::visit_until_node(self, node);
     }
     fn visit_pre_execution_node(&mut self, node: &ruby_prism::PreExecutionNode<'pr>) {
@@ -573,6 +627,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
         self.check_documentation("class", node.location().start_offset(), &node.constant_path(), node.body());
+        self.check_camel_case_name(&node.constant_path());
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         // Default walk — covers the superclass expression too, not just the body.
@@ -582,6 +637,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
         self.check_documentation("module", node.location().start_offset(), &node.constant_path(), node.body());
+        self.check_camel_case_name(&node.constant_path());
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         ruby_prism::visit_module_node(self, node);
@@ -600,6 +656,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
         self.check_method_name_def(node);
+        self.check_binary_operator_parameter(node);
         self.check_nested_method_definition(node);
         self.check_redundant_return(node);
         // Default walk (receiver, params, body) one def level deeper — matches
@@ -699,6 +756,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_unpack_first(node);
         self.check_random_with_offset(node);
         self.check_debugger(node);
+        self.check_stderr_puts(node);
+        self.check_not(node);
+        self.check_duplicate_require(node);
         // Style/RedundantReturn also fires for method-defining blocks
         // (rubocop's RESTRICT_ON_SEND: define_method & friends, lambda).
         if self.hot.redundant_return
@@ -811,6 +871,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         percent_sym_spans: Vec::new(),
         percent_arr_spans: Vec::new(),
         dirname_ignore: Vec::new(),
+        stmts_stack: Vec::new(),
+        requires_seen: HashSet::new(),
         usage_block_depth: 0,
         assumed_arg_offsets: HashSet::new(),
         heredoc_lines,

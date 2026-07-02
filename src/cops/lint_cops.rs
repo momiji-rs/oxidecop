@@ -28,6 +28,40 @@ impl<'a> Cops<'a> {
 }
 
 impl<'a> Cops<'a> {
+    /// Lint/DuplicateRequire — the same `require`/`require_relative` twice
+    /// within one statement list.
+    pub(crate) fn check_duplicate_require(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/DuplicateRequire";
+        let name = node.name().as_slice();
+        if !matches!(name, b"require" | b"require_relative") || !self.on(COP) {
+            return;
+        }
+        if let Some(r) = node.receiver() {
+            let rs = self.node_src(&r);
+            if !(matches!(rs, b"Kernel" | b"::Kernel")
+                && (r.as_constant_read_node().is_some() || r.as_constant_path_node().is_some()))
+            {
+                return;
+            }
+        }
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.len() != 1 {
+            return;
+        }
+        let scope = self.stmts_stack.last().copied().unwrap_or(0);
+        let key = format!(
+            "{}\u{0}{}\u{0}{}",
+            scope,
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(self.node_src(&args[0]))
+        );
+        if !self.requires_seen.insert(key) {
+            let m = String::from_utf8_lossy(name);
+            self.push(node.location().start_offset(), COP, true, format!("Duplicate `{m}` detected."));
+        }
+    }
+
     /// Lint/UriRegexp — `URI.regexp(...)` is obsolete; prefer
     /// `URI::RFC2396_PARSER.make_regexp(...)` (the modern-ruby parser name).
     pub(crate) fn check_uri_regexp(&mut self, node: &ruby_prism::CallNode) {
