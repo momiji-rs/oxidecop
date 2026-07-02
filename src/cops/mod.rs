@@ -124,6 +124,9 @@ pub(crate) struct Hot {
 
 /// Every cop name the engine implements — enablement resolves once per run.
 const IMPLEMENTED: &[&str] = &[
+    "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
+    "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
+    "Style/CharacterLiteral", "Style/EndBlock", "Style/NegatedWhile", "Style/UnlessElse",
     "Layout/LineLength", "Layout/TrailingWhitespace", "Lint/BigDecimalNew",
     "Lint/BooleanSymbol", "Lint/Debugger", "Lint/EmptyEnsure", "Lint/EmptyExpression",
     "Lint/NestedMethodDefinition", "Lint/RandOne", "Lint/UriEscapeUnescape",
@@ -372,6 +375,8 @@ pub(crate) struct Cops<'a> {
     pub(crate) num_ignore: Vec<usize>,
     // Spans of `%i[...]`/`%I[...]` arrays — Lint/BooleanSymbol skips those.
     pub(crate) percent_sym_spans: Vec<(usize, usize)>,
+    // Spans of ANY percent-literal array — Lint/EmptyInterpolation skips those.
+    pub(crate) percent_arr_spans: Vec<(usize, usize)>,
     // Inner `File.dirname` calls claimed by an outer chain (NestedFileDirname).
     pub(crate) dirname_ignore: Vec<usize>,
     // Depth of enclosing blocks / kwbegin / lambdas — Lint/Debugger's
@@ -466,6 +471,7 @@ impl<'a> Cops<'a> {
 impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
         self.check_string_literals(node);
+        self.check_character_literal(node);
     }
     fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
         // `'a' \` line-continuation concatenation parses as this node with
@@ -480,6 +486,34 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_negated_if(node);
         ruby_prism::visit_if_node(self, node);
     }
+    fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        self.check_unless_else(node);
+        ruby_prism::visit_unless_node(self, node);
+    }
+    fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
+        ruby_prism::visit_while_node(self, node);
+    }
+    fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
+        ruby_prism::visit_until_node(self, node);
+    }
+    fn visit_pre_execution_node(&mut self, node: &ruby_prism::PreExecutionNode<'pr>) {
+        if self.on("Style/BeginBlock") {
+            self.push(node.keyword_loc().start_offset(), "Style/BeginBlock", false,
+                "Avoid the use of `BEGIN` blocks.");
+        }
+        ruby_prism::visit_pre_execution_node(self, node);
+    }
+    fn visit_post_execution_node(&mut self, node: &ruby_prism::PostExecutionNode<'pr>) {
+        if self.on("Style/EndBlock") {
+            let kw = node.keyword_loc();
+            self.push(kw.start_offset(), "Style/EndBlock", true,
+                "Avoid the use of `END` blocks. Use `Kernel#at_exit` instead.");
+            self.fixes.push((kw.start_offset(), kw.end_offset(), b"at_exit".to_vec()));
+        }
+        ruby_prism::visit_post_execution_node(self, node);
+    }
     fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
         let kwbegin = node.begin_keyword_loc().is_some();
         if kwbegin {
@@ -492,6 +526,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_ensure_node(&mut self, node: &ruby_prism::EnsureNode<'pr>) {
         self.check_empty_ensure(node);
+        self.check_ensure_return(node);
         ruby_prism::visit_ensure_node(self, node);
     }
     fn visit_parentheses_node(&mut self, node: &ruby_prism::ParenthesesNode<'pr>) {
@@ -499,9 +534,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_parentheses_node(self, node);
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
-        if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"%i") || o.as_slice().starts_with(b"%I")) {
-            let l = node.location();
-            self.percent_sym_spans.push((l.start_offset(), l.end_offset()));
+        if let Some(o) = node.opening_loc() {
+            let o = o.as_slice();
+            if o.starts_with(b"%i") || o.starts_with(b"%I") {
+                let l = node.location();
+                self.percent_sym_spans.push((l.start_offset(), l.end_offset()));
+            }
+            if o.starts_with(b"%") {
+                let l = node.location();
+                self.percent_arr_spans.push((l.start_offset(), l.end_offset()));
+            }
         }
         if self.eng.debugger_on {
             for e in node.elements().iter() {
@@ -519,6 +561,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_assoc_node(self, node);
     }
     fn visit_embedded_statements_node(&mut self, node: &ruby_prism::EmbeddedStatementsNode<'pr>) {
+        self.check_empty_interpolation(node);
         self.interp_depth += 1;
         ruby_prism::visit_embedded_statements_node(self, node);
         self.interp_depth -= 1;
@@ -766,6 +809,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         str_ignore: Vec::new(),
         num_ignore: Vec::new(),
         percent_sym_spans: Vec::new(),
+        percent_arr_spans: Vec::new(),
         dirname_ignore: Vec::new(),
         usage_block_depth: 0,
         assumed_arg_offsets: HashSet::new(),
@@ -780,9 +824,16 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     let t = tick(&T_PREP, t);
 
     // ---- text-based cops ----
+    let first_code_off = result
+        .node()
+        .as_program_node()
+        .and_then(|p| p.statements().body().iter().next().map(|n| n.location().start_offset()));
     cops.check_frozen_string_literal(first_code_line);
     cops.check_line_length();
     cops.check_trailing_whitespace();
+    cops.check_empty_file();
+    cops.check_trailing_empty_lines();
+    cops.check_initial_indentation(first_code_off);
     let t = tick(&T_TEXT, t);
 
     // ---- AST-based cops ----

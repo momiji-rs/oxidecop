@@ -134,6 +134,87 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Lint/EmptyFile — an empty (or, without AllowComments, comment-only)
+    /// file. rubocop's add_global_offense anchors at 1:1.
+    pub(crate) fn check_empty_file(&mut self) {
+        const COP: &str = "Lint/EmptyFile";
+        if !self.on(COP) {
+            return;
+        }
+        let offending = self.src.is_empty()
+            || (self.cfg.get(COP, "AllowComments") != Some("true")
+                && self.src.split(|b| *b == b'\n').all(|l| {
+                    let t: Vec<u8> = l.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+                    t.is_empty() || l.iter().find(|b| !b.is_ascii_whitespace()) == l.iter().find(|b| **b == b'#')
+                        && t.first() == Some(&b'#')
+                }));
+        if offending {
+            self.push(0, COP, false, "Empty file detected.");
+        }
+    }
+
+    /// Layout/TrailingEmptyLines — the file must end in exactly one newline
+    /// (`final_newline`, default) or one blank line (`final_blank_line`).
+    pub(crate) fn check_trailing_empty_lines(&mut self) {
+        const COP: &str = "Layout/TrailingEmptyLines";
+        if !self.on(COP) || self.src.is_empty() {
+            return;
+        }
+        // rubocop bails whenever __END__ appears (its regex is unanchored),
+        // and on a file ending in a blank percent-string literal
+        if self.src.windows(7).any(|w| w == b"__END__") || self.src.ends_with(b"%\n\n") {
+            return;
+        }
+        let ws_len = self.src.iter().rev().take_while(|b| b.is_ascii_whitespace()).count();
+        let newlines = self.src[self.src.len() - ws_len..].iter().filter(|b| **b == b'\n').count() as i64;
+        let blank_lines = newlines - 1;
+        let wanted: i64 = if self.cfg.enforced_style(COP) == "final_blank_line" { 1 } else { 0 };
+        if blank_lines == wanted {
+            return;
+        }
+        let mut begin = self.src.len() - ws_len;
+        let fix_start = begin;
+        if ws_len > 0 {
+            begin += 1;
+        }
+        let msg = match blank_lines {
+            -1 => "Final newline missing.".to_string(),
+            0 => "Trailing blank line missing.".to_string(),
+            n => {
+                let instead = if wanted == 0 { String::new() } else { format!("instead of {wanted} ") };
+                format!("{n} trailing blank lines {instead}detected.")
+            }
+        };
+        self.push(begin, COP, true, msg);
+        let rep: &[u8] = if wanted == 0 { b"\n" } else { b"\n\n" };
+        self.fixes.push((fix_start, self.src.len(), rep.to_vec()));
+    }
+
+    /// Layout/InitialIndentation — the first line of code must not be indented.
+    pub(crate) fn check_initial_indentation(&mut self, first_code: Option<usize>) {
+        const COP: &str = "Layout/InitialIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(off) = first_code else { return };
+        let (line, col) = self.idx.loc(off);
+        if col == 1 {
+            return;
+        }
+        let ls0 = self.idx.starts[line - 1];
+        let mut ls = ls0;
+        // a leading BOM is not indentation (but counts as one CHAR for cols)
+        if self.src[ls..].starts_with(&[0xEF, 0xBB, 0xBF]) {
+            ls += 3;
+        }
+        if ls < off && self.src[ls..off].iter().all(|b| matches!(b, b' ' | b'\t')) {
+            let col = String::from_utf8_lossy(&self.src[ls0..off]).chars().count() + 1;
+            self.offenses.push(Offense { line, col, cop: COP, correctable: true,
+                message: "Indentation of first line in file detected.".into() });
+            self.fixes.push((ls, off, Vec::new()));
+        }
+    }
+
     /// Layout/TrailingWhitespace — `[[:blank:]]` (tab + Unicode Zs, so `　`
     /// counts) before the line end. Lines inside heredoc bodies are skipped
     /// under `AllowInHeredoc: true`; otherwise they're offenses whose fix

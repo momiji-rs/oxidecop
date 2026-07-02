@@ -136,6 +136,47 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Lint/EmptyInterpolation — `"#{}"` (or interpolations of only nil /
+    /// empty string literals), outside `%W[]`-style percent arrays.
+    pub(crate) fn check_empty_interpolation(&mut self, node: &ruby_prism::EmbeddedStatementsNode) {
+        const COP: &str = "Lint/EmptyInterpolation";
+        if !self.on(COP) {
+            return;
+        }
+        let l = node.location();
+        if self.percent_arr_spans.iter().any(|(s, e)| l.start_offset() >= *s && l.start_offset() < *e) {
+            return;
+        }
+        let empty = match node.statements() {
+            None => true,
+            Some(stmts) => stmts.body().iter().all(|n| {
+                n.as_nil_node().is_some()
+                    || n.as_string_node().is_some_and(|s| s.content_loc().as_slice().is_empty())
+            }),
+        };
+        if empty {
+            self.push(l.start_offset(), COP, true, "Empty interpolation detected.");
+            self.fixes.push((l.start_offset(), l.end_offset(), Vec::new()));
+        }
+    }
+
+    /// Lint/EnsureReturn — a `return` inside an `ensure` body (not from an
+    /// inner def/lambda scope).
+    pub(crate) fn check_ensure_return(&mut self, node: &ruby_prism::EnsureNode) {
+        const COP: &str = "Lint/EnsureReturn";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(stmts) = node.statements() else { return };
+        let mut returns = Vec::new();
+        for n in stmts.body().iter() {
+            collect_returns(&n, &mut returns);
+        }
+        for off in returns {
+            self.push(off, COP, false, "Do not return from an `ensure` block.");
+        }
+    }
+
     /// Lint/UriEscapeUnescape — `URI.escape` & friends are obsolete; the
     /// message lists the case-specific replacements.
     pub(crate) fn check_uri_escape_unescape(&mut self, node: &ruby_prism::CallNode) {
@@ -200,6 +241,34 @@ fn chained_method_name(node: &ruby_prism::CallNode, src: &[u8]) -> String {
         }
     }
     name
+}
+
+/// Find `return` nodes, not descending into inner defs or lambda scopes.
+fn collect_returns(node: &ruby_prism::Node, out: &mut Vec<usize>) {
+    struct Finder<'a> {
+        out: &'a mut Vec<usize>,
+    }
+    impl<'pr, 'a> ruby_prism::Visit<'pr> for Finder<'a> {
+        fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+            self.out.push(node.location().start_offset());
+            ruby_prism::visit_return_node(self, node);
+        }
+        fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _node: &ruby_prism::LambdaNode<'pr>) {}
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            // a `lambda { return }` block is its own scope; other blocks aren't
+            if matches!(node.name().as_slice(), b"lambda" | b"proc") && node.block().is_some() {
+                if let Some(r) = node.receiver() {
+                    self.visit(&r);
+                }
+                return;
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut f = Finder { out };
+    use ruby_prism::Visit;
+    f.visit(node);
 }
 
 // ---- is this block "scoping" (its body may define methods)? ----

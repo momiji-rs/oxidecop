@@ -51,7 +51,17 @@ COPS = {
   'Style/UnpackFirst'                => 'style/unpack_first',
   'Style/RandomWithOffset'           => 'style/random_with_offset',
   'Lint/Debugger'                    => 'lint/debugger',
-  'Style/NegatedIf'                  => 'style/negated_if'
+  'Style/NegatedIf'                  => 'style/negated_if',
+  'Lint/EmptyFile'                   => 'lint/empty_file',
+  'Layout/TrailingEmptyLines'        => 'layout/trailing_empty_lines',
+  'Layout/InitialIndentation'        => 'layout/initial_indentation',
+  'Style/NegatedWhile'               => 'style/negated_while',
+  'Style/CharacterLiteral'           => 'style/character_literal',
+  'Style/UnlessElse'                 => 'style/unless_else',
+  'Lint/EmptyInterpolation'          => 'lint/empty_interpolation',
+  'Lint/EnsureReturn'                => 'lint/ensure_return',
+  'Style/EndBlock'                   => 'style/end_block',
+  'Style/BeginBlock'                 => 'style/begin_block'
 }.freeze
 
 FileUtils.mkdir_p(DIR)

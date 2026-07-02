@@ -810,29 +810,70 @@ impl<'a> Cops<'a> {
             2 if !modifier => return,
             _ => {}
         }
-        // unwrap parens (taking the last statement), bail on empty `()`
-        let mut cond = node.predicate();
-        while let Some(p) = cond.as_parentheses_node() {
-            let Some(last) = p.body().and_then(|b| b.as_statements_node()).and_then(|s| s.body().iter().last())
-            else {
-                return;
-            };
-            cond = last;
-        }
-        // single_negative?: `(send !(send _ :!) :!)`
-        let Some(call) = cond.as_call_node() else { return };
-        if call.name().as_slice() != b"!" {
-            return;
-        }
-        let Some(recv) = call.receiver() else { return };
-        if recv.as_call_node().is_some_and(|c| c.name().as_slice() == b"!") {
-            return; // double negation is Style/DoubleNegation's business
-        }
+        let Some((bang_start, recv_start)) = single_negative(node.predicate()) else { return };
         let l = node.location();
         self.push(l.start_offset(), COP, true, "Favor `unless` over `if` for negative conditions.");
         // fix: swap the keyword and drop the `!`
         self.fixes.push((kw.start_offset(), kw.end_offset(), b"unless".to_vec()));
-        self.fixes.push((call.location().start_offset(), recv.location().start_offset(), Vec::new()));
+        self.fixes.push((bang_start, recv_start, Vec::new()));
+    }
+
+    /// Style/NegatedWhile — `while !x` → `until x` and vice versa (shares
+    /// rubocop's NegativeConditional with NegatedIf, minus the style gate).
+    pub(crate) fn check_negated_while(&mut self, predicate: ruby_prism::Node, node_start: usize, kw: ruby_prism::Location, until: bool) {
+        const COP: &str = "Style/NegatedWhile";
+        if !self.on(COP) {
+            return;
+        }
+        let Some((bang_start, recv_start)) = single_negative(predicate) else { return };
+        let (inverse, current) = if until { ("while", "until") } else { ("until", "while") };
+        self.push(node_start, COP, true,
+            format!("Favor `{inverse}` over `{current}` for negative conditions."));
+        self.fixes.push((kw.start_offset(), kw.end_offset(), inverse.as_bytes().to_vec()));
+        self.fixes.push((bang_start, recv_start, Vec::new()));
+    }
+
+    /// Style/CharacterLiteral — `?a` → `'a'`.
+    pub(crate) fn check_character_literal(&mut self, node: &ruby_prism::StringNode) {
+        const COP: &str = "Style/CharacterLiteral";
+        if !self.on(COP) || self.interp_depth > 0 {
+            return;
+        }
+        if node.opening_loc().is_none_or(|o| o.as_slice() != b"?") {
+            return;
+        }
+        let l = node.location();
+        let src = self.node_src(&node.as_node());
+        if !(2..=3).contains(&src.len()) {
+            return;
+        }
+        self.push(l.start_offset(), COP, true,
+            "Do not use the character literal - use string literal instead.");
+        let inner = &src[1..];
+        let rep = if inner.len() == 2 || inner == b"'" {
+            let mut r = vec![b'"'];
+            r.extend_from_slice(inner);
+            r.push(b'"');
+            r
+        } else {
+            let mut r = vec![b'\''];
+            r.extend_from_slice(inner);
+            r.push(b'\'');
+            r
+        };
+        self.fixes.push((l.start_offset(), l.end_offset(), rep));
+    }
+
+    /// Style/UnlessElse — `unless ... else ... end`.
+    pub(crate) fn check_unless_else(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Style/UnlessElse";
+        if !self.on(COP) {
+            return;
+        }
+        if node.else_clause().is_some() {
+            self.push(node.location().start_offset(), COP, false,
+                "Do not use `unless` with `else`. Rewrite these with the positive case first.");
+        }
     }
 
     /// Lint/BooleanSymbol — `:true` / `:false` literals (outside `%i[]`).
@@ -1072,6 +1113,24 @@ impl<'a> Cops<'a> {
             format!("Pass `&:{method}` as an argument to `lambda` instead of a block."),
         ))
     }
+}
+
+/// rubocop's `single_negative?` on a condition: unwrap parens (taking the
+/// last statement; empty `()` bails), then require a single non-double `!`
+/// call. Returns (bang start, receiver start) for the autocorrect.
+fn single_negative(mut cond: ruby_prism::Node) -> Option<(usize, usize)> {
+    while let Some(p) = cond.as_parentheses_node() {
+        cond = p.body().and_then(|b| b.as_statements_node()).and_then(|s| s.body().iter().last())?;
+    }
+    let call = cond.as_call_node()?;
+    if call.name().as_slice() != b"!" {
+        return None;
+    }
+    let recv = call.receiver()?;
+    if recv.as_call_node().is_some_and(|c| c.name().as_slice() == b"!") {
+        return None; // double negation is Style/DoubleNegation's business
+    }
+    Some((call.location().start_offset(), recv.location().start_offset()))
 }
 
 // ---- Style/Documentation helpers ----

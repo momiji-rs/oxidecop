@@ -4,9 +4,11 @@ A fast, native, **RuboCop-compatible** Ruby linter — written in Rust, over the
 official [Prism](https://github.com/ruby/prism) parser. Think *ruff, but for
 Ruby, and bug-compatible with the RuboCop everyone already uses.*
 
-> **Status: early / experimental.** The core idea is proven — the 27
+> **Status: early / experimental.** The core idea is proven — the 39
 > implemented cops pass **100% of RuboCop's own representable spec examples**
-> (779/779, see below) — but 27 cops is not a shippable linter yet.
+> (951/951, see below) and match RuboCop **byte-for-byte on real repos**
+> (Rails, Mastodon, rubygems.org — see BENCHMARKS.md) — but 39 cops is not a
+> shippable linter yet.
 
 ---
 
@@ -95,37 +97,11 @@ de-annotated source through the `rubocop-rs` binary under *the example's own*
 Current leaderboard (`ruby oracle/leaderboard.rb`), against RuboCop v1.88.0:
 
 ```
-cop                                  scored   skip         LOC        FULL
-Layout/LineLength                       145     41   145/145     145/145     100%
-Style/FrozenStringLiteralComment         88      7    88/88       88/88      100%
-Style/ZeroLengthPredicate                74      0    74/74       74/74      100%
-Style/SymbolProc                         57     13    57/57       57/57      100%
-Style/StringLiterals                     49      5    49/49       49/49      100%
-Style/Documentation                      43      6    43/43       43/43      100%
-Style/NumericPredicate                   39      4    39/39       39/39      100%
-Lint/NestedMethodDefinition              38      0    38/38       38/38      100%
-Style/RedundantReturn                    37      1    37/37       37/37      100%
-Naming/MethodName                        29     49    29/29       29/29      100%
-Style/NumericLiterals                    28      0    28/28       28/28      100%
-Layout/TrailingWhitespace                19      0    19/19       19/19      100%
-Style/EvenOdd                            18      0    18/18       18/18      100%
-Lint/UriRegexp                           10      0    10/10       10/10      100%
-Lint/BooleanSymbol                       10      0    10/10       10/10      100%
-Style/NilComparison                       8      0     8/8         8/8       100%
-Style/StringChars                         8      0     8/8         8/8       100%
-Style/RandomWithOffset                   29      0    29/29       29/29      100%
-Lint/EmptyExpression                     12      0    12/12       12/12      100%
-Style/UnpackFirst                        11      0    11/11       11/11      100%
-Lint/UriEscapeUnescape                    9      0     9/9         9/9       100%
-Style/ArrayJoin                           5      0     5/5         5/5       100%
-Style/Dir                                 4      0     4/4         4/4       100%
-Style/NestedFileDirname                   4      1     4/4         4/4       100%
-Lint/BigDecimalNew                        3      0     3/3         3/3       100%
-Lint/EmptyEnsure                          2      0     2/2         2/2       100%
-Lint/RandOne                              0      1     0/0         0/0          —
-────────────────────────────────────────────────────────────────────────────
-TOTAL (representable examples)          779    128                779/779     100%
+39 cops implemented — every one at 100% FULL match.
+TOTAL (representable examples)          951    119                951/951     100%
 ```
+
+(The full per-cop table is one command away: `ruby oracle/leaderboard.rb`.)
 
 **Read this honestly:** the score is over *representable* examples only. RuboCop's
 specs encode some text dynamically — escape sequences the heredoc renders
