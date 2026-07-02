@@ -16,6 +16,9 @@ pub struct Schema {
     /// Default `AllowedMethods` when the config doesn't set one (e.g. rubocop
     /// ships `Style/SymbolProc` with `AllowedMethods: [define_method]`).
     pub allowed_methods: &'static [&'static str],
+    /// Default per-cop `Exclude` globs (e.g. Style/NumericPredicate ships
+    /// with `spec/**/*`) — apply unless the user config sets its own.
+    pub excludes: &'static [&'static str],
     /// The style-guide anchor/URL (default.yml `StyleGuide:`) — appended to
     /// messages under `AllCops: DisplayStyleGuide`.
     pub style_guide: Option<&'static str>,
@@ -262,12 +265,16 @@ impl Config {
     pub fn exclude_matchers(&self) -> Vec<regex::Regex> {
         self.section_exclude_matchers("AllCops")
     }
-    /// A section's Exclude patterns (per-cop Exclude), compiled.
+    /// A section's Exclude patterns (per-cop Exclude), compiled. A user
+    /// Exclude REPLACES the default one (rubocop needs `inherit_mode` to
+    /// merge); absent that, the schema's default Excludes apply.
     pub fn section_exclude_matchers(&self, section: &str) -> Vec<regex::Regex> {
-        let Some(v) = self.sections.get(section).and_then(|s| s.get("Exclude")) else {
-            return Vec::new();
-        };
-        parse_allowed_list(v).iter().filter_map(|p| exclude_regex(p)).collect()
+        match self.sections.get(section).and_then(|s| s.get("Exclude")) {
+            Some(v) => parse_allowed_list(v).iter().filter_map(|p| exclude_regex(p)).collect(),
+            None => schema(section)
+                .map(|sc| sc.excludes.iter().filter_map(|p| exclude_regex(p)).collect())
+                .unwrap_or_default(),
+        }
     }
     /// AllCops/ActiveSupportExtensionsEnabled (default false). Gates whether
     /// `proc`/`lambda`/`Proc.new` blocks are candidates for Style/SymbolProc.

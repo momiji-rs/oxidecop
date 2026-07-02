@@ -286,7 +286,7 @@ impl Engine {
         }
     }
     /// The " (https://...)" message suffix for a cop, when configured.
-    fn style_guide_suffix(&self, cop: &str) -> Option<String> {
+    pub(crate) fn style_guide_suffix(&self, cop: &str) -> Option<String> {
         if !self.display_style_guide {
             return None;
         }
@@ -447,7 +447,13 @@ impl<'a> Cops<'a> {
             })
     }
     pub(crate) fn push(&mut self, off: usize, cop: &'static str, correctable: bool, msg: impl Into<String>) {
-        let (line, col) = self.idx.loc(off);
+        let (line, mut col) = self.idx.loc(off);
+        // rubocop columns count CHARACTERS; recount when the prefix has
+        // multi-byte text (the ASCII case is byte == char).
+        let prefix = &self.src[self.idx.starts[line - 1]..off];
+        if !prefix.is_ascii() {
+            col = String::from_utf8_lossy(prefix).chars().count() + 1;
+        }
         let mut message = msg.into();
         if let Some(sfx) = self.eng.style_guide_suffix(cop) {
             message.push_str(&sfx);

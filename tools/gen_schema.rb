@@ -23,6 +23,8 @@ META = %w[
   Include Exclude
   SupportedStyles AllowedMethods
 ].freeze
+# Exclude is not a lintable parameter, but default per-cop Excludes (e.g.
+# Style/NumericPredicate skips spec/**/*) must ship with the schema.
 
 def rust_str(s)
   '"' + s.to_s.gsub('\\', '\\\\\\\\').gsub('"', '\\"') + '"'
@@ -51,10 +53,12 @@ rows = cops.map do |cop, conf|
   end
   styles = (conf['SupportedStyles'] || []).map { |s| rust_str(s) }
   allowed = (conf['AllowedMethods'] || []).map { |m| rust_str(m) }
+  excludes = (conf['Exclude'] || []).map { |m| rust_str(m) }
   sg = conf['StyleGuide'] ? rust_str(conf['StyleGuide']) : 'e'
   sg = sg == 'e' ? 'None' : "Some(#{sg})"
   "    Schema { cop: #{rust_str(cop)}, params: &[#{params.join(', ')}], " \
-    "styles: &[#{styles.join(', ')}], allowed_methods: &[#{allowed.join(', ')}], style_guide: #{sg} },"
+    "styles: &[#{styles.join(', ')}], allowed_methods: &[#{allowed.join(', ')}], " \
+    "excludes: &[#{excludes.join(', ')}], style_guide: #{sg} },"
 end
 
 File.write(OUT, <<~RUST)

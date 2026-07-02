@@ -94,8 +94,11 @@ impl<'a> Cops<'a> {
                         let prefix = &self.src[self.idx.starts[li]..*coff];
                         let len = String::from_utf8_lossy(prefix).trim_end().chars().count();
                         if len > max {
-                            self.offenses.push(Offense { line: line_no, col: max + 1, cop: COP, correctable: false,
-                                message: format!("Line is too long. [{len}/{max}]") });
+                            let mut message = format!("Line is too long. [{len}/{max}]");
+                            if let Some(sfx) = self.eng.style_guide_suffix(COP) {
+                                message.push_str(&sfx);
+                            }
+                            self.offenses.push(Offense { line: line_no, col: max + 1, cop: COP, correctable: false, message });
                         }
                         continue;
                     }
@@ -129,8 +132,11 @@ impl<'a> Cops<'a> {
                     }
                 }
             }
-            self.offenses.push(Offense { line: line_no, col, cop: COP, correctable: false,
-                message: format!("Line is too long. [{line_len}/{max}]") });
+            let mut message = format!("Line is too long. [{line_len}/{max}]");
+            if let Some(sfx) = self.eng.style_guide_suffix(COP) {
+                message.push_str(&sfx);
+            }
+            self.offenses.push(Offense { line: line_no, col, cop: COP, correctable: false, message });
         }
     }
 
@@ -325,8 +331,12 @@ fn uri_regex(schemes: Option<&str>) -> regex::Regex {
         .iter()
         .map(|s| regex::escape(s))
         .collect();
+    // Structured like ruby's RFC2396 make_regexp: the hier part rejects
+    // brackets (path chars), but query and fragment are URIC* — where `[` `]`
+    // count as reserved and get swallowed. URI.parse then rejects them, which
+    // is exactly what kills the exemption for a doc-link's trailing `]`.
     regex::Regex::new(&format!(
-        r#"(?i)\b(?:{}):(?://)?[^\s<>"{{}}|\\^\x60\[\]]+"#,
+        r#"(?i)\b(?:{}):(?://)?[^\s<>"{{}}|\\^\x60\[\]?#]*(?:\?[^\s<>"{{}}|\\^\x60#]*)?(?:#[^\s<>"{{}}|\\^\x60]*)?"#,
         schemes.join("|")
     ))
     .unwrap()
@@ -355,8 +365,27 @@ fn uri_match_ranges(line: &str, re: &regex::Regex) -> Vec<(usize, usize)> {
                 .split_once(':')
                 .is_none_or(|(_, rest)| !rest.starts_with(':'))
         })
+        .filter(|m| valid_uri(m.as_str()))
         .map(|m| (m.start(), m.end()))
         .collect()
+}
+
+/// The practical slice of `URI.parse` (RFC3986): brackets are only legal as
+/// an IPv6 host right after `//` — one swallowed into a query/fragment (see
+/// uri_regex) makes the whole candidate invalid, killing the line-length
+/// exemption exactly like rubocop.
+fn valid_uri(s: &str) -> bool {
+    let Some(first) = s.find(['[', ']']) else { return true };
+    let Some(auth) = s.find("//") else { return false };
+    if first != auth + 2 || !s[first..].starts_with('[') {
+        return false;
+    }
+    match s[first + 1..].find([']', '/', '?', '#']) {
+        Some(p) if s.as_bytes()[first + 1 + p] == b']' => {
+            !s[first + 2 + p..].contains(['[', ']'])
+        }
+        _ => false,
+    }
 }
 
 /// rubocop's `find_excessive_range`: the LAST match on the line (byte range),

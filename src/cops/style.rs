@@ -281,7 +281,7 @@ impl<'a> Cops<'a> {
         }
         let mut parts = self.mod_stack.clone();
         parts.push(String::from_utf8_lossy(name_src).into_owned());
-        let ident = parts.join("::").replace("::::", "::");
+        let ident = parts.join("::"); // `class ::X` nested yields `Parent::::X` — so does rubocop
         self.push(node_start, COP, false,
             format!("Missing top-level documentation comment for `{kind} {ident}`."));
     }
@@ -958,10 +958,10 @@ impl<'a> Cops<'a> {
         self.fixes.push((bang_start, recv_start, Vec::new()));
     }
 
-    /// Style/CharacterLiteral — `?a` → `'a'`.
+    /// Style/CharacterLiteral — `?a` → `'a'` (interpolations included).
     pub(crate) fn check_character_literal(&mut self, node: &ruby_prism::StringNode) {
         const COP: &str = "Style/CharacterLiteral";
-        if !self.on(COP) || self.interp_depth > 0 {
+        if !self.on(COP) {
             return;
         }
         if node.opening_loc().is_none_or(|o| o.as_slice() != b"?") {

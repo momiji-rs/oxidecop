@@ -37,8 +37,14 @@ normalize() {
   ' | sort
 }
 
-"$BIN" "$TARGET" | normalize "^$TARGET/" > "$WORK/ours.txt" || true
-(cd "$TARGET" && rubocop --only "$COPS" --cache false -f simple --no-color . 2>/dev/null) \
+# A corpus whose config `plugins:`-requires gems we don't install carries a
+# cleaned copy (.rubocop_bench.yml); both sides must use the same one.
+CFG=".rubocop.yml"
+[ -f "$TARGET/.rubocop_bench.yml" ] && CFG=".rubocop_bench.yml"
+# Both sides get --only: rubocop force-enables the listed cops (even under
+# DisabledByDefault configs like rails'), so ours must too.
+(cd "$TARGET" && "$BIN" --only "$COPS" . "$CFG") | normalize "^\./" > "$WORK/ours.txt" || true
+(cd "$TARGET" && rubocop -c "$CFG" --only "$COPS" --cache false -f simple --no-color . 2>/dev/null) \
   | normalize "^\./" > "$WORK/theirs.txt" || true
 
 if diff -u "$WORK/theirs.txt" "$WORK/ours.txt"; then
