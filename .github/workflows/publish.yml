@@ -17,7 +17,7 @@ jobs:
       id-token: write # OIDC token exchange with crates.io
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Gate — tag matches Cargo.toml, version not already published
