@@ -3148,3 +3148,34 @@ fn reindent_body(body_src: &[u8], offset_len: usize, indentation_len: usize) -> 
     }
     out
 }
+impl<'a> super::Cops<'a> {
+    /// Style/ClassVars — assignments to class variables (both direct and via
+    /// `class_variable_set`). Reads and gets are allowed; message interpolates
+    /// the variable name.
+    pub(crate) fn check_class_vars(&mut self, class_var: &[u8], name_start: usize) {
+        const COP: &str = "Style/ClassVars";
+        if !self.on(COP) {
+            return;
+        }
+        let class_var = String::from_utf8_lossy(class_var);
+        let msg = format!("Replace class var {} with a class instance var.", class_var);
+        self.push(name_start, COP, false, msg);
+    }
+
+    pub(crate) fn check_class_variable_set(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/ClassVars";
+        if !self.on(COP) {
+            return;
+        }
+        if node.name().as_slice() != b"class_variable_set" {
+            return;
+        }
+        if let Some(args) = node.arguments() {
+            if let Some(first_arg) = args.arguments().first() {
+                let arg_src = self.node_src(&first_arg).to_vec();
+                self.check_class_vars(&arg_src, first_arg.location().start_offset());
+            }
+        }
+    }
+}
+

@@ -91,6 +91,7 @@ COPS = {
   'Style/MultilineIfModifier'        => 'style/multiline_if_modifier',
   'Layout/EmptyLinesAroundBeginBody' => 'layout/empty_lines_around_begin_body',
   'Layout/EmptyLinesAroundBlockBody' => 'layout/empty_lines_around_block_body',
+  'Style/ClassVars'                  => 'style/class_vars',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
