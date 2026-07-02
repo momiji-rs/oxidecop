@@ -1777,8 +1777,16 @@ impl<'a> super::Cops<'a> {
                     backslash_count += 1;
                     j -= 1;
                 }
-                // If even number of backslashes (or zero), the # is not escaped
-                if backslash_count % 2 == 0 {
+                // If even number of backslashes (or zero), the # is not escaped.
+                // Upstream matches /(?<!\\)#\{.*\}/ — `.` doesn't cross
+                // newlines, so a `}` must close the braces on the same line
+                // (`'#{'` alone is not an interpolation).
+                if backslash_count % 2 == 0
+                    && src[i + 2..]
+                        .iter()
+                        .take_while(|&&b| b != b'\n')
+                        .any(|&b| b == b'}')
+                {
                     return true;
                 }
             }
