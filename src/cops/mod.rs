@@ -88,9 +88,9 @@ pub(crate) struct Cops<'a> {
     pub(crate) str_ignore: Vec<(usize, usize)>,
     // Numeric literals already checked as part of a folded `-@` call.
     pub(crate) num_ignore: Vec<usize>,
-    // Inclusive line ranges of heredoc BODIES (terminator excluded) — the
-    // regions Layout/TrailingWhitespace treats specially.
-    pub(crate) heredoc_lines: Vec<(usize, usize)>,
+    // Heredoc BODIES as (first line, last line, delimiter) — terminator
+    // excluded. Layout/TrailingWhitespace and Layout/LineLength consult these.
+    pub(crate) heredoc_lines: Vec<(usize, usize, Vec<u8>)>,
     // The `__END__` line — nothing at or after it is lintable text.
     pub(crate) data_line: Option<usize>,
     // Per enclosing body (program/class/module/def), the names of classes
@@ -430,7 +430,7 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
 
     // ---- text-based cops ----
     cops.check_frozen_string_literal(&comment_data, first_code_line);
-    cops.check_line_length();
+    cops.check_line_length(&comment_data);
     cops.check_trailing_whitespace();
 
     // ---- AST-based cops ----
@@ -446,12 +446,21 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
 /// excluded), mirroring rubocop's `extract_heredocs`.
 struct HeredocFinder<'a> {
     idx: &'a LineIndex,
-    ranges: Vec<(usize, usize)>,
+    ranges: Vec<(usize, usize, Vec<u8>)>,
 }
 impl<'a> HeredocFinder<'a> {
-    fn add_span(&mut self, start: usize, end: usize) {
+    fn add_span(&mut self, start: usize, end: usize, closing: Option<ruby_prism::Location>) {
+        let delim: Vec<u8> = closing
+            .map(|c| {
+                c.as_slice()
+                    .iter()
+                    .copied()
+                    .filter(|b| !b.is_ascii_whitespace())
+                    .collect()
+            })
+            .unwrap_or_default();
         if start < end {
-            self.ranges.push((self.idx.loc(start).0, self.idx.loc(end - 1).0));
+            self.ranges.push((self.idx.loc(start).0, self.idx.loc(end - 1).0, delim));
         }
     }
 }
@@ -459,19 +468,19 @@ impl<'pr, 'a> Visit<'pr> for HeredocFinder<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
         if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) {
             let c = node.content_loc();
-            self.add_span(c.start_offset(), c.end_offset());
+            self.add_span(c.start_offset(), c.end_offset(), node.closing_loc());
         }
     }
     fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
         if node.opening_loc().as_slice().starts_with(b"<<") {
             let c = node.content_loc();
-            self.add_span(c.start_offset(), c.end_offset());
+            self.add_span(c.start_offset(), c.end_offset(), Some(node.closing_loc()));
         }
     }
     fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
         if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) {
             if let (Some(first), Some(close)) = (node.parts().iter().next(), node.closing_loc()) {
-                self.add_span(first.location().start_offset(), close.start_offset());
+                self.add_span(first.location().start_offset(), close.start_offset(), node.closing_loc());
             }
         }
         // keep walking — interpolations can nest further heredocs
