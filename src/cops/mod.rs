@@ -847,6 +847,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         ruby_prism::visit_class_variable_and_write_node(self, node);
     }
+    fn visit_class_variable_target_node(&mut self, node: &ruby_prism::ClassVariableTargetNode<'pr>) {
+        // a class var target in a multiple assignment (`@@a, @@b = 1, 2`) is a
+        // cvasgn in whitequark, so upstream's on_cvasgn fires per target
+        self.check_class_vars(node.name().as_slice(), node.location().start_offset());
+    }
     fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
     }
