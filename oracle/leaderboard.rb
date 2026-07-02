@@ -115,6 +115,7 @@ COPS = {
   'Lint/IneffectiveAccessModifier'   => 'lint/ineffective_access_modifier',
   'Layout/LeadingCommentSpace'       => 'layout/leading_comment_space',
   'Lint/DeprecatedOpenSSLConstant'   => 'lint/deprecated_open_ssl_constant',
+  'Lint/AssignmentInCondition'       => 'lint/assignment_in_condition',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

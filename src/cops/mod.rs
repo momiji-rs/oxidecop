@@ -142,7 +142,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire", "Lint/TrailingCommaInAttributeDeclaration",
-    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant",
+    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -797,6 +797,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
         self.check_nested_ternary_operator(node);
         self.check_else_layout_if(node);
+        self.check_assignment_in_condition(&node.predicate());
         self.check_negated_if(node);
         self.check_duplicate_elsif_condition(node);
         self.check_safe_navigation_with_empty(&node.predicate());
@@ -835,6 +836,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
         self.check_else_layout_unless(node);
+        // whitequark's parser has no distinct `unless` node type — `unless
+        // cond` compiles to `(if cond nil body)`, so upstream's `on_if` (which
+        // Lint/AssignmentInCondition aliases to `on_while`/`on_until`, but
+        // never separately defines `on_unless`) already covers it for free.
+        // Prism DOES give `unless` its own `UnlessNode`, so it needs its own
+        // hook here to match.
+        self.check_assignment_in_condition(&node.predicate());
         self.check_safe_navigation_with_empty(&node.predicate());
         self.check_unless_else(node);
         self.check_multiline_if_then(
@@ -1046,6 +1054,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        self.check_assignment_in_condition(&node.predicate());
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
         if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
             self.check_condition_position(b"while", node.keyword_loc().start_offset(), &node.predicate());
@@ -1057,6 +1066,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth -= 1;
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        self.check_assignment_in_condition(&node.predicate());
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
         if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
             self.check_condition_position(b"until", node.keyword_loc().start_offset(), &node.predicate());

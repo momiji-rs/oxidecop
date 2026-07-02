@@ -2855,3 +2855,171 @@ fn openssl_build_cipher_arguments(src: &[u8], args: &[ruby_prism::Node], algorit
     }
     format!("'{}'", combined.into_iter().take(3).collect::<Vec<_>>().join("-"))
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/AssignmentInCondition — `if/while/until foo = bar` almost always
+    /// means `==` was intended. Ported from upstream's `on_if` (aliased to
+    /// `on_while`/`on_until`) + its private `traverse_node`/`SafeAssignment`
+    /// mixin, walking the ENTIRE condition subtree (not just the top node):
+    ///
+    ///   - stop dead at a block literal (`return 1 if any_errors? { o = x }`
+    ///     never flags the `o = x` inside — a whole call-with-block IS the
+    ///     `BlockNode`'s enclosing `CallNode` here, so this only matters for
+    ///     nested blocks reached WHILE descending, e.g. `foo { x if y = z }`'s
+    ///     OUTER block doesn't stop the INNER `if`'s own on_if walk, since
+    ///     that's a fresh top-level call from `visit_if_node`).
+    ///   - a plain call/safe-call (`CallNode`) that ISN'T itself an
+    ///     assignment method (`foo?`, `include?`, …) stops the walk outright
+    ///     — this is what makes a block-call-as-condition inert without a
+    ///     separate "is this a block" check: `any_errors? { ... }`'s outer
+    ///     node is the `CallNode` (prism attaches the block as a field, not
+    ///     an ancestor, unlike whitequark's `(block (send ...) ...)`), and a
+    ///     non-assignment method name stops descent before ever reaching it.
+    ///   - a parenthesized group (`ParenthesesNode`, upstream's `:begin`)
+    ///     is transparent — never itself flagged — but `()` (empty) or (when
+    ///     `AllowSafeAssignment`) a SOLE assignment/assignment-call child
+    ///     stops the walk there (the "wrap it in parens to opt in" escape
+    ///     hatch); any other content keeps descending, catching assignments
+    ///     buried in `(foo == bar && baz = 1)`.
+    ///   - every other node shape (`&&`, `||`, method args, …) is plain
+    ///     structure: never flagged, always descended into.
+    ///
+    /// `AllowSafeAssignment` (default true) gates BOTH the parenthesized-
+    /// escape-hatch above and whether the autocorrect (wrap the flagged
+    /// expression in parens) ever fires — when false, offenses still fire
+    /// (with a different message) but autocorrect never runs, matching
+    /// upstream's `add_offense(...) { |c| next unless safe_assignment_allowed?; ... }`.
+    pub(crate) fn check_assignment_in_condition(&mut self, predicate: &ruby_prism::Node) {
+        const COP: &str = "Lint/AssignmentInCondition";
+        if !self.on(COP) {
+            return;
+        }
+        let allow_safe = self.cfg.get(COP, "AllowSafeAssignment") != Some("false");
+        let mut hits: Vec<(usize, usize, usize)> = Vec::new(); // (operator_start, wrap_start, wrap_end)
+        {
+            struct Finder<'h> {
+                allow_safe: bool,
+                hits: &'h mut Vec<(usize, usize, usize)>,
+            }
+            impl<'pr, 'h> ruby_prism::Visit<'pr> for Finder<'h> {
+                // A block literal is a dead end — upstream's `any_block_type?`
+                // guard fires before anything else, so this never even checks
+                // whether the block's underlying call was an assignment.
+                fn visit_block_node(&mut self, _node: &ruby_prism::BlockNode<'pr>) {}
+
+                fn visit_parentheses_node(&mut self, node: &ruby_prism::ParenthesesNode<'pr>) {
+                    let stmts: Vec<ruby_prism::Node> = node
+                        .body()
+                        .and_then(|b| b.as_statements_node())
+                        .map(|s| s.body().iter().collect())
+                        .unwrap_or_default();
+                    let empty_condition = stmts.is_empty();
+                    let safe_assignment = stmts.len() == 1
+                        && (is_equals_assignment(&stmts[0]) || is_assignment_call(&stmts[0]));
+                    if empty_condition || (self.allow_safe && safe_assignment) {
+                        return; // skip_children?: stop, no offense, no descent
+                    }
+                    // allowed_construct? (begin_type? is always true here): the
+                    // group itself is never flagged, but descent continues.
+                    ruby_prism::visit_parentheses_node(self, node);
+                }
+
+                fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                    // skip_children?: `call_type? && !assignment_method?`.
+                    if !is_assignment_method_name(node.name().as_slice()) {
+                        return;
+                    }
+                    // allowed_construct? via `conditional_assignment?`
+                    // (`!loc.operator`): a bracket/dot assignment ALWAYS has
+                    // one in practice (`equal_loc`); the explicit-call form
+                    // (`a.[]=(3, 10)`) doesn't, and is correctly left unflagged.
+                    if let Some(op) = node.equal_loc() {
+                        let l = node.location();
+                        self.hits.push((op.start_offset(), l.start_offset(), l.end_offset()));
+                    }
+                    ruby_prism::visit_call_node(self, node);
+                }
+
+                fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+                    self.report_write(node.operator_loc(), node.location());
+                    ruby_prism::visit_local_variable_write_node(self, node);
+                }
+                fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
+                    self.report_write(node.operator_loc(), node.location());
+                    ruby_prism::visit_instance_variable_write_node(self, node);
+                }
+                fn visit_class_variable_write_node(&mut self, node: &ruby_prism::ClassVariableWriteNode<'pr>) {
+                    self.report_write(node.operator_loc(), node.location());
+                    ruby_prism::visit_class_variable_write_node(self, node);
+                }
+                fn visit_global_variable_write_node(&mut self, node: &ruby_prism::GlobalVariableWriteNode<'pr>) {
+                    self.report_write(node.operator_loc(), node.location());
+                    ruby_prism::visit_global_variable_write_node(self, node);
+                }
+                fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+                    self.report_write(node.operator_loc(), node.location());
+                    ruby_prism::visit_constant_write_node(self, node);
+                }
+                fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+                    self.report_write(node.operator_loc(), node.location());
+                    ruby_prism::visit_constant_path_write_node(self, node);
+                }
+                fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+                    self.report_write(node.operator_loc(), node.location());
+                    ruby_prism::visit_multi_write_node(self, node);
+                }
+            }
+            impl<'h> Finder<'h> {
+                fn report_write(&mut self, op: ruby_prism::Location, whole: ruby_prism::Location) {
+                    self.hits.push((op.start_offset(), whole.start_offset(), whole.end_offset()));
+                }
+            }
+            let mut finder = Finder { allow_safe, hits: &mut hits };
+            use ruby_prism::Visit;
+            finder.visit(predicate);
+        }
+        if hits.is_empty() {
+            return;
+        }
+        let msg = if allow_safe {
+            "Use `==` if you meant to do a comparison or wrap the expression in parentheses to indicate you meant to assign in a condition."
+        } else {
+            "Use `==` if you meant to do a comparison or move the assignment up out of the condition."
+        };
+        for (op_start, wrap_start, wrap_end) in hits {
+            self.push(op_start, COP, allow_safe, msg);
+            if allow_safe {
+                self.fixes.push((wrap_start, wrap_start, b"(".to_vec()));
+                self.fixes.push((wrap_end, wrap_end, b")".to_vec()));
+            }
+        }
+    }
+}
+
+/// Upstream's `AST::Node::EQUALS_ASSIGNMENTS` (`lvasgn`/`ivasgn`/`cvasgn`/
+/// `gvasgn`/`casgn`/`masgn`) — the plain-`=` write node kinds, split across
+/// several prism node types (`casgn` alone splits into `ConstantWriteNode`
+/// and `ConstantPathWriteNode` depending on whether the constant is scoped).
+fn is_equals_assignment(node: &ruby_prism::Node) -> bool {
+    node.as_local_variable_write_node().is_some()
+        || node.as_instance_variable_write_node().is_some()
+        || node.as_class_variable_write_node().is_some()
+        || node.as_global_variable_write_node().is_some()
+        || node.as_constant_write_node().is_some()
+        || node.as_constant_path_write_node().is_some()
+        || node.as_multi_write_node().is_some()
+}
+
+/// Upstream's `SafeAssignment#setter_method?` (`[(call ...) setter_method?]`):
+/// a call/safe-call node that is ITSELF an assignment (has an operator
+/// location) — `test[0] = 10`'s `[]=` call, not a plain predicate call.
+fn is_assignment_call(node: &ruby_prism::Node) -> bool {
+    node.as_call_node().is_some_and(|c| c.equal_loc().is_some())
+}
+
+/// Upstream's `MethodDispatchNode#assignment_method?`: the method name ends
+/// in `=` and isn't one of the comparison operators that also end in `=`
+/// (`==`, `===`, `!=`, `<=`, `>=`).
+fn is_assignment_method_name(name: &[u8]) -> bool {
+    !matches!(name, b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<") && name.ends_with(b"=")
+}
