@@ -1,0 +1,61 @@
+# Benchmarks
+
+A three-way comparison against **RuboCop v1.88.0** (Ruby 3.4.1) and
+**[oxicop](https://github.com/npow/oxicop) v0.2.0**, following oxicop's own
+published protocol ([BENCHMARKS.md](https://github.com/npow/oxicop/blob/master/BENCHMARKS.md)):
+`--only` the same 6 cops, median of 5 consecutive runs, warm caches, one machine
+(Apple Silicon).
+
+Cops: `Layout/TrailingWhitespace, Style/FrozenStringLiteralComment,
+Style/StringLiterals, Style/NegatedIf, Lint/Debugger, Naming/MethodName`.
+
+## Speed (median of 5)
+
+| Corpus | files | rubocop-rs | oxicop | RuboCop (cached) | RuboCop (no cache) |
+|---|--:|--:|--:|--:|--:|
+| Jekyll | 163 | **35 ms** | 42 ms | 841 ms | 1.78 s |
+| RuboCop repo | 1,710 | 203 ms | **158 ms** | 1.51 s | 14.9 s |
+
+## Correctness on the same runs
+
+Speed only matters if the answers are right. Offense counts on the exact same
+corpora, with working RuboCop (project config, plugin `require`s stripped so it
+can run) as ground truth:
+
+| Corpus | RuboCop (truth) | rubocop-rs | oxicop |
+|---|--:|--:|--:|
+| Jekyll | **0** | **0** | **6,504** |
+| RuboCop repo | **0** | **0** | **2,665** |
+
+oxicop's offenses on Jekyll are 6,499 × `Style/StringLiterals` false positives:
+it applies the default `single_quotes` style to a codebase whose `.rubocop.yml`
+sets `EnforcedStyle: double_quotes`, and scans directories the config excludes
+(`benchmark/`, …) — despite advertising `.rubocop.yml` support. rubocop-rs
+honors both (`AllCops: Exclude` globs, per-cop styles) and matches RuboCop's
+zero exactly. Message-level agreement is verified separately by
+`tools/parity.sh` (byte-identical offense lists vs. RuboCop on real trees) and
+by the oracle (100% of RuboCop's own representable spec examples for every
+implemented cop).
+
+## A note on oxicop's published RuboCop baseline
+
+oxicop's BENCHMARKS.md reports RuboCop at a near-constant ~775 ms on every
+project — Jekyll (22K lines) through Discourse (936K lines). RuboCop cannot
+lint 936K lines in 775 ms; that constant is the signature of Ruby boot followed
+by an immediate config error (these projects' `.rubocop.yml` files `require`
+plugin gems, and RuboCop aborts when they aren't installed) and/or a fully
+cached result run. On our machine, RuboCop *actually linting* the RuboCop repo
+takes **14.9 s** uncached (1.5 s result-cached) — so the honest speedup story
+is much larger than their table suggests, for both tools.
+
+## Reproducing
+
+```sh
+C6="Layout/TrailingWhitespace,Style/FrozenStringLiteralComment,Style/StringLiterals,Style/NegatedIf,Lint/Debugger,Naming/MethodName"
+git clone --depth 1 https://github.com/jekyll/jekyll.git /tmp/jekyll
+cd /tmp/jekyll
+hyperfine -i -w 1 -r 5 \
+  "rubocop-rs --only $C6 ." \
+  "oxicop --only $C6 ." \
+  "rubocop --only $C6 --cache false ."   # needs the config's plugin gems installed
+```

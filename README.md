@@ -190,6 +190,11 @@ one-line guard. No plugin/require support yet.
 
 ## Performance
 
+See [BENCHMARKS.md](BENCHMARKS.md) for the three-way comparison against
+RuboCop and oxicop (their protocol, plus a correctness column their table
+lacks: on Jekyll, oxicop reports 6,504 offenses where RuboCop — and
+rubocop-rs — report zero).
+
 `bench/run.sh` (hyperfine; fetches a real rubocop source file as corpus, and a
 10× concatenation of it for scaling):
 
