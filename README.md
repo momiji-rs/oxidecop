@@ -1,87 +1,43 @@
-# rubocop-rs
+# OxideCop
 
-A fast, native, **RuboCop-compatible** Ruby linter — written in Rust, over the
-official [Prism](https://github.com/ruby/prism) parser. Think *ruff, but for
-Ruby, and bug-compatible with the RuboCop everyone already uses.*
+A fast, native, **RuboCop-compatible** Ruby linter and autocorrector — written
+in Rust over the official [Prism](https://github.com/ruby/prism) parser. Think
+*ruff, but for Ruby, and bug-compatible with the RuboCop everyone already uses.*
+
+```sh
+cargo install oxidecop
+oxidecop .        # same offenses, same messages, same exit code — just fast
+```
 
 > **Status: early / experimental.** The core idea is proven — the 47
 > implemented cops pass **100% of RuboCop's own representable spec examples**,
 > detection (1051/1051) *and* autocorrection (477/477, `--fix`), and match
 > RuboCop **byte-for-byte on real repos** (Rails, Mastodon, rubygems.org,
-> RuboCop's own source — see BENCHMARKS.md) — but 47 cops is not a shippable
-> linter yet.
-
----
+> RuboCop's own source — see
+> [BENCHMARKS.md](https://github.com/momiji-rs/oxidecop/blob/master/BENCHMARKS.md))
+> — but 47 cops is not a shippable linter yet.
 
 ## Why
 
 RuboCop is the de-facto Ruby linter, but it runs on CRuby and is dominated by
-**parse time in the interpreted `parser` gem** (measured ~40× slower than a
-native parse on a 600-line file). A native linter that speaks Prism can be an
-order of magnitude faster while producing **byte-identical output**, so it drops
-into existing projects with zero config changes — the goal is:
-
-```sh
-brew install rubocop-rs
-rubocop-rs ./          # same offenses, same messages, same exit code — just fast
-```
+**parse time in the interpreted `parser` gem**. A native linter that speaks
+Prism is an order of magnitude faster while producing **byte-identical
+output**, so it drops into existing projects with zero config changes.
 
 The bet only pays off if we are **faithful to RuboCop's actual behavior**, not
 "morally equivalent." That is why fidelity is measured against RuboCop's *own*
-test suite (below), not by eyeballing.
+test suite, not by eyeballing:
 
-## The core idea: cops are (mostly) data
-
-RuboCop has ~600 cops. ~266 of them are *pattern cops* — they match an AST shape
-via RuboCop's `def_node_matcher` S-expression DSL and emit a message. In
-rubocop-rs those become **table rows, not code**:
-
-```rust
-// src/main.rs — the DECLARATIVE table. Each row is a whole cop.
-("(send _ {:== :===} (nil))", "Style/NilComparison",
- "Prefer the use of the `nil?` predicate.", Anchor::Op),
-
-("(send (send (...) ${:size :length}) :== (int 0))", "Style/ZeroLengthPredicate",
- "Use `empty?` instead of `{} == 0`.", Anchor::Node),
-```
-
-A small **node-pattern engine** (`src/nodepattern.rs`) parses that DSL and
-matches it against Prism nodes. Supported so far:
-
-| DSL form | meaning |
+| | |
 |---|---|
-| `(send RECV :meth ARG…)` | a call node, mapped onto Prism's `receiver`/`name`/`arguments` |
-| `(csend …)` / `(call …)` | safe-navigation call (`&.`) / either form (rubocop's `call`) |
-| `nil?` | absent / nil receiver |
-| `_` | any node |
-| `(...)` | any **present** node (requires an explicit receiver) |
-| `...` | rest — any remaining children (a send's method+args, or trailing args) |
-| `:sym` | a method-name symbol |
-| `{a b c}` | union — any alternative matches (captures backtrack on failure) |
-| `$…` | **capture** — records matched text for message interpolation |
-| `(nil)` / `(int N)` / `(int $N)` | literal nodes |
-| `(const SCOPE :Name)` / `cbase` | constants: `Foo` (`nil?` scope), `::Foo` (`cbase`), `File::Stat` (nested) |
+| Whole-tree lint, Rails (~3,400 files) | **57 ms** |
+| vs [oxicop](https://crates.io/crates/oxicop) (regex-based, no parser) | 2–5× faster — and correct where it reports thousands of false positives |
+| vs [nitrocop](https://github.com/6/nitrocop) (prism-based, 915 cops) | 4–31× faster cold; on RuboCop's own CI-clean repo it reports 17,174 offenses, OxideCop reports the true zero |
+| Warm rerun (nothing changed) | **~29 ms** (stat-keyed result cache, no file reads) |
 
-Imperative cops reuse the same engine as **matchers** — a parsed pattern held in
-a `OnceLock`, rubocop's `def_node_matcher` — e.g. `Style/ZeroLengthPredicate`
-transcribes rubocop's four patterns verbatim and builds its messages from the
-captures.
+## Fidelity, measured
 
-Two things are **not** derivable from the pattern and live alongside it as data:
-
-- **`Anchor`** — where `add_offense` points (whole node vs. the operator/selector
-  vs. the receiver's selector). RuboCop cops choose this per-cop.
-- **message template** — `{}` placeholders filled from `$` captures, because
-  RuboCop interpolates the offending method/expression into the message.
-
-Cops that need real logic (e.g. `Style/RedundantReturn`, `Naming/MethodName`)
-are small imperative `Visit` methods in `src/main.rs`. The dividing line is
-explicit and the oracle tells you which side a cop needs to be on.
-
-## Fidelity: measured against RuboCop's own specs
-
-RuboCop's specs use the `expect_offense` DSL, which encodes the exact expected
-line:col + message inline as caret annotations:
+RuboCop's spec suite encodes exact expectations inline:
 
 ```ruby
 expect_offense(<<~RUBY)
@@ -91,9 +47,10 @@ RUBY
 ```
 
 The **oracle** (`oracle/oracle.rb`) parses those fixtures, runs the
-de-annotated source through the `rubocop-rs` binary under *the example's own*
-`cop_config`, and diffs at two levels: **LOC** (right line:col) and **FULL**
-(line:col *and* identical message).
+de-annotated source through the `oxidecop` binary under *the example's own*
+`cop_config`, and diffs at three levels: **LOC** (right line:col), **FULL**
+(line:col *and* identical message), and **FIX** (the `--fix` output against
+`expect_correction`).
 
 Current leaderboard (`ruby oracle/leaderboard.rb`), against RuboCop v1.88.0:
 
@@ -102,152 +59,82 @@ Current leaderboard (`ruby oracle/leaderboard.rb`), against RuboCop v1.88.0:
 TOTAL (representable examples)         1051    108               1051/1051    100%   FIX 477/477
 ```
 
-The **FIX** column is the autocorrection oracle: each example's
-`expect_correction` / `expect_no_corrections` block is compared against the
-binary's `--fix` output. (Where the two rubocop behaviors differ — the
-expect_correction DSL iterates one cop instance, a fresh `rubocop -a` run
-corrects more — the binary matches `-a` byte-for-byte and the oracle accepts
-either.)
+**Read this honestly:** the score is over *representable* examples only.
+RuboCop's specs encode some text dynamically (RSpec loop variables,
+`%{identifier}` substitutions, shared_examples that run under a caller's
+config); the oracle renders what is static and **skips** what isn't, rather
+than scoring a harness limitation as a cop miss — hence the `skip` column.
 
-(The full per-cop table is one command away: `ruby oracle/leaderboard.rb`.)
-
-**Read this honestly:** the score is over *representable* examples only. RuboCop's
-specs encode some text dynamically — escape sequences the heredoc renders
-(`x = 0\t`, `　`), loop variables as `#{keyword}`/`#{args}` in
-`.each`-generated examples, and `%{identifier}` `expect_offense` substitutions.
-The oracle renders what is static (heredoc escapes per Ruby's quoting rules,
-the known-constant helpers like `trailing_whitespace`, `#{enforced_style}` from
-the active config) and **skips** anything still-dynamic rather than scoring a
-harness limitation as a cop miss — hence the `skip` column. (`Lint/RandOne`'s
-spec is ENTIRELY shared_examples — which run at their `it_behaves_like` call
-sites with the caller's config, so their textual position lies about the
-active configuration and the oracle skips them; its cases are covered verbatim
-by `cargo test` instead.)
-
-Each example runs under its own `let(:cop_config)`, translated to `.rubocop.yml`.
-So a `LineLength` example with `Max: 30, AllowURI: true` is tested at that `Max` —
-and its failures then honestly attribute to features rubocop-rs lacks (`AllowURI`,
-`AllowedPatterns`, `EnforcedStyle`, …), not to a coincidental default. That is
-"config coverage we haven't built," measured where it actually bites.
-
-The value is that **every gap is a named, reproducible spec example**, so
-improving a cop is a test-driven grind, and residual failures cluster into
-**reusable engine features** (config/`EnforcedStyle` support, receiver-guard
-clauses) that lift many cops at once — not one-off hacks.
+End-to-end, `tools/parity.sh <ruby-tree>` lints a tree with both linters
+(both under `--only` with the implemented cop list, which RuboCop
+force-enables) and diffs the normalized offense lists. Byte-identical on all
+four corpora: **Rails (12,271 offense lines), Mastodon (4,123), rubygems.org
+(772), and RuboCop's own 1,712-file source tree (0 vs 0)**. CI re-verifies the
+oracle at 100% and the parity on every push.
 
 ## Usage
 
 ```sh
-cargo build --release
-./target/release/rubocop-rs lib/ spec/                   # lint trees in parallel (uses ./.rubocop.yml if present)
-./target/release/rubocop-rs path/to/file.rb my.yml       # explicit config
-./target/release/rubocop-rs path/to/file.rb --fix        # autocorrect → stdout (single file)
+oxidecop lib/ spec/              # lint trees in parallel (nearest .rubocop.yml per file)
+oxidecop file.rb my.yml          # explicit config
+oxidecop -a .                    # autocorrect in place (like rubocop -a)
+oxidecop file.rb --fix           # autocorrect a single file -> stdout
+oxidecop --only Style/SymbolProc --format json .
 ```
 
-Directories walk recursively for Ruby files (`*.rb`, `*.rake`, `*.gemspec`,
-`Gemfile`, `Rakefile`; hidden/`vendor`/`node_modules` skipped), lint in
-parallel, and the exit code is 1 when offenses were found.
+Output mimics RuboCop's simple formatter (severity letters, `[Correctable]`
+tags, per-cop `Severity` config honored); `--format json` emits
+RuboCop-compatible JSON. Exit code is 1 when offenses were found.
 
-Output mimics RuboCop's simple formatter:
+Config support covers the surface real projects use: `.rubocop.yml` discovery
+(nearest config per file), `inherit_from` chains, `inherit_gem`, `AllCops:
+DisabledByDefault / Exclude / Include`, per-cop `Enabled` / `Exclude` /
+`EnforcedStyle` / `AllowedMethods` / `AllowedPatterns` (including
+`!ruby/regexp`), magic-comment `rubocop:disable` directives (with `-- reason`
+trailers), and `TargetRubyVersion`. Parameter defaults for **all 606 cops**
+are generated from RuboCop's own `config/default.yml` into one schema table,
+so a newly ported cop's defaults are already correct.
 
-```
-C:  4:  8: Style/NilComparison: Prefer the use of the `nil?` predicate.
-1 file inspected, 1 offense detected
-```
-
-Config support is a minimal `.rubocop.yml` subset: `AllCops: DisabledByDefault`,
-per-cop `Enabled`, simple params (`Max`, `MinDigits`, …), and `EnforcedStyle`.
-Parameter defaults and each style cop's `SupportedStyles`/default live in one
-place — the `SCHEMA` table (`src/schema_gen.rs`), **generated for all 606 cops**
-from rubocop's own `config/default.yml` by `tools/gen_schema.rb` (the yml is
-vendored under `vendor/`). A cop reads config through
-`Config::enforced_style`/`int` instead of hardcoding its own defaults, so a
-newly ported cop's defaults are already there. `Style/StringLiterals` dispatches on it (`single_quotes` ↔
-`double_quotes`); other style cops just need to be pointed at the same resolver.
-
-`AllowedMethods` / `AllowedPatterns` are a cross-cutting mechanism (rubocop's
-shared `AllowedMethods` mixin): a cop calls `Cops::allowed(cop, text)` to suppress
-an offense whose relevant string is either an exact `AllowedMethods` entry or
-matches an `AllowedPatterns` regex (compiled once via the `regex` crate). It's
-wired to the method name for `Naming/MethodName`, the source line for
-`Layout/LineLength`, and the operator/predicate (plus any enclosing call, via a
-call-name stack) for `Style/NumericPredicate`; adding it to another cop is a
-one-line guard. No plugin/require support yet.
-
-## Performance
-
-See [BENCHMARKS.md](BENCHMARKS.md) for the three-way comparison against
-RuboCop and oxicop (their protocol, plus a correctness column their table
-lacks: on Jekyll, oxicop reports 6,504 offenses where RuboCop — and
-rubocop-rs — report zero).
-
-`bench/run.sh` (hyperfine; fetches a real rubocop source file as corpus, and a
-10× concatenation of it for scaling):
-
-```
-corpus                       rubocop-rs      rubocop --only <same 13 cops>
-medium.rb  (404 lines)       2.4 ms          657 ms          ~276× faster
-big.rb    (4040 lines)       5.7 ms          865 ms          ~151× faster
-```
-
-On a real multi-file run — rubocop v1.88.0's own `lib/rubocop` tree, 916
-files — rubocop-rs finishes in **0.05s** against rubocop's 4.7s with the same
-cops (~90×, with rubocop's boot amortized across all files).
-
-And the offense sets match: `tools/parity.sh <ruby-tree>` lints a tree with
-both linters (both under `--only` with the implemented cop list, which rubocop
-force-enables) and diffs the normalized offense lists. Byte-identical on all
-four corpora: **Rails (12,271 offense lines), Mastodon (4,123),
-rubygems.org (772), and rubocop's own 1,712-file source tree (0 vs 0)** — the
-end-to-end check the per-example oracle can't give. CI
-(`.github/workflows/ci.yml`) re-verifies the oracle at 100% and the
-rubocop-src parity on every push.
+A result cache (stat-keyed, content-hash fallback) makes unchanged-tree reruns
+~2× faster; `--cache false` disables it.
 
 ## Repo layout
 
 ```
-src/main.rs          the runner: argv, file/config I/O, output, --fix application
-src/config.rs        .rubocop.yml subset + the per-cop SCHEMA (defaults/styles)
-src/declarative.rs   the DECLARATIVE pattern-cop table + Anchor + message render
-src/cops/mod.rs      the Cops visitor, thin Visit dispatch, lint() entry, tests
-src/cops/*.rs        per-department imperative cop logic (style, naming, …)
-src/nodepattern.rs   the node-pattern DSL parser + Prism matcher (captures, unions)
-oracle/oracle.rb     spec-suite oracle: one cop's fixtures vs. the binary
-oracle/leaderboard.rb runs the oracle across all cops, prints the ranked table
-oracle/run_oracle.sh  convenience: build + oracle a few cops
-oracle/spec_fixtures/ RuboCop's own *_spec.rb, fetched verbatim (v1.88.0)
+src/main.rs            the runner: argv, file/config discovery, output, --fix loop
+src/config.rs          .rubocop.yml subset + the generated per-cop SCHEMA
+src/declarative.rs     the DECLARATIVE pattern-cop table (node-pattern rows)
+src/nodepattern.rs     RuboCop's node-pattern DSL, parsed and matched over Prism
+src/cops/              the visitor + per-department cop logic
+src/cops/breakable.rs  Layout/LineLength autocorrection (CheckLineBreakable port)
+oracle/                the spec-suite oracle + leaderboard (fidelity measurement)
+tools/parity.sh        whole-tree byte-identical diff vs reference RuboCop
+bench/compare.sh       the speed scoreboard vs competing linters
 ```
 
-## How to add / improve a cop (the workflow)
+## How to add / improve a cop
 
-1. **Find RuboCop's real pattern.** Copy the `def_node_matcher` string and `MSG`
-   from RuboCop's source *verbatim* — do not paraphrase. (Guessed patterns are
-   systematically over-broad; the oracle catches this every time.)
-2. **Express it.** A pattern cop → add a row to `DECLARATIVE` in `src/main.rs`
-   (pattern, cop name, message template, anchor). A logic cop → add a small
-   `Visit` method. If the DSL can't express the pattern yet, extend
-   `src/nodepattern.rs`.
-3. **Measure.** Add the cop → spec mapping in `oracle/leaderboard.rb` (the
-   fixture auto-fetches from GitHub), then `ruby oracle/leaderboard.rb`. The
-   miss list is your exact TODO.
-4. **Iterate** until FULL-match is where you want it. Residual misses that need
-   real logic (semantic guards, alternate configs) are legitimate — note them.
+1. **Find RuboCop's real pattern.** Copy the `def_node_matcher` string and
+   `MSG` from RuboCop's source *verbatim* — do not paraphrase. (Guessed
+   patterns are systematically over-broad; the oracle catches this every time.)
+2. **Express it.** A pattern cop -> one row in the `DECLARATIVE` table. A logic
+   cop -> a small `Visit` method. If the DSL can't express the pattern yet,
+   extend `src/nodepattern.rs`.
+3. **Measure.** Map the cop to its spec in `oracle/leaderboard.rb`, run it —
+   the miss list is your exact TODO, down to the failing example.
+4. **Verify end-to-end.** `tools/parity.sh` against a real tree must stay
+   byte-identical.
 
 ## Roadmap
 
-- **Deepen** the top cops toward 100% (config/`EnforcedStyle` support is the
-  single biggest lever — it unlocks the "config-gated" failures across the board).
-- **Widen**: port the ~266 declarative cops in tiers; the DSL grows to meet them.
-- **Autocorrect fidelity**: diff against `rubocop -a` output (an oracle mode).
-- **Runner**: multi-file globbing, `.rubocop.yml` inheritance/`require`,
-  RuboCop-compatible formatters and exit codes.
-- **Distribution**: `brew install rubocop-rs`, prebuilt binaries.
-
-## Provenance
-
-Spun out of experiments in a sibling Ruby-in-Rust project (`rubyrs`). rubocop-rs
-has **zero dependency** on that project — it only needs `ruby-prism`.
+- **Widen**: port the next tiers of cops (the schema and node-pattern DSL
+  already cover their config surface).
+- **Distribution**: prebuilt binaries, `brew install oxidecop`.
+- **Close the warm-rerun gap**: cache the directory walk to take no-change
+  reruns from ~29 ms toward ~5 ms.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/momiji-rs/oxidecop/blob/master/LICENSE).
+OxideCop is not affiliated with the RuboCop project; RuboCop is the work of
+its authors and contributors, and this project exists to be faithful to it.

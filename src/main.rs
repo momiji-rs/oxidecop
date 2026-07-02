@@ -1,4 +1,4 @@
-//! rubocop-rs — a fast, native RuboCop-compatible Ruby linter over the Prism
+//! OxideCop — a fast, native RuboCop-compatible Ruby linter over the Prism
 //! AST. Pattern cops are DATA (see `declarative` + `nodepattern`); imperative
 //! cops are small methods under `cops/`. Fidelity is measured against RuboCop's
 //! own spec suite via the `oracle/` harness. See README.md.
@@ -206,11 +206,11 @@ fn main() {
             "--color" => color = Some(true),
             "--no-color" => color = Some(false),
             "-v" | "--version" => {
-                println!("rubocop-rs {}", env!("CARGO_PKG_VERSION"));
+                println!("oxidecop {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
             "-h" | "--help" => {
-                println!("usage: rubocop-rs [options] <path>...\n\
+                println!("usage: oxidecop [options] <path>...\n\
                     \x20 --only COPS        run only the listed cops/departments\n\
                     \x20 --except COPS      skip the listed cops/departments\n\
                     \x20 -f, --format FMT   simple (default) | json | quiet\n\
@@ -231,7 +231,7 @@ fn main() {
         std::io::stdout().is_terminal()
     });
     if paths.is_empty() && stdin_path.is_none() {
-        eprintln!("usage: rubocop-rs [options] <path>... (see --help)");
+        eprintln!("usage: oxidecop [options] <path>... (see --help)");
         std::process::exit(2);
     }
 
@@ -441,7 +441,7 @@ fn main() {
                     (display, offenses)
                 }
                 Err(e) => {
-                    eprintln!("rubocop-rs: cannot read {display}: {e}");
+                    eprintln!("oxidecop: cannot read {display}: {e}");
                     (display, Vec::new())
                 }
             }
@@ -459,7 +459,7 @@ fn main() {
         _ => print_simple(&results, results.len(), use_color, &cfg),
     }
 
-    if std::env::var_os("RUBOCOP_RS_TIMING").is_some() {
+    if std::env::var_os("OXIDECOP_TIMING").is_some() {
         let ms = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
         eprintln!("timing (cpu-ms summed across threads):");
         eprintln!("  parse  {:9.1}", ms(&cops::T_PARSE));
@@ -599,7 +599,7 @@ fn print_json(results: &[(String, Vec<cops::Offense>)], cfg: &config::Config) {
         ));
     }
     println!(
-        "{{\"metadata\":{{\"rubocop_version\":\"{}\",\"ruby_engine\":\"rubocop-rs\"}},\"files\":[{}],\"summary\":{{\"offense_count\":{total},\"target_file_count\":{n},\"inspected_file_count\":{n}}}}}",
+        "{{\"metadata\":{{\"rubocop_version\":\"{}\",\"ruby_engine\":\"oxidecop\"}},\"files\":[{}],\"summary\":{{\"offense_count\":{total},\"target_file_count\":{n},\"inspected_file_count\":{n}}}}}",
         env!("CARGO_PKG_VERSION"),
         files.join(","),
         n = results.len()

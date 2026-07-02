@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Nanosecond tallies per phase, summed across threads — printed by the
-/// runner when RUBOCOP_RS_TIMING is set. Loads/stores are relaxed; this is
+/// runner when OXIDECOP_TIMING is set. Loads/stores are relaxed; this is
 /// diagnostics, not synchronization.
 pub static T_PARSE: AtomicU64 = AtomicU64::new(0);
 pub static T_PREP: AtomicU64 = AtomicU64::new(0);

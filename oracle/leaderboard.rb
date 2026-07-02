@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# Fidelity leaderboard: for every cop rubocop-rs implements, run rubocop's OWN
+# Fidelity leaderboard: for every cop oxidecop implements, run rubocop's OWN
 # spec suite through the oracle and rank by pass-rate. This is the acceptance
 # metric — "what % of rubocop's own tests do we pass, per cop", measured, not
 # guessed.
@@ -14,7 +14,7 @@ require 'fileutils'
 
 REF  = 'v1.88.0'
 ROOT = File.expand_path('..', __dir__)
-BIN  = File.join(ROOT, 'target/release/rubocop-rs')
+BIN  = File.join(ROOT, 'target/release/oxidecop')
 DIR  = File.expand_path('spec_fixtures', __dir__)
 
 system('cargo', 'build', '--release', '--manifest-path', File.join(ROOT, 'Cargo.toml'),
@@ -109,7 +109,7 @@ end
 rows.sort_by! { |r| [-(r[:total].zero? ? 0 : r[:full].to_f / r[:total]), -r[:total]] }
 
 puts
-puts '════════════════════════ rubocop-rs fidelity leaderboard ════════════════════════'
+puts '════════════════════════ oxidecop fidelity leaderboard ════════════════════════'
 puts format('  %-34s %8s %6s  %10s  %10s', 'cop', 'scored', 'skip', 'LOC', 'FULL')
 puts '  ' + ('─' * 80)
 tot_full = tot_all = tot_skip = 0

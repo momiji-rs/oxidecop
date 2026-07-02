@@ -1,6 +1,6 @@
 #!/bin/sh
-# End-to-end parity check: lint a real Ruby tree with rubocop-rs AND real
-# rubocop (restricted to the cops rubocop-rs implements), then diff the
+# End-to-end parity check: lint a real Ruby tree with oxidecop AND real
+# rubocop (restricted to the cops oxidecop implements), then diff the
 # normalized offense lists. This is the acceptance test for the project's
 # actual selling point — same offenses on real code, not just on spec
 # fixtures. Exit 0 = byte-identical offense sets.
@@ -11,7 +11,7 @@ set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TARGET=${1:?usage: parity.sh <ruby-source-dir>}
 [ -d "$TARGET" ] || { echo "not a directory: $TARGET" >&2; exit 2; }
-BIN="$ROOT/target/release/rubocop-rs"
+BIN="$ROOT/target/release/oxidecop"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -50,6 +50,6 @@ CFG=".rubocop.yml"
 if diff -u "$WORK/theirs.txt" "$WORK/ours.txt"; then
   echo "PARITY: $(wc -l < "$WORK/ours.txt" | tr -d ' ') offense lines identical on $TARGET"
 else
-  echo "DIVERGED (see diff above; - = rubocop only, + = rubocop-rs only)" >&2
+  echo "DIVERGED (see diff above; - = rubocop only, + = oxidecop only)" >&2
   exit 1
 fi

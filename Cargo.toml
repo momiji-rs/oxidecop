@@ -1,13 +1,20 @@
 [package]
-name = "rubocop-rs"
-version = "0.0.1"
+name = "oxidecop"
+version = "0.1.0"
 edition = "2021"
-description = "A fast, native RuboCop-compatible Ruby linter — cops as data over the Prism AST"
+description = "OxideCop: a fast, native, RuboCop-compatible Ruby linter and autocorrector over the Prism parser"
 license = "MIT"
-repository = "https://github.com/lawrencelin/rubocop-rs"
+repository = "https://github.com/momiji-rs/oxidecop"
+homepage = "https://github.com/momiji-rs/oxidecop"
+readme = "README.md"
+keywords = ["ruby", "linter", "rubocop", "prism", "lint"]
+categories = ["development-tools", "command-line-utilities"]
+# the crate ships the linter itself; the oracle/parity harnesses, bench
+# scripts and the vendored rubocop default.yml stay in the repo only
+exclude = ["vendor/*", "oracle/*", "bench/*", "tools/*", ".github/*", "BENCHMARKS.md"]
 
 [[bin]]
-name = "rubocop-rs"
+name = "oxidecop"
 path = "src/main.rs"
 
 [dependencies]

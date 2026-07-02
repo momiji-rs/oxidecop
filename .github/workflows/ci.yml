@@ -30,7 +30,7 @@ jobs:
         run: cargo test --release
 
       - name: Oracle — 100% of rubocop's representable spec examples
-        run: ruby oracle/leaderboard.rb target/release/rubocop-rs --assert
+        run: ruby oracle/leaderboard.rb target/release/oxidecop --assert
 
       - name: Fetch reference rubocop + its source tree
         run: |
@@ -52,7 +52,7 @@ jobs:
         run: |
           cd /tmp/rubocop-src
           start=$(date +%s%N)
-          $GITHUB_WORKSPACE/target/release/rubocop-rs . > /dev/null || true
+          $GITHUB_WORKSPACE/target/release/oxidecop . > /dev/null || true
           ms=$(( ($(date +%s%N) - start) / 1000000 ))
           echo "lint of rubocop-src took ${ms}ms"
           test "$ms" -lt 2000

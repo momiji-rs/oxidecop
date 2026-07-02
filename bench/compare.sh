@@ -1,5 +1,5 @@
 #!/bin/sh
-# The scoreboard: median-of-N timings for rubocop-rs vs competing linters on
+# The scoreboard: median-of-N timings for oxidecop vs competing linters on
 # fixed corpora, same cops, same protocol (hyperfine, warm caches). Every perf
 # change gets judged by THIS script, not ad-hoc runs.
 #
@@ -12,7 +12,7 @@
 # a fast wrong answer is not a win.
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BIN="$ROOT/target/release/rubocop-rs"
+BIN="$ROOT/target/release/oxidecop"
 RUNS=${RUNS:-7}
 COPS=${COPS:-"Layout/TrailingWhitespace,Style/FrozenStringLiteralComment,Style/StringLiterals,Style/NegatedIf,Lint/Debugger,Naming/MethodName"}
 
@@ -31,7 +31,7 @@ for corpus in "$@"; do
   cd "$corpus"
 
   # correctness column: total offenses each tool reports
-  printf '   offenses:  rubocop-rs=%s' "$("$BIN" --only "$COPS" . 2>/dev/null | grep -c '^[A-Z]:' || true)"
+  printf '   offenses:  oxidecop=%s' "$("$BIN" --only "$COPS" . 2>/dev/null | grep -c '^[A-Z]:' || true)"
   for comp in ${COMPETITORS:-oxicop nitrocop}; do
     cbin=$(find_bin "$comp") || continue
     [ -n "$cbin" ] || continue
@@ -39,7 +39,7 @@ for corpus in "$@"; do
   done
   echo
 
-  cmds="-n rubocop-rs '$BIN --only $COPS .'"
+  cmds="-n oxidecop '$BIN --only $COPS .'"
   for comp in ${COMPETITORS:-oxicop nitrocop}; do
     cbin=$(find_bin "$comp") || continue
     [ -n "$cbin" ] || continue

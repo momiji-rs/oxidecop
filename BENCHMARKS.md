@@ -11,7 +11,7 @@ Style/StringLiterals, Style/NegatedIf, Lint/Debugger, Naming/MethodName`.
 
 ## Speed (median of 5)
 
-| Corpus | files | rubocop-rs | oxicop | vs oxicop | RuboCop (cached) | RuboCop (no cache) |
+| Corpus | files | oxidecop | oxicop | vs oxicop | RuboCop (cached) | RuboCop (no cache) |
 |---|--:|--:|--:|--:|--:|--:|
 | Jekyll | 163 | **14 ms** | 24 ms | 1.7× | 841 ms | 1.78 s |
 | RuboCop repo | 1,710 | **26 ms** | 119 ms | 4.7× | 1.51 s | 14.9 s |
@@ -31,10 +31,10 @@ offenses are wrong).
 
 Speed only matters if the answers are right. Offense counts on the exact same
 corpora, with working RuboCop (project config, plugin `require`s stripped so it
-can run) as ground truth. For rubocop-rs, "match" means the diff of normalized
+can run) as ground truth. For oxidecop, "match" means the diff of normalized
 offense lines (file:line:col + full message) is empty — not just equal counts:
 
-| Corpus | RuboCop (truth) | rubocop-rs | nitrocop | oxicop |
+| Corpus | RuboCop (truth) | oxidecop | nitrocop | oxicop |
 |---|--:|--:|--:|--:|
 | Jekyll | **0** | **0** | 0 | 6,504 |
 | RuboCop repo | **0** | **0** | 0 | 2,665 |
@@ -52,13 +52,13 @@ Mastodon exercises `inherit_from` chains, `DisplayStyleGuide` message
 suffixes, `rubocop:disable all -- reason` trailers, and shebang-only `bin/*`
 executables — all reproduced byte-for-byte. Rails (`DisabledByDefault: true`)
 exposes that nitrocop's `--only` does not force-enable cops the way RuboCop's
-does: it reports 1 offense where RuboCop reports 393; rubocop-rs matches all
+does: it reports 1 offense where RuboCop reports 393; oxidecop matches all
 393 byte-for-byte.
 
 oxicop's offenses on Jekyll are 6,499 × `Style/StringLiterals` false positives:
 it applies the default `single_quotes` style to a codebase whose `.rubocop.yml`
 sets `EnforcedStyle: double_quotes`, and scans directories the config excludes
-(`benchmark/`, …) — despite advertising `.rubocop.yml` support. rubocop-rs
+(`benchmark/`, …) — despite advertising `.rubocop.yml` support. oxidecop
 honors both (`AllCops: Exclude` globs, per-cop styles) and matches RuboCop's
 zero exactly. Message-level agreement is verified separately by
 `tools/parity.sh` (byte-identical offense lists vs. RuboCop on real trees) and
@@ -76,11 +76,11 @@ columns or message text, both of which our oracle and parity check require.
 
 Correctness: on rubygems.org (1,317 files, a config exercising per-cop
 Exclude, `!ruby/regexp` excludes and inherit_from), RuboCop, nitrocop and
-rubocop-rs all report **zero offenses** — three-way agreement.
+oxidecop all report **zero offenses** — three-way agreement.
 
 Speed (same 6-cop protocol, median of 7):
 
-| Corpus | rubocop-rs | nitrocop (no cache) | vs |
+| Corpus | oxidecop | nitrocop (no cache) | vs |
 |---|--:|--:|--:|
 | Jekyll | **12 ms** | 997 ms | 85× |
 | RuboCop repo | **44 ms** | 1,049 ms | 24× |
@@ -95,13 +95,13 @@ the fairer one.
 
 ## Drop-in run vs nitrocop (full project config, 2026-07)
 
-`rubocop-rs .` vs `nitrocop .` — no `--only`, each tool reading the corpus's
+`oxidecop .` vs `nitrocop .` — no `--only`, each tool reading the corpus's
 own `.rubocop.yml`, median of 7 (hyperfine). This is the command a developer
 actually types. Cop coverage differs (we implement 47 cops, nitrocop 915), so
 offense counts aren't directly comparable — what IS comparable is agreement
 with RuboCop where verified:
 
-| Corpus | rubocop-rs (no cache) | nitrocop (no cache) | vs | rubocop-rs offenses | nitrocop offenses |
+| Corpus | oxidecop (no cache) | nitrocop (no cache) | vs | oxidecop offenses | nitrocop offenses |
 |---|--:|--:|--:|--:|--:|
 | Rails | **93 ms** | 2,899 ms | 31× | 1 † | 3 |
 | Mastodon | **290 ms** | 1,285 ms | 4.4× | 2,115 | 2,197 |
@@ -119,7 +119,7 @@ behavior both tools are trying to clone.
 
 Warm cache (second run, nothing changed):
 
-| Corpus | rubocop-rs | nitrocop |
+| Corpus | oxidecop | nitrocop |
 |---|--:|--:|
 | Rails | **29 ms** | 3.5 ms |
 | Mastodon | **27 ms** | 3.8 ms |
@@ -149,7 +149,7 @@ C6="Layout/TrailingWhitespace,Style/FrozenStringLiteralComment,Style/StringLiter
 git clone --depth 1 https://github.com/jekyll/jekyll.git /tmp/jekyll
 cd /tmp/jekyll
 hyperfine -i -w 1 -r 5 \
-  "rubocop-rs --only $C6 ." \
+  "oxidecop --only $C6 ." \
   "oxicop --only $C6 ." \
   "rubocop --only $C6 --cache false ."   # needs the config's plugin gems installed
 ```

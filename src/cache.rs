@@ -29,13 +29,13 @@ pub struct Cache {
 impl Cache {
     /// None when the cache directory can't be created (cache disabled).
     pub fn open(config_text: &str, only: &Option<Vec<String>>) -> Option<Cache> {
-        let base = std::env::var_os("RUBOCOP_RS_CACHE_DIR")
+        let base = std::env::var_os("OXIDECOP_CACHE_DIR")
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::var_os("XDG_CACHE_HOME").map(|c| PathBuf::from(c).join("rubocop-rs"))
+                std::env::var_os("XDG_CACHE_HOME").map(|c| PathBuf::from(c).join("oxidecop"))
             })
             .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("rubocop-rs"))
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("oxidecop"))
             })?;
         // binary identity: version + the executable's mtime/len (a rebuild
         // with the same version must not reuse entries)
