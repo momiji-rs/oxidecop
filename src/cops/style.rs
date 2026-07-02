@@ -3296,8 +3296,14 @@ impl<'a> super::Cops<'a> {
 
         // `body_and_end_on_same_line?`: node.children.last (the body, since
         // rescue/ensure wrappers are themselves the body node in prism) ends
-        // on the same line as the `end` keyword.
-        let body_end = body.location().end_offset();
+        // on the same line as the `end` keyword. A prism BeginNode (def with
+        // rescue/ensure) extends through the def's own `end` keyword, unlike
+        // whitequark's rescue/ensure wrapper nodes which stop at their last
+        // clause's content — unwrap to the content end.
+        let body_end = match body.as_begin_node() {
+            Some(b) => begin_node_content_end(&b),
+            None => body.location().end_offset(),
+        };
         let body_last_line = self.idx.loc(body_end.saturating_sub(1)).0;
         if body_last_line != end_line {
             return;
@@ -3309,6 +3315,38 @@ impl<'a> super::Cops<'a> {
         let keyword_col = self.idx.loc(keyword_start).1 - 1;
         let indent = " ".repeat(keyword_col);
         self.fixes.push((end_start, end_start, format!("\n{indent}").into_bytes()));
+    }
+}
+
+/// Where a def-body BeginNode's *content* ends, mirroring whitequark's
+/// rescue/ensure wrapper ranges: the ensure body if present, else the else
+/// body, else the last rescue clause, else the plain statements. Empty
+/// clauses fall back to their keyword, like whitequark.
+fn begin_node_content_end(b: &ruby_prism::BeginNode) -> usize {
+    if let Some(ens) = b.ensure_clause() {
+        return match ens.statements() {
+            Some(stmts) => stmts.location().end_offset(),
+            None => ens.ensure_keyword_loc().end_offset(),
+        };
+    }
+    if let Some(els) = b.else_clause() {
+        return match els.statements() {
+            Some(stmts) => stmts.location().end_offset(),
+            None => els.else_keyword_loc().end_offset(),
+        };
+    }
+    if let Some(mut resc) = b.rescue_clause() {
+        while let Some(next) = resc.subsequent() {
+            resc = next;
+        }
+        return match resc.statements() {
+            Some(stmts) => stmts.location().end_offset(),
+            None => resc.location().end_offset(),
+        };
+    }
+    match b.statements() {
+        Some(stmts) => stmts.location().end_offset(),
+        None => b.location().end_offset(),
     }
 }
 
