@@ -80,11 +80,13 @@ pub struct Engine {
     // Direct enablement bits + hot per-cop config, resolved once — the
     // per-node checks read fields instead of hashing strings.
     pub(crate) hot: Hot,
+    // Per-cop Exclude patterns (cop name, matchers) — applied per file.
+    cop_excludes: Vec<(&'static str, Vec<regex::Regex>)>,
 }
 
 /// Enablement + configuration the per-NODE checks consult. Everything here is
 /// a plain field read in the hot loop.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Hot {
     pub(crate) string_literals: bool,
     /// 1 = single_quotes, 2 = double_quotes, 0 = anything else
@@ -252,7 +254,46 @@ impl Engine {
                 _ => 0,
             },
         };
-        Engine { decl, enabled, allowed_patterns, allowed_methods, debugger_on, debugger_last, hot }
+        let cop_excludes: Vec<(&'static str, Vec<regex::Regex>)> = IMPLEMENTED
+            .iter()
+            .filter_map(|c| {
+                let m = cfg.section_exclude_matchers(c);
+                (!m.is_empty()).then_some((*c, m))
+            })
+            .collect();
+        Engine { decl, enabled, allowed_patterns, allowed_methods, debugger_on, debugger_last, hot, cop_excludes }
+    }
+    /// The hot flags for one file: the base view with per-cop Excludes for
+    /// matching cops switched off. Returns the excluded non-hot cop names too.
+    pub fn file_view(&self, rel_path: &str) -> (Hot, Vec<&'static str>) {
+        let mut hot = self.hot.clone();
+        let mut disabled = Vec::new();
+        for (cop, matchers) in &self.cop_excludes {
+            if matchers.iter().any(|re| re.is_match(rel_path)) {
+                disabled.push(*cop);
+                match *cop {
+                    "Style/StringLiterals" => hot.string_literals = false,
+                    "Style/NumericLiterals" => hot.numeric_literals = false,
+                    "Naming/MethodName" => hot.method_name = false,
+                    "Style/NumericPredicate" => hot.numeric_predicate = false,
+                    "Style/SymbolProc" => hot.symbol_proc = false,
+                    "Style/ZeroLengthPredicate" => hot.zero_length = false,
+                    "Style/EvenOdd" => hot.even_odd = false,
+                    "Style/Dir" => hot.dir = false,
+                    "Style/StringChars" => hot.string_chars = false,
+                    "Style/NestedFileDirname" => hot.nested_file_dirname = false,
+                    "Lint/UriRegexp" => hot.uri_regexp = false,
+                    "Lint/UriEscapeUnescape" => hot.uri_escape = false,
+                    "Style/RandomWithOffset" => hot.random_with_offset = false,
+                    "Lint/BooleanSymbol" => hot.boolean_symbol = false,
+                    "Style/RedundantReturn" => hot.redundant_return = false,
+                    "Lint/NestedMethodDefinition" => hot.nested_method_definition = false,
+                    "Style/NegatedIf" => hot.negated_if = false,
+                    _ => {}
+                }
+            }
+        }
+        (hot, disabled)
     }
     pub(crate) fn debugger_on(&self) -> bool {
         self.debugger_on
@@ -282,6 +323,10 @@ pub(crate) struct Cops<'a> {
     // Per-run engine state: parsed+prefiltered patterns, resolved enablement,
     // compiled exemption maps.
     pub(crate) eng: &'a Engine,
+    // Per-FILE view of the hot flags (per-cop Exclude may switch cops off for
+    // this file) + the excluded non-hot cops.
+    pub(crate) hot: Hot,
+    pub(crate) file_disabled: Vec<&'static str>,
     // Enclosing call/block method-name SPANS (outermost first), maintained
     // around the manual recursion in `visit_call_node`. Lets cops consult
     // ancestors (e.g. Style/NumericPredicate's AllowedMethods on a wrapping
@@ -333,6 +378,9 @@ impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
     /// short static list, called on every node for every check.
     pub(crate) fn on(&self, cop: &str) -> bool {
+        if !self.file_disabled.is_empty() && self.file_disabled.iter().any(|c| *c == cop) {
+            return false;
+        }
         self.eng
             .enabled
             .binary_search_by(|(c, _)| (*c).cmp(cop))
@@ -498,7 +546,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.push(off, "Style/SymbolProc", true, msg);
         }
         // `->` is a lambda literal — rubocop reaches it via the `lambda` send.
-        if self.eng.hot.redundant_return {
+        if self.hot.redundant_return {
             if let Some(b) = node.body() {
                 self.rr_branch(&b);
             }
@@ -583,7 +631,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_debugger(node);
         // Style/RedundantReturn also fires for method-defining blocks
         // (rubocop's RESTRICT_ON_SEND: define_method & friends, lambda).
-        if self.eng.hot.redundant_return
+        if self.hot.redundant_return
             && matches!(node.name().as_slice(), b"define_method" | b"define_singleton_method" | b"lambda")
         {
             if let Some(body) = node.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) {
@@ -624,7 +672,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             // A block is "scoping" (allows nested defs) if it's a class
             // constructor, an (instance|class|module)_(eval|exec), or its method
             // is in AllowedMethods.
-            let scoping = self.eng.hot.nested_method_definition
+            let scoping = self.hot.nested_method_definition
                 && (lint_cops::is_eval_exec(node)
                     || lint_cops::is_class_constructor(node, self.src)
                     || self.allowed("Lint/NestedMethodDefinition", node.name().as_slice()));
@@ -645,7 +693,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
 /// Lint one file: run the text-based cops and the AST visitor, return sorted
 /// offenses + autocorrect edits. Pure — no I/O; the caller owns file reading,
 /// config discovery, and output formatting.
-pub fn lint(src: &[u8], cfg: &Config, eng: &Engine) -> LintResult {
+pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResult {
     let t0 = std::time::Instant::now();
     let result = ruby_prism::parse(src);
     let t = tick(&T_PARSE, t0);
@@ -673,10 +721,13 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine) -> LintResult {
     hd.visit(&result.node());
     let heredoc_lines = hd.ranges;
 
+    let (hot, file_disabled) = eng.file_view(rel_path);
     let mut cops = Cops {
         src,
         idx: &idx,
         cfg,
+        hot,
+        file_disabled,
         comment_lines,
         offenses: Vec::new(),
         fixes: Vec::new(),
@@ -842,7 +893,7 @@ mod tests {
     fn offenses(src: &str, cfg: &str) -> Vec<(usize, usize, &'static str)> {
         let cfg = Config::parse(cfg);
         let eng = Engine::new(&cfg);
-        lint(src.as_bytes(), &cfg, &eng)
+        lint(src.as_bytes(), &cfg, &eng, "test.rb")
             .offenses
             .iter()
             .map(|o| (o.line, o.col, o.cop))

@@ -40,8 +40,44 @@ fn collect_files(path: &Path, out: &mut Vec<PathBuf>) {
 
 fn is_ruby_file(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    matches!(path.extension().and_then(|e| e.to_str()), Some("rb" | "rake" | "gemspec"))
-        || matches!(name, "Gemfile" | "Rakefile")
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("rb" | "rake" | "gemspec" | "ru" | "builder" | "jbuilder" | "rabl" | "thor" | "gemfile" | "podspec")
+    ) || matches!(
+        name,
+        "Gemfile" | "Rakefile" | "rakefile" | "Guardfile" | "Capfile" | "Berksfile" | "Brewfile"
+            | "Dangerfile" | "Fastfile" | "Podfile" | "Puppetfile" | "Thorfile" | "Vagrantfile"
+            | "Appraisals" | "Steepfile" | ".irbrc" | ".pryrc" | ".simplecov" | "buildfile"
+    )
+}
+
+/// Load a config honoring `inherit_from` (base files first, child overrides;
+/// Exclude lists merge), recursively with a depth cap.
+fn load_config_chain(path: &Path, depth: usize) -> config::Config {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let child = config::Config::parse(&text);
+    if child.inherits.is_empty() || depth > 8 {
+        return child;
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut base: Option<config::Config> = None;
+    for inh in &child.inherits {
+        if inh.starts_with("http://") || inh.starts_with("https://") {
+            continue; // remote configs unsupported
+        }
+        let sub = load_config_chain(&dir.join(inh), depth + 1);
+        match &mut base {
+            None => base = Some(sub),
+            Some(b) => b.merge_child(sub),
+        }
+    }
+    match base {
+        Some(mut b) => {
+            b.merge_child(child);
+            b
+        }
+        None => child,
+    }
 }
 
 fn main() {
@@ -67,11 +103,8 @@ fn main() {
         std::process::exit(2);
     }
 
-    let cfg_text = cfg_path
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .or_else(|| std::fs::read_to_string(".rubocop.yml").ok())
-        .unwrap_or_default();
-    let mut cfg = config::Config::parse(&cfg_text);
+    let cfg_file = cfg_path.clone().unwrap_or_else(|| ".rubocop.yml".to_string());
+    let mut cfg = load_config_chain(Path::new(&cfg_file), 0);
     cfg.only = only;
     let eng = cops::Engine::new(&cfg);
 
@@ -101,7 +134,8 @@ fn main() {
             std::process::exit(2);
         }
         let src = std::fs::read(&files[0]).expect("read");
-        let result = cops::lint(&src, &cfg, &eng);
+        let rel = files[0].strip_prefix("./").unwrap_or(&files[0]).to_string_lossy().replace('\\', "/");
+        let result = cops::lint(&src, &cfg, &eng, &rel);
         let mut out = src.clone();
         let mut fixes = result.fixes;
         fixes.sort_by(|a, b| b.0.cmp(&a.0)); // descending by start
@@ -120,8 +154,9 @@ fn main() {
         .par_iter()
         .map(|f| {
             let display = f.display().to_string();
+            let rel = f.strip_prefix("./").unwrap_or(f).to_string_lossy().replace('\\', "/");
             match std::fs::read(f) {
-                Ok(src) => (display, cops::lint(&src, &cfg, &eng).offenses),
+                Ok(src) => (display, cops::lint(&src, &cfg, &eng, &rel).offenses),
                 Err(e) => {
                     eprintln!("rubocop-rs: cannot read {display}: {e}");
                     (display, Vec::new())

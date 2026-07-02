@@ -75,12 +75,17 @@ pub struct Config {
     // `--only Cop1,Cop2` — when set, ONLY these cops (or departments) run,
     // regardless of Enabled flags, like rubocop's flag.
     pub only: Option<Vec<String>>,
+    // `inherit_from:` targets, in order (base-most first), relative to the
+    // config file's directory. The runner resolves and merges them.
+    pub inherits: Vec<String>,
 }
 impl Config {
     pub fn parse(text: &str) -> Self {
         let mut sections: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut cur: Option<String> = None;
         let mut cur_list_key: Option<String> = None;
+        let mut inherits: Vec<String> = Vec::new();
+        let mut in_inherit_list = false;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or(""); // strip comments
             if line.trim().is_empty() {
@@ -90,6 +95,18 @@ impl Config {
             let t = line.trim();
             if !indented {
                 cur_list_key = None;
+                in_inherit_list = false;
+                // `inherit_from:` — scalar or block list of config paths
+                if t == "inherit_from:" {
+                    in_inherit_list = true;
+                    cur = None;
+                    continue;
+                }
+                if let Some(v) = t.strip_prefix("inherit_from:") {
+                    inherits.push(v.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+                    cur = None;
+                    continue;
+                }
                 // top-level "Section:" (may also be "Section: value" — ignore value)
                 if let Some(name) = t.strip_suffix(':') {
                     cur = Some(name.to_string());
@@ -97,6 +114,10 @@ impl Config {
                 } else if let Some((k, _)) = t.split_once(':') {
                     cur = Some(k.trim().to_string());
                     sections.entry(k.trim().to_string()).or_default();
+                }
+            } else if in_inherit_list {
+                if let Some(item) = t.strip_prefix("- ") {
+                    inherits.push(item.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
                 }
             } else if let Some(item) = t.strip_prefix("- ") {
                 // a block-list item under the last seen key: accumulate into
@@ -123,7 +144,36 @@ impl Config {
             .and_then(|s| s.get("DisabledByDefault"))
             .map(|v| v == "true")
             .unwrap_or(false);
-        Config { sections, all_disabled_by_default, only: None }
+        Config { sections, all_disabled_by_default, only: None, inherits }
+    }
+    /// Overlay `child` on top of self (self is the inherited base). Scalar
+    /// keys override; `Exclude` lists MERGE (union), matching rubocop's
+    /// default inherit_mode.
+    pub fn merge_child(&mut self, child: Config) {
+        for (sec, kv) in child.sections {
+            let base = self.sections.entry(sec).or_default();
+            for (k, v) in kv {
+                if k == "Exclude" {
+                    let entry = base.entry(k).or_default();
+                    if entry.is_empty() || entry == "[]" {
+                        *entry = v;
+                    } else if !v.is_empty() && v != "[]" && entry.ends_with(']') && v.starts_with('[') {
+                        entry.truncate(entry.len() - 1);
+                        entry.push_str(", ");
+                        entry.push_str(v.trim_start_matches('['));
+                    }
+                } else {
+                    base.insert(k, v);
+                }
+            }
+        }
+        self.all_disabled_by_default = self
+            .sections
+            .get("AllCops")
+            .and_then(|s| s.get("DisabledByDefault"))
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        self.inherits = Vec::new();
     }
     pub fn enabled(&self, cop: &str) -> bool {
         if let Some(only) = &self.only {
@@ -177,12 +227,17 @@ impl Config {
             .unwrap_or(2.7)
     }
     /// The AllCops Exclude patterns, compiled once. Patterns are
-    /// rubocop-style globs: `**` spans directories, `*` doesn't.
+    /// rubocop-style globs (`**` spans directories, `*` doesn't) or
+    /// `!ruby/regexp /.../` literals.
     pub fn exclude_matchers(&self) -> Vec<regex::Regex> {
-        let Some(v) = self.sections.get("AllCops").and_then(|s| s.get("Exclude")) else {
+        self.section_exclude_matchers("AllCops")
+    }
+    /// A section's Exclude patterns (per-cop Exclude), compiled.
+    pub fn section_exclude_matchers(&self, section: &str) -> Vec<regex::Regex> {
+        let Some(v) = self.sections.get(section).and_then(|s| s.get("Exclude")) else {
             return Vec::new();
         };
-        parse_allowed_list(v).iter().filter_map(|p| glob_regex(p)).collect()
+        parse_allowed_list(v).iter().filter_map(|p| exclude_regex(p)).collect()
     }
     /// AllCops/ActiveSupportExtensionsEnabled (default false). Gates whether
     /// `proc`/`lambda`/`Proc.new` blocks are candidates for Style/SymbolProc.
@@ -219,4 +274,14 @@ pub fn glob_regex(pat: &str) -> Option<regex::Regex> {
     }
     re.push('$');
     regex::Regex::new(&re).ok()
+}
+
+/// Compile one Exclude entry: a `!ruby/regexp /.../` literal or a glob.
+pub fn exclude_regex(pat: &str) -> Option<regex::Regex> {
+    if let Some(rest) = pat.strip_prefix("!ruby/regexp") {
+        let rest = rest.trim();
+        let body = rest.strip_prefix('/').and_then(|r| r.rsplit_once('/')).map(|(b, _)| b)?;
+        return regex::Regex::new(body).ok();
+    }
+    glob_regex(pat)
 }

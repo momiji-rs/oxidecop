@@ -5,10 +5,10 @@ use super::Cops;
 impl<'a> Cops<'a> {
     /// Naming/MethodName on a `def` — the definition's own name.
     pub(crate) fn check_method_name_def(&mut self, node: &ruby_prism::DefNode) {
-        if !self.eng.hot.method_name {
+        if !self.hot.method_name {
             return;
         }
-        let style = self.eng.hot.method_name_style.clone();
+        let style = self.hot.method_name_style.clone();
         let style = style.as_str();
         let name = node.name().as_slice();
         // Operator methods (`def +`, `def []=`, `def ~@`) are exempt.
@@ -32,10 +32,10 @@ impl<'a> Cops<'a> {
 
     /// Naming/MethodName on `alias new_name old_name` — the new name only.
     pub(crate) fn check_method_name_alias(&mut self, node: &ruby_prism::AliasMethodNode) {
-        if !self.eng.hot.method_name {
+        if !self.hot.method_name {
             return;
         }
-        let style = self.eng.hot.method_name_style.clone();
+        let style = self.hot.method_name_style.clone();
         let nn = node.new_name();
         if let Some((nm, off)) = method_name_arg(&nn, self.src) {
             if !name_matches_style(nm, &style) && !self.allowed("Naming/MethodName", nm) {
@@ -52,11 +52,11 @@ impl<'a> Cops<'a> {
         if !matches!(
             node.name().as_slice(),
             b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor" | b"alias_method" | b"new" | b"define"
-        ) || !self.eng.hot.method_name
+        ) || !self.hot.method_name
         {
             return;
         }
-        let style = self.eng.hot.method_name_style.clone();
+        let style = self.hot.method_name_style.clone();
         let args: Vec<ruby_prism::Node> = node
             .arguments()
             .map(|a| a.arguments().iter().collect())
