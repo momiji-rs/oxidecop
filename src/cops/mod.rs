@@ -634,6 +634,15 @@ mod tests {
         assert_eq!(got, vec![(1, 12, "Style/NumericLiterals")]);
     }
 
+    // Found linting rubocop's own source: `map { |a| a&.name }` must NOT
+    // suggest `&:name` (safe navigation differs from a plain call on nil).
+    #[test]
+    fn symbol_proc_rejects_safe_navigation() {
+        let cfg = "AllCops:\n  DisabledByDefault: true\nStyle/SymbolProc:\n  Enabled: true\n";
+        assert_eq!(offenses("x.map { |a| a&.name }\n", cfg), vec![]);
+        assert_eq!(offenses("x.map { |a| a.name }\n", cfg), vec![(1, 7, "Style/SymbolProc")]);
+    }
+
     // Lint/RandOne's spec is entirely parameterized shared_examples (the
     // oracle skips it); these are its it_behaves_like cases verbatim.
     #[test]

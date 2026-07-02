@@ -859,6 +859,11 @@ impl<'a> Cops<'a> {
             return None;
         }
         let call = first.as_call_node()?;
+        // `x&.meth` is NOT a symbol-proc candidate — `&:meth` raises on nil
+        // where safe navigation returns it (rubocop's pattern requires `send`).
+        if call.is_safe_navigation() {
+            return None;
+        }
         if call.receiver()?.as_local_variable_read_node()?.name().as_slice() != varname.as_slice()
             || call.arguments().is_some()
             || call.block().is_some()
