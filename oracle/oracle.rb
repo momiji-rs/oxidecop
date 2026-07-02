@@ -82,7 +82,8 @@ while i < lines.length
     cfg_stack.pop while cfg_stack.any? && cfg_stack.last[0] >= indent
     inh_cfg  = cfg_stack.any? ? cfg_stack.last[1] : 'default'
     inh_skip = cfg_stack.any? ? cfg_stack.last[2] : false
-    cfg_stack.push([indent, inh_cfg, inh_skip || l.include?('unsupported_on: :prism')])
+    inh_as   = cfg_stack.any? ? cfg_stack.last[3] : nil
+    cfg_stack.push([indent, inh_cfg, inh_skip || l.include?('unsupported_on: :prism'), inh_as])
   end
   # `let(:cop_config)` in either single-line `{ {...} }` or multi-line `do..end`
   # form. Capture the raw hash text (quotes preserved, whitespace collapsed) so
@@ -98,8 +99,24 @@ while i < lines.length
     end
     cfg_stack.last[1] = extract_hash(blk.join(' ')) if cfg_stack.any?
   end
+  # `let(:config)` may set an AllCops dimension we model — capture
+  # ActiveSupportExtensionsEnabled and thread it into the generated .rubocop.yml.
+  if l =~ /let\(:config\)\s*(do|\{)/
+    blk = [l]
+    if l.include?('do') && !l.include?('end')
+      i += 1
+      while i < lines.length && lines[i].strip != 'end'
+        blk << lines[i]
+        i += 1
+      end
+    end
+    if (m = blk.join(' ').match(/ActiveSupportExtensionsEnabled'\s*=>\s*(true|false)/)) && cfg_stack.any?
+      cfg_stack.last[3] = m[1]
+    end
+  end
   cur_cfg = cfg_stack.any? ? cfg_stack.last[1] : 'default'
   cur_skip = cfg_stack.any? ? cfg_stack.last[2] : false
+  cur_as = cfg_stack.any? ? cfg_stack.last[3] : nil
   if l =~ /expect_(offense|no_offenses)\(<<[~-]RUBY\)/
     kind = Regexp.last_match(1) == 'offense' ? :offense : :no_offense
     body = []
@@ -109,9 +126,9 @@ while i < lines.length
       i += 1
     end
     src, expected = parse_block(body)
-    examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, src: src, expected: expected }
+    examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as, src: src, expected: expected }
   elsif l =~ /expect_no_offenses\((['"])(.*?)\1\)/
-    examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, src: Regexp.last_match(2) + "\n", expected: [] }
+    examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as, src: Regexp.last_match(2) + "\n", expected: [] }
   end
   i += 1
 end
@@ -215,8 +232,10 @@ end
 # example's own cop_config so config-reading cops (Layout/LineLength `Max`,
 # Style/NumericLiterals `MinDigits`, AllowedPatterns, …) are exercised faithfully.
 # Array values (AllowedPatterns) are emitted as single-quoted YAML flow sequences.
-def build_cfg(cop, cfg_hash)
-  lines = ['AllCops:', '  DisabledByDefault: true', "#{cop}:", '  Enabled: true']
+def build_cfg(cop, cfg_hash, as_val = nil)
+  lines = ['AllCops:', '  DisabledByDefault: true']
+  lines << "  ActiveSupportExtensionsEnabled: #{as_val}" if as_val
+  lines += ["#{cop}:", '  Enabled: true']
   cfg_hash.each do |k, v|
     if v.is_a?(Array)
       lines << "  #{k}: [#{v.map { |p| "'#{p}'" }.join(', ')}]"
@@ -270,7 +289,7 @@ examples.each_with_index do |ex, n|
     next
   end
 
-  actual = run_poc(POC, src, build_cfg(COP, cfg_hash))
+  actual = run_poc(POC, src, build_cfg(COP, cfg_hash, ex[:as]))
   exp = ex[:expected].map { |l, c, m| [l, c, resolve_interp(m, cfg_hash)] }
   g[:total] += 1
 

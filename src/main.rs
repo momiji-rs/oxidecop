@@ -201,6 +201,15 @@ impl Config {
             _ => default,
         }
     }
+    /// AllCops/ActiveSupportExtensionsEnabled (default false). Gates whether
+    /// `proc`/`lambda`/`Proc.new` blocks are candidates for Style/SymbolProc.
+    fn active_support(&self) -> bool {
+        self.sections
+            .get("AllCops")
+            .and_then(|s| s.get("ActiveSupportExtensionsEnabled"))
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
 }
 
 // ---------------- offense + line index ----------------
@@ -355,18 +364,12 @@ impl<'a> Cops<'a> {
         };
         Some((node_off, format!("Use `{prefer}` instead of `{current}`.")))
     }
-    /// Style/SymbolProc: a block `recv.m { |x| x.meth }` (single plain param,
-    /// body a parameterless call on that param) → suggest `recv.m(&:meth)`. The
-    /// offense range is the block (`{`..`}`). Returns (offset, message) or None.
-    fn symbol_proc(&self, node: &ruby_prism::CallNode) -> Option<(usize, String)> {
-        if !self.on("Style/SymbolProc") {
-            return None;
-        }
-        let block = node.block()?;
-        let block = block.as_block_node()?;
-        // The block's sole parameter: either one plain required positional param
-        // (`{ |x| }`) or a single numbered param (`{ _1 }`), nothing else.
-        let params = block.parameters()?;
+    /// Shared "symbol proc" shape check for a block/lambda body: the sole param
+    /// is one plain positional (`|x|`) or a single numbered param (`_1`), and the
+    /// body is one parameterless, blockless call on that param. Returns the
+    /// called method name (e.g. `upcase`) or None.
+    fn proc_shape(&self, params: Option<ruby_prism::Node>, body: Option<ruby_prism::Node>) -> Option<String> {
+        let params = params?;
         let varname: Vec<u8> = if let Some(bp) = params.as_block_parameters_node() {
             let pn = bp.parameters()?;
             let reqs: Vec<_> = pn.requireds().iter().collect();
@@ -389,25 +392,49 @@ impl<'a> Cops<'a> {
         } else {
             return None;
         };
-        // body: a single parameterless, blockless call whose receiver is the param.
-        let stmts = block.body()?;
-        let stmts = stmts.as_statements_node()?;
+        let stmts = body?.as_statements_node()?;
         let mut it = stmts.body().iter();
         let first = it.next()?;
         if it.next().is_some() {
             return None;
         }
         let call = first.as_call_node()?;
-        let recv = call.receiver()?;
-        if recv.as_local_variable_read_node()?.name().as_slice() != varname.as_slice()
+        if call.receiver()?.as_local_variable_read_node()?.name().as_slice() != varname.as_slice()
             || call.arguments().is_some()
             || call.block().is_some()
         {
             return None;
         }
+        Some(String::from_utf8_lossy(call.name().as_slice()).into_owned())
+    }
+    /// AllowComments guard: skip when enabled and a comment sits inside the block
+    /// body (opening line through the line before the closer, so a trailing
+    /// `end # comment` doesn't count).
+    fn block_has_inner_comment(&self, open: usize, close: usize) -> bool {
+        let l0 = self.idx.loc(open).0;
+        let l1 = self.idx.loc(close).0;
+        (l0..l1).any(|ln| self.comment_lines.contains(&ln))
+    }
+    /// Style/SymbolProc for a method-call block `recv.m { |x| x.meth }` →
+    /// `recv.m(&:meth)`. Offense range is the block (`{`..`}`).
+    fn symbol_proc(&self, node: &ruby_prism::CallNode) -> Option<(usize, String)> {
+        if !self.on("Style/SymbolProc") {
+            return None;
+        }
+        let block = node.block()?.as_block_node()?;
+        let method = self.proc_shape(block.parameters(), block.body())?;
         let block_method = node.name();
         let bm = block_method.as_slice();
-        // ---- guards (rubocop's, at default config) ----
+        // ActiveSupport gating: `proc`/`lambda`/`Proc.new` blocks are only
+        // candidates when ActiveSupportExtensionsEnabled is off (the default).
+        if self.cfg.active_support() {
+            if matches!(bm, b"lambda" | b"proc") {
+                return None;
+            }
+            if bm == b"new" && node.receiver().is_some_and(|r| matches!(self.node_src(&r), b"Proc" | b"::Proc")) {
+                return None;
+            }
+        }
         // AllowedMethods/Patterns on the block's method (default [define_method]).
         if self.allowed("Style/SymbolProc", bm) {
             return None;
@@ -427,20 +454,59 @@ impl<'a> Cops<'a> {
         {
             return None;
         }
-        // AllowComments: skip when enabled and the block spans a comment line.
-        if self.cfg.param("Style/SymbolProc", "AllowComments") == Some("true") {
-            // "inside" = opening line through the line before `end`, so a
-            // trailing `end # comment` (on the closing line) doesn't count.
-            let l0 = self.idx.loc(block.opening_loc().start_offset()).0;
-            let l1 = self.idx.loc(block.closing_loc().start_offset()).0;
-            if (l0..l1).any(|ln| self.comment_lines.contains(&ln)) {
-                return None;
-            }
+        if self.cfg.param("Style/SymbolProc", "AllowComments") == Some("true")
+            && self.block_has_inner_comment(block.opening_loc().start_offset(), block.closing_loc().start_offset())
+        {
+            return None;
         }
-        let method = String::from_utf8_lossy(call.name().as_slice());
         Some((
             block.opening_loc().start_offset(),
             format!("Pass `&:{method}` as an argument to `{}` instead of a block.", String::from_utf8_lossy(bm)),
+        ))
+    }
+    /// Style/SymbolProc for a `super { |x| x.meth }` / `super(...) { … }` block →
+    /// `super(&:meth)`. `super` is always a candidate (no ActiveSupport gating).
+    fn symbol_proc_super(&self, block: &ruby_prism::Node, has_args: bool) -> Option<(usize, String)> {
+        if !self.on("Style/SymbolProc") {
+            return None;
+        }
+        let block = block.as_block_node()?;
+        let method = self.proc_shape(block.parameters(), block.body())?;
+        if self.allowed("Style/SymbolProc", b"super") {
+            return None;
+        }
+        // AllowMethodsWithArguments: skip when enabled and `super` has arguments.
+        if self.cfg.param("Style/SymbolProc", "AllowMethodsWithArguments") == Some("true") && has_args {
+            return None;
+        }
+        if self.cfg.param("Style/SymbolProc", "AllowComments") == Some("true")
+            && self.block_has_inner_comment(block.opening_loc().start_offset(), block.closing_loc().start_offset())
+        {
+            return None;
+        }
+        Some((
+            block.opening_loc().start_offset(),
+            format!("Pass `&:{method}` as an argument to `super` instead of a block."),
+        ))
+    }
+    /// Style/SymbolProc for an arrow lambda literal `->(x) { x.meth }` →
+    /// `lambda(&:meth)`. Only a candidate when ActiveSupport extensions are off.
+    fn symbol_proc_lambda(&self, node: &ruby_prism::LambdaNode) -> Option<(usize, String)> {
+        if !self.on("Style/SymbolProc") || self.cfg.active_support() {
+            return None;
+        }
+        let method = self.proc_shape(node.parameters(), node.body())?;
+        if self.allowed("Style/SymbolProc", b"lambda") {
+            return None;
+        }
+        if self.cfg.param("Style/SymbolProc", "AllowComments") == Some("true")
+            && self.block_has_inner_comment(node.opening_loc().start_offset(), node.closing_loc().start_offset())
+        {
+            return None;
+        }
+        Some((
+            node.opening_loc().start_offset(),
+            format!("Pass `&:{method}` as an argument to `lambda` instead of a block."),
         ))
     }
     fn check_documentation(&mut self, start_off: usize, kind: &str, name: &ruby_prism::Node) {
@@ -706,6 +772,39 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.visit(&b);
         }
         self.def_depth -= 1;
+    }
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        if let Some((off, msg)) = self.symbol_proc_lambda(node) {
+            self.push(off, "Style/SymbolProc", true, msg);
+        }
+        if let Some(b) = node.body() {
+            self.visit(&b);
+        }
+    }
+    fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+        if let Some(b) = node.block() {
+            let has_args = node.arguments().is_some_and(|a| a.arguments().iter().count() > 0);
+            if let Some((off, msg)) = self.symbol_proc_super(&b, has_args) {
+                self.push(off, "Style/SymbolProc", true, msg);
+            }
+        }
+        if let Some(a) = node.arguments() {
+            for arg in a.arguments().iter() {
+                self.visit(&arg);
+            }
+        }
+        if let Some(b) = node.block() {
+            self.visit(&b);
+        }
+    }
+    fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+        if let Some(b) = node.block() {
+            let b = b.as_node();
+            if let Some((off, msg)) = self.symbol_proc_super(&b, false) {
+                self.push(off, "Style/SymbolProc", true, msg);
+            }
+            self.visit(&b);
+        }
     }
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
         // `class << self` is a scoping context — nested defs inside are allowed.
