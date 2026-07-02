@@ -1298,6 +1298,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ll_exit_collection();
     }
     fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.check_block_end_newline_lambda(node);
         self.check_empty_lambda_parameter(node);
         self.ll_check_lambda(node);
         if let Some((off, msg)) = self.symbol_proc_lambda(node) {

@@ -2401,14 +2401,37 @@ impl<'a> Cops<'a> {
     /// Layout/BlockEndNewline — checks whether the end statement of a do..end
     /// block or closing `}` of a { } block is on its own line (for multiline blocks).
     pub(crate) fn check_block_end_newline(&mut self, node: &ruby_prism::BlockNode) {
+        let last_child_end = self.find_block_last_child_end_offset(node);
+        self.check_block_end_newline_core(node.opening_loc(), node.closing_loc(), last_child_end, node.body());
+    }
+
+    // `-> { ... }` is a whitequark :block (upstream's on_block fires) but a
+    // distinct LambdaNode in prism — same geometry, same check.
+    pub(crate) fn check_block_end_newline_lambda(&mut self, node: &ruby_prism::LambdaNode) {
+        let last_child_end = if let Some(body) = node.body() {
+            match body.as_statements_node().and_then(|st| st.body().iter().last()) {
+                Some(last_stmt) => last_stmt.location().end_offset(),
+                None => body.location().end_offset(),
+            }
+        } else if let Some(params) = node.parameters() {
+            params.location().end_offset()
+        } else {
+            node.opening_loc().end_offset()
+        };
+        self.check_block_end_newline_core(node.opening_loc(), node.closing_loc(), last_child_end, node.body());
+    }
+
+    fn check_block_end_newline_core(
+        &mut self,
+        open_loc: ruby_prism::Location,
+        close_loc: ruby_prism::Location,
+        offense_start: usize,
+        body: Option<ruby_prism::Node>,
+    ) {
         const COP: &str = "Layout/BlockEndNewline";
         if !self.on(COP) {
             return;
         }
-
-        // Get the opening and closing locations
-        let open_loc = node.opening_loc();
-        let close_loc = node.closing_loc();
 
         let open_line = self.idx.loc(open_loc.start_offset()).0;
         let close_line = self.idx.loc(close_loc.start_offset()).0;
@@ -2429,10 +2452,6 @@ impl<'a> Cops<'a> {
             return; // end/} is already on its own line
         }
 
-        // Calculate the offense range: from the last child of the block body to the end
-        // This matches RuboCop's logic of finding the last non-nil child
-        let offense_start = self.find_block_last_child_end_offset(node);
-
         // The offense range spans THROUGH the `}`/`end` (upstream joins the
         // last child's end with node.loc.end), so the lstripped replacement
         // carries the terminator with it.
@@ -2450,7 +2469,7 @@ impl<'a> Cops<'a> {
 
         let replacement = format!("\n{}", trimmed).into_bytes();
         // Check if there's a heredoc in the block body
-        let heredoc_end_off = self.find_last_heredoc_offset(node.body());
+        let heredoc_end_off = self.find_last_heredoc_offset(body);
         if let Some(heredoc_off) = heredoc_end_off {
             // For heredoc case: remove the offense range and insert after the
             // heredoc terminator (before its newline)
