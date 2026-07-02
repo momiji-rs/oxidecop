@@ -140,7 +140,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Layout/SpaceBeforeComma",
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
-    "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot",
+    "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -671,25 +671,6 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         ruby_prism::visit_constant_path_write_node(self, node);
     }
-    fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
-        let klass = node.name().as_slice();
-        if matches!(klass, b"Fixnum" | b"Bignum") {
-            let l = node.location();
-            self.check_unified_integer(klass, l.start_offset(), l.end_offset());
-        }
-    }
-    fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
-        // Only check if parent is None (bare ::rooted constant, not namespaced)
-        if node.parent().is_none() {
-            if let Some(name) = node.name() {
-                let klass = name.as_slice();
-                if matches!(klass, b"Fixnum" | b"Bignum") {
-                    let l = node.location();
-                    self.check_unified_integer(klass, l.start_offset(), l.end_offset());
-                }
-            }
-        }
-    }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
         self.check_negated_if(node);
         if let Some(kw) = node.if_keyword_loc() {
@@ -740,6 +721,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_when_node(&mut self, node: &ruby_prism::WhenNode<'pr>) {
         self.check_when_then(node);
         ruby_prism::visit_when_node(self, node);
+    }
+    fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+        let klass = node.name().as_slice();
+        if matches!(klass, b"Fixnum" | b"Bignum") {
+            let l = node.location();
+            self.check_unified_integer(klass, l.start_offset(), l.end_offset());
+        }
+    }
+    fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+        // only a bare ::-rooted constant counts, not a namespaced one
+        if node.parent().is_none() {
+            if let Some(name) = node.name() {
+                let klass = name.as_slice();
+                if matches!(klass, b"Fixnum" | b"Bignum") {
+                    let l = node.location();
+                    self.check_unified_integer(klass, l.start_offset(), l.end_offset());
+                }
+            }
+        }
+        ruby_prism::visit_constant_path_node(self, node);
     }
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
         self.check_rescue_exception(node);
