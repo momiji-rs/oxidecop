@@ -193,7 +193,8 @@ def parse_config_sections(joined)
     sec = Regexp.last_match(1)
     val = Regexp.last_match(2).strip
     merges_cop_config = !val.sub!(/\.merge\(cop_config\)\s*\z/, '').nil?
-    sections[sec] = [extract_hash(val), merges_cop_config]
+    # a bare identifier is a let reference — resolved per example, lazily
+    sections[sec] = [val =~ /\A\w+\z/ ? val : extract_hash(val), merges_cop_config]
   end
   sections.empty? ? nil : sections
 end
@@ -258,8 +259,8 @@ while i < lines.length
   # A scalar `let(:name) { true/false/42/'str' }` — cop_config values often
   # reference these (`'SplitStrings' => split_strings`); record them per scope
   # so the reference resolves like RSpec would.
-  if cfg_stack.any? && l =~ /let\(:(\w+)\)\s*\{\s*(true|false|-?\d+|'[^']*'|"[^"]*")\s*\}\s*\z/ &&
-     !%w[cop_config config cop].include?(Regexp.last_match(1))
+  if cfg_stack.any? && l =~ /let\(:(\w+)\)\s*\{\s*(true|false|-?\d+|'[^']*'|"[^"]*"|\{.*\})\s*\}\s*\z/ &&
+     !%w[cop_config config cop other_cops].include?(Regexp.last_match(1))
     cfg_stack.last[7][Regexp.last_match(1)] = Regexp.last_match(2)
   end
   # `let(:other_cops)` — extra config SECTIONS the example needs (e.g.
@@ -472,6 +473,14 @@ def resolve_cfg_variables!(h, lets = {})
   h
 end
 
+# A section text that is a bare identifier resolves through the example's
+# lets (RSpec's lazy `let` semantics); else it's already hash text.
+def resolve_section_text(text, lets)
+  return lets[text] || 'default' if text =~ /\A\w+\z/
+
+  text
+end
+
 # `ex[:cfg]` is the raw `let(:cop_config)` hash text (quotes preserved), e.g.
 # "{ 'EnforcedStyle' => single_quotes }" or
 # "{ 'Max' => 18, 'AllowedPatterns' => ['^\\s*test\\s'] }" or "default".
@@ -586,12 +595,12 @@ examples.each_with_index do |ex, n|
     cfg_hash = resolve_cfg_variables!(parse_cfg(ex[:override]), ex[:lets] || {}) || {}
     if (sections = ex[:sections])
       extra_sections = sections.reject { |k, _| k == COP }
-                               .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(h)) || {}] }
+                               .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(resolve_section_text(h, ex[:lets] || {}))) || {}] }
     end
   elsif (sections = ex[:sections])
     replace = true
     base = sections[COP]
-    cop_hash = base ? parse_cfg(base[0]) : {}
+    cop_hash = base ? parse_cfg(resolve_section_text(base[0], ex[:lets] || {})) : {}
     cop_hash.merge!(cfg_hash) if base && base[1]
     cfg_hash = resolve_cfg_variables!(cop_hash, ex[:lets] || {})
     if cfg_hash.nil?
@@ -599,7 +608,7 @@ examples.each_with_index do |ex, n|
       next
     end
     extra_sections = sections.reject { |k, _| k == COP }
-                             .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(h)) || {}] }
+                             .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(resolve_section_text(h, ex[:lets] || {}))) || {}] }
   end
 
   if (oc = ex[:other_cops]) && oc != 'default'
