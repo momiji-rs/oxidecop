@@ -83,6 +83,14 @@ fn main() {
             files.push(p.clone());
         }
     }
+    // honor AllCops: Exclude (paths made config-relative, i.e. CWD-relative)
+    let excludes = cfg.exclude_matchers();
+    if !excludes.is_empty() {
+        files.retain(|f| {
+            let rel = f.strip_prefix("./").unwrap_or(f).to_string_lossy().replace('\\', "/");
+            !excludes.iter().any(|re| re.is_match(&rel))
+        });
+    }
 
     // --fix rewrites a single file's source to stdout (like `rubocop -a`
     // piped); multi-file in-place correction is not wired up yet.

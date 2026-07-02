@@ -80,6 +80,7 @@ impl Config {
     pub fn parse(text: &str) -> Self {
         let mut sections: HashMap<String, HashMap<String, String>> = HashMap::new();
         let mut cur: Option<String> = None;
+        let mut cur_list_key: Option<String> = None;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or(""); // strip comments
             if line.trim().is_empty() {
@@ -88,6 +89,7 @@ impl Config {
             let indented = line.starts_with(' ') || line.starts_with('\t');
             let t = line.trim();
             if !indented {
+                cur_list_key = None;
                 // top-level "Section:" (may also be "Section: value" — ignore value)
                 if let Some(name) = t.strip_suffix(':') {
                     cur = Some(name.to_string());
@@ -96,11 +98,24 @@ impl Config {
                     cur = Some(k.trim().to_string());
                     sections.entry(k.trim().to_string()).or_default();
                 }
+            } else if let Some(item) = t.strip_prefix("- ") {
+                // a block-list item under the last seen key: accumulate into
+                // the flow form (`['a', 'b']`) that parse_allowed_list reads.
+                if let (Some(sec), Some(key)) = (&cur, &cur_list_key) {
+                    let map = sections.get_mut(sec).unwrap();
+                    let item = item.trim().trim_matches(|c| c == '\'' || c == '"');
+                    let entry = map.entry(key.clone()).or_default();
+                    if entry.is_empty() || entry == "[]" {
+                        *entry = format!("['{item}']");
+                    } else if entry.ends_with(']') {
+                        entry.truncate(entry.len() - 1);
+                        entry.push_str(&format!(", '{item}']"));
+                    }
+                }
             } else if let (Some(sec), Some((k, v))) = (&cur, t.split_once(':')) {
-                sections
-                    .get_mut(sec)
-                    .unwrap()
-                    .insert(k.trim().to_string(), v.trim().to_string());
+                let (k, v) = (k.trim().to_string(), v.trim().to_string());
+                cur_list_key = v.is_empty().then(|| k.clone());
+                sections.get_mut(sec).unwrap().insert(k, v);
             }
         }
         let all_disabled_by_default = sections
@@ -161,6 +176,14 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2.7)
     }
+    /// The AllCops Exclude patterns, compiled once. Patterns are
+    /// rubocop-style globs: `**` spans directories, `*` doesn't.
+    pub fn exclude_matchers(&self) -> Vec<regex::Regex> {
+        let Some(v) = self.sections.get("AllCops").and_then(|s| s.get("Exclude")) else {
+            return Vec::new();
+        };
+        parse_allowed_list(v).iter().filter_map(|p| glob_regex(p)).collect()
+    }
     /// AllCops/ActiveSupportExtensionsEnabled (default false). Gates whether
     /// `proc`/`lambda`/`Proc.new` blocks are candidates for Style/SymbolProc.
     pub fn active_support(&self) -> bool {
@@ -170,4 +193,30 @@ impl Config {
             .map(|v| v == "true")
             .unwrap_or(false)
     }
+}
+
+/// Minimal rubocop-glob compiler: `**` crosses directory separators, `*` and
+/// `?` don't. Anchored to the whole path.
+pub fn glob_regex(pat: &str) -> Option<regex::Regex> {
+    let mut re = String::from("^");
+    let mut chars = pat.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' if chars.peek() == Some(&'*') => {
+                chars.next();
+                // `**/` may match nothing at all
+                if chars.peek() == Some(&'/') {
+                    chars.next();
+                    re.push_str("(?:.*/)?");
+                } else {
+                    re.push_str(".*");
+                }
+            }
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            c => re.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    re.push('$');
+    regex::Regex::new(&re).ok()
 }
