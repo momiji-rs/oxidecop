@@ -283,6 +283,7 @@ while i < lines.length
     kind = Regexp.last_match(1) == 'offense' ? :offense : :no_offense
     squiggly = Regexp.last_match(2) == '~'
     raw_heredoc = Regexp.last_match(3) == "'"
+    chomp = !(l =~ /chomp:\s*true/).nil? # expect_offense(<<~RUBY, chomp: true)
     body = []
     i += 1
     until lines[i].strip == 'RUBY'
@@ -290,15 +291,18 @@ while i < lines.length
       i += 1
     end
     src, expected = parse_block(body, raw_heredoc, squiggly)
+    src = src.chomp if chomp
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
-                  sections: cur_sec, override: cur_ovr, ruby: cur_rb, src: src, expected: expected }
+                  sections: cur_sec, override: cur_ovr, ruby: cur_rb, raw: raw_heredoc,
+                  src: src, expected: expected }
   elsif l =~ /expect_no_offenses\((['"])(.*?)\1\)/
     quote, body = Regexp.last_match(1), Regexp.last_match(2)
     # A plain string arg renders by its quote's rules: double-quoted like a
     # heredoc; single-quoted only interprets \\ and \'.
     body = quote == '"' ? unescape_dq(body) : body.gsub(/\\([\\'])/, '\1')
+    body += "\n" unless body.end_with?("\n")
     examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
-                  sections: cur_sec, override: cur_ovr, ruby: cur_rb, src: body + "\n", expected: [] }
+                  sections: cur_sec, override: cur_ovr, ruby: cur_rb, src: body, expected: [] }
   end
   i += 1
 end
@@ -503,8 +507,9 @@ examples.each_with_index do |ex, n|
   # Unrepresentable: source still interpolates a value we can't resolve
   # statically — `#{keyword}`-style RSpec loop vars, or `%{identifier}`
   # expect_offense keyword substitutions. Linting the literal text would be
-  # meaningless, so exclude rather than score as a miss.
-  if src =~ /\#\{|%\{/
+  # meaningless, so exclude rather than score as a miss. A raw `<<~'RUBY'`
+  # heredoc is never interpolated by RSpec — its `#{}` is code under test.
+  if (src =~ /\#\{/ && !ex[:raw]) || src =~ /%\{/
     g[:skipped] += 1
     next
   end
