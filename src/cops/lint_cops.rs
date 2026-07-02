@@ -1247,3 +1247,31 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((l.start_offset(), l.end_offset(), replacement));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/UselessElseWithoutRescue — `begin ... else ... end` with an
+    /// `else` clause but no `rescue` clause. Without a `rescue`, `else` is
+    /// dead code: it only ever runs when the `begin` body raised nothing,
+    /// which is exactly when a bare `begin/end` would already fall through
+    /// to run it anyway — so the `else` adds nothing but confusion.
+    ///
+    /// NOTE: this construct is a SYNTAX ERROR on Ruby 2.6+ (rubocop's own
+    /// cop is capped via `maximum_target_ruby_version 2.5` and sources the
+    /// offense from the legacy parser's `:useless_else` diagnostic reason).
+    /// prism still parses it into a usable `BeginNode` — `else_clause` set,
+    /// `rescue_clause` `None` — alongside a `begin_lonely_else` parse error
+    /// we don't surface elsewhere, so we detect it directly off the AST
+    /// shape instead of a diagnostic-reason lookup.
+    pub(crate) fn check_useless_else_without_rescue(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Lint/UselessElseWithoutRescue";
+        if !self.on(COP) {
+            return;
+        }
+        if node.rescue_clause().is_some() {
+            return;
+        }
+        let Some(else_clause) = node.else_clause() else { return };
+        let kw = else_clause.else_keyword_loc();
+        self.push(kw.start_offset(), COP, false, "`else` without `rescue` is useless.");
+    }
+}
