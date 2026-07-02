@@ -108,6 +108,7 @@ COPS = {
   'Layout/SpaceInsidePercentLiteralDelimiters' => 'layout/space_inside_percent_literal_delimiters',
   'Lint/EmptyWhen'                   => 'lint/empty_when',
   'Lint/InheritException'            => 'lint/inherit_exception',
+  'Lint/ConstantDefinitionInBlock'   => 'lint/constant_definition_in_block',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

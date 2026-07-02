@@ -2276,3 +2276,62 @@ fn inherit_exception_const_info(node: &ruby_prism::Node) -> Option<(String, bool
     }
     None
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/ConstantDefinitionInBlock — a bare constant assignment
+    /// (`FOO = 1`), or a `class`/`module` definition, that's a direct
+    /// statement of a block's body (do..end/`{}`/numblock/itblock — prism
+    /// represents all of these as one `BlockNode`).
+    ///
+    /// Ported from rubocop's two node-matchers:
+    ///   constant_assigned_in_block?: ({^any_block [^begin ^^any_block]} nil? ...)
+    ///   module_defined_in_block?:    ({^any_block [^begin ^^any_block]} ...)
+    /// i.e. the node's parent is any_block, OR its parent is `begin` (a
+    /// multi-statement body) and ITS parent is any_block; casgn additionally
+    /// requires a nil scope (excludes `self::FOO`/`::FOO`/`Foo::BAR`).
+    ///
+    /// Prism always wraps a block's body in a `StatementsNode` — even a
+    /// single-statement body — so both whitequark shapes above collapse into
+    /// one check here: is this node a direct element of a `StatementsNode`
+    /// whose own parent is a `BlockNode`? That's exactly what
+    /// `block_owns_next_stmts` (set in `visit_block_node`, mod.rs) answers:
+    /// it's only ever true for the StatementsNode reached immediately after
+    /// a block (a rescue/ensure body inside a block is a `BeginNode`, not a
+    /// `StatementsNode`, so the flag is never set for it — matching rubocop,
+    /// which doesn't flag a casgn whose parent is `rescue`/`ensure` either).
+    ///
+    /// `self::FOO = 1` / `::FOO = 1` / `Foo::BAR = 1` (prism's
+    /// ConstantPathWriteNode) always have a non-nil scope, so they can never
+    /// match the upstream pattern — only plain ConstantWriteNode is checked.
+    /// Compound constant assignment (`FOO ||= 1`, `FOO += 1`, ...) translates
+    /// to `(op_asgn (casgn nil :FOO) ...)` upstream — the casgn's parent is
+    /// the op-asgn node, never any_block/begin — so those never match either
+    /// and prism's dedicated Or/And/Operator-write nodes are correctly never
+    /// hooked into this check.
+    pub(crate) fn check_constant_definition_in_block(&mut self, stmts: &ruby_prism::StatementsNode) {
+        const COP: &str = "Lint/ConstantDefinitionInBlock";
+        let parent_is_block = std::mem::take(&mut self.block_owns_next_stmts);
+        if !parent_is_block || !self.on(COP) {
+            return;
+        }
+        let Some(&(mstart, mend)) = self.call_stack.last() else { return };
+        for stmt in stmts.body().iter() {
+            if stmt.as_constant_write_node().is_none()
+                && stmt.as_class_node().is_none()
+                && stmt.as_module_node().is_none()
+            {
+                continue;
+            }
+            let method_name = &self.src[mstart..mend];
+            if self.allowed(COP, method_name) {
+                continue;
+            }
+            self.push(
+                stmt.location().start_offset(),
+                COP,
+                false,
+                "Do not define constants this way within a block.",
+            );
+        }
+    }
+}

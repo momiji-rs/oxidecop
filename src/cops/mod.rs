@@ -142,7 +142,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire", "Lint/TrailingCommaInAttributeDeclaration",
-    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException",
+    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -495,6 +495,12 @@ pub(crate) struct Cops<'a> {
     // `assignment_indentation_hook` in layout.rs for why this is only ever
     // ONE level, matching upstream's `leftmost_multiple_assignment` bug.
     pub(crate) assignment_leftmost: HashMap<usize, usize>,
+    // Lint/ConstantDefinitionInBlock: set by `visit_block_node` right before
+    // descending into a block's body when that body is a `StatementsNode` —
+    // the very next `visit_statements_node` call consumes (takes) it, so it's
+    // true iff THAT statements list is literally the block's own body (not
+    // some deeper def/if/class statements list reached along the way).
+    pub(crate) block_owns_next_stmts: bool,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1006,9 +1012,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
         self.check_semicolon_separators(node);
         self.ll_check_semicolons(node);
+        self.check_constant_definition_in_block(node);
         self.stmts_stack.push(node.location().start_offset());
         ruby_prism::visit_statements_node(self, node);
         self.stmts_stack.pop();
+    }
+    // Lint/ConstantDefinitionInBlock: no other cop needs a general "what's my
+    // parent" answer, so rather than a full ancestor stack this hand-rolls
+    // the default BlockNode walk (params, then body — see
+    // `ruby_prism::visit_block_node`) to flag "the body about to be visited
+    // IS this block's own StatementsNode" right before descending into it.
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        if let Some(params) = node.parameters() {
+            self.visit(&params);
+        }
+        if let Some(body) = node.body() {
+            if body.as_statements_node().is_some() {
+                self.block_owns_next_stmts = true;
+            }
+            self.visit(&body);
+        }
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
@@ -1607,6 +1630,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         multiline_if_mod_seen: HashSet::new(),
         nested_ternary_reported: HashSet::new(),
         assignment_leftmost: HashMap::new(),
+        block_owns_next_stmts: false,
     };
 
     let t = tick(&T_PREP, t);
