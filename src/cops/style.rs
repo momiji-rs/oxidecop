@@ -2031,6 +2031,12 @@ impl<'a> super::Cops<'a> {
                             self.push(c.start_offset() + i + 1, "Style/GlobalVars", false,
                                 "Do not introduce global variables.");
                         }
+                        // rubocop's VariableInterpolation fires on the same
+                        // phantom gvar interpolation
+                        if self.on("Style/VariableInterpolation") {
+                            self.push(c.start_offset() + i + 1, "Style/VariableInterpolation", false,
+                                format!("Replace interpolated variable `{name}` with expression `#{{{name}}}`."));
+                        }
                     }
                 }
             }
