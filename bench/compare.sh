@@ -39,7 +39,6 @@ for corpus in "$@"; do
   done
   echo
 
-  set --_dummy
   cmds="-n rubocop-rs '$BIN --only $COPS .'"
   for comp in ${COMPETITORS:-oxicop nitrocop}; do
     cbin=$(find_bin "$comp") || continue
