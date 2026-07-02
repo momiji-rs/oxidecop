@@ -1664,3 +1664,207 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/InterpolationCheck — detects interpolation in single-quoted strings.
+    /// Single-quoted strings should not have interpolation; the correct approach
+    /// is to use double quotes for interpolated strings.
+    pub(crate) fn check_interpolation_check(&mut self, node: &ruby_prism::StringNode) {
+        const COP: &str = "Lint/InterpolationCheck";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Skip if this string is inside an interpolation context
+        if self.interp_depth > 0 {
+            return;
+        }
+
+        // Get opening and closing locations
+        let Some(open_loc) = node.opening_loc() else { return };
+        let Some(close_loc) = node.closing_loc() else { return };
+
+        // Check if it's a single-quoted string
+        if open_loc.as_slice() != b"'" {
+            return;
+        }
+
+        // Skip heredocs
+        if open_loc.as_slice().starts_with(b"<<") {
+            return;
+        }
+
+        // Get the full source of the string
+        let src = self.node_src(&node.as_node());
+
+        // Check for unescaped interpolation
+        let has_interpolation = self.has_unescaped_interpolation(src);
+        if !has_interpolation {
+            return;
+        }
+
+        // Check if the syntax would be valid if converted to double quotes
+        if !self.would_be_valid_double_quoted(src) {
+            return;
+        }
+
+        let l = node.location();
+        self.push(
+            l.start_offset(),
+            COP,
+            true,
+            "Interpolation in single quoted string detected. Use double quoted strings if you need interpolation.",
+        );
+
+        // Add the fix
+        self.add_interpolation_fix(open_loc.start_offset(), open_loc.end_offset(), close_loc.start_offset(), close_loc.end_offset(), src);
+    }
+
+    /// Check for interpolation in multiline single-quoted strings (dstr nodes)
+    pub(crate) fn check_interpolation_check_dstr(&mut self, node: &ruby_prism::InterpolatedStringNode) {
+        const COP: &str = "Lint/InterpolationCheck";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Skip if this is not a single-quoted string
+        let Some(open_loc) = node.opening_loc() else { return };
+        if open_loc.as_slice() != b"'" {
+            return;
+        }
+
+        // Skip heredocs
+        if open_loc.as_slice().starts_with(b"<<") {
+            return;
+        }
+
+        // Get the full source
+        let src = self.node_src(&node.as_node());
+
+        // Check for unescaped interpolation
+        let has_interpolation = self.has_unescaped_interpolation(src);
+        if !has_interpolation {
+            return;
+        }
+
+        // Check if the syntax would be valid if converted to double quotes
+        if !self.would_be_valid_double_quoted(src) {
+            return;
+        }
+
+        let l = node.location();
+        self.push(
+            l.start_offset(),
+            COP,
+            true,
+            "Interpolation in single quoted string detected. Use double quoted strings if you need interpolation.",
+        );
+
+        // Add the fix
+        let Some(close_loc) = node.closing_loc() else { return };
+        self.add_interpolation_fix(open_loc.start_offset(), open_loc.end_offset(), close_loc.start_offset(), close_loc.end_offset(), src);
+    }
+
+    /// Check if a byte string contains unescaped interpolation (#{ ... })
+    fn has_unescaped_interpolation(&self, src: &[u8]) -> bool {
+        let mut i = 0;
+        while i < src.len() {
+            if src[i] == b'#' && i + 1 < src.len() && src[i + 1] == b'{' {
+                // Check if the # is escaped (preceded by odd number of backslashes)
+                let mut backslash_count = 0;
+                let mut j = i as i32 - 1;
+                while j >= 0 && src[j as usize] == b'\\' {
+                    backslash_count += 1;
+                    j -= 1;
+                }
+                // If even number of backslashes (or zero), the # is not escaped
+                if backslash_count % 2 == 0 {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Check if converting to double quotes would result in valid syntax
+    fn would_be_valid_double_quoted(&self, src: &[u8]) -> bool {
+        // Skip if source contains patterns that would create invalid syntax
+
+        // Skip if contains %<...>s pattern (format string syntax invalid in interpolation)
+        if src.windows(2).any(|w| w == b"%<") {
+            return false;
+        }
+
+        // Get the content (without quotes)
+        let content = if src.len() > 2 {
+            &src[1..src.len() - 1]
+        } else {
+            b""
+        };
+
+        // Skip if using %{...} format and content has unbalanced closing braces
+        if src.contains(&b'"') {
+            // Would use %{...} format
+            // Check for } followed by #{, which would break the percent literal
+            let mut i = 0;
+            while i < content.len() {
+                if content[i] == b'}' {
+                    // Check if this is followed by unescaped #{
+                    if i + 1 < content.len() {
+                        if content[i + 1..].starts_with(b" #{")
+                            || (i + 1 < content.len() && content[i + 1..].starts_with(b"#{")) {
+                            return false;
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        // Try to parse the converted string
+        let double_quoted_string = if src.contains(&b'"') {
+            // If the string contains double quotes, wrap with %{...}
+            let mut result = Vec::with_capacity(src.len() + 4);
+            result.extend_from_slice(b"%{");
+            result.extend_from_slice(content);
+            result.extend_from_slice(b"}");
+            result
+        } else {
+            // Replace single quotes with double quotes
+            let mut result = Vec::with_capacity(src.len());
+            result.push(b'"');
+            result.extend_from_slice(content);
+            result.push(b'"');
+            result
+        };
+
+        // Try to parse the converted string
+        let parse_result = ruby_prism::parse(&double_quoted_string);
+        let root_node = &parse_result.node();
+
+        // The parsed result is a ProgramNode, get the first statement
+        if let Some(program) = root_node.as_program_node() {
+            if let Some(stmt) = program.statements().body().iter().next() {
+                // Check if the statement is an interpolated string
+                return stmt.as_interpolated_string_node().is_some();
+            }
+        }
+
+        false
+    }
+
+    /// Add the autocorrect fix for interpolation check
+    fn add_interpolation_fix(&mut self, open_start: usize, open_end: usize, close_start: usize, close_end: usize, src: &[u8]) {
+        if src.contains(&b'"') {
+            // Replace single quote with %{
+            self.fixes.push((open_start, open_end, b"%{".to_vec()));
+            // Replace closing single quote with }
+            self.fixes.push((close_start, close_end, b"}".to_vec()));
+        } else {
+            // Replace single quotes with double quotes
+            self.fixes.push((open_start, open_end, b"\"".to_vec()));
+            self.fixes.push((close_start, close_end, b"\"".to_vec()));
+        }
+    }
+}
