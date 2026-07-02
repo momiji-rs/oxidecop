@@ -1840,17 +1840,21 @@ impl<'a> Cops<'a> {
 }
 
 
-/// The 4 `EnforcedStyle`s the `EmptyLinesAroundBody` mixin supports for
-/// class/module bodies (the `beginning_only`/`ending_only` styles are
-/// `EmptyLinesAroundClassBody`-only additions to `SupportedStyles` that
-/// `EmptyLinesAroundModuleBody`'s schema never lists, so they're not
-/// modeled here).
+/// The `EnforcedStyle`s the `EmptyLinesAroundBody` mixin supports for
+/// class/module bodies. `BeginningOnly`/`EndingOnly` are
+/// `EmptyLinesAroundClassBody`-only additions to `SupportedStyles` —
+/// `EmptyLinesAroundModuleBody`'s schema never lists them — but they're
+/// modeled here too since both cops share this enum; `el_check_both`
+/// resolves them down to a `NoEmptyLines`/`EmptyLines` pair before they
+/// ever reach `el_check_beginning`/`el_check_ending`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ElStyle {
     NoEmptyLines,
     EmptyLines,
     EmptyLinesExceptNamespace,
     EmptyLinesSpecial,
+    BeginningOnly,
+    EndingOnly,
 }
 
 /// `EmptyLinesAroundBody#constant_definition?` — `{class module}` node
@@ -1986,6 +1990,26 @@ impl<'a> Cops<'a> {
             return; // `node.single_line?`
         }
 
+        self.el_check(COP, "module", style, body, first_line, last_line);
+    }
+
+    /// Shared `check`/`check_empty_lines_except_namespace`/
+    /// `check_empty_lines_special` dispatch from the `EmptyLinesAroundBody`
+    /// mixin — common to `EmptyLinesAroundModuleBody`'s `on_module` and
+    /// `EmptyLinesAroundClassBody`'s `on_class`/`on_sclass`, once each has
+    /// resolved its own `style`/`body`/`first_line`/`last_line` (including
+    /// the `on_class`-only `adjusted_first_line` and the `valid_body_style?`/
+    /// `single_line?` guards, which live in the per-node-type callers since
+    /// they run before this point in the mixin's `check`).
+    fn el_check(
+        &mut self,
+        cop: &'static str,
+        kind: &str,
+        style: ElStyle,
+        body: Option<ruby_prism::Node>,
+        first_line: usize,
+        last_line: usize,
+    ) {
         match style {
             ElStyle::EmptyLinesExceptNamespace => {
                 // Guaranteed `Some` here: a `nil` body already returned above
@@ -1993,7 +2017,7 @@ impl<'a> Cops<'a> {
                 let body = body.expect("checked above");
                 let sub =
                     if el_is_namespace(&body, true) { ElStyle::NoEmptyLines } else { ElStyle::EmptyLines };
-                self.el_check_both(COP, sub, first_line, last_line);
+                self.el_check_both(cop, kind, sub, first_line, last_line);
             }
             ElStyle::EmptyLinesSpecial => {
                 let Some(body) = body else { return };
@@ -2001,18 +2025,18 @@ impl<'a> Cops<'a> {
                 // and `check_empty_lines_special`) pass `with_one_child:
                 // true` — the `false` default is never actually used.
                 if el_is_namespace(&body, true) {
-                    self.el_check_both(COP, ElStyle::NoEmptyLines, first_line, last_line);
+                    self.el_check_both(cop, kind, ElStyle::NoEmptyLines, first_line, last_line);
                 } else {
                     if el_first_child_requires_empty_line(&body) {
-                        self.el_check_beginning(COP, ElStyle::EmptyLines, first_line);
+                        self.el_check_beginning(cop, kind, ElStyle::EmptyLines, first_line);
                     } else {
-                        self.el_check_beginning(COP, ElStyle::NoEmptyLines, first_line);
-                        self.check_deferred_empty_line(COP, body);
+                        self.el_check_beginning(cop, kind, ElStyle::NoEmptyLines, first_line);
+                        self.check_deferred_empty_line(cop, body);
                     }
-                    self.el_check_ending(COP, ElStyle::EmptyLines, last_line);
+                    self.el_check_ending(cop, kind, ElStyle::EmptyLines, last_line);
                 }
             }
-            other => self.el_check_both(COP, other, first_line, last_line),
+            other => self.el_check_both(cop, kind, other, first_line, last_line),
         }
     }
 
@@ -2043,34 +2067,56 @@ impl<'a> Cops<'a> {
         }
     }
 
-    /// `check_both`.
-    fn el_check_both(&mut self, cop: &'static str, style: ElStyle, first_line: usize, last_line: usize) {
-        self.el_check_beginning(cop, style, first_line);
-        self.el_check_ending(cop, style, last_line);
+    /// `check_both` — plus the `beginning_only`/`ending_only` cases from
+    /// the same-named mixin method (`EmptyLinesAroundClassBody`-only
+    /// styles: each resolves to a fixed `NoEmptyLines`/`EmptyLines` pair
+    /// rather than reusing `style` for both ends).
+    fn el_check_both(&mut self, cop: &'static str, kind: &str, style: ElStyle, first_line: usize, last_line: usize) {
+        match style {
+            ElStyle::BeginningOnly => {
+                self.el_check_beginning(cop, kind, ElStyle::EmptyLines, first_line);
+                self.el_check_ending(cop, kind, ElStyle::NoEmptyLines, last_line);
+            }
+            ElStyle::EndingOnly => {
+                self.el_check_beginning(cop, kind, ElStyle::NoEmptyLines, first_line);
+                self.el_check_ending(cop, kind, ElStyle::EmptyLines, last_line);
+            }
+            _ => {
+                self.el_check_beginning(cop, kind, style, first_line);
+                self.el_check_ending(cop, kind, style, last_line);
+            }
+        }
     }
 
     /// `check_beginning` + `check_source`/`check_line` for the "beginning"
     /// anchor (`desc == 'beginning'`, so `check_line`'s `offset` is always
     /// 1): tests the line right after the node's own first line, and
     /// (for both styles) anchors the offense/fix at that same tested line.
-    fn el_check_beginning(&mut self, cop: &'static str, style: ElStyle, first_line: usize) {
+    fn el_check_beginning(&mut self, cop: &'static str, kind: &str, style: ElStyle, first_line: usize) {
         let tested_line = first_line + 1;
         match style {
             ElStyle::NoEmptyLines => {
                 if self.el_is_blank_line(tested_line) {
                     let off = self.idx.starts[tested_line - 1];
-                    self.push(off, cop, true, "Extra empty line detected at module body beginning.");
-                    self.fixes.push((off, off + 1, Vec::new()));
+                    if self.el_offended.insert((cop, off)) {
+                        self.push(off, cop, true, format!("Extra empty line detected at {kind} body beginning."));
+                        self.fixes.push((off, off + 1, Vec::new()));
+                    }
                 }
             }
             ElStyle::EmptyLines => {
                 if !self.el_is_blank_line(tested_line) {
                     let off = self.idx.starts[tested_line - 1];
-                    self.push(off, cop, true, "Empty line missing at module body beginning.");
-                    self.fixes.push((off, off, b"\n".to_vec()));
+                    if self.el_offended.insert((cop, off)) {
+                        self.push(off, cop, true, format!("Empty line missing at {kind} body beginning."));
+                        self.fixes.push((off, off, b"\n".to_vec()));
+                    }
                 }
             }
-            ElStyle::EmptyLinesExceptNamespace | ElStyle::EmptyLinesSpecial => unreachable!(),
+            ElStyle::EmptyLinesExceptNamespace
+            | ElStyle::EmptyLinesSpecial
+            | ElStyle::BeginningOnly
+            | ElStyle::EndingOnly => unreachable!(),
         }
     }
 
@@ -2079,24 +2125,31 @@ impl<'a> Cops<'a> {
     /// `end`. `no_empty_lines` anchors at that same tested line;
     /// `empty_lines` anchors one line further down — the closer's own line
     /// (`check_line`'s `offset = 2` special case for an "end." message).
-    fn el_check_ending(&mut self, cop: &'static str, style: ElStyle, last_line: usize) {
+    fn el_check_ending(&mut self, cop: &'static str, kind: &str, style: ElStyle, last_line: usize) {
         let tested_line = last_line - 1;
         match style {
             ElStyle::NoEmptyLines => {
                 if self.el_is_blank_line(tested_line) {
                     let off = self.idx.starts[tested_line - 1];
-                    self.push(off, cop, true, "Extra empty line detected at module body end.");
-                    self.fixes.push((off, off + 1, Vec::new()));
+                    if self.el_offended.insert((cop, off)) {
+                        self.push(off, cop, true, format!("Extra empty line detected at {kind} body end."));
+                        self.fixes.push((off, off + 1, Vec::new()));
+                    }
                 }
             }
             ElStyle::EmptyLines => {
                 if !self.el_is_blank_line(tested_line) {
                     let off = self.idx.starts[last_line - 1];
-                    self.push(off, cop, true, "Empty line missing at module body end.");
-                    self.fixes.push((off, off, b"\n".to_vec()));
+                    if self.el_offended.insert((cop, off)) {
+                        self.push(off, cop, true, format!("Empty line missing at {kind} body end."));
+                        self.fixes.push((off, off, b"\n".to_vec()));
+                    }
                 }
             }
-            ElStyle::EmptyLinesExceptNamespace | ElStyle::EmptyLinesSpecial => unreachable!(),
+            ElStyle::EmptyLinesExceptNamespace
+            | ElStyle::EmptyLinesSpecial
+            | ElStyle::BeginningOnly
+            | ElStyle::EndingOnly => unreachable!(),
         }
     }
 
@@ -2121,8 +2174,100 @@ impl<'a> Cops<'a> {
 
         let anchor_line = tested_line + 1;
         let Some(&off) = self.idx.starts.get(anchor_line - 1) else { return };
-        self.push(off, cop, true, el_deferred_message(&node));
-        self.fixes.push((off, off, b"\n".to_vec()));
+        if self.el_offended.insert((cop, off)) {
+            self.push(off, cop, true, el_deferred_message(&node));
+            self.fixes.push((off, off, b"\n".to_vec()));
+        }
+    }
+}
+
+/// `EnforcedStyle` for `Layout/EmptyLinesAroundClassBody` — unlike
+/// `EmptyLinesAroundModuleBody`, this cop's schema also lists
+/// `beginning_only`/`ending_only` (see `config/default.yml`).
+fn el_class_style(raw: &str) -> ElStyle {
+    match raw {
+        "empty_lines" => ElStyle::EmptyLines,
+        "empty_lines_except_namespace" => ElStyle::EmptyLinesExceptNamespace,
+        "empty_lines_special" => ElStyle::EmptyLinesSpecial,
+        "beginning_only" => ElStyle::BeginningOnly,
+        "ending_only" => ElStyle::EndingOnly,
+        _ => ElStyle::NoEmptyLines,
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// Layout/EmptyLinesAroundClassBody — ports rubocop's
+    /// `EmptyLinesAroundClassBody` cop: a thin `on_class`/`on_sclass` shim
+    /// over the shared `EmptyLinesAroundBody` mixin (see
+    /// `check_empty_lines_around_module_body` above, whose `el_*` helpers
+    /// this reuses in full). Two differences from the module cop:
+    ///
+    /// - its `SupportedStyles` additionally include `beginning_only`/
+    ///   `ending_only` (`el_class_style` above, `el_check_both`'s extra
+    ///   match arms);
+    /// - `on_class` passes `adjusted_first_line: node.parent_class.last_line`
+    ///   when the class has a superclass expression — so for e.g.
+    ///   `class Foo < Struct.new(\n  ...\n)\n\n  body\nend`, the "beginning"
+    ///   check treats the superclass's own closing line as the class's
+    ///   effective first line, and looks for a blank line right after it
+    ///   (not right after the `class Foo < Struct.new(` line). `on_sclass`
+    ///   has no superclass, so it never adjusts.
+    ///
+    /// Both entry points share the KIND = 'class' message text (i.e.
+    /// "class body ..." even for `class << self`) since rubocop's `KIND`
+    /// is a cop-level constant, not per-node.
+    pub(crate) fn check_empty_lines_around_class_body(&mut self, node: &ruby_prism::ClassNode) {
+        const COP: &str = "Layout/EmptyLinesAroundClassBody";
+        if !self.on(COP) {
+            return;
+        }
+
+        let style = el_class_style(self.cfg.enforced_style(COP));
+
+        let body = node.body();
+        // `valid_body_style?`: `body.nil? && style != :no_empty_lines`.
+        if body.is_none() && style != ElStyle::NoEmptyLines {
+            return;
+        }
+
+        let node_loc = node.location();
+        let first_line = self.idx.loc(node_loc.start_offset()).0;
+        let last_line = self.idx.loc(node_loc.end_offset().saturating_sub(1)).0;
+        if first_line == last_line {
+            return; // `node.single_line?`
+        }
+
+        // `first_line = node.parent_class.last_line if node.parent_class`.
+        let first_line = match node.superclass() {
+            Some(sc) => self.idx.loc(sc.location().end_offset().saturating_sub(1)).0,
+            None => first_line,
+        };
+
+        self.el_check(COP, "class", style, body, first_line, last_line);
+    }
+
+    /// `on_sclass` — `check(node, node.body)`, no `adjusted_first_line`.
+    pub(crate) fn check_empty_lines_around_sclass_body(&mut self, node: &ruby_prism::SingletonClassNode) {
+        const COP: &str = "Layout/EmptyLinesAroundClassBody";
+        if !self.on(COP) {
+            return;
+        }
+
+        let style = el_class_style(self.cfg.enforced_style(COP));
+
+        let body = node.body();
+        if body.is_none() && style != ElStyle::NoEmptyLines {
+            return;
+        }
+
+        let node_loc = node.location();
+        let first_line = self.idx.loc(node_loc.start_offset()).0;
+        let last_line = self.idx.loc(node_loc.end_offset().saturating_sub(1)).0;
+        if first_line == last_line {
+            return;
+        }
+
+        self.el_check(COP, "class", style, body, first_line, last_line);
     }
 }
 impl<'a> super::Cops<'a> {

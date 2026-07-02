@@ -142,7 +142,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire", "Lint/TrailingCommaInAttributeDeclaration",
-    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition",
+    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -503,6 +503,15 @@ pub(crate) struct Cops<'a> {
     pub(crate) block_owns_next_stmts: bool,
     // Relative file path for cops that need to check the filename (e.g., Gemfile)
     pub(crate) rel_path: &'a str,
+    // Layout/EmptyLinesAroundClassBody / EmptyLinesAroundModuleBody:
+    // (cop, start-offset) pairs already offended-on — `check_beginning` and
+    // `check_ending` collapse onto the exact same physical line when a
+    // class/module/sclass body is nothing but a single blank line (e.g.
+    // `class << self\n\nend`), and upstream's `Base#add_offense` silently
+    // drops the second `add_offense` call for an identical range
+    // (`current_offense_locations.add?(range)`), so only the "beginning"
+    // message survives.
+    pub(crate) el_offended: HashSet<(&'static str, usize)>,
     // Lint/ElseLayout: start offsets of else-body first-statements already
     // reported — upstream's unguarded one-level elsif recursion can revisit
     // the same else branch; Base#add_offense dedups by range there.
@@ -1208,6 +1217,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_camel_case_name(&node.constant_path());
         self.check_inherit_exception_class(node);
         self.check_ineffective_access_modifier(node.body());
+        self.check_empty_lines_around_class_body(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
@@ -1343,6 +1353,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_forwarding_super_node(self, node);
     }
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        self.check_empty_lines_around_sclass_body(node);
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(), node.body().is_some(), false, true);
         self.check_trailing_body_on_class(node.class_keyword_loc().start_offset(), l.end_offset(), node.body());
@@ -1659,6 +1670,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         assignment_leftmost: HashMap::new(),
         block_owns_next_stmts: false,
         rel_path,
+        el_offended: HashSet::new(),
         else_layout_seen: HashSet::new(),
     };
 
