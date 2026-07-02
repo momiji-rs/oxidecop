@@ -2396,3 +2396,173 @@ fn needs_leading_space(comment: &str) -> bool {
         Some(_) => true, // Some other character - needs a space
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/BlockEndNewline — checks whether the end statement of a do..end
+    /// block or closing `}` of a { } block is on its own line (for multiline blocks).
+    pub(crate) fn check_block_end_newline(&mut self, node: &ruby_prism::BlockNode) {
+        const COP: &str = "Layout/BlockEndNewline";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Get the opening and closing locations
+        let open_loc = node.opening_loc();
+        let close_loc = node.closing_loc();
+
+        let open_line = self.idx.loc(open_loc.start_offset()).0;
+        let close_line = self.idx.loc(close_loc.start_offset()).0;
+
+        // Single-line blocks are OK
+        if open_line == close_line {
+            return;
+        }
+
+        // Check if the end/} is on its own line (begins_its_line?)
+        let close_off = close_loc.start_offset();
+        let (close_line_num, _) = self.idx.loc(close_off);
+        let line_start = self.idx.starts[close_line_num - 1];
+
+        // Check if everything from line start to close_off is whitespace
+        let begins_line = self.src[line_start..close_off].iter().all(|b| b.is_ascii_whitespace());
+        if begins_line {
+            return; // end/} is already on its own line
+        }
+
+        // Calculate the offense range: from the last child of the block body to the end
+        // This matches RuboCop's logic of finding the last non-nil child
+        let offense_start = self.find_block_last_child_end_offset(node);
+
+        // The offense range spans THROUGH the `}`/`end` (upstream joins the
+        // last child's end with node.loc.end), so the lstripped replacement
+        // carries the terminator with it.
+        let close_end = close_loc.end_offset();
+        let range_source = &self.src[offense_start..close_end];
+        let trimmed = String::from_utf8_lossy(range_source).trim_start().to_string();
+        if trimmed.starts_with(';') {
+            return;
+        }
+
+        // Report the offense at the end/} location
+        let (offense_line, offense_col) = self.idx.loc(close_off);
+        let message = format!("Expression at {}, {} should be on its own line.", offense_line, offense_col);
+        self.push(close_off, COP, true, message);
+
+        let replacement = format!("\n{}", trimmed).into_bytes();
+        // Check if there's a heredoc in the block body
+        let heredoc_end_off = self.find_last_heredoc_offset(node.body());
+        if let Some(heredoc_off) = heredoc_end_off {
+            // For heredoc case: remove the offense range and insert after the
+            // heredoc terminator (before its newline)
+            self.fixes.push((offense_start, close_end, Vec::new()));
+            self.fixes.push((heredoc_off, heredoc_off, replacement));
+        } else {
+            // Normal case: replace with newline + trimmed content
+            self.fixes.push((offense_start, close_end, replacement));
+        }
+    }
+
+    /// Find the end offset of the last child in the block
+    /// This includes body statements or parameters, whichever comes last
+    fn find_block_last_child_end_offset(&self, node: &ruby_prism::BlockNode) -> usize {
+        // Try to find the end offset of the last statement in the body
+        if let Some(body) = node.body() {
+            if let Some(stmts) = body.as_statements_node() {
+                if let Some(last_stmt) = stmts.body().iter().last() {
+                    return last_stmt.location().end_offset();
+                }
+            }
+            // Single non-statements node body
+            return body.location().end_offset();
+        }
+
+        // No body - try parameters
+        if let Some(params) = node.parameters() {
+            return params.location().end_offset();
+        }
+
+        // Fallback to the opening bracket
+        node.opening_loc().end_offset()
+    }
+
+    /// Find the end offset of the last heredoc argument in the block body
+    /// Returns the offset right after the heredoc closing delimiter and its trailing newline
+    fn find_last_heredoc_offset(&self, body: Option<ruby_prism::Node>) -> Option<usize> {
+        let Some(body_node) = body else { return None };
+
+        // If body is a StatementsNode, extract the last statement
+        // Otherwise work with the body itself
+        if let Some(stmts) = body_node.as_statements_node() {
+            // Get the last statement in the StatementsNode
+            if let Some(last_stmt) = stmts.body().iter().last() {
+                if let Some(call) = last_stmt.as_call_node() {
+                    return self.find_heredoc_in_call_node(&call);
+                }
+            }
+        }
+
+        // Check if the body itself is a call
+        if let Some(call) = body_node.as_call_node() {
+            return self.find_heredoc_in_call_node(&call);
+        }
+
+        None
+    }
+
+    /// Helper function to find heredoc in a call node
+    fn find_heredoc_in_call_node(&self, call: &ruby_prism::CallNode) -> Option<usize> {
+        if let Some(arguments) = call.arguments() {
+            // Search arguments in reverse for a heredoc
+            let args: Vec<_> = arguments.arguments().iter().collect();
+            for arg in args.iter().rev() {
+                if let Some(str_node) = arg.as_string_node() {
+                    if let Some(opening) = str_node.opening_loc() {
+                        let opening_bytes = opening.as_slice();
+                        // Check if it's a heredoc (starts with <<)
+                        if opening_bytes.len() >= 2 && &opening_bytes[0..2] == b"<<" {
+                            if let Some(closing) = str_node.closing_loc() {
+                                // Position right after the terminator text
+                                // ("EOS") — prism's closing loc includes the
+                                // trailing newline; upstream's heredoc_end
+                                // token does not, so back over it.
+                                let mut off = closing.end_offset();
+                                while off > closing.start_offset()
+                                    && (self.src[off - 1] == b'\n' || self.src[off - 1] == b'\r')
+                                {
+                                    off -= 1;
+                                }
+                                return Some(off);
+                            }
+                        }
+                    }
+                } else if let Some(interp_str) = arg.as_interpolated_string_node() {
+                    if let Some(opening) = interp_str.opening_loc() {
+                        let opening_bytes = opening.as_slice();
+                        if opening_bytes.len() >= 2 && &opening_bytes[0..2] == b"<<" {
+                            if let Some(closing) = interp_str.closing_loc() {
+                                // Position right after the terminator text —
+                                // see the StringNode branch above.
+                                let mut off = closing.end_offset();
+                                while off > closing.start_offset()
+                                    && (self.src[off - 1] == b'\n' || self.src[off - 1] == b'\r')
+                                {
+                                    off -= 1;
+                                }
+                                return Some(off);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recursively check the receiver (for chained calls like foo(...).bar(...))
+        if let Some(receiver) = call.receiver() {
+            if let Some(recv_call) = receiver.as_call_node() {
+                return self.find_heredoc_in_call_node(&recv_call);
+            }
+        }
+
+        None
+    }
+}
