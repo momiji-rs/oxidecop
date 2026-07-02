@@ -1515,3 +1515,64 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/CircularArgumentReference — detects circular argument references
+    /// in optional keyword arguments and optional ordinal arguments.
+    pub(crate) fn check_circular_argument_reference(
+        &mut self,
+        arg_name: &[u8],
+        arg_value: &ruby_prism::Node,
+    ) {
+        const COP: &str = "Lint/CircularArgumentReference";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check for direct reference: arg_name = arg_name or kwarg: kwarg
+        if let Some(lvar) = arg_value.as_local_variable_read_node() {
+            if lvar.name().as_slice() == arg_name {
+                let msg = format!("Circular argument reference - `{}`.", String::from_utf8_lossy(arg_name));
+                self.push(arg_value.location().start_offset(), COP, false, msg);
+                return;
+            }
+        }
+
+        // Check for assignment chain: arg_name = x = y = arg_name
+        self.check_assignment_chain(arg_name, arg_value);
+    }
+
+    fn check_assignment_chain(&mut self, arg_name: &[u8], node: &ruby_prism::Node) {
+        const COP: &str = "Lint/CircularArgumentReference";
+
+        // Only proceed if this is a local variable write node
+        let Some(lv_write) = node.as_local_variable_write_node() else {
+            return;
+        };
+
+        let mut seen_variables = std::collections::HashSet::new();
+        let mut current_node = lv_write.value();
+        seen_variables.insert(lv_write.name().as_slice().to_vec());
+
+        // Traverse the assignment chain
+        loop {
+            if let Some(next_lv_write) = current_node.as_local_variable_write_node() {
+                let var_name = next_lv_write.name().as_slice();
+                seen_variables.insert(var_name.to_vec());
+                current_node = next_lv_write.value();
+            } else {
+                break;
+            }
+        }
+
+        // Check if we end up with a local variable read
+        if let Some(lvar) = current_node.as_local_variable_read_node() {
+            let var_name = lvar.name().as_slice();
+            // Check if this variable is in the chain or if it's the original arg_name
+            if seen_variables.iter().any(|v| v.as_slice() == var_name) || var_name == arg_name {
+                let msg = format!("Circular argument reference - `{}`.", String::from_utf8_lossy(arg_name));
+                self.push(current_node.location().start_offset(), COP, false, msg);
+            }
+        }
+    }
+}

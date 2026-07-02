@@ -101,6 +101,7 @@ COPS = {
   'Layout/EmptyLinesAroundMethodBody' => 'layout/empty_lines_around_method_body',
   'Style/NestedTernaryOperator'      => 'style/nested_ternary_operator',
   'Layout/AssignmentIndentation'     => 'layout/assignment_indentation',
+  'Lint/CircularArgumentReference'   => 'lint/circular_argument_reference',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
