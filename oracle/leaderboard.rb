@@ -46,6 +46,7 @@ COPS = {
   'Style/NestedFileDirname'          => 'style/nested_file_dirname',
   'Lint/UriRegexp'                   => 'lint/uri_regexp',
   'Lint/UnifiedInteger'              => 'lint/unified_integer',
+  'Lint/FlipFlop'                    => 'lint/flip_flop',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

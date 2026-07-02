@@ -140,7 +140,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Layout/SpaceBeforeComma",
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
-    "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger",
+    "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -745,6 +745,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
         self.check_rescue_exception(node);
         ruby_prism::visit_rescue_node(self, node);
+    }
+    fn visit_flip_flop_node(&mut self, node: &ruby_prism::FlipFlopNode<'pr>) {
+        self.check_flip_flop(node);
+        ruby_prism::visit_flip_flop_node(self, node);
     }
     fn visit_range_node(&mut self, node: &ruby_prism::RangeNode<'pr>) {
         if self.hot.semicolon {

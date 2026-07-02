@@ -643,3 +643,18 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/FlipFlop — prism represents `if a..b` / `if a...b` conditions
+    /// directly as a `FlipFlopNode` (unlike whitequark's `iflipflop`/
+    /// `eflipflop`, which had to be inferred from a `RangeNode` sitting in a
+    /// boolean context). Both inclusive and exclusive flip-flops always
+    /// offend — there's no config to gate.
+    pub(crate) fn check_flip_flop(&mut self, node: &ruby_prism::FlipFlopNode) {
+        const COP: &str = "Lint/FlipFlop";
+        if !self.on(COP) {
+            return;
+        }
+        self.push(node.location().start_offset(), COP, false, "Avoid the use of flip-flop operators.");
+    }
+}
