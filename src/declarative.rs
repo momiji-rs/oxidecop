@@ -33,7 +33,10 @@ pub const DECLARATIVE: &[(&str, &str, &str, Anchor, Option<&str>)] = &[
 pub enum Anchor {
     Node,   // start of the whole matched node (the default `add_offense(node)`)
     Op,     // the call's operator/selector (`node.loc.selector`)
-    RecvOp, // the receiver-call's selector (e.g. the `.length` in `x.length.zero?`)
+    // the receiver-call's selector (e.g. the `.length` in `x.length.zero?`);
+    // currently unused by the table but part of the anchor vocabulary.
+    #[allow(dead_code)]
+    RecvOp,
 }
 
 /// Substitute `{}` placeholders in a message template with captures, in order.
