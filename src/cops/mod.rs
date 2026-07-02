@@ -80,10 +80,28 @@ pub(crate) struct Cops<'a> {
     // offense iff def_depth >= 1 and scoping_depth == 0.
     pub(crate) def_depth: usize,
     pub(crate) scoping_depth: usize,
+    // Inside a `#{...}` interpolation (rubocop's `inside_interpolation?`) —
+    // string-literal style is not enforced there.
+    pub(crate) interp_depth: usize,
+    // Node spans claimed by a multiline string-concat check (rubocop's
+    // `ignore_node`): individual strings inside are exempt from on_str.
+    pub(crate) str_ignore: Vec<(usize, usize)>,
 }
 impl<'a> Cops<'a> {
     pub(crate) fn on(&self, cop: &str) -> bool {
-        self.cfg.enabled(cop)
+        if !self.cfg.enabled(cop) {
+            return false;
+        }
+        // rubocop raises on an EnforcedStyle outside SupportedStyles and the
+        // file yields no offenses; the closest equivalent is disabling the cop.
+        if let Some(v) = self.cfg.param(cop, "EnforcedStyle") {
+            if let Some(s) = crate::config::schema(cop) {
+                if !s.styles.is_empty() && !s.styles.contains(&v) {
+                    return false;
+                }
+            }
+        }
+        true
     }
     /// Is `text` exempt for `cop` via AllowedMethods (exact) or AllowedPatterns?
     pub(crate) fn allowed(&self, cop: &str, text: &[u8]) -> bool {
@@ -119,6 +137,17 @@ impl<'a> Cops<'a> {
 impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
         self.check_string_literals(node);
+    }
+    fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
+        // `'a' \` line-continuation concatenation parses as this node with
+        // quoted string parts — the ConsistentQuotesInMultiline check.
+        self.check_string_concat(node);
+        ruby_prism::visit_interpolated_string_node(self, node);
+    }
+    fn visit_embedded_statements_node(&mut self, node: &ruby_prism::EmbeddedStatementsNode<'pr>) {
+        self.interp_depth += 1;
+        ruby_prism::visit_embedded_statements_node(self, node);
+        self.interp_depth -= 1;
     }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
         self.check_documentation(node.location().start_offset(), "class", &node.constant_path());
@@ -317,6 +346,8 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         call_stack: Vec::new(),
         def_depth: 0,
         scoping_depth: 0,
+        interp_depth: 0,
+        str_ignore: Vec::new(),
     };
 
     // ---- text-based cops ----

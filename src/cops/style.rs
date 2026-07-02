@@ -3,70 +3,126 @@
 use super::Cops;
 
 impl<'a> Cops<'a> {
-    /// Style/StringLiterals — dispatch on the active EnforcedStyle, resolved
-    /// once from the config SCHEMA (see `Config::enforced_style`). Heredocs /
-    /// %-literals have other openings and fall through untouched.
+    /// Style/StringLiterals on a plain string — rubocop's `wrong_quotes?` over
+    /// the literal's full source. Heredocs / %-literals / `?c` have other
+    /// openings and fall through untouched; strings inside `#{}` interpolation
+    /// and strings claimed by a multiline-concat check are exempt.
     pub(crate) fn check_string_literals(&mut self, node: &ruby_prism::StringNode) {
-        if !self.on("Style/StringLiterals") {
+        if !self.on("Style/StringLiterals") || self.interp_depth > 0 {
+            return;
+        }
+        let l = node.location();
+        if self.str_ignore.iter().any(|(s, e)| l.start_offset() >= *s && l.start_offset() < *e) {
             return;
         }
         let Some(open) = node.opening_loc() else { return };
+        let src = self.node_src(&node.as_node());
         let c = node.content_loc().as_slice();
-        let l = node.location();
         match self.cfg.enforced_style("Style/StringLiterals") {
-            // Prefer single quotes: a double-quoted string with no `'` and
-            // no `\` in its content could be single-quoted losslessly.
             "single_quotes" if open.as_slice() == b"\"" => {
-                if !c.contains(&b'\'') && !c.contains(&b'\\') {
-                    self.push(l.start_offset(), "Style/StringLiterals", true,
-                        "Prefer single-quoted strings when you don't need string interpolation or special symbols.");
-                    // fix: `"c"` -> `'c'`
+                if !double_quotes_required(src) {
+                    self.push(l.start_offset(), "Style/StringLiterals", true, MSG_SINGLE);
+                    // fix: `"c"` -> `'c'`, unescaping `\"` -> `"` (`\\` stays)
                     let mut rep = vec![b'\''];
-                    rep.extend_from_slice(c);
+                    let mut i = 0;
+                    while i < c.len() {
+                        if c[i] == b'\\' && matches!(c.get(i + 1), Some(b'"')) {
+                            rep.push(b'"');
+                            i += 2;
+                        } else if c[i] == b'\\' && matches!(c.get(i + 1), Some(b'\\')) {
+                            rep.extend_from_slice(b"\\\\");
+                            i += 2;
+                        } else {
+                            rep.push(c[i]);
+                            i += 1;
+                        }
+                    }
                     rep.push(b'\'');
                     self.fixes.push((l.start_offset(), l.end_offset(), rep));
                 }
             }
-            // Prefer double quotes: a single-quoted string is an offense
-            // UNLESS it needs the single quotes — i.e. it contains a `\`
-            // that is NOT part of `\\` or `\'` (those are the only escapes
-            // single quotes interpret; a bare `\x` is a literal backslash
-            // that double quotes would have to escape as `\\x`).
             "double_quotes" if open.as_slice() == b"'" => {
-                let mut needs_single = false;
-                let mut i = 0;
-                while i < c.len() {
-                    if c[i] == b'\\' {
-                        match c.get(i + 1) {
-                            Some(b'\\') | Some(b'\'') => { i += 2; continue; }
-                            _ => { needs_single = true; break; }
-                        }
-                    }
-                    i += 1;
-                }
-                if !needs_single {
-                    self.push(l.start_offset(), "Style/StringLiterals", true,
-                        "Prefer double-quoted strings unless you need single quotes to avoid extra backslashes for escaping.");
+                if !single_quotes_required(src) {
+                    self.push(l.start_offset(), "Style/StringLiterals", true, MSG_DOUBLE);
                     // fix: `'c'` -> `"c"`, unescaping `\'` -> `'` (`\\` stays)
-                    let mut inner = Vec::new();
+                    let mut rep = vec![b'"'];
                     let mut i = 0;
                     while i < c.len() {
                         if c[i] == b'\\' && c.get(i + 1) == Some(&b'\'') {
-                            inner.push(b'\'');
+                            rep.push(b'\'');
                             i += 2;
                         } else {
-                            inner.push(c[i]);
+                            rep.push(c[i]);
                             i += 1;
                         }
                     }
-                    let mut rep = vec![b'"'];
-                    rep.extend_from_slice(&inner);
                     rep.push(b'"');
                     self.fixes.push((l.start_offset(), l.end_offset(), rep));
                 }
             }
             _ => {}
         }
+    }
+
+    /// Style/StringLiterals with `ConsistentQuotesInMultiline: true` on a
+    /// string continued across lines with `\` — parsed as an interpolated-
+    /// string container whose parts are themselves quoted literals. Mixed
+    /// quotes are one "Inconsistent quote style." offense on the whole node;
+    /// a consistent-but-wrong quote is one style offense. Either way the
+    /// parts are claimed (rubocop's `ignore_node`) so `on_str` skips them.
+    pub(crate) fn check_string_concat(&mut self, node: &ruby_prism::InterpolatedStringNode) {
+        const COP: &str = "Style/StringLiterals";
+        if !self.on(COP) || self.cfg.param(COP, "ConsistentQuotesInMultiline") != Some("true") {
+            return;
+        }
+        // Heredocs keep their parts.
+        if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) {
+            return;
+        }
+        // Every part must itself be a string literal (a `#{}` part means this
+        // is ordinary interpolation, not concatenation).
+        let parts: Vec<ruby_prism::Node> = node.parts().iter().collect();
+        let openings: Vec<Option<Vec<u8>>> = parts
+            .iter()
+            .map(|p| {
+                if let Some(s) = p.as_string_node() {
+                    Some(s.opening_loc().map(|o| o.as_slice().to_vec()).unwrap_or_default())
+                } else {
+                    p.as_interpolated_string_node()
+                        .map(|d| d.opening_loc().map(|o| o.as_slice().to_vec()).unwrap_or_default())
+                }
+            })
+            .collect();
+        if openings.iter().any(|o| o.is_none()) || parts.is_empty() {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        let l = node.location();
+        let mut quotes: Vec<&[u8]> = openings.iter().map(|o| o.as_deref().unwrap()).filter(|q| !q.is_empty()).collect();
+        quotes.dedup();
+        quotes.sort();
+        quotes.dedup();
+        let offense = if quotes.len() > 1 {
+            Some("Inconsistent quote style.".to_string())
+        } else if quotes == [b"'" as &[u8]] && style == "double_quotes" {
+            // All parts must be wrong for the node to be an offense.
+            parts
+                .iter()
+                .all(|p| !single_quotes_required(self.node_src(p)))
+                .then(|| MSG_DOUBLE.to_string())
+        } else if quotes == [b"\"" as &[u8]] && style == "single_quotes" {
+            // Accepted if ANY part is interpolated or genuinely needs `"`.
+            let accept = parts.iter().any(|p| {
+                p.as_interpolated_string_node().is_some() || double_quotes_required(self.node_src(p))
+            });
+            (!accept).then(|| MSG_SINGLE.to_string())
+        } else {
+            None
+        };
+        if let Some(msg) = offense {
+            self.push(l.start_offset(), COP, false, msg);
+        }
+        self.str_ignore.push((l.start_offset(), l.end_offset()));
     }
 
     /// Style/NumericLiterals — decimal literals over MinDigits want `_` grouping.
@@ -445,6 +501,61 @@ impl<'a> Cops<'a> {
             format!("Pass `&:{method}` as an argument to `lambda` instead of a block."),
         ))
     }
+}
+
+// ---- Style/StringLiterals helpers ----
+const MSG_SINGLE: &str =
+    "Prefer single-quoted strings when you don't need string interpolation or special symbols.";
+const MSG_DOUBLE: &str =
+    "Prefer double-quoted strings unless you need single quotes to avoid extra backslashes for escaping.";
+
+/// rubocop's `double_quotes_required?` over a literal's full source: true if it
+/// contains a `'`, or an odd run of backslashes introducing a real escape
+/// sequence (i.e. not followed by `"` — `/'|(?<!\\)\\{2}*\\(?![\\"])/x`).
+fn double_quotes_required(src: &[u8]) -> bool {
+    if src.contains(&b'\'') {
+        return true;
+    }
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'\\' {
+            let start = i;
+            while i < src.len() && src[i] == b'\\' {
+                i += 1;
+            }
+            if (i - start) % 2 == 1 && src.get(i) != Some(&b'"') {
+                return true;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// The single-quoted literal genuinely needs single quotes — rubocop's
+/// `/" | \\[^'\\] | \#[@{$]/x` over the full source: a `"`, an escape other
+/// than `\'`/`\\`, or text that would interpolate under double quotes.
+fn single_quotes_required(src: &[u8]) -> bool {
+    for i in 0..src.len() {
+        match src[i] {
+            b'"' => return true,
+            b'\\' => {
+                if let Some(&c) = src.get(i + 1) {
+                    if c != b'\'' && c != b'\\' {
+                        return true;
+                    }
+                }
+            }
+            b'#' => {
+                if matches!(src.get(i + 1), Some(b'@' | b'{' | b'$')) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 // ---- Style/FrozenStringLiteralComment helpers: MagicComment parsing ----
