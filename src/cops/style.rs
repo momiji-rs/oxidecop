@@ -2173,3 +2173,47 @@ impl<'a> super::Cops<'a> {
         self.push(op.start_offset(), COP, true, "Do not use `::` for defining class methods.");
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/Strip — `lstrip.rstrip` or `rstrip.lstrip` can be replaced
+    /// by `strip`. Matches the outer call node where the method is the second
+    /// in the chain. The receiver must be a call to the opposite method.
+    pub(crate) fn check_strip(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/Strip";
+        if !self.on(COP) {
+            return;
+        }
+
+        let name = node.name().as_slice();
+        let is_lstrip = name == b"lstrip";
+        let is_rstrip = name == b"rstrip";
+
+        if !is_lstrip && !is_rstrip {
+            return;
+        }
+
+        // Check if receiver is a call to the opposite method
+        let Some(recv) = node.receiver() else { return };
+        let Some(recv_call) = recv.as_call_node() else { return };
+        let recv_name = recv_call.name().as_slice();
+
+        let is_opposite = (is_lstrip && recv_name == b"rstrip") || (is_rstrip && recv_name == b"lstrip");
+        if !is_opposite {
+            return;
+        }
+
+        // Get the message location of the inner call and end of outer call
+        let Some(inner_msg_loc) = recv_call.message_loc() else { return };
+        let outer_end = node.location().end_offset();
+
+        let start = inner_msg_loc.start_offset();
+        let end = outer_end;
+
+        // Get the text being replaced for the message
+        let methods_text = String::from_utf8_lossy(&self.src[start..end]);
+        let message = format!("Use `strip` instead of `{}`.", methods_text);
+
+        self.fixes.push((start, end, b"strip".to_vec()));
+        self.push(start, COP, true, message);
+    }
+}
