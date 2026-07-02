@@ -111,6 +111,7 @@ COPS = {
   'Lint/ConstantDefinitionInBlock'   => 'lint/constant_definition_in_block',
   'Lint/ElseLayout'                  => 'lint/else_layout',
   'Layout/EmptyLinesAroundModuleBody' => 'layout/empty_lines_around_module_body',
+  'Lint/DisjunctiveAssignmentInConstructor' => 'lint/disjunctive_assignment_in_constructor',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -2474,3 +2474,46 @@ fn else_layout_begin_type(subsequent: &Option<ruby_prism::Node>) -> bool {
             .is_some_and(|e| e.statements().is_some_and(|s| s.body().iter().count() >= 2))
     })
 }
+impl<'a> Cops<'a> {
+    /// Lint/DisjunctiveAssignmentInConstructor — checks for disjunctive
+    /// assignment (||=) of instance variables in initialize methods.
+    /// Since instance variables are nil by default, ||= is unnecessary.
+    pub(crate) fn check_disjunctive_assignment_in_constructor(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Lint/DisjunctiveAssignmentInConstructor";
+        if !self.on(COP) {
+            return;
+        }
+        // Only check initialize methods (plain def, not defs)
+        if node.name().as_slice() != b"initialize" || node.receiver().is_some() {
+            return;
+        }
+        let Some(body) = node.body() else { return };
+
+        // Check statements until we hit something other than ||= on ivars
+        if let Some(stmts) = body.as_statements_node() {
+            // Multiple statements in the body
+            for stmt in stmts.body().iter() {
+                if let Some(or_write) = stmt.as_instance_variable_or_write_node() {
+                    // Found ||= on instance variable - report offense
+                    let op_loc = or_write.operator_loc();
+                    self.push(op_loc.start_offset(), COP, true,
+                        "Unnecessary disjunctive assignment. Use plain assignment.");
+                    // Fix: replace ||= with =
+                    self.fixes.push((op_loc.start_offset(), op_loc.end_offset(), b"=".to_vec()));
+                } else {
+                    // Stop checking - we found something other than ivar ||=
+                    break;
+                }
+            }
+        } else {
+            // Single statement in the body
+            if let Some(or_write) = body.as_instance_variable_or_write_node() {
+                let op_loc = or_write.operator_loc();
+                self.push(op_loc.start_offset(), COP, true,
+                    "Unnecessary disjunctive assignment. Use plain assignment.");
+                self.fixes.push((op_loc.start_offset(), op_loc.end_offset(), b"=".to_vec()));
+            }
+        }
+    }
+}
+
