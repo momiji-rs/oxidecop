@@ -1275,3 +1275,80 @@ impl<'a> super::Cops<'a> {
         self.push(kw.start_offset(), COP, false, "`else` without `rescue` is useless.");
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/ReturnInVoidContext — a `return` WITH a value inside a
+    /// void-context method: `initialize`, or a setter (`def foo=`) whose
+    /// name isn't one of the comparison operators (`==`, `===`, `!=`,
+    /// `<=`, `>=`) — mirrors rubocop-ast's `DefNode#void_context?`.
+    ///
+    /// The scan doesn't descend into nested `def`s (their own scope) nor
+    /// into `lambda`/`define_method`/`define_singleton_method` blocks
+    /// (rubocop's `SCOPE_CHANGING_METHODS` — "returning out of these
+    /// methods only exits the block itself"). Plain blocks, numblocks,
+    /// itblocks, and `proc` blocks are NOT scope-changing here, so returns
+    /// inside them still count — this differs from `collect_returns`
+    /// above (used by `Lint/EnsureReturn`), which treats `proc` as its own
+    /// scope.
+    pub(crate) fn check_return_in_void_context(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Lint/ReturnInVoidContext";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        const COMPARISON_OPERATORS: &[&[u8]] = &[b"==", b"===", b"!=", b"<=", b">=", b">", b"<"];
+        let is_setter = name.ends_with(b"=") && !COMPARISON_OPERATORS.contains(&name);
+        // rubocop's `void_context?` requires plain `def_type?` (not `defs_type?`)
+        // for the `initialize` branch — `def self.initialize` doesn't count —
+        // but `assignment_method?` (the setter branch) doesn't check receiver.
+        let is_initialize = name == b"initialize" && node.receiver().is_none();
+        if !is_initialize && !is_setter {
+            return;
+        }
+        let Some(body) = node.body() else { return };
+        let mut returns = Vec::new();
+        collect_void_context_returns(&body, &mut returns);
+        let method = String::from_utf8_lossy(name).into_owned();
+        for off in returns {
+            self.push(off, COP, false, format!("Do not return a value in `{method}`."));
+        }
+    }
+}
+
+/// Find `return`-with-a-value keyword offsets, not descending into nested
+/// `def`s or `lambda`/`define_method`/`define_singleton_method` blocks.
+fn collect_void_context_returns(node: &ruby_prism::Node, out: &mut Vec<usize>) {
+    struct Finder<'a> {
+        out: &'a mut Vec<usize>,
+    }
+    impl<'pr, 'a> ruby_prism::Visit<'pr> for Finder<'a> {
+        fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+            if node.arguments().is_some() {
+                self.out.push(node.keyword_loc().start_offset());
+            }
+            ruby_prism::visit_return_node(self, node);
+        }
+        fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if let Some(r) = node.receiver() {
+                self.visit(&r);
+            }
+            if let Some(a) = node.arguments() {
+                self.visit_arguments_node(&a);
+            }
+            let scope_changing = node.block().is_some()
+                && matches!(
+                    node.name().as_slice(),
+                    b"lambda" | b"define_method" | b"define_singleton_method"
+                );
+            if !scope_changing {
+                if let Some(b) = node.block() {
+                    self.visit(&b);
+                }
+            }
+        }
+    }
+    let mut f = Finder { out };
+    use ruby_prism::Visit;
+    f.visit(node);
+}

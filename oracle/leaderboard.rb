@@ -79,6 +79,7 @@ COPS = {
   'Style/ClassMethods'               => 'style/class_methods',
   'Style/TrailingBodyOnMethodDefinition' => 'style/trailing_body_on_method_definition',
   'Lint/UselessElseWithoutRescue'    => 'lint/useless_else_without_rescue',
+  'Lint/ReturnInVoidContext'         => 'lint/return_in_void_context',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
