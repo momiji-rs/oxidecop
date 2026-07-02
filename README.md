@@ -4,9 +4,9 @@ A fast, native, **RuboCop-compatible** Ruby linter — written in Rust, over the
 official [Prism](https://github.com/ruby/prism) parser. Think *ruff, but for
 Ruby, and bug-compatible with the RuboCop everyone already uses.*
 
-> **Status: early / experimental.** The core idea is proven (see the fidelity
-> numbers below), but only ~10 cops are implemented. This is a working
-> foundation, not a shippable linter yet.
+> **Status: early / experimental.** The core idea is proven — the 13
+> implemented cops pass **100% of RuboCop's own representable spec examples**
+> (654/654, see below) — but 13 cops is not a shippable linter yet.
 
 ---
 
@@ -96,6 +96,7 @@ Current leaderboard (`ruby oracle/leaderboard.rb`), against RuboCop v1.88.0:
 
 ```
 cop                                  scored   skip         LOC        FULL
+Layout/LineLength                       145     41   145/145     145/145     100%
 Style/FrozenStringLiteralComment         88      7    88/88       88/88      100%
 Style/ZeroLengthPredicate                74      0    74/74       74/74      100%
 Style/SymbolProc                         57     13    57/57       57/57      100%
@@ -108,9 +109,8 @@ Naming/MethodName                        29     49    29/29       29/29      100
 Style/NumericLiterals                    28      0    28/28       28/28      100%
 Layout/TrailingWhitespace                19      0    19/19       19/19      100%
 Style/NilComparison                       8      0     8/8         8/8       100%
-Layout/LineLength                       145     41   138/145     138/145      95%
 ────────────────────────────────────────────────────────────────────────────
-TOTAL (representable examples)          654    126                647/654      99%
+TOTAL (representable examples)          654    126                654/654     100%
 ```
 
 **Read this honestly:** the score is over *representable* examples only. RuboCop's

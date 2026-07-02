@@ -116,9 +116,22 @@ impl Config {
     pub fn param(&self, cop: &str, key: &str) -> Option<&str> {
         self.sections.get(cop).and_then(|s| s.get(key)).map(|s| s.as_str())
     }
-    /// Resolved value: user config if present, else the SCHEMA default.
+    /// The cop's section carries `__replace_defaults__` — it REPLACES the
+    /// defaults instead of merging over them (a spec whose `let(:config)`
+    /// rebuilt the whole RuboCop::Config; unspecified params are nil there).
+    pub fn replaces_defaults(&self, cop: &str) -> bool {
+        self.param(cop, "__replace_defaults__") == Some("true")
+    }
+    /// Resolved value: user config if present, else the SCHEMA default —
+    /// unless the section replaces defaults outright.
     pub fn get(&self, cop: &str, key: &str) -> Option<&str> {
-        self.param(cop, key).or_else(|| schema_default(cop, key))
+        self.param(cop, key).or_else(|| {
+            if self.replaces_defaults(cop) {
+                None
+            } else {
+                schema_default(cop, key)
+            }
+        })
     }
     pub fn int(&self, cop: &str, key: &str) -> usize {
         self.get(cop, key).and_then(|v| v.parse().ok()).unwrap_or(0)

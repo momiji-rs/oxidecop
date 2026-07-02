@@ -406,9 +406,13 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         }
     }
     // Seed schema-default AllowedMethods for cops the config didn't set them on
-    // (rubocop's config/default.yml ships some, e.g. Style/SymbolProc).
+    // (rubocop's config/default.yml ships some, e.g. Style/SymbolProc) —
+    // unless the section replaces defaults outright.
     for s in SCHEMA {
-        if !s.allowed_methods.is_empty() && !allowed_methods.contains_key(s.cop) {
+        if !s.allowed_methods.is_empty()
+            && !allowed_methods.contains_key(s.cop)
+            && !cfg.replaces_defaults(s.cop)
+        {
             allowed_methods.insert(s.cop.to_string(), s.allowed_methods.iter().map(|m| m.to_string()).collect());
         }
     }

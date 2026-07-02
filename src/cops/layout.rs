@@ -24,7 +24,9 @@ impl<'a> Cops<'a> {
             Some("false") => false,
             _ => self.cfg.get(COP, "AllowCopDirectives") == Some("true"),
         };
-        let heredoc_allow = self.cfg.get(COP, "AllowHeredoc").unwrap_or("true").to_string();
+        // get() hands back the default.yml "true" in merge-world; None only
+        // when the section replaces defaults (spec harness) — nil is falsy.
+        let heredoc_allow = self.cfg.get(COP, "AllowHeredoc").unwrap_or("false").to_string();
         // Tabs bill at the configured indentation width.
         let tab_width: usize = self
             .cfg
@@ -90,10 +92,13 @@ impl<'a> Cops<'a> {
             let mut col = max.saturating_sub(indent_diff) + 1; // highlight_start, 1-based
             if allow_uri || allow_qn {
                 let uri_range = allow_uri
-                    .then(|| find_excessive_range(line, &uri_re, indent_diff, max))
+                    .then(|| find_excessive_range(line, uri_match_ranges(line, &uri_re).last().copied(), indent_diff, max))
                     .flatten();
                 let qn_range = allow_qn
-                    .then(|| find_excessive_range(line, qualified_name_regex(), indent_diff, max))
+                    .then(|| {
+                        let m = qualified_name_regex().find_iter(line).last().map(|m| (m.start(), m.end()));
+                        find_excessive_range(line, m, indent_diff, max)
+                    })
                     .flatten();
                 let allowed_pos = |r: &(usize, usize)| r.0 < max && r.1 == line_len;
                 let ok = match (&uri_range, &qn_range) {
@@ -206,14 +211,28 @@ fn is_directive_comment(comment: &[u8]) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     cached(&RE, r"^#\s*rubocop\s*:\s*(?:disable|todo|enable)\b").is_match(&String::from_utf8_lossy(comment))
 }
-/// rubocop's `find_excessive_range`: the LAST regexp match on the line, end
-/// extended over an enclosing `{…}` and the following non-space run, both
+/// URI candidates on the line, as byte ranges — rubocop matches broadly and
+/// then filters with `URI.parse` (`valid_uri?`); the practical rejection is a
+/// `scheme::Opaque` shape, whose opaque part starts with another `:`.
+fn uri_match_ranges(line: &str, re: &regex::Regex) -> Vec<(usize, usize)> {
+    re.find_iter(line)
+        .filter(|m| {
+            m.as_str()
+                .split_once(':')
+                .is_none_or(|(_, rest)| !rest.starts_with(':'))
+        })
+        .map(|m| (m.start(), m.end()))
+        .collect()
+}
+
+/// rubocop's `find_excessive_range`: the LAST match on the line (byte range),
+/// end extended over an enclosing `{…}` and the following non-space run, both
 /// endpoints shifted by the tab surcharge; None when it sits fully before Max
 /// (char positions, 0-based begin, exclusive end).
-fn find_excessive_range(line: &str, re: &regex::Regex, indent_diff: usize, max: usize) -> Option<(usize, usize)> {
-    let m = re.find_iter(line).last()?;
-    let begin = line[..m.start()].chars().count() + indent_diff;
-    let mut end = begin - indent_diff + line[m.start()..m.end()].chars().count();
+fn find_excessive_range(line: &str, m: Option<(usize, usize)>, indent_diff: usize, max: usize) -> Option<(usize, usize)> {
+    let (mstart, mend) = m?;
+    let begin = line[..mstart].chars().count() + indent_diff;
+    let mut end = begin - indent_diff + line[mstart..mend].chars().count();
     let chars: Vec<char> = line.chars().collect();
     // `{(\s|\S)*}$` — when the line ends in a brace group, extend to its `}`.
     static BRACE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
