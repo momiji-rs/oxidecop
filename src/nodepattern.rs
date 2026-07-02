@@ -307,6 +307,25 @@ fn match_typed(ty: &str, children: &[Pat], node: &Node, src: &[u8], caps: &mut V
                     .is_some_and(|v| match_meth(p, &src[v.start_offset()..v.end_offset()], caps)),
             }
         }
+        // `(range LEFT RIGHT)` — both endpoints must be present and match.
+        "range" | "irange" | "erange" => {
+            let Some(r) = node.as_range_node() else { return false };
+            match ty {
+                "irange" if r.operator_loc().as_slice() != b".." => return false,
+                "erange" if r.operator_loc().as_slice() != b"..." => return false,
+                _ => {}
+            }
+            if children.len() != 2 {
+                return children.is_empty();
+            }
+            let ends = [r.left(), r.right()];
+            children.iter().zip(ends).all(|(p, end)| match (p, end) {
+                (Pat::NilRecv, None) => true,
+                (Pat::Any, _) => true,
+                (p, Some(n)) => m(p, &n, src, caps),
+                _ => false,
+            })
+        }
         // parser's `(begin X)` — a parenthesized expression wrapping X.
         "begin" => {
             let Some(pn) = node.as_parentheses_node() else { return false };

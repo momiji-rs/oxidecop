@@ -182,6 +182,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
         self.check_boolean_symbol(node);
     }
+    fn visit_ensure_node(&mut self, node: &ruby_prism::EnsureNode<'pr>) {
+        self.check_empty_ensure(node);
+        ruby_prism::visit_ensure_node(self, node);
+    }
+    fn visit_parentheses_node(&mut self, node: &ruby_prism::ParenthesesNode<'pr>) {
+        self.check_empty_expression(node);
+        ruby_prism::visit_parentheses_node(self, node);
+    }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
         if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"%i") || o.as_slice().starts_with(b"%I")) {
             let l = node.location();
@@ -331,6 +339,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_string_chars(node);
         self.check_nested_file_dirname(node);
         self.check_uri_regexp(node);
+        self.check_uri_escape_unescape(node);
+        self.check_unpack_first(node);
+        self.check_random_with_offset(node);
         // Style/RedundantReturn also fires for method-defining blocks
         // (rubocop's RESTRICT_ON_SEND: define_method & friends, lambda).
         if self.on("Style/RedundantReturn")

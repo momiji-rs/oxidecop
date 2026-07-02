@@ -44,7 +44,12 @@ COPS = {
   'Style/Dir'                        => 'style/dir',
   'Style/StringChars'                => 'style/string_chars',
   'Style/NestedFileDirname'          => 'style/nested_file_dirname',
-  'Lint/UriRegexp'                   => 'lint/uri_regexp'
+  'Lint/UriRegexp'                   => 'lint/uri_regexp',
+  'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
+  'Lint/EmptyExpression'             => 'lint/empty_expression',
+  'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
+  'Style/UnpackFirst'                => 'style/unpack_first',
+  'Style/RandomWithOffset'           => 'style/random_with_offset'
 }.freeze
 
 FileUtils.mkdir_p(DIR)

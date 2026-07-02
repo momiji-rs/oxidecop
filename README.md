@@ -4,9 +4,9 @@ A fast, native, **RuboCop-compatible** Ruby linter — written in Rust, over the
 official [Prism](https://github.com/ruby/prism) parser. Think *ruff, but for
 Ruby, and bug-compatible with the RuboCop everyone already uses.*
 
-> **Status: early / experimental.** The core idea is proven — the 22
+> **Status: early / experimental.** The core idea is proven — the 27
 > implemented cops pass **100% of RuboCop's own representable spec examples**
-> (716/716, see below) — but 22 cops is not a shippable linter yet.
+> (779/779, see below) — but 27 cops is not a shippable linter yet.
 
 ---
 
@@ -113,13 +113,18 @@ Lint/UriRegexp                           10      0    10/10       10/10      100
 Lint/BooleanSymbol                       10      0    10/10       10/10      100%
 Style/NilComparison                       8      0     8/8         8/8       100%
 Style/StringChars                         8      0     8/8         8/8       100%
+Style/RandomWithOffset                   29      0    29/29       29/29      100%
+Lint/EmptyExpression                     12      0    12/12       12/12      100%
+Style/UnpackFirst                        11      0    11/11       11/11      100%
+Lint/UriEscapeUnescape                    9      0     9/9         9/9       100%
 Style/ArrayJoin                           5      0     5/5         5/5       100%
 Style/Dir                                 4      0     4/4         4/4       100%
 Style/NestedFileDirname                   4      1     4/4         4/4       100%
 Lint/BigDecimalNew                        3      0     3/3         3/3       100%
+Lint/EmptyEnsure                          2      0     2/2         2/2       100%
 Lint/RandOne                              0      1     0/0         0/0          —
 ────────────────────────────────────────────────────────────────────────────
-TOTAL (representable examples)          716    128                716/716     100%
+TOTAL (representable examples)          779    128                779/779     100%
 ```
 
 **Read this honestly:** the score is over *representable* examples only. RuboCop's

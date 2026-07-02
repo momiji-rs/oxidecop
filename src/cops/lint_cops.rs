@@ -56,6 +56,55 @@ impl<'a> Cops<'a> {
             format!("`{current}` is obsolete and should not be used. Instead, use `{preferred}`."));
         self.fixes.push((l.start_offset(), l.end_offset(), preferred.into_bytes()));
     }
+
+    /// Lint/EmptyEnsure — an `ensure` with no body.
+    pub(crate) fn check_empty_ensure(&mut self, node: &ruby_prism::EnsureNode) {
+        if !self.on("Lint/EmptyEnsure") {
+            return;
+        }
+        if node.statements().is_none() {
+            let kw = node.ensure_keyword_loc();
+            self.push(kw.start_offset(), "Lint/EmptyEnsure", true, "Empty `ensure` block detected.");
+            self.fixes.push((kw.start_offset(), kw.end_offset(), Vec::new()));
+        }
+    }
+
+    /// Lint/EmptyExpression — a bare `()`.
+    pub(crate) fn check_empty_expression(&mut self, node: &ruby_prism::ParenthesesNode) {
+        if !self.on("Lint/EmptyExpression") {
+            return;
+        }
+        if node.body().is_none() {
+            self.push(node.location().start_offset(), "Lint/EmptyExpression", false, "Avoid empty expressions.");
+        }
+    }
+
+    /// Lint/UriEscapeUnescape — `URI.escape` & friends are obsolete; the
+    /// message lists the case-specific replacements.
+    pub(crate) fn check_uri_escape_unescape(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/UriEscapeUnescape";
+        let name = node.name().as_slice();
+        if !matches!(name, b"escape" | b"encode" | b"unescape" | b"decode") || !self.on(COP) {
+            return;
+        }
+        static PAT: OnceLock<Pat> = OnceLock::new();
+        let uri_const = matcher(&PAT, "(const {cbase nil?} :URI)");
+        let Some(recv) = node.receiver() else { return };
+        if nodepattern::matches(uri_const, &recv, self.src).is_none() {
+            return;
+        }
+        let replacements = if matches!(name, b"escape" | b"encode") {
+            "`CGI.escape`, `URI.encode_www_form` or `URI.encode_www_form_component`"
+        } else {
+            "`CGI.unescape`, `URI.decode_www_form` or `URI.decode_www_form_component`"
+        };
+        let double_colon = if self.node_src(&recv).starts_with(b"::") { "::" } else { "" };
+        let method = String::from_utf8_lossy(name);
+        let l = node.location();
+        self.push(l.start_offset(), COP, false, format!(
+            "`{double_colon}URI.{method}` method is obsolete and should not be used. \
+             Instead, use {replacements} depending on your specific use case."));
+    }
 }
 
 // ---- is this block "scoping" (its body may define methods)? ----

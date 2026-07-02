@@ -733,6 +733,56 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Style/UnpackFirst — `x.unpack(fmt).first` / `[0]` / `.slice(0)` /
+    /// `.at(0)` → `unpack1(fmt)`. Offense spans the unpack selector to the
+    /// node end so the message quotes the real dispatch.
+    pub(crate) fn check_unpack_first(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/UnpackFirst";
+        if !self.on(COP) {
+            return;
+        }
+        static PAT: OnceLock<Pat> = OnceLock::new();
+        let pat = matcher(&PAT,
+            "{(call (call (...) :unpack (...)) :first) \
+              (call (call (...) :unpack (...)) {:[] :slice :at} (int 0))}");
+        if nodepattern::matches(pat, &node.as_node(), self.src).is_none() {
+            return;
+        }
+        let Some(unpack) = node.receiver().and_then(|r| r.as_call_node()) else { return };
+        let Some(sel) = unpack.message_loc() else { return };
+        let Some(arg) = first_call_arg(&unpack) else { return };
+        let (start, end) = (sel.start_offset(), node.location().end_offset());
+        let current = String::from_utf8_lossy(&self.src[start..end]).into_owned();
+        let fmt = String::from_utf8_lossy(self.node_src(&arg)).into_owned();
+        self.push(start, COP, true, format!("Use `unpack1({fmt})` instead of `{current}`."));
+        self.fixes.push((start, end, format!("unpack1({fmt})").into_bytes()));
+    }
+
+    /// Style/RandomWithOffset — `rand(6) + 1`, `1 + rand(6)`, `rand(6).succ`
+    /// and friends should be ranges. rubocop's three matchers verbatim.
+    pub(crate) fn check_random_with_offset(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/RandomWithOffset";
+        if !self.on(COP)
+            || !matches!(node.name().as_slice(), b"+" | b"-" | b"succ" | b"pred" | b"next")
+            || node.receiver().is_none()
+        {
+            return;
+        }
+        static INT_OP_RAND: OnceLock<Pat> = OnceLock::new();
+        static RAND_OP_INT: OnceLock<Pat> = OnceLock::new();
+        static RAND_MODIFIED: OnceLock<Pat> = OnceLock::new();
+        const RAND: &str =
+            "(send {nil? (const {nil? cbase} :Random) (const {nil? cbase} :Kernel)} :rand {int (range int int)})";
+        let n = node.as_node();
+        let hit = nodepattern::matches(matcher(&INT_OP_RAND, &format!("(send int {{:+ :-}} {RAND})")), &n, self.src)
+            .or_else(|| nodepattern::matches(matcher(&RAND_OP_INT, &format!("(send {RAND} {{:+ :-}} int)")), &n, self.src))
+            .or_else(|| nodepattern::matches(matcher(&RAND_MODIFIED, &format!("(send {RAND} {{:succ :pred :next}})")), &n, self.src));
+        if hit.is_some() {
+            self.push(node.location().start_offset(), COP, true,
+                "Prefer ranges when generating random numbers instead of integers with offsets.");
+        }
+    }
+
     /// Lint/BooleanSymbol — `:true` / `:false` literals (outside `%i[]`).
     pub(crate) fn check_boolean_symbol(&mut self, node: &ruby_prism::SymbolNode) {
         const COP: &str = "Lint/BooleanSymbol";

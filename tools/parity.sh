@@ -16,7 +16,7 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 # Keep in sync with oracle/leaderboard.rb COPS (the implemented set).
-COPS="Style/NilComparison,Style/NumericPredicate,Style/ZeroLengthPredicate,Style/RedundantReturn,Style/NumericLiterals,Style/StringLiterals,Style/Documentation,Style/FrozenStringLiteralComment,Style/SymbolProc,Naming/MethodName,Lint/NestedMethodDefinition,Layout/LineLength,Layout/TrailingWhitespace,Style/EvenOdd,Lint/RandOne,Style/ArrayJoin,Lint/BooleanSymbol,Lint/BigDecimalNew,Style/Dir,Style/StringChars,Style/NestedFileDirname,Lint/UriRegexp"
+COPS="Style/NilComparison,Style/NumericPredicate,Style/ZeroLengthPredicate,Style/RedundantReturn,Style/NumericLiterals,Style/StringLiterals,Style/Documentation,Style/FrozenStringLiteralComment,Style/SymbolProc,Naming/MethodName,Lint/NestedMethodDefinition,Layout/LineLength,Layout/TrailingWhitespace,Style/EvenOdd,Lint/RandOne,Style/ArrayJoin,Lint/BooleanSymbol,Lint/BigDecimalNew,Style/Dir,Style/StringChars,Style/NestedFileDirname,Lint/UriRegexp,Lint/EmptyEnsure,Lint/EmptyExpression,Lint/UriEscapeUnescape,Style/UnpackFirst,Style/RandomWithOffset"
 
 cargo build --release --manifest-path "$ROOT/Cargo.toml" --quiet
 
