@@ -61,6 +61,7 @@ COPS = {
   'Lint/RegexpAsCondition'           => 'lint/regexp_as_condition',
   'Lint/DuplicateRescueException'    => 'lint/duplicate_rescue_exception',
   'Style/TrailingBodyOnClass'        => 'style/trailing_body_on_class',
+  'Lint/SafeNavigationWithEmpty'     => 'lint/safe_navigation_with_empty',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

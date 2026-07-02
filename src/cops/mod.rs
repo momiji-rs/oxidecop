@@ -141,7 +141,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceBeforeComment", "Lint/FloatOutOfRange", "Style/SymbolLiteral",
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
-    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass",
+    "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -686,6 +686,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
         self.check_negated_if(node);
         self.check_duplicate_elsif_condition(node);
+        self.check_safe_navigation_with_empty(&node.predicate());
         if let Some(kw) = node.if_keyword_loc() {
             if matches!(kw.as_slice(), b"if" | b"elsif") {
                 let kw_text = if kw.as_slice() == b"elsif" { "elsif" } else { "if" };
@@ -702,6 +703,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth -= 1;
     }
     fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        self.check_safe_navigation_with_empty(&node.predicate());
         self.check_unless_else(node);
         self.check_multiline_if_then(
             node.then_keyword_loc(),

@@ -966,3 +966,55 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/SafeNavigationWithEmpty — `foo&.empty?` in a conditional
+    /// (if/unless predicate) is unsafe because when foo is nil, the result
+    /// is nil (falsy) instead of false, inverting the author's intent.
+    /// The fix is to change `&.` to `&&` with explicit nil check.
+    pub(crate) fn check_safe_navigation_with_empty(&mut self, node: &ruby_prism::Node) {
+        const COP: &str = "Lint/SafeNavigationWithEmpty";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Pattern match: a call node with method name "empty?" and safe navigation operator
+        let Some(call) = node.as_call_node() else { return };
+
+        // Check method name is "empty?"
+        if call.name().as_slice() != b"empty?" {
+            return;
+        }
+
+        // Check for safe navigation operator "&."
+        let Some(op_loc) = call.call_operator_loc() else { return };
+        if op_loc.as_slice() != b"&." {
+            return;
+        }
+
+        // Check that receiver exists and is NOT itself a safe navigation call
+        let Some(recv) = call.receiver() else { return };
+
+        // If receiver is a call with safe navigation, don't flag it
+        // (pattern says !csend - not a safe navigation call)
+        if let Some(recv_call) = recv.as_call_node() {
+            if recv_call.call_operator_loc().is_some_and(|rl| rl.as_slice() == b"&.") {
+                return;
+            }
+        }
+
+        let recv_src = String::from_utf8_lossy(self.node_src(&recv)).into_owned();
+        let l = call.location();
+
+        self.push(
+            l.start_offset(),
+            COP,
+            true,
+            "Avoid calling `empty?` with the safe navigation operator in conditionals.",
+        );
+
+        // Fix: replace the condition with "#{receiver} && #{receiver}.empty?"
+        let replacement = format!("{} && {}.empty?", recv_src, recv_src);
+        self.fixes.push((l.start_offset(), l.end_offset(), replacement.into_bytes()));
+    }
+}
