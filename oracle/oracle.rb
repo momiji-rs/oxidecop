@@ -69,6 +69,15 @@ def unescape_dq(s)
   out
 end
 
+# RSpec interpolates string literals (`#{' ' * 68}^^^`, `#{'a' * 80}`) before
+# the expect_* DSL sees the block; render those the same way. Escaped `\#{...}`
+# is literal text (rubocop's own heredoc corrections look like `\#{'   '}`) —
+# run BEFORE unescape_dq, while the backslash still marks it.
+def resolve_literal_interp(text)
+  text = text.gsub(/(?<!\\)\#\{'([^']*)'\s*\*\s*(\d+)\}/) { Regexp.last_match(1) * Regexp.last_match(2).to_i }
+  text.gsub(/(?<!\\)\#\{'([^']*)'\}/) { Regexp.last_match(1) }
+end
+
 def parse_block(raw_lines, raw_heredoc, squiggly)
   # raw_lines: the heredoc body (already the interior). Dedent ONLY for the
   # squiggly `<<~` form — `<<-` keeps its indentation at runtime, and line-
@@ -77,6 +86,7 @@ def parse_block(raw_lines, raw_heredoc, squiggly)
   # source lines from caret-annotation lines. Escape-rendering before the
   # split is what RSpec sees: a `\n` inside a line legitimately becomes two.
   text = (squiggly ? dedent(raw_lines) : raw_lines).join("\n")
+  text = resolve_literal_interp(text) unless raw_heredoc
   text = unescape_dq(text) unless raw_heredoc
   src = []
   expected = []
@@ -194,14 +204,16 @@ while i < lines.length
     inh_sec  = cfg_stack.any? ? cfg_stack.last[4] : nil
     inh_ovr  = cfg_stack.any? ? cfg_stack.last[5] : nil
     inh_rb   = cfg_stack.any? ? cfg_stack.last[6] : nil
+    inh_lets = cfg_stack.any? ? cfg_stack.last[7].dup : {}
     # a `:rubyXY` context tag pins TargetRubyVersion for its examples
     inh_rb = "#{Regexp.last_match(1)}.#{Regexp.last_match(2)}" if l =~ /,\s*:ruby(\d)(\d)\b/
-    # A parameterized shared_examples group (`do |style|`) runs differently
-    # per caller — its inline examples are not statically representable.
-    parameterized = !(l =~ /^\s*shared_examples\b.*do\s*\|/).nil?
+    # A shared_examples group runs at its it_behaves_like call sites, with
+    # the CALLER's lets/config — its inline text position lies about the
+    # active config, so its examples are not statically representable.
+    shared = !(l =~ /^\s*shared_examples\b/).nil?
     cfg_stack.push([indent, inh_cfg,
-                    inh_skip || l.include?('unsupported_on: :prism') || parameterized,
-                    inh_as, inh_sec, inh_ovr, inh_rb])
+                    inh_skip || l.include?('unsupported_on: :prism') || shared,
+                    inh_as, inh_sec, inh_ovr, inh_rb, inh_lets])
   elsif l =~ /^\s*(it|specify)\b/
     # An `it` at indent N means every context defined at indent >= N has
     # closed — without this, a trailing top-level example would inherit the
@@ -217,6 +229,13 @@ while i < lines.length
   # cop's section becomes EXACTLY that hash (defaults don't apply).
   if l =~ /before\s*\{\s*config\['#{Regexp.escape(COP)}'\]\s*=\s*(\{.*\})\s*\}/ && cfg_stack.any?
     cfg_stack.last[5] = extract_hash(Regexp.last_match(1))
+  end
+  # A scalar `let(:name) { true/false/42/'str' }` — cop_config values often
+  # reference these (`'SplitStrings' => split_strings`); record them per scope
+  # so the reference resolves like RSpec would.
+  if cfg_stack.any? && l =~ /let\(:(\w+)\)\s*\{\s*(true|false|-?\d+|'[^']*'|"[^"]*")\s*\}\s*\z/ &&
+     !%w[cop_config config cop].include?(Regexp.last_match(1))
+    cfg_stack.last[7][Regexp.last_match(1)] = Regexp.last_match(2)
   end
   # `let(:cop_config)` in either single-line `{ {...} }` or multi-line `do..end`
   # form. Capture the raw hash text (quotes preserved, whitespace collapsed) so
@@ -275,6 +294,7 @@ while i < lines.length
   cur_sec = cfg_stack.any? ? cfg_stack.last[4] : nil
   cur_ovr = cfg_stack.any? ? cfg_stack.last[5] : nil
   cur_rb  = cfg_stack.any? ? cfg_stack.last[6] : nil
+  cur_lets = cfg_stack.any? ? cfg_stack.last[7] : {}
   # Heredoc examples, all forms: `<<~RUBY` (escapes render), `<<~'RUBY'` (raw),
   # `<<-RUBY`, and trailing keyword args (`, identifier: identifier` — those
   # substitute `%{key}` in the body; unresolvable statically, so they fall into
@@ -294,7 +314,7 @@ while i < lines.length
     src = src.chomp if chomp
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
                   sections: cur_sec, override: cur_ovr, ruby: cur_rb, raw: raw_heredoc,
-                  src: src, expected: expected }
+                  lets: cur_lets.dup, src: src, expected: expected }
   elsif l =~ /expect_correction\(<<([~-])('?)RUBY\2\s*[,)]/ && examples.any? && examples.last[:kind] == :offense
     squiggly = Regexp.last_match(1) == '~'
     raw_heredoc = Regexp.last_match(2) == "'"
@@ -306,9 +326,11 @@ while i < lines.length
       i += 1
     end
     text = (squiggly ? dedent(body) : body).join("\n") + "\n"
+    text = resolve_literal_interp(text) unless raw_heredoc
     text = unescape_dq(text) unless raw_heredoc
     text = text.chomp if chomp
     examples.last[:correction] = text
+    examples.last[:correction_raw] = raw_heredoc
   elsif l =~ /expect_no_corrections/ && examples.any? && examples.last[:kind] == :offense
     examples.last[:correction] = :none
   elsif l =~ /expect_no_offenses\((['"])(.*?)\1\)/
@@ -318,7 +340,8 @@ while i < lines.length
     body = quote == '"' ? unescape_dq(body) : body.gsub(/\\([\\'])/, '\1')
     body += "\n" unless body.end_with?("\n")
     examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
-                  sections: cur_sec, override: cur_ovr, ruby: cur_rb, src: body, expected: [] }
+                  sections: cur_sec, override: cur_ovr, ruby: cur_rb, lets: cur_lets.dup,
+                  src: body, expected: [] }
   end
   i += 1
 end
@@ -338,7 +361,7 @@ COP_DEFAULT_STYLE = {
   'Naming/MethodName' => 'snake_case'
 }.freeze
 
-def resolve_interp(text, cfg_hash)
+def resolve_interp(text, cfg_hash, raw: false)
   text = text.gsub(/\#\{trailing_whitespace \* (\d+)\}/) { ' ' * Regexp.last_match(1).to_i }
   text = text.gsub('#{trailing_whitespace}', ' ')
   style = cfg_hash['EnforcedStyle']
@@ -393,9 +416,15 @@ end
 # the source or message and are skipped by those checks). EnforcedStyle is the
 # exception: the STYLE decides which names/quotes/etc. flag at all, so an
 # example with a variable style is genuinely unrepresentable.
-def resolve_cfg_variables!(h)
+def resolve_cfg_variables!(h, lets = {})
   h.each do |k, v|
     next unless v.is_a?(String) && v.start_with?(VAR_SENTINEL)
+
+    name = v.delete_prefix(VAR_SENTINEL)
+    if (resolved = lets[name])
+      h[k] = parse_val(resolved)
+      next
+    end
     return nil if k == 'EnforcedStyle'
 
     h.delete(k)
@@ -472,13 +501,13 @@ end
 # interpolation in the SOURCE); they're excluded from loc/full/total.
 groups = Hash.new { |h, k| h[k] = { loc: 0, full: 0, total: 0, skipped: 0 } }
 fails = []
-def run_fix(poc, src, cfg)
+def run_fix(poc, src, cfg, once: false)
   Dir.mktmpdir do |d|
     rb = File.join(d, 'ex.rb')
     yml = File.join(d, 'c.yml')
     File.write(rb, src)
     File.write(yml, cfg)
-    out, = Open3.capture2(poc, rb, yml, '--fix')
+    out, = Open3.capture2(poc, rb, yml, once ? '--fix-once' : '--fix')
     out
   end
 end
@@ -496,7 +525,7 @@ examples.each_with_index do |ex, n|
     next
   end
 
-  cfg_hash = resolve_cfg_variables!(parse_cfg(ex[:cfg]))
+  cfg_hash = resolve_cfg_variables!(parse_cfg(ex[:cfg]), ex[:lets] || {})
 
   # A variable EnforcedStyle varies per loop run — unrepresentable statically,
   # like interpolated source.
@@ -513,7 +542,7 @@ examples.each_with_index do |ex, n|
   if ex[:override]
     # a before-block replaced the cop's section outright
     replace = true
-    cfg_hash = resolve_cfg_variables!(parse_cfg(ex[:override])) || {}
+    cfg_hash = resolve_cfg_variables!(parse_cfg(ex[:override]), ex[:lets] || {}) || {}
     if (sections = ex[:sections])
       extra_sections = sections.reject { |k, _| k == COP }
                                .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(h)) || {}] }
@@ -523,7 +552,7 @@ examples.each_with_index do |ex, n|
     base = sections[COP]
     cop_hash = base ? parse_cfg(base[0]) : {}
     cop_hash.merge!(cfg_hash) if base && base[1]
-    cfg_hash = resolve_cfg_variables!(cop_hash)
+    cfg_hash = resolve_cfg_variables!(cop_hash, ex[:lets] || {})
     if cfg_hash.nil?
       g[:skipped] += 1
       next
@@ -532,7 +561,7 @@ examples.each_with_index do |ex, n|
                              .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(h)) || {}] }
   end
 
-  src = resolve_interp(ex[:src], cfg_hash)
+  src = resolve_interp(ex[:src], cfg_hash, raw: ex[:raw])
 
   # Unrepresentable: source still interpolates a value we can't resolve
   # statically — `#{keyword}`-style RSpec loop vars, or `%{identifier}`
@@ -567,8 +596,14 @@ examples.each_with_index do |ex, n|
   # FIX dimension: expect_correction / expect_no_corrections
   if (want = ex[:correction])
     fix_total += 1
-    got = run_fix(POC, src, build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace, ruby: ex[:ruby]))
-    want_text = want == :none ? src : resolve_interp(want, cfg_hash)
+    yml = build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace, ruby: ex[:ruby])
+    got = run_fix(POC, src, yml)
+    want_text = want == :none ? src : resolve_interp(want, cfg_hash, raw: ex[:correction_raw])
+    # expect_correction iterates with ONE cop instance, so `ignore_node`
+    # suppressions persist structurally across rounds; a fresh `rubocop -a`
+    # (our --fix) iterates with fresh instances and corrects more. Both are
+    # rubocop behaviors — accept the single-pass result as the fallback.
+    got = run_fix(POC, src, yml, once: true) if got != want_text
     if got == want_text
       fix_pass += 1
     else
