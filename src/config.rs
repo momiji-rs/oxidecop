@@ -37,6 +37,10 @@ pub fn schema_default(cop: &str, key: &str) -> Option<&'static str> {
 /// This backs the cross-cutting `AllowedPatterns` config (see `Cops::allowed`).
 pub fn parse_allowed_list(s: &str) -> Vec<String> {
     let s = s.trim();
+    // the block-list accumulator's sentinel form: \u{1}item\u{0}item...
+    if let Some(rest) = s.strip_prefix('\u{1}') {
+        return rest.split('\u{0}').map(str::to_string).collect();
+    }
     if !s.starts_with('[') {
         return Vec::new(); // `nil` / absent / scalar → no patterns
     }
@@ -153,17 +157,19 @@ impl Config {
                     inherit_gems.push((g, paths));
                 }
             } else if let Some(item) = t.strip_prefix("- ") {
-                // a block-list item under the last seen key: accumulate into
-                // the flow form (`['a', 'b']`) that parse_allowed_list reads.
+                // a block-list item under the last seen key: accumulate
+                // under a sentinel-delimited form that survives items
+                // containing quotes (`!ruby/regexp /... ["']/`), which the
+                // quoted flow form can't represent.
                 if let (Some(sec), Some(key)) = (&cur, &cur_list_key) {
                     let map = sections.get_mut(sec).unwrap();
                     let item = item.trim().trim_matches(|c| c == '\'' || c == '"');
                     let entry = map.entry(key.clone()).or_default();
                     if entry.is_empty() || entry == "[]" {
-                        *entry = format!("['{item}']");
-                    } else if entry.ends_with(']') {
-                        entry.truncate(entry.len() - 1);
-                        entry.push_str(&format!(", '{item}']"));
+                        *entry = format!("\u{1}{item}");
+                    } else if entry.starts_with('\u{1}') {
+                        entry.push('\u{0}');
+                        entry.push_str(item);
                     }
                 }
             } else if let (Some(sec), Some((k, v))) = (&cur, t.split_once(':')) {

@@ -188,7 +188,17 @@ impl Engine {
             if let Some(v) = kv.get("AllowedPatterns") {
                 let pats = parse_allowed_list(v)
                     .into_iter()
-                    .filter_map(|p| regex::Regex::new(&p).ok())
+                    .filter_map(|p| {
+                        // `!ruby/regexp /.../ ` wraps an explicit regexp;
+                        // plain strings are already regexps to rubocop
+                        let body = p
+                            .strip_prefix("!ruby/regexp")
+                            .map(|r| r.trim())
+                            .and_then(|r| r.strip_prefix('/'))
+                            .and_then(|r| r.rsplit_once('/').map(|(b, _)| b.to_string()))
+                            .unwrap_or(p);
+                        regex::Regex::new(&body).ok()
+                    })
                     .collect();
                 allowed_patterns.insert(sec.clone(), pats);
             }
