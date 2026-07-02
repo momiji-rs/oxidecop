@@ -144,9 +144,11 @@ C:  4:  8: Style/NilComparison: Prefer the use of the `nil?` predicate.
 Config support is a minimal `.rubocop.yml` subset: `AllCops: DisabledByDefault`,
 per-cop `Enabled`, simple params (`Max`, `MinDigits`, …), and `EnforcedStyle`.
 Parameter defaults and each style cop's `SupportedStyles`/default live in one
-place — the `SCHEMA` table in `src/main.rs` (mirrors rubocop's `config/default.yml`),
-so a cop reads config through `Config::enforced_style`/`int` instead of hardcoding
-its own defaults. `Style/StringLiterals` dispatches on it (`single_quotes` ↔
+place — the `SCHEMA` table (`src/schema_gen.rs`), **generated for all 606 cops**
+from rubocop's own `config/default.yml` by `tools/gen_schema.rb` (the yml is
+vendored under `vendor/`). A cop reads config through
+`Config::enforced_style`/`int` instead of hardcoding its own defaults, so a
+newly ported cop's defaults are already there. `Style/StringLiterals` dispatches on it (`single_quotes` ↔
 `double_quotes`); other style cops just need to be pointed at the same resolver.
 
 `AllowedMethods` / `AllowedPatterns` are a cross-cutting mechanism (rubocop's

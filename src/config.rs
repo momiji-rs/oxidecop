@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 
 /// Per-cop config schema: parameter defaults and (for style cops) the supported
-/// `EnforcedStyle`s + default. This mirrors the relevant slice of rubocop's
-/// `config/default.yml` and is the ONE place defaults live — no default literals
-/// scattered at call sites, EnforcedStyle resolution/validation in one spot.
-/// Ideally generated from rubocop's own `config/default.yml` (see roadmap).
+/// `EnforcedStyle`s + default. This is the ONE place defaults live — no default
+/// literals scattered at call sites, EnforcedStyle resolution/validation in one
+/// spot. The table itself (`SCHEMA`, all 606 cops) is GENERATED from rubocop's
+/// own `config/default.yml` by `tools/gen_schema.rb` — see `src/schema_gen.rs`.
 pub struct Schema {
     pub cop: &'static str,
     /// (param, default-as-string). For style cops, includes `EnforcedStyle`.
@@ -17,22 +17,10 @@ pub struct Schema {
     /// ships `Style/SymbolProc` with `AllowedMethods: [define_method]`).
     pub allowed_methods: &'static [&'static str],
 }
-pub const SCHEMA: &[Schema] = &[
-    Schema { cop: "Layout/LineLength", params: &[("Max", "120")], styles: &[], allowed_methods: &[] },
-    Schema { cop: "Style/NumericLiterals", params: &[("MinDigits", "5")], styles: &[], allowed_methods: &[] },
-    Schema { cop: "Layout/TrailingWhitespace", params: &[("AllowInHeredoc", "false")], styles: &[], allowed_methods: &[] },
-    Schema { cop: "Style/StringLiterals", params: &[("EnforcedStyle", "single_quotes")],
-             styles: &["single_quotes", "double_quotes"], allowed_methods: &[] },
-    Schema { cop: "Style/NilComparison", params: &[("EnforcedStyle", "predicate")],
-             styles: &["predicate", "comparison"], allowed_methods: &[] },
-    Schema { cop: "Style/NumericPredicate", params: &[("EnforcedStyle", "predicate")],
-             styles: &["predicate", "comparison"], allowed_methods: &[] },
-    Schema { cop: "Naming/MethodName", params: &[("EnforcedStyle", "snake_case")],
-             styles: &["snake_case", "camelCase"], allowed_methods: &[] },
-    Schema { cop: "Style/SymbolProc", params: &[], styles: &[], allowed_methods: &["define_method"] },
-];
+pub use crate::schema_gen::SCHEMA;
 pub fn schema(cop: &str) -> Option<&'static Schema> {
-    SCHEMA.iter().find(|s| s.cop == cop)
+    // SCHEMA is generated sorted by cop name.
+    SCHEMA.binary_search_by(|s| s.cop.cmp(cop)).ok().map(|i| &SCHEMA[i])
 }
 pub fn schema_default(cop: &str, key: &str) -> Option<&'static str> {
     schema(cop).and_then(|s| s.params.iter().find(|(k, _)| *k == key).map(|(_, v)| *v))

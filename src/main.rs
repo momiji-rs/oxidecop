@@ -9,6 +9,7 @@ mod config;
 mod cops;
 mod declarative;
 mod nodepattern;
+mod schema_gen;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
