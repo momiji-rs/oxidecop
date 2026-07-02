@@ -89,16 +89,18 @@ impl<'a> Cops<'a> {
             }
             if allow_directives {
                 if let Some((_, coff, cend)) = comment {
-                    if is_directive_comment(&self.src[*coff..*cend]) {
-                        // re-measure without the trailing directive
-                        let prefix = &self.src[self.idx.starts[li]..*coff];
+                    if let Some(marker) = directive_marker_offset(&self.src[*coff..*cend]) {
+                        // re-measure without the directive (explanatory text
+                        // before the marker still counts)
+                        let prefix = &self.src[self.idx.starts[li]..*coff + marker];
                         let len = String::from_utf8_lossy(prefix).trim_end().chars().count();
                         if len > max {
                             let mut message = format!("Line is too long. [{len}/{max}]");
                             if let Some(sfx) = self.eng.style_guide_suffix(COP) {
                                 message.push_str(&sfx);
                             }
-                            self.offenses.push(Offense { line: line_no, col: max + 1, cop: COP, correctable: false, message });
+                            let correctable = self.ll_fix_for_line(line_no);
+                            self.offenses.push(Offense { line: line_no, col: max + 1, cop: COP, correctable, message });
                         }
                         continue;
                     }
@@ -136,7 +138,8 @@ impl<'a> Cops<'a> {
             if let Some(sfx) = self.eng.style_guide_suffix(COP) {
                 message.push_str(&sfx);
             }
-            self.offenses.push(Offense { line: line_no, col, cop: COP, correctable: false, message });
+            let correctable = self.ll_fix_for_line(line_no);
+            self.offenses.push(Offense { line: line_no, col, cop: COP, correctable, message });
         }
     }
 
@@ -351,9 +354,14 @@ fn is_rbs_annotation(comment: &[u8]) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     cached(&RE, r"^#:|^#\[.+\]|^#\|").is_match(&String::from_utf8_lossy(comment))
 }
-fn is_directive_comment(comment: &[u8]) -> bool {
+/// Byte offset of the `# rubocop:` directive marker inside a comment — like
+/// rubocop's DirectiveComment regexp, it may sit mid-comment (after
+/// explanatory text).
+fn directive_marker_offset(comment: &[u8]) -> Option<usize> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    cached(&RE, r"^#\s*rubocop\s*:\s*(?:disable|todo|enable)\b").is_match(&String::from_utf8_lossy(comment))
+    cached(&RE, r"#\s*rubocop\s*:\s*(?:disable|todo|enable)\b")
+        .find(&String::from_utf8_lossy(comment))
+        .map(|m| m.start())
 }
 /// URI candidates on the line, as byte ranges — rubocop matches broadly and
 /// then filters with `URI.parse` (`valid_uri?`); the practical rejection is a

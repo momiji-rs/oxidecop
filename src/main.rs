@@ -111,6 +111,7 @@ fn main() {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut cfg_path: Option<String> = None;
     let mut fix = false;
+    let mut fix_once = false;
     let mut autocorrect = false;
     let mut use_cache = true;
     let mut only: Option<Vec<String>> = None;
@@ -122,6 +123,13 @@ fn main() {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--fix" => fix = true,
+            // single lint+apply pass — the semantics of rubocop's
+            // expect_correction DSL when a corrector ignore_node's (a fresh
+            // `-a` run iterates instead); used by the oracle harness
+            "--fix-once" => {
+                fix = true;
+                fix_once = true;
+            }
             "-a" | "--autocorrect" | "-A" | "--autocorrect-all" => autocorrect = true,
             "--no-cache" => use_cache = false,
             "--cache" => {
@@ -185,7 +193,12 @@ fn main() {
         std::io::stdin().read_to_end(&mut src).ok();
         let result = cops::lint(&src, &cfg, &eng, &sp);
         if autocorrect || fix {
-            let out = apply_fixes(&src, result.fixes);
+            let out = if fix_once {
+                let result = cops::lint(&src, &cfg, &eng, &sp);
+                apply_fixes(&src, result.fixes)
+            } else {
+                apply_fixes_iter(src, &cfg, &eng, &sp)
+            };
             use std::io::Write;
             std::io::stdout().write_all(&out).unwrap();
             return;
@@ -222,8 +235,12 @@ fn main() {
         }
         let src = std::fs::read(&files[0]).expect("read");
         let rel = files[0].strip_prefix("./").unwrap_or(&files[0]).to_string_lossy().replace('\\', "/");
-        let result = cops::lint(&src, &cfg, &eng, &rel);
-        let out = apply_fixes(&src, result.fixes);
+        let out = if fix_once {
+            let result = cops::lint(&src, &cfg, &eng, &rel);
+            apply_fixes(&src, result.fixes)
+        } else {
+            apply_fixes_iter(src, &cfg, &eng, &rel)
+        };
         use std::io::Write;
         std::io::stdout().write_all(&out).unwrap();
         return;
@@ -236,11 +253,7 @@ fn main() {
             .map(|f| {
                 let rel = f.strip_prefix("./").unwrap_or(f).to_string_lossy().replace('\\', "/");
                 let Ok(src) = std::fs::read(f) else { return 0 };
-                let result = cops::lint(&src, &cfg, &eng, &rel);
-                if result.fixes.is_empty() {
-                    return 0;
-                }
-                let out = apply_fixes(&src, result.fixes);
+                let out = apply_fixes_iter(src.clone(), &cfg, &eng, &rel);
                 if out != src && std::fs::write(f, &out).is_ok() {
                     1
                 } else {
@@ -307,6 +320,24 @@ fn main() {
 }
 
 /// Apply autocorrect edits right-to-left, skipping overlaps.
+/// rubocop reruns its correctors until the source stops changing (long lines
+/// re-break, one insertion per line per pass); mirror that with a capped loop.
+fn apply_fixes_iter(src: Vec<u8>, cfg: &config::Config, eng: &cops::Engine, rel: &str) -> Vec<u8> {
+    let mut cur = src;
+    for _ in 0..200 {
+        let result = cops::lint(&cur, cfg, eng, rel);
+        if result.fixes.is_empty() {
+            return cur;
+        }
+        let out = apply_fixes(&cur, result.fixes);
+        if out == cur {
+            return cur;
+        }
+        cur = out;
+    }
+    cur
+}
+
 fn apply_fixes(src: &[u8], mut fixes: Vec<cops::Fix>) -> Vec<u8> {
     let mut out = src.to_vec();
     fixes.sort_by(|a, b| b.0.cmp(&a.0)); // descending by start

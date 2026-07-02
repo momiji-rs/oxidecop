@@ -1,6 +1,7 @@
 //! The cop engine: the `Cops` visitor (shared state + cross-cutting helpers),
 //! a THIN `Visit` impl that dispatches into per-department modules
 //! (`style`/`naming`/`lint`/`layout`), and the `lint()` entry point.
+mod breakable;
 mod layout;
 mod lint_cops;
 mod naming;
@@ -391,6 +392,17 @@ pub(crate) struct Cops<'a> {
     pub(crate) stmts_stack: Vec<usize>,
     // unless/else nodes already corrected — nested ones only get offenses.
     pub(crate) unless_else_spans: Vec<(usize, usize)>,
+    // ---- Layout/LineLength breakable machinery (see breakable.rs) ----
+    pub(crate) ll_active: bool,
+    pub(crate) ll_max: usize,
+    pub(crate) ll_split: bool,
+    pub(crate) ll_long: Vec<bool>,
+    pub(crate) ll_break: std::collections::HashMap<usize, (usize, Option<u8>)>,
+    pub(crate) ll_semi: std::collections::HashMap<usize, usize>,
+    pub(crate) ll_block: std::collections::HashMap<usize, usize>,
+    pub(crate) ll_coll_stack: Vec<breakable::LlFrame>,
+    pub(crate) ll_str_skip: HashSet<usize>,
+    pub(crate) ll_dstr_delim: Vec<u8>,
     pub(crate) requires_seen: HashSet<String>,
     // Depth of enclosing blocks / kwbegin / lambdas — Lint/Debugger's
     // assumed-usage heuristic consults this.
@@ -553,15 +565,52 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
         self.check_string_literals(node);
         self.check_character_literal(node);
+        self.ll_check_str(node);
     }
     fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
         // `'a' \` line-continuation concatenation parses as this node with
         // quoted string parts — the ConsistentQuotesInMultiline check.
         self.check_string_concat(node);
+        self.ll_check_dstr(node);
+        let delim = node.opening_loc().and_then(|o| match o.as_slice() {
+            b"'" | b"\"" => Some(o.as_slice()[0]),
+            _ => None,
+        });
+        if let Some(d) = delim {
+            self.ll_dstr_delim.push(d);
+        }
         ruby_prism::visit_interpolated_string_node(self, node);
+        if delim.is_some() {
+            self.ll_dstr_delim.pop();
+        }
     }
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
         self.check_boolean_symbol(node);
+    }
+    fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
+        if self.ll_active {
+            let elements: Vec<(usize, usize)> = node
+                .elements()
+                .iter()
+                .map(|e| (e.location().start_offset(), e.location().end_offset()))
+                .collect();
+            let l = node.location();
+            self.ll_enter_collection(
+                l.start_offset(),
+                l.end_offset(),
+                elements,
+                breakable::LlKind::Hash,
+                breakable::LlCallInfo::default(),
+            );
+        }
+        ruby_prism::visit_hash_node(self, node);
+        self.ll_exit_collection();
+    }
+    fn visit_optional_keyword_parameter_node(&mut self, node: &ruby_prism::OptionalKeywordParameterNode<'pr>) {
+        if self.ll_active {
+            self.ll_str_skip.insert(node.value().location().start_offset());
+        }
+        ruby_prism::visit_optional_keyword_parameter_node(self, node);
     }
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
         let v = node.value();
@@ -611,6 +660,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_unless_node(self, node);
     }
     fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        self.ll_check_semicolons(node);
         self.stmts_stack.push(node.location().start_offset());
         ruby_prism::visit_statements_node(self, node);
         self.stmts_stack.pop();
@@ -663,6 +713,28 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_parentheses_node(self, node);
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+        if self.ll_active {
+            let elements: Vec<(usize, usize)> = node
+                .elements()
+                .iter()
+                .map(|e| (e.location().start_offset(), e.location().end_offset()))
+                .collect();
+            let heredoc_arg_index = node
+                .elements()
+                .iter()
+                .position(|e| breakable::is_heredoc_node(&e));
+            for e in node.elements().iter() {
+                self.ll_str_skip.insert(e.location().start_offset());
+            }
+            let l = node.location();
+            self.ll_enter_collection(
+                l.start_offset(),
+                l.end_offset(),
+                elements,
+                breakable::LlKind::Array,
+                breakable::LlCallInfo { heredoc_arg_index, ..Default::default() },
+            );
+        }
         if let Some(o) = node.opening_loc() {
             let o = o.as_slice();
             if o.starts_with(b"%i") || o.starts_with(b"%I") {
@@ -680,12 +752,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         ruby_prism::visit_array_node(self, node);
+        self.ll_exit_collection();
     }
     fn visit_assoc_node(&mut self, node: &ruby_prism::AssocNode<'pr>) {
         // both sides of a hash pair are "assumed arguments"
         if self.eng.debugger_on {
             self.assumed_arg_offsets.insert(node.key().location().start_offset());
             self.assumed_arg_offsets.insert(node.value().location().start_offset());
+        }
+        if self.ll_active {
+            // strings under a pair are not split-candidates (rubocop's
+            // breakable_string? parent check)
+            self.ll_str_skip.insert(node.key().location().start_offset());
+            self.ll_str_skip.insert(node.value().location().start_offset());
         }
         ruby_prism::visit_assoc_node(self, node);
     }
@@ -737,13 +816,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Default walk (receiver, params, body) one def level deeper — matches
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
         // parameter default values, which a body-only walk silently skipped.
+        if self.ll_active {
+            let elements = breakable::def_param_spans(node);
+            let l = node.location();
+            self.ll_enter_collection(
+                l.start_offset(),
+                l.end_offset(),
+                elements,
+                breakable::LlKind::Def,
+                breakable::LlCallInfo::default(),
+            );
+        }
         self.def_depth += 1;
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         ruby_prism::visit_def_node(self, node);
         self.class_children_stack.pop();
         self.def_depth -= 1;
+        self.ll_exit_collection();
     }
     fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.ll_check_lambda(node);
         if let Some((off, msg)) = self.symbol_proc_lambda(node) {
             self.push(off, "Style/SymbolProc", true, msg);
         }
@@ -794,6 +886,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_alias_method_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if self.ll_active {
+            let (elements, info) = breakable::call_break_info(node);
+            let l = node.location();
+            self.ll_enter_collection(l.start_offset(), l.end_offset(), elements,
+                breakable::LlKind::Call, info);
+            if let Some(b) = node.block().and_then(|b| b.as_block_node()) {
+                self.ll_check_block(node, &b);
+            }
+        }
         // The parser gem folds unary minus into a numeric literal; prism keeps
         // the `-@` call when the sign is separated from the digits. Emulate
         // the fold so the offense span starts at the `-`.
@@ -904,6 +1005,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.call_stack.pop();
+        self.ll_exit_collection();
     }
 }
 
@@ -960,6 +1062,16 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         dirname_ignore: Vec::new(),
         stmts_stack: Vec::new(),
         unless_else_spans: Vec::new(),
+        ll_active: false,
+        ll_max: 0,
+        ll_split: false,
+        ll_long: Vec::new(),
+        ll_break: std::collections::HashMap::new(),
+        ll_semi: std::collections::HashMap::new(),
+        ll_block: std::collections::HashMap::new(),
+        ll_coll_stack: Vec::new(),
+        ll_str_skip: HashSet::new(),
+        ll_dstr_delim: Vec::new(),
         requires_seen: HashSet::new(),
         usage_block_depth: 0,
         assumed_arg_offsets: HashSet::new(),
@@ -979,7 +1091,6 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         .as_program_node()
         .and_then(|p| p.statements().body().iter().next().map(|n| n.location().start_offset()));
     cops.check_frozen_string_literal(first_code_line);
-    cops.check_line_length();
     cops.check_trailing_whitespace();
     cops.check_empty_file();
     cops.check_trailing_empty_lines();
@@ -987,7 +1098,10 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     let t = tick(&T_TEXT, t);
 
     // ---- AST-based cops ----
+    cops.ll_prepare();
     cops.visit(&result.node());
+    // needs the breakable nominations the walk collected
+    cops.check_line_length();
     let t = tick(&T_VISIT, t);
 
     let mut offenses = cops.offenses;
