@@ -162,6 +162,20 @@ def resolve_cop_config_text(body, cfg_stack)
   end
 end
 
+# The text form of a `let(:other_cops)` body, composing super().merge like
+# cop_config does (frame slot 8 holds the inherited text).
+def resolve_other_cops_text(body, cfg_stack)
+  if (m = body.match(/super\(\)\s*\.merge\(\s*(.*?)\s*\)\s*\z/m))
+    inner = m[1]
+    inner = inner.sub(/\A\{\s*/, '').sub(/\s*\}\z/, '') if inner.start_with?('{')
+    parent = cfg_stack.last[8]
+    base = parent == 'default' ? '' : parent.sub(/\A\{\s*/, '').sub(/\s*\}\z/, '')
+    "{ #{[base, inner].reject(&:empty?).join(', ')} }"
+  else
+    extract_hash(body)
+  end
+end
+
 # Parse `RuboCop::Config.new('Section' => {...}, ...)` out of a spec block:
 # returns { section => [hash_text, merges_cop_config] } or nil.
 def parse_config_sections(joined)
@@ -205,6 +219,7 @@ while i < lines.length
     inh_ovr  = cfg_stack.any? ? cfg_stack.last[5] : nil
     inh_rb   = cfg_stack.any? ? cfg_stack.last[6] : nil
     inh_lets = cfg_stack.any? ? cfg_stack.last[7].dup : {}
+    inh_oc   = cfg_stack.any? ? cfg_stack.last[8] : 'default'
     # a `:rubyXY` context tag pins TargetRubyVersion for its examples
     inh_rb = "#{Regexp.last_match(1)}.#{Regexp.last_match(2)}" if l =~ /,\s*:ruby(\d)(\d)\b/
     # A shared_examples group runs at its it_behaves_like call sites, with
@@ -213,7 +228,7 @@ while i < lines.length
     shared = !(l =~ /^\s*shared_examples\b/).nil?
     cfg_stack.push([indent, inh_cfg,
                     inh_skip || l.include?('unsupported_on: :prism') || shared,
-                    inh_as, inh_sec, inh_ovr, inh_rb, inh_lets])
+                    inh_as, inh_sec, inh_ovr, inh_rb, inh_lets, inh_oc])
   elsif l =~ /^\s*(it|specify)\b/
     # An `it` at indent N means every context defined at indent >= N has
     # closed — without this, a trailing top-level example would inherit the
@@ -236,6 +251,20 @@ while i < lines.length
   if cfg_stack.any? && l =~ /let\(:(\w+)\)\s*\{\s*(true|false|-?\d+|'[^']*'|"[^"]*")\s*\}\s*\z/ &&
      !%w[cop_config config cop].include?(Regexp.last_match(1))
     cfg_stack.last[7][Regexp.last_match(1)] = Regexp.last_match(2)
+  end
+  # `let(:other_cops)` — extra config SECTIONS the example needs (e.g.
+  # Style/StringLiterals EnforcedStyle for Style/EmptyLiteral). Same scoping
+  # and super().merge composition as cop_config, but keys are cop names.
+  if l =~ /let\(:other_cops\)\s*\{(.*)\}\s*\z/
+    cfg_stack.last[8] = resolve_other_cops_text(Regexp.last_match(1), cfg_stack) if cfg_stack.any?
+  elsif l =~ /let\(:other_cops\)\s*do\s*\z/
+    blk = []
+    i += 1
+    while i < lines.length && lines[i].strip != 'end'
+      blk << lines[i]
+      i += 1
+    end
+    cfg_stack.last[8] = resolve_other_cops_text(blk.join(' '), cfg_stack) if cfg_stack.any?
   end
   # `let(:cop_config)` in either single-line `{ {...} }` or multi-line `do..end`
   # form. Capture the raw hash text (quotes preserved, whitespace collapsed) so
@@ -295,6 +324,7 @@ while i < lines.length
   cur_ovr = cfg_stack.any? ? cfg_stack.last[5] : nil
   cur_rb  = cfg_stack.any? ? cfg_stack.last[6] : nil
   cur_lets = cfg_stack.any? ? cfg_stack.last[7] : {}
+  cur_oc   = cfg_stack.any? ? cfg_stack.last[8] : 'default'
   # Heredoc examples, all forms: `<<~RUBY` (escapes render), `<<~'RUBY'` (raw),
   # `<<-RUBY`, and trailing keyword args (`, identifier: identifier` — those
   # substitute `%{key}` in the body; unresolvable statically, so they fall into
@@ -314,7 +344,7 @@ while i < lines.length
     src = src.chomp if chomp
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
                   sections: cur_sec, override: cur_ovr, ruby: cur_rb, raw: raw_heredoc,
-                  lets: cur_lets.dup, src: src, expected: expected }
+                  lets: cur_lets.dup, other_cops: cur_oc, src: src, expected: expected }
   elsif l =~ /expect_correction\(<<([~-])('?)RUBY\2\s*[,)]/ && examples.any? && examples.last[:kind] == :offense
     squiggly = Regexp.last_match(1) == '~'
     raw_heredoc = Regexp.last_match(2) == "'"
@@ -341,7 +371,7 @@ while i < lines.length
     body += "\n" unless body.end_with?("\n")
     examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
                   sections: cur_sec, override: cur_ovr, ruby: cur_rb, lets: cur_lets.dup,
-                  src: body, expected: [] }
+                  other_cops: cur_oc, src: body, expected: [] }
   end
   i += 1
 end
@@ -488,7 +518,8 @@ def run_poc(poc, src, cfg)
     out, = Open3.capture2(poc, rb, yml)
     # parse "C: 4:  8: [Correctable] Cop/Name: message"
     out.lines.filter_map do |line|
-      if line =~ /\A[A-Z]:\s*(\d+):\s*(\d+):\s*(?:\[Correctable\]\s*)?(\S+):\s*(.*)/
+      if line =~ /\A[A-Z]:\s*(\d+):\s*(\d+):\s*(?:\[Correctable\]\s*)?(\S+):\s*(.*)/ &&
+         Regexp.last_match(3) == COP
         [Regexp.last_match(1).to_i, Regexp.last_match(2).to_i, Regexp.last_match(4).strip]
       end
     end
@@ -559,6 +590,17 @@ examples.each_with_index do |ex, n|
     end
     extra_sections = sections.reject { |k, _| k == COP }
                              .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(h)) || {}] }
+  end
+
+  if (oc = ex[:other_cops]) && oc != 'default'
+    body = oc.strip.sub(/\A\{/, '').sub(/\}\z/, '')
+    split_top(body).each do |part|
+      next unless part =~ /\A\s*['"]([^'"]+)['"]\s*=>\s*(.*)\z/m
+
+      sec = Regexp.last_match(1)
+      h = resolve_cfg_variables!(parse_cfg(extract_hash(Regexp.last_match(2))), ex[:lets] || {}) || {}
+      extra_sections << [sec, h]
+    end
   end
 
   src = resolve_interp(ex[:src], cfg_hash, raw: ex[:raw])
