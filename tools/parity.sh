@@ -27,9 +27,9 @@ cargo build --release --manifest-path "$ROOT/Cargo.toml" --quiet
 normalize() {
   awk -v strip="$1" '
     /^== .* ==$/ { f = substr($0, 4, length($0) - 6); sub(strip, "", f); next }
-    /^C:/ {
+    /^[A-Z]:/ {
       line = $0
-      sub(/^C: */, "", line)
+      sub(/^[A-Z]: */, "", line)
       gsub(/\[Correctable\] /, "", line)
       gsub(/`/, "", line)
       printf "%s:%s\n", f, line

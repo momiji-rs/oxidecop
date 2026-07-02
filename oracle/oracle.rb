@@ -152,6 +152,24 @@ def resolve_cop_config_text(body, cfg_stack)
   end
 end
 
+# Parse `RuboCop::Config.new('Section' => {...}, ...)` out of a spec block:
+# returns { section => [hash_text, merges_cop_config] } or nil.
+def parse_config_sections(joined)
+  m = joined.match(/RuboCop::Config\.new\((.*)\)/m)
+  return nil unless m
+
+  sections = {}
+  split_top(m[1]).each do |part|
+    next unless part =~ /\A\s*['"]([^'"]+)['"]\s*=>\s*(.*)\z/m
+
+    sec = Regexp.last_match(1)
+    val = Regexp.last_match(2).strip
+    merges_cop_config = !val.sub!(/\.merge\(cop_config\)\s*\z/, '').nil?
+    sections[sec] = [extract_hash(val), merges_cop_config]
+  end
+  sections.empty? ? nil : sections
+end
+
 examples = []
 lines = File.readlines(SPEC, chomp: true)
 i = 0
@@ -190,6 +208,11 @@ while i < lines.length
     # previous sibling context's cop_config.
     cfg_stack.pop while cfg_stack.any? && cfg_stack.last[0] >= indent
   end
+  # `before { (cur_)cop_config[...][...] = ... }` mutates a NESTED key of the
+  # config hash — unrepresentable statically; skip the context.
+  if l =~ /before\s*\{\s*(cur_)?cop_config\[[^\]]*\]\[/ && cfg_stack.any?
+    cfg_stack.last[2] = true
+  end
   # `before { config['Cop/Name'] = { ... } }` mutates the built config: the
   # cop's section becomes EXACTLY that hash (defaults don't apply).
   if l =~ /before\s*\{\s*config\['#{Regexp.escape(COP)}'\]\s*=\s*(\{.*\})\s*\}/ && cfg_stack.any?
@@ -227,17 +250,23 @@ while i < lines.length
     if (m = joined.match(/ActiveSupportExtensionsEnabled'\s*=>\s*(true|false)/)) && cfg_stack.any?
       cfg_stack.last[3] = m[1]
     end
-    if cfg_stack.any? && (m = joined.match(/RuboCop::Config\.new\((.*)\)/m))
-      sections = {}
-      split_top(m[1]).each do |part|
-        next unless part =~ /\A\s*['"]([^'"]+)['"]\s*=>\s*(.*)\z/m
-
-        sec = Regexp.last_match(1)
-        val = Regexp.last_match(2).strip
-        merges_cop_config = !val.sub!(/\.merge\(cop_config\)\s*\z/, '').nil?
-        sections[sec] = [extract_hash(val), merges_cop_config]
+    if cfg_stack.any? && (sections = parse_config_sections(joined))
+      cfg_stack.last[4] = sections
+    end
+  end
+  # `subject(:cop) { described_class.new(RuboCop::Config.new(...)) }` — another
+  # way specs pin a full config; same replacement semantics as let(:config).
+  if l =~ /subject\(:cop\)\s*(do|\{)/
+    blk = [l]
+    if l.include?('do')
+      i += 1
+      while i < lines.length && lines[i].strip != 'end'
+        blk << lines[i]
+        i += 1
       end
-      cfg_stack.last[4] = sections unless sections.empty?
+    end
+    if cfg_stack.any? && (sections = parse_config_sections(blk.join(' ')))
+      cfg_stack.last[4] = sections
     end
   end
   cur_cfg = cfg_stack.any? ? cfg_stack.last[1] : 'default'
@@ -318,6 +347,12 @@ VAR_SENTINEL = " VAR:"
 
 def parse_val(v)
   v = v.strip
+  # hash-form grouped values (`{ 'Pry' => %w[...], 'X' => nil }`) act like
+  # rubocop's `config.values.flatten`: the arrays inside, flattened.
+  if v.start_with?('{')
+    return v.scan(/%[wi]\[([^\]]*)\]/).flat_map { |m| m[0].split(/\s+/) } +
+           v.scan(/\[([^\]]*)\]/).flat_map { |m| split_top(m[0]).map { |x| normalize_pattern(x) } }
+  end
   if v.start_with?('[')
     inner = v.sub(/\A\[/, '').sub(/\]\s*\z/, '')
     split_top(inner).map { |item| normalize_pattern(item) }
@@ -404,7 +439,7 @@ def run_poc(poc, src, cfg)
     out, = Open3.capture2(poc, rb, yml)
     # parse "C: 4:  8: [Correctable] Cop/Name: message"
     out.lines.filter_map do |line|
-      if line =~ /\AC:\s*(\d+):\s*(\d+):\s*(?:\[Correctable\]\s*)?(\S+):\s*(.*)/
+      if line =~ /\A[A-Z]:\s*(\d+):\s*(\d+):\s*(?:\[Correctable\]\s*)?(\S+):\s*(.*)/
         [Regexp.last_match(1).to_i, Regexp.last_match(2).to_i, Regexp.last_match(4).strip]
       end
     end

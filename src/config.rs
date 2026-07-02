@@ -72,6 +72,9 @@ pub struct Config {
     // cop/section name -> { key -> value }
     pub(crate) sections: HashMap<String, HashMap<String, String>>,
     all_disabled_by_default: bool,
+    // `--only Cop1,Cop2` — when set, ONLY these cops (or departments) run,
+    // regardless of Enabled flags, like rubocop's flag.
+    pub only: Option<Vec<String>>,
 }
 impl Config {
     pub fn parse(text: &str) -> Self {
@@ -105,9 +108,12 @@ impl Config {
             .and_then(|s| s.get("DisabledByDefault"))
             .map(|v| v == "true")
             .unwrap_or(false);
-        Config { sections, all_disabled_by_default }
+        Config { sections, all_disabled_by_default, only: None }
     }
     pub fn enabled(&self, cop: &str) -> bool {
+        if let Some(only) = &self.only {
+            return only.iter().any(|o| o == cop || cop.starts_with(&format!("{o}/")));
+        }
         match self.sections.get(cop).and_then(|s| s.get("Enabled")) {
             Some(v) => v != "false",
             None => !self.all_disabled_by_default,

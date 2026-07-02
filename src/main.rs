@@ -49,9 +49,14 @@ fn main() {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut cfg_path: Option<String> = None;
     let mut fix = false;
-    for a in &args[1..] {
+    let mut only: Option<Vec<String>> = None;
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "--fix" => fix = true,
+            "--only" => {
+                only = it.next().map(|v| v.split(',').map(|c| c.trim().to_string()).collect());
+            }
             // back-compat: a bare .yml positional arg is the config
             s if s.ends_with(".yml") || s.ends_with(".yaml") => cfg_path = Some(s.to_string()),
             s => paths.push(PathBuf::from(s)),
@@ -66,7 +71,8 @@ fn main() {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .or_else(|| std::fs::read_to_string(".rubocop.yml").ok())
         .unwrap_or_default();
-    let cfg = config::Config::parse(&cfg_text);
+    let mut cfg = config::Config::parse(&cfg_text);
+    cfg.only = only;
 
     let mut files: Vec<PathBuf> = Vec::new();
     for p in &paths {
@@ -125,7 +131,9 @@ fn main() {
         println!("== {path} ==");
         for o in offenses {
             let c = if o.correctable { correctable += 1; "[Correctable] " } else { "" };
-            println!("C:{:>3}:{:>3}: {}{}: {}", o.line, o.col, c, o.cop, o.message);
+            // Lint's default severity is warning, everything else convention.
+            let sev = if o.cop.starts_with("Lint/") { 'W' } else { 'C' };
+            println!("{sev}:{:>3}:{:>3}: {}{}: {}", o.line, o.col, c, o.cop, o.message);
         }
         total += offenses.len();
     }
