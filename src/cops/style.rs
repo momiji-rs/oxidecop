@@ -626,6 +626,52 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Style/EvenOdd — `x % 2 == 0` → `x.even?` etc. rubocop's matcher
+    /// verbatim; which predicate depends on the operator and the compared int.
+    pub(crate) fn check_even_odd(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/EvenOdd";
+        if !self.on(COP) {
+            return;
+        }
+        static PAT: OnceLock<Pat> = OnceLock::new();
+        let pat = matcher(&PAT,
+            "(send {(send $_ :% (int 2)) (begin (send $_ :% (int 2)))} ${:== :!=} (int ${0 1}))");
+        let Some(caps) = nodepattern::matches(pat, &node.as_node(), self.src) else { return };
+        // caps: [base, operator, compared-int]
+        let method = match (caps[2].as_str(), caps[1].as_str()) {
+            ("0", "==") | ("1", "!=") => "even",
+            ("0", "!=") | ("1", "==") => "odd",
+            _ => return,
+        };
+        let l = node.location();
+        self.push(l.start_offset(), COP, true, format!("Replace with `Integer#{method}?`."));
+        self.fixes.push((l.start_offset(), l.end_offset(), format!("{}.{method}?", caps[0]).into_bytes()));
+    }
+
+    /// Lint/BooleanSymbol — `:true` / `:false` literals (outside `%i[]`).
+    pub(crate) fn check_boolean_symbol(&mut self, node: &ruby_prism::SymbolNode) {
+        const COP: &str = "Lint/BooleanSymbol";
+        if !self.on(COP) {
+            return;
+        }
+        let l = node.location();
+        if self.percent_sym_spans.iter().any(|(s, e)| l.start_offset() >= *s && l.start_offset() < *e) {
+            return;
+        }
+        let Some(v) = node.value_loc() else { return };
+        let value = &self.src[v.start_offset()..v.end_offset()];
+        if !matches!(value, b"true" | b"false") {
+            return;
+        }
+        let value = String::from_utf8_lossy(value).into_owned();
+        self.push(l.start_offset(), COP, true,
+            format!("Symbol with a boolean name - you probably meant to use `{value}`."));
+        // fix: `:true` -> `true` (the `key:` label form is left alone).
+        if self.src[l.start_offset()] == b':' {
+            self.fixes.push((l.start_offset(), l.end_offset(), value.into_bytes()));
+        }
+    }
+
     /// Style/NumericPredicate: under `predicate` style flag `x {==,>,<} 0` (and
     /// inverted) → suggest `x.zero?/positive?/negative?`; under `comparison`
     /// style flag those predicates → suggest the comparison. Returns the offense

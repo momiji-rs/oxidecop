@@ -12,6 +12,15 @@ pub const DECLARATIVE: &[(&str, &str, &str, Anchor, Option<&str>)] = &[
     // NilComparison. Two styles, two rows, gated on EnforcedStyle. Verbatim msgs.
     ("(send _ {:== :===} (nil))", "Style/NilComparison", "Prefer the use of the `nil?` predicate.", Anchor::Op, Some("predicate")),
     ("(send (...) :nil?)", "Style/NilComparison", "Prefer the use of the `==` comparison.", Anchor::Op, Some("comparison")),
+
+    // RandOne — rubocop's rand_one? pattern verbatim; the whole matched call
+    // (the `$(...)` capture) interpolates into the message.
+    ("$(send {(const {nil? cbase} :Kernel) nil?} :rand {(int {-1 1}) (float {-1.0 1.0})})",
+     "Lint/RandOne", "`{}` always returns `0`. Perhaps you meant `rand(2)` or `rand`?", Anchor::Node, None),
+
+    // ArrayJoin — rubocop's join_candidate? pattern; fixed message, offense on
+    // the `*` selector.
+    ("(send array :* str)", "Style/ArrayJoin", "Favor `Array#join` over `Array#*`.", Anchor::Op, None),
 ];
 
 /// Where a declarative offense points. Per-cop metadata, since rubocop's cops

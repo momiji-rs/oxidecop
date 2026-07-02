@@ -4,9 +4,9 @@ A fast, native, **RuboCop-compatible** Ruby linter — written in Rust, over the
 official [Prism](https://github.com/ruby/prism) parser. Think *ruff, but for
 Ruby, and bug-compatible with the RuboCop everyone already uses.*
 
-> **Status: early / experimental.** The core idea is proven — the 13
+> **Status: early / experimental.** The core idea is proven — the 17
 > implemented cops pass **100% of RuboCop's own representable spec examples**
-> (654/654, see below) — but 13 cops is not a shippable linter yet.
+> (687/687, see below) — but 17 cops is not a shippable linter yet.
 
 ---
 
@@ -108,9 +108,13 @@ Style/RedundantReturn                    37      1    37/37       37/37      100
 Naming/MethodName                        29     49    29/29       29/29      100%
 Style/NumericLiterals                    28      0    28/28       28/28      100%
 Layout/TrailingWhitespace                19      0    19/19       19/19      100%
+Style/EvenOdd                            18      0    18/18       18/18      100%
+Lint/BooleanSymbol                       10      0    10/10       10/10      100%
 Style/NilComparison                       8      0     8/8         8/8       100%
+Style/ArrayJoin                           5      0     5/5         5/5       100%
+Lint/RandOne                              0      1     0/0         0/0          —
 ────────────────────────────────────────────────────────────────────────────
-TOTAL (representable examples)          654    126                654/654     100%
+TOTAL (representable examples)          687    127                687/687     100%
 ```
 
 **Read this honestly:** the score is over *representable* examples only. RuboCop's
@@ -120,7 +124,9 @@ specs encode some text dynamically — escape sequences the heredoc renders
 The oracle renders what is static (heredoc escapes per Ruby's quoting rules,
 the known-constant helpers like `trailing_whitespace`, `#{enforced_style}` from
 the active config) and **skips** anything still-dynamic rather than scoring a
-harness limitation as a cop miss — hence the `skip` column.
+harness limitation as a cop miss — hence the `skip` column. (`Lint/RandOne`'s
+spec is ENTIRELY parameterized shared_examples, so the oracle scores nothing;
+its cases are covered verbatim by `cargo test` instead.)
 
 Each example runs under its own `let(:cop_config)`, translated to `.rubocop.yml`.
 So a `LineLength` example with `Max: 30, AllowURI: true` is tested at that `Max` —

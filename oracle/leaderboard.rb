@@ -35,7 +35,11 @@ COPS = {
   'Lint/NestedMethodDefinition'      => 'lint/nested_method_definition',
   'Style/SymbolProc'                 => 'style/symbol_proc',
   'Layout/LineLength'                => 'layout/line_length',
-  'Layout/TrailingWhitespace'        => 'layout/trailing_whitespace'
+  'Layout/TrailingWhitespace'        => 'layout/trailing_whitespace',
+  'Style/EvenOdd'                    => 'style/even_odd',
+  'Lint/RandOne'                     => 'lint/rand_one',
+  'Style/ArrayJoin'                  => 'style/array_join',
+  'Lint/BooleanSymbol'               => 'lint/boolean_symbol'
 }.freeze
 
 FileUtils.mkdir_p(DIR)

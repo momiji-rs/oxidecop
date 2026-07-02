@@ -88,6 +88,8 @@ pub(crate) struct Cops<'a> {
     pub(crate) str_ignore: Vec<(usize, usize)>,
     // Numeric literals already checked as part of a folded `-@` call.
     pub(crate) num_ignore: Vec<usize>,
+    // Spans of `%i[...]`/`%I[...]` arrays — Lint/BooleanSymbol skips those.
+    pub(crate) percent_sym_spans: Vec<(usize, usize)>,
     // Heredoc BODIES as (first line, last line, delimiter) — terminator
     // excluded. Layout/TrailingWhitespace and Layout/LineLength consult these.
     pub(crate) heredoc_lines: Vec<(usize, usize, Vec<u8>)>,
@@ -174,6 +176,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // quoted string parts — the ConsistentQuotesInMultiline check.
         self.check_string_concat(node);
         ruby_prism::visit_interpolated_string_node(self, node);
+    }
+    fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
+        self.check_boolean_symbol(node);
+    }
+    fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+        if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"%i") || o.as_slice().starts_with(b"%I")) {
+            let l = node.location();
+            self.percent_sym_spans.push((l.start_offset(), l.end_offset()));
+        }
+        ruby_prism::visit_array_node(self, node);
     }
     fn visit_embedded_statements_node(&mut self, node: &ruby_prism::EmbeddedStatementsNode<'pr>) {
         self.interp_depth += 1;
@@ -312,6 +324,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.check_zero_length(node);
+        self.check_even_odd(node);
         // Style/RedundantReturn also fires for method-defining blocks
         // (rubocop's RESTRICT_ON_SEND: define_method & friends, lambda).
         if self.on("Style/RedundantReturn")
@@ -438,6 +451,7 @@ pub fn lint(src: &[u8], cfg: &Config) -> LintResult {
         interp_depth: 0,
         str_ignore: Vec::new(),
         num_ignore: Vec::new(),
+        percent_sym_spans: Vec::new(),
         heredoc_lines,
         data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
         class_children_stack: Vec::new(),
@@ -611,6 +625,21 @@ mod tests {
     fn visits_lambda_parameter_defaults() {
         let got = offenses("f = ->(x = 1000000) { x }\n", NUMERIC_ONLY);
         assert_eq!(got, vec![(1, 12, "Style/NumericLiterals")]);
+    }
+
+    // Lint/RandOne's spec is entirely parameterized shared_examples (the
+    // oracle skips it); these are its it_behaves_like cases verbatim.
+    #[test]
+    fn rand_one_cases() {
+        let cfg = "AllCops:\n  DisabledByDefault: true\nLint/RandOne:\n  Enabled: true\n";
+        for src in ["rand 1\n", "rand(-1)\n", "rand(1.0)\n", "rand(-1.0)\n",
+                    "Kernel.rand(1)\n", "Kernel.rand 1.0\n", "::Kernel.rand(-1.0)\n"] {
+            assert_eq!(offenses(src, cfg).len(), 1, "expected offense for {src:?}");
+        }
+        for src in ["rand\n", "rand(2)\n", "rand(-1..1)\n", "Kernel.rand 2\n",
+                    "::Kernel.rand\n", "x.rand(1)\n"] {
+            assert_eq!(offenses(src, cfg), vec![], "expected clean for {src:?}");
+        }
     }
 
     // nodepattern extensions: const/cbase scopes, `...` rest-args, csend.
