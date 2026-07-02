@@ -2894,3 +2894,53 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+impl<'a> super::Cops<'a> {
+
+    /// Style/OptionalArguments — optional positional parameters that come
+    /// before required positional parameters should be moved to the end.
+    /// Ported from rubocop's `each_misplaced_optional_arg`: for each optional
+    /// parameter, check if there are any required positional parameters (either
+    /// `.requireds()` or `.posts()`) that come after it in the source, and if
+    /// so, flag the optional parameter.
+    ///
+    /// No autocorrect: rubocop's cop doesn't extend `AutoCorrector`.
+    pub(crate) fn check_optional_arguments(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/OptionalArguments";
+        if !self.on(COP) {
+            return;
+        }
+
+        let Some(params) = node.parameters() else { return };
+
+        let optionals: Vec<_> = params.optionals().iter().collect();
+        if optionals.is_empty() {
+            return;
+        }
+
+        // Collect all required positional parameters (both regular and posts)
+        let mut requireds: Vec<_> = params.requireds().iter().collect();
+        requireds.extend(params.posts().iter());
+
+        if requireds.is_empty() {
+            return;
+        }
+
+        // For each optional parameter, check if there's any required parameter
+        // that comes after it (has a greater start offset in the source)
+        for optional in optionals {
+            let opt_start = optional.location().start_offset();
+            for required in &requireds {
+                let req_start = required.location().start_offset();
+                if req_start > opt_start {
+                    self.push(
+                        opt_start,
+                        COP,
+                        false,
+                        "Optional arguments should appear at the end of the argument list.",
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
