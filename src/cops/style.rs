@@ -2679,3 +2679,72 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((sel.start_offset(), sel.end_offset(), replacement.as_bytes().to_vec()));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/ClassMethods — `def ClassName.method` inside a class/module
+    /// should be `def self.method`. Ported from rubocop's Style/ClassMethods.
+    /// Checks both direct DefNodes and DefNodes nested in a StatementsNode body.
+    pub(crate) fn check_class_methods(
+        &mut self,
+        constant_path: &ruby_prism::Node,
+        body: Option<ruby_prism::Node>,
+    ) {
+        const COP: &str = "Style/ClassMethods";
+        if !self.on(COP) {
+            return;
+        }
+
+        let Some(body_node) = body else { return };
+
+        // Get the class/module name
+        let class_name = self.node_src(constant_path);
+
+        // Handle direct DefNode
+        if let Some(def_node) = body_node.as_def_node() {
+            self.check_class_method_def(class_name, &def_node);
+            return;
+        }
+
+        // Handle StatementsNode containing DefNodes
+        if let Some(stmts) = body_node.as_statements_node() {
+            for stmt in stmts.body().iter() {
+                if let Some(def_node) = stmt.as_def_node() {
+                    self.check_class_method_def(class_name, &def_node);
+                }
+            }
+        }
+    }
+
+    fn check_class_method_def(
+        &mut self,
+        class_name: &[u8],
+        def_node: &ruby_prism::DefNode,
+    ) {
+        const COP: &str = "Style/ClassMethods";
+        let Some(receiver) = def_node.receiver() else { return };
+
+        // Get the receiver name as bytes
+        let receiver_name = self.node_src(&receiver);
+
+        // Compare: only trigger if receiver matches class name
+        if receiver_name != class_name {
+            return;
+        }
+
+        // Get the method name
+        let method_name = String::from_utf8_lossy(def_node.name().as_slice());
+
+        let message = format!(
+            "Use `self.{}` instead of `{}.{}`.",
+            method_name,
+            String::from_utf8_lossy(class_name),
+            method_name
+        );
+
+        self.push(receiver.location().start_offset(), COP, true, message);
+
+        // Fix: replace receiver with "self"
+        let (start, end) = (receiver.location().start_offset(), receiver.location().end_offset());
+        self.fixes.push((start, end, b"self".to_vec()));
+    }
+}
