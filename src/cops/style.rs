@@ -3256,3 +3256,58 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((start, end, replacement));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/TrailingMethodEndStatement — a multiline `def`/`def self.foo`
+    /// whose closing `end` trails the body's last statement on the same
+    /// line (`def foo\n  bar; end`). Ported verbatim from rubocop's
+    /// `TrailingMethodEndStatement#trailing_end?` +
+    /// `body_and_end_on_same_line?`:
+    ///   - `node.endless?` / no `end` keyword at all → skip (handled by the
+    ///     caller via `end_keyword_loc`/`equal_loc`, and defensively here);
+    ///   - no body at all (`def no_op; end`) → skip;
+    ///   - the whole `def ... end` node fits on one line (not
+    ///     `node.multiline?`) → skip;
+    ///   - the body's last line isn't the same as the `end` keyword's line
+    ///     → skip (nothing trailing).
+    /// Autocorrect ports `insert_before(node.loc.end, "\n" + ' ' *
+    /// node.loc.keyword.column)`: break onto a new line indented to match
+    /// the `def` keyword's own column, leaving any whitespace that used to
+    /// separate the body from `end` as trailing whitespace on the body's
+    /// line (see the `expect_correction` fixtures — a literal trailing
+    /// space is expected there).
+    pub(crate) fn check_trailing_method_end_statement(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/TrailingMethodEndStatement";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = node.body() else { return }; // `def no_op; end`
+        let Some(end_loc) = node.end_keyword_loc() else { return }; // endless def
+        let keyword = node.def_keyword_loc();
+        let keyword_start = keyword.start_offset();
+        let end_start = end_loc.start_offset();
+
+        // `node.multiline?`: the whole def...end node spans more than one line.
+        let start_line = self.idx.loc(keyword_start).0;
+        let end_line = self.idx.loc(end_start).0;
+        if start_line == end_line {
+            return;
+        }
+
+        // `body_and_end_on_same_line?`: node.children.last (the body, since
+        // rescue/ensure wrappers are themselves the body node in prism) ends
+        // on the same line as the `end` keyword.
+        let body_end = body.location().end_offset();
+        let body_last_line = self.idx.loc(body_end.saturating_sub(1)).0;
+        if body_last_line != end_line {
+            return;
+        }
+
+        self.push(end_start, COP, true, "Place the end statement of a multi-line method on its own line.");
+
+        // `node.loc.keyword.column`: 0-based column of the `def` keyword.
+        let keyword_col = self.idx.loc(keyword_start).1 - 1;
+        let indent = " ".repeat(keyword_col);
+        self.fixes.push((end_start, end_start, format!("\n{indent}").into_bytes()));
+    }
+}
