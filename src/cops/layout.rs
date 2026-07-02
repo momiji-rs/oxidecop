@@ -867,3 +867,106 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/SpaceInsideArrayPercentLiteral — checks for unnecessary additional
+    /// spaces inside array percent literals (%i/%w/%I/%W).
+    /// The regex pattern /(?:[\S&&[^\\]](?:\\ )*)( {2,})(?=\S)/ matches runs of 2+ spaces
+    /// that are preceded by a non-escaped non-whitespace character.
+    pub(crate) fn check_space_inside_array_percent_literal(&mut self, node: &ruby_prism::ArrayNode<'_>) {
+        const COP: &str = "Layout/SpaceInsideArrayPercentLiteral";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is a percent literal array
+        let Some(opening) = node.opening_loc() else { return };
+        let opening_bytes = opening.as_slice();
+
+        // Must start with %
+        if !opening_bytes.starts_with(b"%") || opening_bytes.len() < 2 {
+            return;
+        }
+
+        // Check for %i, %I, %w, %W
+        let literal_type = opening_bytes[1];
+        if !matches!(literal_type, b'i' | b'I' | b'w' | b'W') {
+            return;
+        }
+
+        let elements: Vec<_> = node.elements().iter().collect();
+        if elements.len() < 2 {
+            return;
+        }
+
+        // Scan for multiple spaces between consecutive elements
+        for i in 0..elements.len() - 1 {
+            let elem_end = elements[i].location().end_offset();
+            let next_elem_start = elements[i + 1].location().start_offset();
+
+            // Scan the gap between elements for multiple spaces
+            // The gap starts at elem_end and ends before next_elem_start
+            if elem_end < next_elem_start {
+                self.find_space_gaps(elem_end, next_elem_start);
+            }
+        }
+    }
+
+    /// Find runs of 2+ consecutive spaces in the gap between two array elements.
+    /// The gap should contain only whitespace and escaped spaces.
+    fn find_space_gaps(&mut self, start: usize, end: usize) {
+        const COP: &str = "Layout/SpaceInsideArrayPercentLiteral";
+        const MSG: &str = "Use only a single space inside array percent literal.";
+
+        let mut pos = start;
+
+        while pos < end {
+            // Check if we have a newline - if so, multi-line arrays are exempt
+            if self.src[pos] == b'\n' {
+                return;
+            }
+
+            // Look for 2+ consecutive regular spaces
+            if self.src[pos] == b' ' {
+                let space_start = pos;
+                let mut space_count = 0;
+
+                // Count consecutive spaces
+                let mut space_pos = pos;
+                while space_pos < end && self.src[space_pos] == b' ' {
+                    space_count += 1;
+                    space_pos += 1;
+                }
+
+                // If we have 2+ spaces, it's an offense
+                // (The character after the spaces should be non-whitespace by definition of a gap)
+                if space_count >= 2 {
+                    // This is a valid match of 2+ spaces
+                    self.push(space_start, COP, true, MSG);
+                    // Fix: replace the multiple spaces with a single space
+                    self.fixes.push((space_start, space_pos, b" ".to_vec()));
+                    pos = space_pos;
+                    continue;
+                }
+
+                pos = space_pos;
+                continue;
+            }
+
+            // Skip escaped spaces (backslash followed by space)
+            if self.src[pos] == b'\\' && pos + 1 < end && self.src[pos + 1] == b' ' {
+                pos += 2;
+                continue;
+            }
+
+            // Skip any other whitespace (shouldn't happen in a well-formed gap)
+            if self.src[pos].is_ascii_whitespace() {
+                pos += 1;
+                continue;
+            }
+
+            // Unexpected non-whitespace character - shouldn't happen in a gap
+            break;
+        }
+    }
+}
