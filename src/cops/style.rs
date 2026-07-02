@@ -3353,3 +3353,139 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/NestedTernaryOperator — Detects ternary operators nested
+    /// inside other ternary operators. The offense is registered on the
+    /// inner (nested) ternary, and the outer ternary is converted to an
+    /// if/else/end block as the autocorrect.
+    pub(crate) fn check_nested_ternary_operator(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/NestedTernaryOperator";
+        if !self.on(COP) {
+            return;
+        }
+        // Only process ternaries (no if_keyword_loc means it's a `?:` ternary)
+        if node.if_keyword_loc().is_some() {
+            return;
+        }
+        // Find all nested ternaries within this outer ternary (excluding the outer itself)
+        let mut nested_ternaries = Vec::new();
+        collect_nested_ternaries_excluding_root(&node.as_node(), &mut nested_ternaries, node.location().start_offset());
+
+        // Report an offense for each nested ternary (avoiding duplicates)
+        let mut has_new_offenses = false;
+        for nested_offset in &nested_ternaries {
+            if self.nested_ternary_reported.insert(*nested_offset) {
+                self.push(
+                    *nested_offset,
+                    COP,
+                    true,
+                    "Ternary operators must not be nested. Prefer `if` or `else` constructs instead.".to_string(),
+                );
+                has_new_offenses = true;
+            }
+        }
+
+        // Apply autocorrect to the outer ternary ONLY if this ternary's offenses are new.
+        // This avoids double-correcting when nested ternaries are visited multiple times.
+        if has_new_offenses {
+            self.autocorrect_nested_ternary(node);
+        }
+    }
+
+    fn autocorrect_nested_ternary(&mut self, node: &ruby_prism::IfNode) {
+        let node_loc = node.location();
+        let node_start = node_loc.start_offset();
+        let node_end = node_loc.end_offset();
+
+        // Get the offset of the node's first column (for indentation purposes)
+        let (_, col) = self.idx.loc(node_start);
+        let indent_len = col - 1;
+
+        // Ensure this is actually a ternary (has a `?` keyword)
+        if node.then_keyword_loc().is_none() {
+            return;
+        }
+
+        // Get the condition source
+        let cond_src = self.node_src(&node.predicate()).to_vec();
+
+        // Get the then-branch source (between `?` and `:`)
+        let then_branch_src = if let Some(stmts) = node.statements() {
+            let stmts_src = self.node_src(&stmts.as_node());
+            remove_surrounding_parens(stmts_src)
+        } else {
+            b"".to_vec()
+        };
+
+        // Get the else-branch source - need to extract just the value part without the else keyword
+        let else_branch_src = if let Some(subseq) = node.subsequent() {
+            // For ternary, subsequent is an ElseNode; we need the statements inside
+            if let Some(else_node) = subseq.as_else_node() {
+                if let Some(else_stmts) = else_node.statements() {
+                    self.node_src(&else_stmts.as_node()).to_vec()
+                } else {
+                    b"".to_vec()
+                }
+            } else {
+                // Fallback to the entire node if not an ElseNode
+                self.node_src(&subseq).to_vec()
+            }
+        } else {
+            b"".to_vec()
+        };
+
+        // Build the replacement: `if condition\nthen_branch\nelse\nelse_branch\nend`
+        // We preserve the original indentation within branches and only add
+        // indentation at the start of the else keyword.
+        let mut replacement = b"if ".to_vec();
+        replacement.extend_from_slice(&cond_src);
+        replacement.push(b'\n');
+        replacement.extend_from_slice(&then_branch_src);
+        replacement.push(b'\n');
+        replacement.extend(std::iter::repeat_n(b' ', indent_len));
+        replacement.extend_from_slice(b"else\n");
+        replacement.extend_from_slice(&else_branch_src);
+        replacement.push(b'\n');
+        replacement.extend(std::iter::repeat_n(b' ', indent_len));
+        replacement.extend_from_slice(b"end");
+
+        self.fixes.push((node_start, node_end, replacement));
+    }
+}
+
+/// Collect all nested ternary operators within the given node, excluding the root.
+/// A ternary is an IfNode with no if_keyword_loc.
+fn collect_nested_ternaries_excluding_root(node: &ruby_prism::Node, out: &mut Vec<usize>, root_offset: usize) {
+    struct Finder<'a> {
+        out: &'a mut Vec<usize>,
+        root_offset: usize,
+        is_root: bool,
+    }
+    impl<'pr, 'a> ruby_prism::Visit<'pr> for Finder<'a> {
+        fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+            let offset = node.location().start_offset();
+            // Check if this is a ternary (no if_keyword_loc)
+            if node.if_keyword_loc().is_none() {
+                // Skip the root node on the first visit
+                if offset != self.root_offset || !self.is_root {
+                    self.out.push(offset);
+                }
+                self.is_root = false;
+            }
+            ruby_prism::visit_if_node(self, node);
+        }
+    }
+    let mut f = Finder { out, root_offset, is_root: true };
+    use ruby_prism::Visit;
+    f.visit(node);
+}
+
+/// Remove surrounding parentheses from source code if present.
+fn remove_surrounding_parens(src: &[u8]) -> Vec<u8> {
+    if src.len() >= 2 && src[0] == b'(' && src[src.len() - 1] == b')' {
+        src[1..src.len() - 1].to_vec()
+    } else {
+        src.to_vec()
+    }
+}
