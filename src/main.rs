@@ -70,19 +70,23 @@ struct Schema {
     params: &'static [(&'static str, &'static str)],
     /// SupportedStyles — used to validate a configured `EnforcedStyle`.
     styles: &'static [&'static str],
+    /// Default `AllowedMethods` when the config doesn't set one (e.g. rubocop
+    /// ships `Style/SymbolProc` with `AllowedMethods: [define_method]`).
+    allowed_methods: &'static [&'static str],
 }
 const SCHEMA: &[Schema] = &[
-    Schema { cop: "Layout/LineLength", params: &[("Max", "120")], styles: &[] },
-    Schema { cop: "Style/NumericLiterals", params: &[("MinDigits", "5")], styles: &[] },
-    Schema { cop: "Layout/TrailingWhitespace", params: &[("AllowInHeredoc", "false")], styles: &[] },
+    Schema { cop: "Layout/LineLength", params: &[("Max", "120")], styles: &[], allowed_methods: &[] },
+    Schema { cop: "Style/NumericLiterals", params: &[("MinDigits", "5")], styles: &[], allowed_methods: &[] },
+    Schema { cop: "Layout/TrailingWhitespace", params: &[("AllowInHeredoc", "false")], styles: &[], allowed_methods: &[] },
     Schema { cop: "Style/StringLiterals", params: &[("EnforcedStyle", "single_quotes")],
-             styles: &["single_quotes", "double_quotes"] },
+             styles: &["single_quotes", "double_quotes"], allowed_methods: &[] },
     Schema { cop: "Style/NilComparison", params: &[("EnforcedStyle", "predicate")],
-             styles: &["predicate", "comparison"] },
+             styles: &["predicate", "comparison"], allowed_methods: &[] },
     Schema { cop: "Style/NumericPredicate", params: &[("EnforcedStyle", "predicate")],
-             styles: &["predicate", "comparison"] },
+             styles: &["predicate", "comparison"], allowed_methods: &[] },
     Schema { cop: "Naming/MethodName", params: &[("EnforcedStyle", "snake_case")],
-             styles: &["snake_case", "camelCase"] },
+             styles: &["snake_case", "camelCase"], allowed_methods: &[] },
+    Schema { cop: "Style/SymbolProc", params: &[], styles: &[], allowed_methods: &["define_method"] },
 ];
 fn schema(cop: &str) -> Option<&'static Schema> {
     SCHEMA.iter().find(|s| s.cop == cop)
@@ -350,6 +354,94 @@ impl<'a> Cops<'a> {
             }
         };
         Some((node_off, format!("Use `{prefer}` instead of `{current}`.")))
+    }
+    /// Style/SymbolProc: a block `recv.m { |x| x.meth }` (single plain param,
+    /// body a parameterless call on that param) → suggest `recv.m(&:meth)`. The
+    /// offense range is the block (`{`..`}`). Returns (offset, message) or None.
+    fn symbol_proc(&self, node: &ruby_prism::CallNode) -> Option<(usize, String)> {
+        if !self.on("Style/SymbolProc") {
+            return None;
+        }
+        let block = node.block()?;
+        let block = block.as_block_node()?;
+        // The block's sole parameter: either one plain required positional param
+        // (`{ |x| }`) or a single numbered param (`{ _1 }`), nothing else.
+        let params = block.parameters()?;
+        let varname: Vec<u8> = if let Some(bp) = params.as_block_parameters_node() {
+            let pn = bp.parameters()?;
+            let reqs: Vec<_> = pn.requireds().iter().collect();
+            if reqs.len() != 1
+                || pn.optionals().iter().count() > 0
+                || pn.rest().is_some()
+                || pn.posts().iter().count() > 0
+                || pn.keywords().iter().count() > 0
+                || pn.keyword_rest().is_some()
+                || pn.block().is_some()
+            {
+                return None;
+            }
+            reqs[0].as_required_parameter_node()?.name().as_slice().to_vec()
+        } else if let Some(np) = params.as_numbered_parameters_node() {
+            if np.maximum() != 1 {
+                return None;
+            }
+            b"_1".to_vec()
+        } else {
+            return None;
+        };
+        // body: a single parameterless, blockless call whose receiver is the param.
+        let stmts = block.body()?;
+        let stmts = stmts.as_statements_node()?;
+        let mut it = stmts.body().iter();
+        let first = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        let call = first.as_call_node()?;
+        let recv = call.receiver()?;
+        if recv.as_local_variable_read_node()?.name().as_slice() != varname.as_slice()
+            || call.arguments().is_some()
+            || call.block().is_some()
+        {
+            return None;
+        }
+        let block_method = node.name();
+        let bm = block_method.as_slice();
+        // ---- guards (rubocop's, at default config) ----
+        // AllowedMethods/Patterns on the block's method (default [define_method]).
+        if self.allowed("Style/SymbolProc", bm) {
+            return None;
+        }
+        // Unsafe on literal hash/array receivers: `{}.{reject,select}`, `[].{min,max}`.
+        if let Some(r) = node.receiver() {
+            if r.as_hash_node().is_some() && matches!(bm, b"reject" | b"select") {
+                return None;
+            }
+            if r.as_array_node().is_some() && matches!(bm, b"min" | b"max") {
+                return None;
+            }
+        }
+        // AllowMethodsWithArguments: skip when enabled and the dispatch has args.
+        if self.cfg.param("Style/SymbolProc", "AllowMethodsWithArguments") == Some("true")
+            && node.arguments().is_some()
+        {
+            return None;
+        }
+        // AllowComments: skip when enabled and the block spans a comment line.
+        if self.cfg.param("Style/SymbolProc", "AllowComments") == Some("true") {
+            // "inside" = opening line through the line before `end`, so a
+            // trailing `end # comment` (on the closing line) doesn't count.
+            let l0 = self.idx.loc(block.opening_loc().start_offset()).0;
+            let l1 = self.idx.loc(block.closing_loc().start_offset()).0;
+            if (l0..l1).any(|ln| self.comment_lines.contains(&ln)) {
+                return None;
+            }
+        }
+        let method = String::from_utf8_lossy(call.name().as_slice());
+        Some((
+            block.opening_loc().start_offset(),
+            format!("Pass `&:{method}` as an argument to `{}` instead of a block.", String::from_utf8_lossy(bm)),
+        ))
     }
     fn check_documentation(&mut self, start_off: usize, kind: &str, name: &ruby_prism::Node) {
         if !self.on("Style/Documentation") {
@@ -709,6 +801,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if let Some((off, msg)) = self.numeric_predicate(node) {
             self.push(off, "Style/NumericPredicate", true, msg);
         }
+        if let Some((off, msg)) = self.symbol_proc(node) {
+            self.push(off, "Style/SymbolProc", true, msg);
+        }
         // recurse into children (we've overridden the default walk). Push this
         // call's name so descendants can see it as an ancestor.
         self.call_stack.push(node.name().as_slice().to_vec());
@@ -786,6 +881,13 @@ fn main() {
         }
         if let Some(v) = kv.get("AllowedMethods") {
             allowed_methods.insert(sec.clone(), parse_allowed_list(v));
+        }
+    }
+    // Seed schema-default AllowedMethods for cops the config didn't set them on
+    // (rubocop's config/default.yml ships some, e.g. Style/SymbolProc).
+    for s in SCHEMA {
+        if !s.allowed_methods.is_empty() && !allowed_methods.contains_key(s.cop) {
+            allowed_methods.insert(s.cop.to_string(), s.allowed_methods.iter().map(|m| m.to_string()).collect());
         }
     }
 

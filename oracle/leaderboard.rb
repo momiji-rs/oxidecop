@@ -33,6 +33,7 @@ COPS = {
   'Style/FrozenStringLiteralComment' => 'style/frozen_string_literal_comment',
   'Naming/MethodName'                => 'naming/method_name',
   'Lint/NestedMethodDefinition'      => 'lint/nested_method_definition',
+  'Style/SymbolProc'                 => 'style/symbol_proc',
   'Layout/LineLength'                => 'layout/line_length',
   'Layout/TrailingWhitespace'        => 'layout/trailing_whitespace'
 }.freeze
