@@ -425,9 +425,10 @@ fn main() {
             }
             match std::fs::read(f) {
                 Ok(src) => {
+                    let base = rel.rsplit('/').next().unwrap_or(&rel);
                     if nested.is_none() {
                         if let Some(c) = &cache {
-                            if let Some(hit) = c.get(&src) {
+                            if let Some(hit) = c.get(&src, base) {
                                 return (display, hit);
                             }
                         }
@@ -435,7 +436,7 @@ fn main() {
                     let offenses = cops::lint(&src, the_cfg, the_eng, &rel).offenses;
                     if nested.is_none() {
                         if let Some(c) = &cache {
-                            c.put(&src, &offenses, meta.map(|(mt, ln)| (rel.as_str(), mt, ln)));
+                            c.put(&src, base, &offenses, meta.map(|(mt, ln)| (rel.as_str(), mt, ln)));
                         }
                     }
                     (display, offenses)

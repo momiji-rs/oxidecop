@@ -78,10 +78,16 @@ impl Cache {
         Some(Cache { file, salt, entries, paths, fresh: std::sync::Mutex::new(Vec::new()) })
     }
 
-    fn key(&self, src: &[u8]) -> u128 {
+    fn key(&self, src: &[u8], basename: &str) -> u128 {
+        // The basename participates because cop behavior is filename-
+        // sensitive (Gemfile/config.ru rules in Layout/LeadingCommentSpace,
+        // and eventually per-cop Include globs) — identical bytes under a
+        // different name may lint differently.
         let mut h1 = fnv(self.salt.as_bytes(), 0xcbf29ce484222325);
+        h1 = fnv(basename.as_bytes(), h1);
         h1 = fnv(src, h1);
         let mut h2 = fnv(self.salt.as_bytes(), 0x9e3779b97f4a7c15);
+        h2 = fnv(basename.as_bytes(), h2);
         h2 = fnv(src, h2);
         ((h1 as u128) << 64) | h2 as u128
     }
@@ -97,8 +103,8 @@ impl Cache {
     }
 
     /// Cached offenses for this source, if present and well-formed.
-    pub fn get(&self, src: &[u8]) -> Option<Vec<Offense>> {
-        Self::parse_entry(self.entries.get(&self.key(src))?)
+    pub fn get(&self, src: &[u8], basename: &str) -> Option<Vec<Offense>> {
+        Self::parse_entry(self.entries.get(&self.key(src, basename))?)
     }
 
     fn parse_entry(text: &str) -> Option<Vec<Offense>> {
@@ -116,7 +122,7 @@ impl Cache {
     }
 
     /// Record a fresh result (kept in memory until `flush`).
-    pub fn put(&self, src: &[u8], offenses: &[Offense], meta: Option<(&str, u64, u64)>) {
+    pub fn put(&self, src: &[u8], basename: &str, offenses: &[Offense], meta: Option<(&str, u64, u64)>) {
         let mut text = String::new();
         for o in offenses {
             let msg = o.message.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
@@ -124,7 +130,7 @@ impl Cache {
                 u8::from(o.correctable), msg));
         }
         if let Ok(mut f) = self.fresh.lock() {
-            f.push((self.key(src), text, meta.map(|(p, mt, ln)| (p.to_string(), mt, ln))));
+            f.push((self.key(src, basename), text, meta.map(|(p, mt, ln)| (p.to_string(), mt, ln))));
         }
     }
 
