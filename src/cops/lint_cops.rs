@@ -826,3 +826,43 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+/// rubocop-ast's `IMMUTABLE_LITERALS` (`LITERALS - MUTABLE_LITERALS`): the
+/// literal node types that can never be mutated in place. Strings, dstr,
+/// xstr, arrays, hashes, regexps, and ranges are excluded (mutable).
+fn is_immutable_literal(node: &ruby_prism::Node) -> bool {
+    node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_interpolated_symbol_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+        || node.as_nil_node().is_some()
+        || node.as_rational_node().is_some()
+        || node.as_imaginary_node().is_some()
+}
+
+impl<'a> super::Cops<'a> {
+    /// Lint/EachWithObjectArgument — `each_with_object`'s argument is the
+    /// object the block accumulates into; an immutable-literal argument
+    /// (`0`, `:sym`, `nil`, ...) can never actually accumulate anything, so
+    /// it's always a bug. rubocop's matcher: `(call _ :each_with_object $_)`
+    /// — exactly one argument, any receiver (incl. safe-navigation `&.`).
+    pub(crate) fn check_each_with_object_argument(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/EachWithObjectArgument";
+        if !self.on(COP) || node.name().as_slice() != b"each_with_object" {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let args: Vec<_> = args.arguments().iter().collect();
+        if args.len() != 1 || !is_immutable_literal(&args[0]) {
+            return;
+        }
+        self.push(
+            node.location().start_offset(),
+            COP,
+            false,
+            "The argument to each_with_object cannot be immutable.",
+        );
+    }
+}
