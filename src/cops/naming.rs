@@ -372,8 +372,9 @@ impl<'a> Cops<'a> {
         let min_length = self.cfg.param(COP, "MinNameLength")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1);
-        let allow_nums = self.cfg.param(COP, "AllowNamesEndingInNumbers")
-            == Some("true");
+        // cfg.get falls back to the schema default (true for this cop);
+        // param() is user-config-only and silently read false here
+        let allow_nums = self.cfg.get(COP, "AllowNamesEndingInNumbers") != Some("false");
         let allowed_names: Vec<String> = self.cfg.param(COP, "AllowedNames")
             .map(|v| crate::config::parse_allowed_list(v))
             .unwrap_or_default();

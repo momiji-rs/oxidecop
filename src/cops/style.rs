@@ -2773,7 +2773,15 @@ impl<'a> super::Cops<'a> {
             return;
         }
         // `same_line?(node, body)`: body starts on the def's first line.
-        if self.idx.loc(body.location().start_offset()).0 != start_line {
+        // A def with rescue/ensure wraps the body in a BeginNode whose span
+        // starts back at the def line in prism — whitequark anchors at the
+        // first real statement, so use that.
+        let body_start = body
+            .as_begin_node()
+            .and_then(|bn| bn.statements())
+            .and_then(|st| st.body().iter().next().map(|n| n.location().start_offset()))
+            .unwrap_or_else(|| body.location().start_offset());
+        if self.idx.loc(body_start).0 != start_line {
             return;
         }
         // `first_part_of`: a bare statement list (`begin_type?`) offends at
@@ -2861,6 +2869,11 @@ impl<'a> super::Cops<'a> {
     pub(crate) fn check_multiline_block_chain(&mut self, outer: &ruby_prism::CallNode<'_>) {
         const COP: &str = "Style/MultilineBlockChain";
         if !self.on(COP) {
+            return;
+        }
+        // rubocop's on_block fires only for REAL brace/do blocks — a
+        // block-pass argument (`map(&:line)`) is not a block node
+        if outer.block().and_then(|b| b.as_block_node()).is_none() {
             return;
         }
         let Some(mut cur) = outer.receiver() else { return };

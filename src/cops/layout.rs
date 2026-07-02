@@ -990,15 +990,14 @@ impl<'a> Cops<'a> {
         // Get the operator bytes (.. or ...)
         let op_bytes = op_loc.as_slice();
 
-        // Check for spaces before the operator (always an offense if present)
+        // A side without an operand (beginless/endless range) has no
+        // "inside" there — surrounding space belongs to the context.
         let mut has_space_before = false;
-        if op_start > 0 && self.src[op_start - 1].is_ascii_whitespace() {
+        if node.left().is_some() && op_start > 0 && self.src[op_start - 1].is_ascii_whitespace() {
             has_space_before = true;
         }
-
-        // Check for spaces after the operator
         let mut has_space_after = false;
-        if op_end < self.src.len() && self.src[op_end].is_ascii_whitespace() {
+        if node.right().is_some() && op_end < self.src.len() && self.src[op_end].is_ascii_whitespace() {
             has_space_after = true;
         }
 
