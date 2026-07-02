@@ -107,6 +107,7 @@ COPS = {
   'Lint/FloatComparison'             => 'lint/float_comparison',
   'Layout/SpaceInsidePercentLiteralDelimiters' => 'layout/space_inside_percent_literal_delimiters',
   'Lint/EmptyWhen'                   => 'lint/empty_when',
+  'Lint/InheritException'            => 'lint/inherit_exception',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

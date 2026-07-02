@@ -142,7 +142,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RescueException", "Style/WhenThen", "Lint/DuplicateHashKey",
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire", "Lint/TrailingCommaInAttributeDeclaration",
-    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen",
+    "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -456,6 +456,11 @@ pub(crate) struct Cops<'a> {
     // defined as its direct children — Naming/MethodName's "class emitter
     // method" exemption consults this.
     pub(crate) class_children_stack: Vec<Vec<Vec<u8>>>,
+    // Lint/InheritException: per enclosing body (program/class/module), the
+    // direct-child `class`/`module` statements as (start_offset, name) —
+    // rubocop's `class_node.left_siblings` (siblings with an earlier start
+    // offset than the node being checked, since prism visits in source order).
+    pub(crate) exception_siblings_stack: Vec<Vec<(usize, Vec<u8>)>>,
     // Every comment as (line, start_offset, end_offset) spans into src.
     pub(crate) comments: &'a [(usize, usize, usize)],
     // Enclosing class/module names (their constant-path sources) — the
@@ -1143,7 +1148,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
         self.class_children_stack.push(Self::direct_child_classes(&Some(node.statements().as_node())));
+        self.exception_siblings_stack.push(Self::direct_child_defs(&Some(node.statements().as_node())));
         ruby_prism::visit_program_node(self, node);
+        self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
     }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
@@ -1154,10 +1161,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_class_methods(&node.constant_path(), node.body());
         self.check_documentation("class", node.location().start_offset(), &node.constant_path(), node.body());
         self.check_camel_case_name(&node.constant_path());
+        self.check_inherit_exception_class(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
+        self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
         // Default walk — covers the superclass expression too, not just the body.
         ruby_prism::visit_class_node(self, node);
+        self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
         self.leave_namespace();
     }
@@ -1168,7 +1178,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_camel_case_name(&node.constant_path());
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
+        self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
         ruby_prism::visit_module_node(self, node);
+        self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
         self.leave_namespace();
     }
@@ -1363,6 +1375,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_strip(node);
         self.check_space_after_not(node);
         self.check_empty_literal(node);
+        self.check_inherit_exception_new(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
         let n = node.as_node();
@@ -1585,6 +1598,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         bare_arg_frames: Vec::new(),
         data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
         class_children_stack: Vec::new(),
+        exception_siblings_stack: Vec::new(),
         comments: &comment_data,
         mod_stack: Vec::new(),
         nodoc_all_stack: Vec::new(),

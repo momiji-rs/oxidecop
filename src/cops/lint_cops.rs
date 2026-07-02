@@ -2157,3 +2157,122 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/InheritException — `class C < Exception` and `Class.new(Exception)`.
+    /// `EnforcedStyle` picks the suggested replacement (`standard_error`
+    /// default, or `runtime_error`). Autocorrect is unsafe upstream (bare
+    /// `rescue` only catches `StandardError`, not `Exception`) but that only
+    /// affects RuboCop's `--safe` gating, not this port's fix generation.
+    ///
+    /// The `class C < Exception` form is exempted when the bare (non-`::`)
+    /// name `Exception` would actually resolve to a LOCAL class/module of
+    /// that name defined earlier as a direct sibling statement — rubocop's
+    /// `inherit_exception_class_with_omitted_namespace?`, ported here via
+    /// `exception_siblings_stack` (see the `visit_*` hooks in `mod.rs` that
+    /// push/pop it — mirrors the existing `class_children_stack` machinery
+    /// but keeps start offsets so only EARLIER siblings count).
+    pub(crate) fn check_inherit_exception_class(&mut self, node: &ruby_prism::ClassNode) {
+        const COP: &str = "Lint/InheritException";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(superclass) = node.superclass() else { return };
+        let Some((name, is_cbase)) = inherit_exception_const_info(&superclass) else { return };
+        if name != "Exception" {
+            return;
+        }
+        if !is_cbase {
+            let node_start = node.location().start_offset();
+            let omitted = self.exception_siblings_stack.last().is_some_and(|sibs| {
+                sibs.iter().any(|(pos, n)| *pos < node_start && n.as_slice() == b"Exception")
+            });
+            if omitted {
+                return;
+            }
+        }
+        let prefer = inherit_exception_preferred(self.cfg.enforced_style(COP));
+        let sl = superclass.location();
+        self.push(sl.start_offset(), COP, true, format!("Inherit from `{prefer}` instead of `Exception`."));
+        self.fixes.push((sl.start_offset(), sl.end_offset(), prefer.as_bytes().to_vec()));
+    }
+
+    /// The `Class.new(Exception)` form of `Lint/InheritException`. Only a
+    /// BARE (or `::`-prefixed) single-constant argument to a bare/`::Class`
+    /// receiver's `new` qualifies (rubocop's `class_new_call?` node
+    /// pattern) — a namespaced argument (`Class.new(Foo::Exception)`) never
+    /// matches, same as `Foo::Exception` never matches on the `on_class`
+    /// side (its `const_name` isn't bare `"Exception"`).
+    pub(crate) fn check_inherit_exception_new(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/InheritException";
+        if node.name().as_slice() != b"new" || node.is_safe_navigation() || !self.on(COP) {
+            return;
+        }
+        let Some(recv) = node.receiver() else { return };
+        if const_name_root(&recv).as_deref() != Some("Class") {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let arg_list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        let [arg] = arg_list.as_slice() else { return };
+        if const_name_root(arg).as_deref() != Some("Exception") {
+            return;
+        }
+        let prefer = inherit_exception_preferred(self.cfg.enforced_style(COP));
+        let al = arg.location();
+        self.push(al.start_offset(), COP, true, format!("Inherit from `{prefer}` instead of `Exception`."));
+        self.fixes.push((al.start_offset(), al.end_offset(), prefer.as_bytes().to_vec()));
+    }
+
+    /// Names of `class`/`module` nodes that are direct children of `body`,
+    /// paired with their start offset — `Lint/InheritException`'s sibling
+    /// scan needs source ORDER (rubocop's `left_siblings`), unlike
+    /// `direct_child_classes` which only needs the name set.
+    pub(crate) fn direct_child_defs(body: &Option<ruby_prism::Node>) -> Vec<(usize, Vec<u8>)> {
+        body.as_ref()
+            .and_then(|b| b.as_statements_node())
+            .map(|stmts| {
+                stmts
+                    .body()
+                    .iter()
+                    .filter_map(|n| {
+                        if let Some(c) = n.as_class_node() {
+                            Some((c.location().start_offset(), c.name().as_slice().to_vec()))
+                        } else if let Some(m) = n.as_module_node() {
+                            Some((m.location().start_offset(), m.name().as_slice().to_vec()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn inherit_exception_preferred(style: &str) -> &'static str {
+    if style == "runtime_error" {
+        "RuntimeError"
+    } else {
+        "StandardError"
+    }
+}
+
+/// Root const info as `(name, is_cbase)` for a bare `Foo` or explicit
+/// top-level `::Foo` — mirrors `const_name_root` but also reports whether
+/// the leading `::` (cbase) was present, since `Lint/InheritException`
+/// treats `::Exception` as unambiguous (never an omitted-namespace local
+/// reference) while bare `Exception` might resolve locally. Anything with a
+/// real namespace segment (`A::Foo`) returns `None` — rubocop's `const_name`
+/// would then read `"A::Foo"`, never bare `"Foo"`.
+fn inherit_exception_const_info(node: &ruby_prism::Node) -> Option<(String, bool)> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some((String::from_utf8_lossy(c.name().as_slice()).into_owned(), false));
+    }
+    if let Some(p) = node.as_constant_path_node() {
+        if p.parent().is_none() {
+            return Some((String::from_utf8_lossy(p.name()?.as_slice()).into_owned(), true));
+        }
+    }
+    None
+}
