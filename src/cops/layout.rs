@@ -973,3 +973,94 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+
+    /// Layout/SpaceInsideRangeLiteral — detect spaces inside .. and ... operators.
+    pub(crate) fn check_space_inside_range_literal(&mut self, node: &ruby_prism::RangeNode<'_>) {
+        const COP: &str = "Layout/SpaceInsideRangeLiteral";
+        if !self.on(COP) {
+            return;
+        }
+
+        let op_loc = node.operator_loc();
+        let op_start = op_loc.start_offset();
+        let op_end = op_loc.end_offset();
+
+        // Get the operator bytes (.. or ...)
+        let op_bytes = op_loc.as_slice();
+
+        // Check for spaces before the operator (always an offense if present)
+        let mut has_space_before = false;
+        if op_start > 0 && self.src[op_start - 1].is_ascii_whitespace() {
+            has_space_before = true;
+        }
+
+        // Check for spaces after the operator
+        let mut has_space_after = false;
+        if op_end < self.src.len() && self.src[op_end].is_ascii_whitespace() {
+            has_space_after = true;
+        }
+
+        // Determine if space after is part of a multiline (newline follows)
+        let mut is_multiline = false;
+        if has_space_after {
+            // Check if there's a newline in the whitespace after the operator
+            let mut check_pos = op_end;
+            while check_pos < self.src.len() && self.src[check_pos].is_ascii_whitespace() {
+                if self.src[check_pos] == b'\n' {
+                    is_multiline = true;
+                    break;
+                }
+                check_pos += 1;
+            }
+        }
+
+        // Report offense if:
+        // - Space before operator, OR
+        // - Space after operator AND it's not a multiline
+        if !has_space_before && (!has_space_after || is_multiline) {
+            return;
+        }
+
+        // Get the range boundaries
+        let range_start = node.location().start_offset();
+        let range_end = node.location().end_offset();
+
+        // Report the offense at the start of the range
+        self.push(range_start, COP, true, "Space inside range literal.");
+
+        // For the fix, reconstruct the range without spaces around the operator
+        let range_bytes = &self.src[range_start..range_end];
+
+        // Find the operator position within the range bytes
+        let op_byte_pos = op_start - range_start;
+
+        // Split the range into left, operator, and right parts
+        let left = &range_bytes[..op_byte_pos];
+        let right = &range_bytes[op_byte_pos + op_bytes.len()..];
+
+        // Trim trailing whitespace from left
+        let mut left_end = left.len();
+        while left_end > 0 && left[left_end - 1].is_ascii_whitespace() {
+            left_end -= 1;
+        }
+        let left_trimmed = &left[..left_end];
+
+        // Trim leading whitespace from right
+        let mut right_start = 0;
+        while right_start < right.len() && right[right_start].is_ascii_whitespace() {
+            right_start += 1;
+        }
+        let right_trimmed = &right[right_start..];
+
+        // Build the fixed range
+        let mut fixed = Vec::new();
+        fixed.extend_from_slice(left_trimmed);
+        fixed.extend_from_slice(op_bytes);
+        fixed.extend_from_slice(right_trimmed);
+
+        // Add the fix
+        self.fixes.push((range_start, range_end, fixed));
+    }
+}
