@@ -1112,3 +1112,82 @@ impl<'a> Cops<'a> {
         self.fixes.push((pred_line_start, removal_end, Vec::new()));
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/EmptyLinesAroundBeginBody — a `begin`/`end` block (kwbegin)
+    /// must not have a blank line directly after `begin` or directly before
+    /// its matching `end`. Ported from the `EmptyLinesAroundBody` mixin with
+    /// `style` hardcoded to `:no_empty_lines` (see
+    /// `EmptyLinesAroundBeginBody#style` — this cop never allows the
+    /// "require a blank line" styles the mixin also supports for other
+    /// cops).
+    ///
+    /// The mixin's `check_beginning`/`check_ending` anchor purely on the
+    /// node's overall first/last source lines — the line carrying `begin`
+    /// and the line carrying `end` — so inner `rescue`/`else`/`ensure`
+    /// clauses are NOT specially walked: a blank line right before an inner
+    /// `rescue`/`else` is simply not this cop's concern (confirmed by the
+    /// spec fixture, e.g. "registers an offense for begin body starting
+    /// with rescue" only flags the blank right after `begin`, not anything
+    /// around the `rescue` keyword itself).
+    pub(crate) fn check_empty_lines_around_begin_body(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Layout/EmptyLinesAroundBeginBody";
+        if !self.on(COP) {
+            return;
+        }
+        // `begin_keyword_loc` is None for the implicit BeginNode prism
+        // synthesizes around a `def` body that has rescue/ensure clauses but
+        // no explicit `begin`/`end` keywords in the source — there's no
+        // `begin` keyword to anchor on, and rubocop's `on_kwbegin` never
+        // fires for that case either, so this cop doesn't apply.
+        let Some(begin_loc) = node.begin_keyword_loc() else { return };
+        let Some(end_loc) = node.end_keyword_loc() else { return };
+
+        // A strictly empty line (rubocop's `String#empty?` on
+        // `processed_source.lines[n]` — whitespace-only lines do NOT count
+        // as blank).
+        fn is_blank_line(c: &super::Cops, line: usize) -> bool {
+            match c.idx.starts.get(line - 1) {
+                Some(&s) => c.line_end(line) == s,
+                None => false,
+            }
+        }
+
+        let begin_line = self.idx.loc(begin_loc.start_offset()).0;
+        let end_line = self.idx.loc(end_loc.start_offset()).0;
+        // rubocop: `return if node.single_line?`
+        if begin_line == end_line {
+            return;
+        }
+
+        let after_begin_line = begin_line + 1;
+        let before_end_line = end_line - 1;
+
+        // Flags a blank line: offense anchors on its (empty) content — a
+        // 1-byte range at column 0 that is really just the line's own
+        // newline — and the fix removes that newline, deleting the line.
+        let flag = |c: &mut Self, line: usize, desc: &str| {
+            let off = c.idx.starts[line - 1];
+            c.fixes.push((off, off + 1, Vec::new()));
+            c.push(off, COP, true, format!("Extra empty line detected at `begin` body {desc}."));
+        };
+
+        let after_blank = is_blank_line(self, after_begin_line);
+        if after_blank {
+            flag(self, after_begin_line, "beginning");
+        }
+        // When the body is exactly one blank line (`begin\n\nend`), the
+        // "line right after `begin`" and "the line right before `end`" are
+        // the SAME line. Real rubocop's `add_offense` dedupes identical
+        // (cop, range) pairs within one investigation, so only the
+        // beginning check (which runs first) ends up reporting — verified
+        // against rubocop 1.88.0 directly, since the spec fixture doesn't
+        // cover this edge case.
+        if before_end_line == after_begin_line && after_blank {
+            return;
+        }
+        if is_blank_line(self, before_end_line) {
+            flag(self, before_end_line, "end");
+        }
+    }
+}
