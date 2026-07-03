@@ -149,10 +149,10 @@ const IMPLEMENTED: &[&str] = &[
     "Security/MarshalLoad", "Layout/SpaceAfterMethodName", "Layout/SpaceAfterSemicolon", "Layout/SpaceAfterNot", "Lint/UnifiedInteger", "Lint/FlipFlop", "Style/Proc", "Lint/DuplicateCaseCondition", "Lint/DuplicateElsifCondition", "Style/ColonMethodDefinition",
     "Layout/LeadingEmptyLines", "Style/Strip", "Lint/TopLevelReturnWithArgument", "Security/Eval", "Style/VariableInterpolation", "Lint/EachWithObjectArgument", "Style/TrailingBodyOnModule", "Lint/DuplicateRescueException", "Style/TrailingBodyOnClass", "Lint/SafeNavigationWithEmpty", "Style/RedundantCapitalW", "Lint/HashCompareByIdentity", "Lint/NextWithoutAccumulator", "Layout/SpaceAfterColon", "Lint/MultipleComparison", "Style/EmptyLambdaParameter", "Layout/SpaceInsideArrayPercentLiteral", "Style/IfUnlessModifierOfIfUnless", "Style/EmptyBlockParameter", "Lint/IdentityComparison", "Layout/SpaceInsideRangeLiteral", "Style/DoubleCopDisableDirective", "Style/ClassCheck", "Naming/BlockParameterName", "Style/ClassMethods", "Style/TrailingBodyOnMethodDefinition", "Lint/UselessElseWithoutRescue", "Lint/ReturnInVoidContext", "Style/MultilineBlockChain", "Style/OptionalArguments", "Style/RedundantFileExtensionInRequire", "Lint/TrailingCommaInAttributeDeclaration",
     "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody", "Lint/AmbiguousRegexpLiteral", "Layout/BlockEndNewline",
-    "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
+    "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize", "Metrics/ParameterLists",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
     "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Style/BarePercentLiterals", "Lint/RequireParentheses", "Style/CaseEquality", "Style/RedundantException", "Lint/ErbNewArguments", "Lint/OrderedMagicComments",
-    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Layout/DefEndAlignment", "Style/ExponentialNotation", "Style/StructInheritance", "Style/ExpandPathArguments", "Style/ModuleFunction", "Style/Encoding", "Style/RedundantFetchBlock",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Layout/DefEndAlignment", "Style/ExponentialNotation", "Style/StructInheritance", "Style/ExpandPathArguments", "Style/ModuleFunction", "Style/Encoding", "Style/RedundantFetchBlock", "Metrics/ParameterLists",
     "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Style/RedundantSelfAssignment", "Layout/DefEndAlignment",
     "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFetchBlock", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Style/BarePercentLiterals", "Lint/RequireParentheses", "Style/CaseEquality", "Style/RedundantException", "Lint/ErbNewArguments", "Lint/OrderedMagicComments",
     "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFetchBlock", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Layout/DefEndAlignment",
@@ -668,6 +668,15 @@ pub(crate) struct Cops<'a> {
     // `Struct.new`/`Data.define` constructor — consumed by the immediately
     // following `visit_block_node` call.
     pub(crate) el_am_ctor_block: bool,
+    // One-shot flag set by `visit_call_node` right before descending into a
+    // block it owns, when that block is specifically a `Struct.new`/`Data.define`
+    // constructor (NOT Class.new or Module.new) — consumed by the immediately
+    // following `visit_block_node` call.
+    pub(crate) metrics_ctor_block: bool,
+    // Metrics/ParameterLists: stack tracking whether we're inside a
+    // Struct.new/Data.define block (true) or not (false). Pushed when
+    // visiting such a block, popped when leaving.
+    pub(crate) metrics_in_struct_data_define_block: Vec<bool>,
     // Style/GlobalStdStream: start offsets of bare `STDIN`/`STDOUT`/`STDERR`
     // ConstantReadNode values already known to be the RHS of a matching
     // `$stdin`/`$stdout`/`$stderr` plain global-var assignment (rubocop's
@@ -1433,6 +1442,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if is_ctor_block {
             self.el_am_scope.push(true);
         }
+        // Consume the metrics_ctor_block flag for Struct.new/Data.define blocks
+        let is_metrics_ctor_block = std::mem::take(&mut self.metrics_ctor_block);
+        if is_metrics_ctor_block {
+            self.metrics_in_struct_data_define_block.push(true);
+        }
         if let Some(params) = node.parameters() {
             self.visit(&params);
         }
@@ -1447,6 +1461,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.rs_block_stack.pop();
         if is_ctor_block {
             self.el_am_scope.pop();
+        }
+        if is_metrics_ctor_block {
+            self.metrics_in_struct_data_define_block.pop();
         }
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
@@ -1736,6 +1753,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_to_json(node);
         self.check_single_line_methods(node);
         self.check_metrics_complexity_def(node);
+        self.check_metrics_parameter_lists(node);
         self.check_def_with_parentheses(node);
         self.check_space_after_method_name(node);
         self.check_colon_method_definition(node);
@@ -2133,6 +2151,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             // (`&:sym` block-pass args aren't block nodes, so this is false
             // whenever `b` isn't one — no visit_block_node ever fires for it).
             self.el_am_ctor_block = b.as_block_node().is_some() && lint_cops::is_class_constructor(node, self.src);
+            self.metrics_ctor_block = b.as_block_node().is_some() && lint_cops::is_struct_data_constructor(node, self.src);
             self.check_multiline_block_chain(node);
             self.check_redundant_fetch_block(node);
             self.check_empty_block_call(node);
@@ -2290,6 +2309,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         el_am_block_line: None,
         el_am_block_owns_next_stmts: false,
         el_am_ctor_block: false,
+        metrics_ctor_block: false,
+        metrics_in_struct_data_define_block: Vec::new(),
         gss_gvasgn_skip: HashSet::new(),
         mlbl_call_child: HashSet::new(),
         dea_ignored: HashSet::new(),

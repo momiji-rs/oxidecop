@@ -1213,3 +1213,78 @@ impl<'a> Cops<'a> {
         }
     }
 }
+impl<'a> super::Cops<'a> {
+
+    pub(crate) fn check_metrics_parameter_lists(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Metrics/ParameterLists";
+        if !self.on(COP) {
+            return;
+        }
+
+        let Some(params) = node.parameters() else { return };
+
+        // Check if this is an initialize method inside a Struct.new/Data.define block
+        let in_struct_data_block = self.metrics_in_struct_data_define_block.last().copied().unwrap_or(false);
+        if node.name().as_slice() == b"initialize" && in_struct_data_block {
+            return;
+        }
+
+        // Check for too many parameters overall
+        // Default is true, so count keyword args by default
+        let count_keyword_args = self.cfg.get(COP, "CountKeywordArgs")
+            .map(|v| v != "false")
+            .unwrap_or(true);
+
+        let param_count = if count_keyword_args {
+            // Count all parameters except block parameters
+            params.requireds().iter().count()
+                + params.optionals().iter().count()
+                + params.rest().is_some() as usize
+                + params.posts().iter().count()
+                + params.keywords().iter().count()
+                + params.keyword_rest().is_some() as usize
+        } else {
+            // Don't count keyword parameters
+            params.requireds().iter().count()
+                + params.optionals().iter().count()
+                + params.rest().is_some() as usize
+                + params.posts().iter().count()
+        };
+
+        let max_params = self.cfg.get(COP, "Max")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5);
+
+        if param_count > max_params {
+            let msg = format!(
+                "Avoid parameter lists longer than {} parameters. [{}/{}]",
+                max_params,
+                param_count,
+                max_params
+            );
+            // Report on the opening paren, which is one character before the parameters
+            let offset = if params.location().start_offset() > 0 {
+                params.location().start_offset() - 1
+            } else {
+                params.location().start_offset()
+            };
+            self.push(offset, COP, false, msg);
+        }
+
+        // Check for too many optional parameters
+        let optionals: Vec<_> = params.optionals().iter().collect();
+        let max_optional = self.cfg.get(COP, "MaxOptionalParameters")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3);
+
+        if optionals.len() > max_optional {
+            let msg = format!(
+                "Method has too many optional parameters. [{}/{}]",
+                optionals.len(),
+                max_optional
+            );
+            // Report on the def node location
+            self.push(node.location().start_offset(), COP, false, msg);
+        }
+    }
+}

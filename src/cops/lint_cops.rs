@@ -7177,3 +7177,15 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+/// `Struct.new` / `Data.define` (incl. `::`-prefixed) — subset of is_class_constructor.
+pub(crate) fn is_struct_data_constructor(node: &ruby_prism::CallNode, src: &[u8]) -> bool {
+    let Some(r) = node.receiver() else { return false };
+    let l = r.location();
+    let recv = &src[l.start_offset()..l.end_offset()];
+    match node.name().as_slice() {
+        b"new" => matches!(recv, b"Struct" | b"::Struct"),
+        b"define" => matches!(recv, b"Data" | b"::Data"),
+        _ => false,
+    }
+}
+
