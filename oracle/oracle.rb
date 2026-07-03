@@ -393,7 +393,7 @@ while i < lines.length
   # `<<-RUBY`, and trailing keyword args (`, identifier: identifier` — those
   # substitute `%{key}` in the body; unresolvable statically, so they fall into
   # the skip column below instead of being silently dropped).
-  if l =~ /expect_(offense|no_offenses)\(<<([~-])('?)RUBY\3\s*[,)]/
+  if l =~ /expect_(offense|no_offenses)(?:\(| )<<([~-])('?)RUBY\3\s*(?:[,)]|\z)/
     kind = Regexp.last_match(1) == 'offense' ? :offense : :no_offense
     squiggly = Regexp.last_match(2) == '~'
     raw_heredoc = Regexp.last_match(3) == "'"
