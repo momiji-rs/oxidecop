@@ -3690,3 +3690,198 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// Lint/UnreachableCode
+// ---------------------------------------------------------------------
+// Ports `flow_expression?` / `check_if` / `check_case` /
+// `report_on_flow_command?` from rubocop's lint/unreachable_code.rb.
+//
+// The one structural wrinkle versus upstream's whitequark-based algorithm:
+// prism always wraps a body in a `StatementsNode` (even a single
+// statement), where whitequark leaves a lone statement bare and only
+// introduces a `:begin` node for 2+ statements. That difference is benign
+// here because `flow_expression?` on a compound node is an `any?` over its
+// elements — checking a `StatementsNode` with exactly one element and
+// recursing into that element are equivalent.
+//
+// The other wrinkle is real and was confirmed against live rubocop 1.88.0:
+// an explicit `begin...end` is only "transparent" to this analysis (i.e.
+// unwraps to its statements, so a `return` inside can make the whole
+// `begin` block count as flow-of-control) when it carries NO rescue/else/
+// ensure clause. `begin; return; rescue; ...; end` and `begin; return;
+// ensure; ...; end` are both opaque — upstream's whitequark AST wraps
+// those in `:kwbegin` around a `:rescue`/`:ensure` node that
+// `flow_expression?` doesn't special-case, so it falls through to `false`
+// regardless of what's inside. Probed via:
+//   if cond
+//     begin; return; rescue; return; end
+//   else
+//     return
+//   end
+//   bar   # NOT flagged (rubocop 1.88.0) — the begin/rescue is opaque
+// versus a bare `begin; return; end` in the same position, which IS
+// transparent and DOES make `bar` unreachable.
+
+/// `redefinable_flow_method?` — only these six names are tracked as
+/// possibly redefined by a `def`/`defs`.
+fn uc_redefinable_flow_method(name: &[u8]) -> bool {
+    matches!(name, b"raise" | b"fail" | b"throw" | b"exit" | b"exit!" | b"abort")
+}
+
+/// The `flow_command?` node-pattern's `send` alternative: a call to one of
+/// the redefinable names, receiverless or explicitly on `Kernel`/`::Kernel`
+/// (never e.g. `Dummy.raise`, which always calls the real class method).
+fn uc_flow_command_call<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::CallNode<'pr>> {
+    let call = node.as_call_node()?;
+    if !uc_redefinable_flow_method(call.name().as_slice()) {
+        return None;
+    }
+    match call.receiver() {
+        None => Some(call),
+        Some(recv) => {
+            let is_kernel = recv.as_constant_read_node().is_some_and(|c| c.name().as_slice() == b"Kernel")
+                || recv
+                    .as_constant_path_node()
+                    .is_some_and(|c| c.parent().is_none() && c.name().is_some_and(|n| n.as_slice() == b"Kernel"));
+            if is_kernel { Some(call) } else { None }
+        }
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// `report_on_flow_command?`: keyword statements (return/next/break/
+    /// retry/redo) always report. A `Kernel`-qualified call always reports
+    /// (it can't have been shadowed). A bare call is suppressed entirely
+    /// inside `instance_eval` (ambiguous `self`), else suppressed once a
+    /// `def`/`defs` with that name has been seen.
+    fn uc_report_on_flow_command(&self, call: &ruby_prism::CallNode) -> bool {
+        if call.receiver().is_some() {
+            return true;
+        }
+        if self.uc_instance_eval_depth > 0 {
+            return false;
+        }
+        !self.uc_redefined.contains(call.name().as_slice())
+    }
+
+    /// `register_redefinition`: a `def`/`defs` shadowing one of the six
+    /// tracked names disarms future bare calls to it.
+    fn uc_register_redefinition(&mut self, name: &[u8]) {
+        if uc_redefinable_flow_method(name) {
+            self.uc_redefined.insert(name.to_vec());
+        }
+    }
+
+    /// `flow_expression?` — does evaluating `node` unconditionally divert
+    /// control flow away, making anything textually after it (in the same
+    /// statement list) unreachable?
+    fn uc_flow_expression(&mut self, node: &ruby_prism::Node) -> bool {
+        if node.as_return_node().is_some()
+            || node.as_next_node().is_some()
+            || node.as_break_node().is_some()
+            || node.as_retry_node().is_some()
+            || node.as_redo_node().is_some()
+        {
+            return true;
+        }
+        if let Some(call) = uc_flow_command_call(node) {
+            return self.uc_report_on_flow_command(&call);
+        }
+        if let Some(stmts) = node.as_statements_node() {
+            for e in stmts.body().iter() {
+                if self.uc_flow_expression(&e) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if let Some(begin) = node.as_begin_node() {
+            // Opaque unless it's a BARE `begin...end` (see module doc comment).
+            if begin.rescue_clause().is_some() || begin.else_clause().is_some() || begin.ensure_clause().is_some() {
+                return false;
+            }
+            let Some(stmts) = begin.statements() else { return false };
+            for e in stmts.body().iter() {
+                if self.uc_flow_expression(&e) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if let Some(els) = node.as_else_node() {
+            let Some(stmts) = els.statements() else { return false };
+            for e in stmts.body().iter() {
+                if self.uc_flow_expression(&e) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if let Some(iff) = node.as_if_node() {
+            let Some(if_branch) = iff.statements() else { return false };
+            let Some(else_branch) = iff.subsequent() else { return false };
+            return self.uc_flow_expression(&if_branch.as_node()) && self.uc_flow_expression(&else_branch);
+        }
+        if let Some(unl) = node.as_unless_node() {
+            // rubocop normalizes `unless`'s branches (node_parts swaps
+            // true/false), but `check_if` only ANDs them together, so the
+            // swap is a no-op here — both must be present and both flow.
+            let Some(else_clause) = unl.else_clause() else { return false };
+            let Some(main_stmts) = unl.statements() else { return false };
+            return self.uc_flow_expression(&else_clause.as_node()) && self.uc_flow_expression(&main_stmts.as_node());
+        }
+        if let Some(c) = node.as_case_node() {
+            let Some(else_branch) = c.else_clause() else { return false };
+            if !self.uc_flow_expression(&else_branch.as_node()) {
+                return false;
+            }
+            for w in c.conditions().iter() {
+                let flows = match w.as_when_node().and_then(|w| w.statements()) {
+                    Some(s) => self.uc_flow_expression(&s.as_node()),
+                    None => false,
+                };
+                if !flows {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if let Some(c) = node.as_case_match_node() {
+            let Some(else_branch) = c.else_clause() else { return false };
+            if !self.uc_flow_expression(&else_branch.as_node()) {
+                return false;
+            }
+            for i in c.conditions().iter() {
+                let flows = match i.as_in_node().and_then(|i| i.statements()) {
+                    Some(s) => self.uc_flow_expression(&s.as_node()),
+                    None => false,
+                };
+                if !flows {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if let Some(d) = node.as_def_node() {
+            self.uc_register_redefinition(d.name().as_slice());
+            return false;
+        }
+        false
+    }
+
+    /// `on_begin`/`on_kwbegin`: within a straight-line statement list, any
+    /// statement after one that always diverts control flow is unreachable.
+    pub(crate) fn check_unreachable_code(&mut self, node: &ruby_prism::StatementsNode) {
+        const COP: &str = "Lint/UnreachableCode";
+        if !self.on(COP) {
+            return;
+        }
+        let body: Vec<_> = node.body().iter().collect();
+        for pair in body.windows(2) {
+            if self.uc_flow_expression(&pair[0]) {
+                self.push(pair[1].location().start_offset(), COP, false, "Unreachable code detected.");
+            }
+        }
+    }
+}

@@ -146,7 +146,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody", "Lint/AmbiguousRegexpLiteral", "Layout/BlockEndNewline",
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
-    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -517,6 +517,14 @@ pub(crate) struct Cops<'a> {
     pub(crate) block_owns_next_stmts: bool,
     // Relative file path for cops that need to check the filename (e.g., Gemfile)
     pub(crate) rel_path: &'a str,
+    // Lint/UnreachableCode: method names redefined by a `def`/`defs` seen so
+    // far in the file (rubocop's `@redefined`) — only the six
+    // `redefinable_flow_method?` names are ever inserted.
+    pub(crate) uc_redefined: HashSet<Vec<u8>>,
+    // Lint/UnreachableCode: depth of enclosing `instance_eval` blocks
+    // (rubocop's `@instance_eval_count`) — inside one, a bare redefinable
+    // call's target `self` is unknown, so the warning is suppressed.
+    pub(crate) uc_instance_eval_depth: usize,
     // Layout/EmptyLinesAroundClassBody / EmptyLinesAroundModuleBody:
     // (cop, start-offset) pairs already offended-on — `check_beginning` and
     // `check_ending` collapse onto the exact same physical line when a
@@ -1060,6 +1068,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ll_check_semicolons(node);
         self.check_constant_definition_in_block(node);
         self.check_empty_lines_around_attribute_accessor(node);
+        self.check_unreachable_code(node);
         self.stmts_stack.push(node.location().start_offset());
         ruby_prism::visit_statements_node(self, node);
         self.stmts_stack.pop();
@@ -1595,9 +1604,22 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if scoping {
                 self.scoping_depth += 1;
             }
+            // Lint/UnreachableCode: `on_block`/`after_block` around any
+            // `instance_eval` block (numbered/`it`/ordinary params all
+            // collapse to one prism `BlockNode`) — inside it, a bare
+            // redefinable-flow call's `self` is unknown.
+            let uc_instance_eval = self.on("Lint/UnreachableCode")
+                && node.name().as_slice() == b"instance_eval"
+                && b.as_block_node().is_some();
+            if uc_instance_eval {
+                self.uc_instance_eval_depth += 1;
+            }
             self.usage_block_depth += 1;
             self.visit(&b);
             self.usage_block_depth -= 1;
+            if uc_instance_eval {
+                self.uc_instance_eval_depth -= 1;
+            }
             if scoping {
                 self.scoping_depth -= 1;
             }
@@ -1705,6 +1727,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         assignment_leftmost: HashMap::new(),
         block_owns_next_stmts: false,
         rel_path,
+        uc_redefined: HashSet::new(),
+        uc_instance_eval_depth: 0,
         el_offended: HashSet::new(),
         else_layout_seen: HashSet::new(),
     };

@@ -132,6 +132,7 @@ COPS = {
   'Layout/EmptyLinesAroundExceptionHandlingKeywords' => 'layout/empty_lines_around_exception_handling_keywords',
   'Style/RedundantPercentQ'          => 'style/redundant_percent_q',
   'Layout/SpaceBeforeFirstArg'       => 'layout/space_before_first_arg',
+  'Lint/UnreachableCode'             => 'lint/unreachable_code',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
