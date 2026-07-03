@@ -7357,3 +7357,146 @@ fn isc_ruby_inspect(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+impl<'a> Cops<'a> {
+    /// Lint/RaiseException — `raise` or `fail` statements that raise `Exception`
+    /// or `Exception.new`. Should use `StandardError` or a specific exception class instead.
+    /// Allows configurable implicit namespaces (default: ['Gem']).
+    pub(crate) fn check_raise_exception(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/RaiseException";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !matches!(name, b"raise" | b"fail") {
+            return;
+        }
+
+        // Pattern 1: raise Exception / raise ::Exception
+        if let Some((offset, end_offset, has_cbase)) = self.check_raise_exception_direct(node) {
+            if self.should_report_raise_exception(has_cbase) {
+                self.register_raise_exception_offense_direct(offset, end_offset, has_cbase);
+            }
+            return;
+        }
+
+        // Pattern 2: raise Exception.new(...) / raise ::Exception.new(...)
+        if let Some((offset, end_offset, has_cbase)) = self.check_raise_exception_new(node) {
+            if self.should_report_raise_exception(has_cbase) {
+                self.register_raise_exception_offense_direct(offset, end_offset, has_cbase);
+            }
+        }
+    }
+
+    /// Check for the pattern: raise Exception or raise ::Exception
+    /// Returns (start_offset, end_offset, has_explicit_namespace) if matches
+    fn check_raise_exception_direct(&self, node: &ruby_prism::CallNode) -> Option<(usize, usize, bool)> {
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.is_empty() {
+            return None;
+        }
+        let first_arg = &args[0];
+        // Check if it's a constant (Exception or ::Exception)
+        if let Some(c) = first_arg.as_constant_read_node() {
+            if c.name().as_slice() == b"Exception" {
+                let loc = first_arg.location();
+                return Some((loc.start_offset(), loc.end_offset(), false));
+            }
+        } else if let Some(p) = first_arg.as_constant_path_node() {
+            // Check for ::Exception pattern (explicit namespace)
+            if p.parent().is_none() && p.name().as_ref().is_some_and(|n| n.as_slice() == b"Exception") {
+                let loc = first_arg.location();
+                return Some((loc.start_offset(), loc.end_offset(), true));
+            }
+        }
+        None
+    }
+
+    /// Check for the pattern: raise Exception.new(...) or raise ::Exception.new(...)
+    /// Returns (start_offset, end_offset, has_explicit_namespace) if matches
+    fn check_raise_exception_new(&self, node: &ruby_prism::CallNode) -> Option<(usize, usize, bool)> {
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.is_empty() {
+            return None;
+        }
+        let first_arg = &args[0];
+        // Check if it's a call to .new
+        if let Some(call) = first_arg.as_call_node() {
+            if call.name().as_slice() != b"new" {
+                return None;
+            }
+            let receiver = call.receiver()?;
+            // Check if the receiver is Exception or ::Exception
+            if let Some(c) = receiver.as_constant_read_node() {
+                if c.name().as_slice() == b"Exception" {
+                    let loc = receiver.location();
+                    return Some((loc.start_offset(), loc.end_offset(), false));
+                }
+            } else if let Some(p) = receiver.as_constant_path_node() {
+                // Check for ::Exception pattern (explicit namespace)
+                if p.parent().is_none() && p.name().as_ref().is_some_and(|n| n.as_slice() == b"Exception") {
+                    let loc = receiver.location();
+                    return Some((loc.start_offset(), loc.end_offset(), true));
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if we should report an offense for this raise/fail Exception
+    fn should_report_raise_exception(&self, has_cbase: bool) -> bool {
+        // If it has an explicit namespace (::Exception), always report
+        if has_cbase {
+            return true;
+        }
+        // Otherwise, check if we're in an allowed implicit namespace
+        !self.is_in_allowed_namespace()
+    }
+
+    /// Check if we're currently inside an allowed namespace
+    fn is_in_allowed_namespace(&self) -> bool {
+        let allowed = self.allowed_implicit_namespaces();
+        // Check the top-level module in the stack against allowed list
+        for module_path in self.mod_stack.iter().rev() {
+            // Get the first component of the module name (e.g., "Gem" from "Gem::Inner")
+            let first_component = module_path.split("::").next().unwrap_or("");
+            if allowed.iter().any(|a| a == first_component) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get the list of allowed implicit namespaces from config, default to ['Gem']
+    fn allowed_implicit_namespaces(&self) -> Vec<String> {
+        const COP: &str = "Lint/RaiseException";
+        match self.cfg.get(COP, "AllowedImplicitNamespaces") {
+            Some(val) => {
+                // Parse the config value as a list
+                crate::config::parse_allowed_list(val)
+            }
+            None => {
+                // Default to ['Gem']
+                vec!["Gem".to_string()]
+            }
+        }
+    }
+
+    /// Register the offense and add autocorrect
+    fn register_raise_exception_offense_direct(&mut self, start_offset: usize, end_offset: usize, _has_cbase: bool) {
+        const COP: &str = "Lint/RaiseException";
+        let exception_src = &self.src[start_offset..end_offset];
+
+        // Determine the replacement
+        let replacement = if exception_src.starts_with(b"::") {
+            b"::StandardError".to_vec()
+        } else {
+            b"StandardError".to_vec()
+        };
+
+        self.push(start_offset, COP, true, "Use `StandardError` over `Exception`.");
+        self.fixes.push((start_offset, end_offset, replacement));
+    }
+}
+
