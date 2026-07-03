@@ -5251,3 +5251,114 @@ impl<'a> super::Cops<'a> {
         );
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/EmptyComment — `on_new_investigation`. When `AllowMarginComment`
+    /// is true (default), consecutive same-column comment lines are joined
+    /// (`concat_consecutive_comments`) into one unit before the empty-comment
+    /// test, so a "margin" (blank-hash / text / blank-hash) block reads as
+    /// non-empty overall even though its bookend lines are individually bare
+    /// `#`s. When false, each comment is tested alone. Either way, every
+    /// comment inside a unit that tests empty gets its own offense (and its
+    /// own autocorrect) — `investigate` iterates `chunk[1]`, not the chunk as
+    /// a whole.
+    pub(crate) fn check_empty_comment(&mut self) {
+        const COP: &str = "Layout/EmptyComment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.comments.is_empty() {
+            return;
+        }
+        const MSG: &str = "Source code comment is empty.";
+        let allow_border = self.cfg.get(COP, "AllowBorderComment") == Some("true");
+        let allow_margin = self.cfg.get(COP, "AllowMarginComment") == Some("true");
+
+        // `comment.text.strip` — the comment token's source text (starts at
+        // `#`) with surrounding whitespace removed. A single comment line
+        // never itself contains a newline, so testing each chunk member's
+        // stripped text against the appropriate single-line pattern is
+        // equivalent to rubocop's `/\A(#\n)+\z/` (border-allowed) /
+        // `/\A(#+\n)+\z/` (border-disallowed) match against the members'
+        // joined `"#{text.strip}\n"` units.
+        let is_empty_unit = |text: &[u8]| -> bool {
+            let t = std::str::from_utf8(text).unwrap_or("").trim();
+            if allow_border { t == "#" } else { !t.is_empty() && t.bytes().all(|b| b == b'#') }
+        };
+
+        if allow_margin {
+            // `concat_consecutive_comments`: `chunk_while { |i, j| i.loc.line.succ
+            // == j.loc.line && i.loc.column == j.loc.column }`.
+            let mut ix = 0;
+            while ix < self.comments.len() {
+                let mut end = ix + 1;
+                let (mut prev_line, prev_start, _) = self.comments[ix];
+                let mut prev_col = self.ec_column(prev_start);
+                while end < self.comments.len() {
+                    let (line, start, _) = self.comments[end];
+                    let col = self.ec_column(start);
+                    if prev_line + 1 == line && prev_col == col {
+                        prev_line = line;
+                        prev_col = col;
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let chunk = &self.comments[ix..end];
+                if chunk.iter().all(|&(_, s, e)| is_empty_unit(&self.src[s..e])) {
+                    let offenders: Vec<(usize, usize, usize)> = chunk.to_vec();
+                    for (line, start, end) in offenders {
+                        self.push(start, COP, true, MSG);
+                        self.ec_autocorrect(line, start, end);
+                    }
+                }
+                ix = end;
+            }
+        } else {
+            let comments = self.comments.to_vec();
+            for (line, start, end) in comments {
+                if is_empty_unit(&self.src[start..end]) {
+                    self.push(start, COP, true, MSG);
+                    self.ec_autocorrect(line, start, end);
+                }
+            }
+        }
+    }
+
+    /// `comment.loc.column`: 0-based CHARACTER column.
+    fn ec_column(&self, off: usize) -> usize {
+        let (line, mut col) = self.idx.loc(off);
+        let prefix = &self.src[self.idx.starts[line - 1]..off];
+        if !prefix.is_ascii() {
+            col = String::from_utf8_lossy(prefix).chars().count() + 1;
+        }
+        col - 1
+    }
+
+    /// `previous_token`/`same_line?` reduce to: is there non-whitespace
+    /// content before the comment on its own physical line? If so it's a
+    /// trailing comment — remove from the whitespace run right before `#`
+    /// through the comment's end (rubocop's `range_with_surrounding_space`
+    /// with `newlines: false`, which eats a whole run of spaces/tabs but
+    /// stops at a newline). Otherwise it's a standalone comment line —
+    /// remove the whole physical line, including its trailing newline
+    /// (`range_by_whole_lines(include_final_newline: true)`).
+    fn ec_autocorrect(&mut self, line: usize, start: usize, end: usize) {
+        let line_start = self.idx.starts[line - 1];
+        let trailing = !self.src[line_start..start].iter().all(u8::is_ascii_whitespace);
+        if trailing {
+            let mut ws_start = start;
+            while ws_start > line_start
+                && (self.src[ws_start - 1] == b' ' || self.src[ws_start - 1] == b'\t')
+            {
+                ws_start -= 1;
+            }
+            self.fixes.push((ws_start, end, Vec::new()));
+        } else {
+            let line_end = self.idx.starts.get(line).copied().unwrap_or(self.src.len());
+            self.fixes.push((line_start, line_end, Vec::new()));
+        }
+    }
+}

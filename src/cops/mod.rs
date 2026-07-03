@@ -193,7 +193,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
     "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException", "Style/TrailingUnderscoreVariable",
-    "Lint/NonLocalExitFromIterator",
+    "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
 ];
 
 impl Engine {
@@ -2676,6 +2676,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     cops.check_space_before_comment();
     cops.check_leading_comment_space();
     cops.check_comment_indentation();
+    cops.check_empty_comment();
     cops.check_block_comments();
     cops.check_comment_annotation();
     // Lint/AmbiguousRegexpLiteral: rides prism's own lex-level
