@@ -434,6 +434,11 @@ pub(crate) struct Cops<'a> {
     // Inside a `#{...}` interpolation (rubocop's `inside_interpolation?`) —
     // string-literal style is not enforced there.
     pub(crate) interp_depth: usize,
+    // interp_depth snapshots taken on entering each interpolated-xstring:
+    // upstream's inside_interpolation? only counts dstr/dsym/regexp parents,
+    // so a string whose NEAREST #{} belongs to an xstr (interp_depth ==
+    // last snapshot + 1) is exempt for Style/StringLiteralsInInterpolation.
+    pub(crate) xstr_interp_base: Vec<usize>,
     // Node spans claimed by a multiline string-concat check (rubocop's
     // `ignore_node`): individual strings inside are exempt from on_str.
     pub(crate) str_ignore: Vec<(usize, usize)>,
@@ -929,7 +934,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_interpolated_x_string_node(&mut self, node: &ruby_prism::InterpolatedXStringNode<'pr>) {
         self.check_space_inside_percent_literal_delimiters_ixstr(node);
         self.check_lii_ixstr(node);
+        self.xstr_interp_base.push(self.interp_depth);
         ruby_prism::visit_interpolated_x_string_node(self, node);
+        self.xstr_interp_base.pop();
     }
     fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
         self.check_heredoc_delimiter_naming(Some(node.opening_loc()), Some(node.closing_loc()));
@@ -2193,6 +2200,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         def_depth: 0,
         scoping_depth: 0,
         interp_depth: 0,
+        xstr_interp_base: Vec::new(),
         str_ignore: Vec::new(),
         num_ignore: Vec::new(),
         percent_sym_spans: Vec::new(),

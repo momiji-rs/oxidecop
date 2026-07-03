@@ -6712,6 +6712,13 @@ impl<'a> super::Cops<'a> {
         if !self.hot.string_literals_in_interpolation || self.interp_depth == 0 {
             return;
         }
+        // Upstream's inside_interpolation? counts only dstr/dsym/regexp
+        // parents — a string whose nearest #{} belongs to an xstring
+        // (interp_depth exactly one past the depth recorded when that
+        // xstr was entered) is exempt; a deeper dstr re-qualifies.
+        if self.xstr_interp_base.last().is_some_and(|&b| self.interp_depth == b + 1) {
+            return;
+        }
         let Some(open) = node.opening_loc() else { return };
         let src = self.node_src(&node.as_node());
         let l = node.location();
