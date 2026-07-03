@@ -217,6 +217,7 @@ COPS = {
   'Layout/MultilineMethodCallBraceLayout' => 'layout/multiline_method_call_brace_layout',
   'Style/LambdaCall'                 => 'style/lambda_call',
   'Naming/HeredocDelimiterCase'      => 'naming/heredoc_delimiter_case',
+  'Lint/RescueType'                  => 'lint/rescue_type',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

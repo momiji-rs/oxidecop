@@ -8196,3 +8196,77 @@ impl<'a> Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Lint/RescueType — rescuing from non-constant literals (symbols, strings,
+    /// numbers, arrays, hashes, etc.) will raise a `TypeError` instead of catching
+    /// the actual exception.
+    pub(crate) fn check_rescue_type(&mut self, node: &ruby_prism::RescueNode) {
+        const COP: &str = "Lint/RescueType";
+        if !self.on(COP) {
+            return;
+        }
+        let exceptions: Vec<ruby_prism::Node> = node.exceptions().iter().collect();
+        if exceptions.is_empty() {
+            return;
+        }
+
+        let invalid: Vec<&ruby_prism::Node> = exceptions
+            .iter()
+            .filter(|e| is_invalid_rescue_type(e))
+            .collect();
+
+        if invalid.is_empty() {
+            return;
+        }
+
+        let kw_loc = node.keyword_loc();
+        let last_exc = exceptions.last().unwrap();
+        let end_offset = last_exc.location().end_offset();
+
+        let invalid_str = invalid.iter()
+            .map(|e| String::from_utf8_lossy(self.node_src(e)).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        self.push(kw_loc.start_offset(), COP, true,
+            format!("Rescuing from `{invalid_str}` will raise a `TypeError` instead of catching the actual exception."));
+
+        // Autocorrect: replace from end of keyword to end of all exceptions
+        let repl_start = kw_loc.end_offset();
+        let valid_exceptions: Vec<&ruby_prism::Node> = exceptions
+            .iter()
+            .filter(|e| !is_invalid_rescue_type(e))
+            .collect();
+
+        let replacement = if valid_exceptions.is_empty() {
+            Vec::new()
+        } else {
+            let valid_str = valid_exceptions.iter()
+                .map(|e| String::from_utf8_lossy(self.node_src(e)).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" {valid_str}").into_bytes()
+        };
+
+        self.fixes.push((repl_start, end_offset, replacement));
+    }
+}
+
+/// Helper function to check if a node is an invalid rescue type (non-constant literal).
+/// Invalid types: nil, true, false, int, float, rational, complex, str, dstr, sym, array, hash
+fn is_invalid_rescue_type(node: &ruby_prism::Node) -> bool {
+    node.as_nil_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+        || node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_rational_node().is_some()
+        || node.as_imaginary_node().is_some()
+        || node.as_string_node().is_some()
+        || node.as_interpolated_string_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_interpolated_symbol_node().is_some()
+        || node.as_array_node().is_some()
+        || node.as_hash_node().is_some()
+}
