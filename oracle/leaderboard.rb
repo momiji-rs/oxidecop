@@ -157,6 +157,7 @@ COPS = {
   'Security/YAMLLoad'                => 'security/yaml_load',
   'Style/StabbyLambdaParentheses'    => 'style/stabby_lambda_parentheses',
   'Lint/StructNewOverride'           => 'lint/struct_new_override',
+  'Lint/Loop'                        => 'lint/loop',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

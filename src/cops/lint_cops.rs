@@ -6157,3 +6157,121 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Lint/Loop — `begin ... end while/until condition` should be replaced
+    /// with `loop do ... break [unless|if] condition ... end`.
+    pub(crate) fn check_loop_while(&mut self, node: &ruby_prism::WhileNode) {
+        const COP: &str = "Lint/Loop";
+        if !self.on(COP) || !node.is_begin_modifier() {
+            return;
+        }
+
+        let statements = match node.statements() {
+            Some(s) => s,
+            None => return,
+        };
+        // Find the BeginNode in statements
+        let Some(begin_node) = statements.body().iter().find_map(|n| n.as_begin_node()) else {
+            return;
+        };
+        let Some(begin_keyword_loc) = begin_node.begin_keyword_loc() else { return };
+        let Some(end_keyword_loc) = begin_node.end_keyword_loc() else { return };
+
+        let keyword_loc = node.keyword_loc();
+        let condition = &node.predicate();
+        let location = node.location();
+
+        const MSG: &str = "Use `Kernel#loop` with `break` rather than `begin/end/until`(or `while`).";
+
+        // Register the offense at the keyword location
+        self.push(keyword_loc.start_offset(), COP, true, MSG);
+
+        // Build the break statement
+        let break_keyword = "unless";
+        let condition_src = String::from_utf8_lossy(self.node_src(condition));
+
+        // Calculate indentation for the break line (same as 'end' keyword)
+        let (_, col) = self.idx.loc(end_keyword_loc.start_offset());
+        let indent = " ".repeat(col.saturating_sub(1));
+        let break_line = format!("break {break_keyword} {condition_src}\n{indent}");
+
+        // Fix 1: Replace 'begin' with 'loop do'
+        self.fixes.push((
+            begin_keyword_loc.start_offset(),
+            begin_keyword_loc.end_offset(),
+            b"loop do".to_vec(),
+        ));
+
+        // Fix 2: Insert break statement before 'end'
+        self.fixes.push((
+            end_keyword_loc.start_offset(),
+            end_keyword_loc.start_offset(),
+            break_line.into_bytes(),
+        ));
+
+        // Fix 3: Remove from after 'end' to the end of the whole statement
+        self.fixes.push((
+            end_keyword_loc.end_offset(),
+            location.end_offset(),
+            Vec::new(),
+        ));
+    }
+
+    pub(crate) fn check_loop_until(&mut self, node: &ruby_prism::UntilNode) {
+        const COP: &str = "Lint/Loop";
+        if !self.on(COP) || !node.is_begin_modifier() {
+            return;
+        }
+
+        let statements = match node.statements() {
+            Some(s) => s,
+            None => return,
+        };
+        // Find the BeginNode in statements
+        let Some(begin_node) = statements.body().iter().find_map(|n| n.as_begin_node()) else {
+            return;
+        };
+        let Some(begin_keyword_loc) = begin_node.begin_keyword_loc() else { return };
+        let Some(end_keyword_loc) = begin_node.end_keyword_loc() else { return };
+
+        let keyword_loc = node.keyword_loc();
+        let condition = &node.predicate();
+        let location = node.location();
+
+        const MSG: &str = "Use `Kernel#loop` with `break` rather than `begin/end/until`(or `while`).";
+
+        // Register the offense at the keyword location
+        self.push(keyword_loc.start_offset(), COP, true, MSG);
+
+        // Build the break statement
+        let break_keyword = "if";
+        let condition_src = String::from_utf8_lossy(self.node_src(condition));
+
+        // Calculate indentation for the break line (same as 'end' keyword)
+        let (_, col) = self.idx.loc(end_keyword_loc.start_offset());
+        let indent = " ".repeat(col.saturating_sub(1));
+        let break_line = format!("break {break_keyword} {condition_src}\n{indent}");
+
+        // Fix 1: Replace 'begin' with 'loop do'
+        self.fixes.push((
+            begin_keyword_loc.start_offset(),
+            begin_keyword_loc.end_offset(),
+            b"loop do".to_vec(),
+        ));
+
+        // Fix 2: Insert break statement before 'end'
+        self.fixes.push((
+            end_keyword_loc.start_offset(),
+            end_keyword_loc.start_offset(),
+            break_line.into_bytes(),
+        ));
+
+        // Fix 3: Remove from after 'end' to the end of the whole statement
+        self.fixes.push((
+            end_keyword_loc.end_offset(),
+            location.end_offset(),
+            Vec::new(),
+        ));
+    }
+}
+
