@@ -9269,3 +9269,155 @@ fn kpo_remove_range(src: &[u8], start: usize, end: usize) -> (usize, usize) {
     }
     (s, e)
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/PerlBackrefs — Perl-style regexp match backreferences and their
+    /// English versions ($1-$9, $&, $`, $', $+, $MATCH, $PREMATCH,
+    /// $POSTMATCH, $LAST_PAREN_MATCH) should use Regexp.last_match forms.
+    pub(crate) fn check_perl_backrefs_numbered(
+        &mut self,
+        node: &ruby_prism::NumberedReferenceReadNode,
+    ) {
+        const COP: &str = "Style/PerlBackrefs";
+        if !self.on(COP) {
+            return;
+        }
+        let offset = node.location().start_offset();
+
+        // Get the number (1-9)
+        let num = node.number();
+        let original = format!("${}", num);
+        let base_preferred = format!("Regexp.last_match({})", num);
+
+        // Add :: prefix if inside class/module
+        let preferred = self.add_constant_prefix(&base_preferred);
+
+        let msg = format!(
+            "Prefer `{}` over `{}`.",
+            preferred, original
+        );
+
+        // Check if inside braceless interpolation
+        let needs_braces = self.interpolated_node_depth > 0;
+
+        let replacement = if needs_braces {
+            let base = format!("Regexp.last_match({})", num);
+            format!("{{{}}}", self.add_constant_prefix(&base))
+        } else {
+            preferred.clone()
+        };
+
+        self.push(offset, COP, true, &msg);
+        self.fixes
+            .push((offset, node.location().end_offset(), replacement.into_bytes()));
+    }
+
+    /// Style/PerlBackrefs for back references ($&, $`, $', $+)
+    pub(crate) fn check_perl_backrefs_back_ref(
+        &mut self,
+        node: &ruby_prism::BackReferenceReadNode,
+    ) {
+        const COP: &str = "Style/PerlBackrefs";
+        if !self.on(COP) {
+            return;
+        }
+        let offset = node.location().start_offset();
+
+        // Get the original source text for this node
+        let src_text = String::from_utf8_lossy(
+            self.node_src(&node.as_node()),
+        );
+
+        let (original, base_preferred) = match src_text.as_ref() {
+            "$&" => ("$&".to_string(), "Regexp.last_match(0)".to_string()),
+            "$`" => ("$`".to_string(), "Regexp.last_match.pre_match".to_string()),
+            "$'" => ("$'".to_string(), "Regexp.last_match.post_match".to_string()),
+            "$+" => ("$+".to_string(), "Regexp.last_match(-1)".to_string()),
+            _ => return, // Unknown back reference
+        };
+
+        // Add :: prefix if inside class/module
+        let preferred = self.add_constant_prefix(&base_preferred);
+
+        let msg = format!(
+            "Prefer `{}` over `{}`.",
+            preferred, original
+        );
+
+        // Check if inside braceless interpolation
+        let replacement = if self.interpolated_node_depth > 0 {
+            format!("{{{}}}", preferred)
+        } else {
+            preferred.clone()
+        };
+
+        self.push(offset, COP, true, &msg);
+        self.fixes.push((
+            offset,
+            node.location().end_offset(),
+            replacement.into_bytes(),
+        ));
+    }
+
+    /// Style/PerlBackrefs for global variable backrefs ($MATCH, $PREMATCH,
+    /// $POSTMATCH, $LAST_PAREN_MATCH)
+    pub(crate) fn check_perl_backrefs_gvar(
+        &mut self,
+        node: &ruby_prism::GlobalVariableReadNode,
+    ) {
+        const COP: &str = "Style/PerlBackrefs";
+        if !self.on(COP) {
+            return;
+        }
+
+        let name_bytes = node.name().as_slice();
+        let (original, base_preferred) = match name_bytes {
+            b"$MATCH" => ("$MATCH".to_string(), "Regexp.last_match(0)".to_string()),
+            b"$PREMATCH" => (
+                "$PREMATCH".to_string(),
+                "Regexp.last_match.pre_match".to_string(),
+            ),
+            b"$POSTMATCH" => (
+                "$POSTMATCH".to_string(),
+                "Regexp.last_match.post_match".to_string(),
+            ),
+            b"$LAST_PAREN_MATCH" => (
+                "$LAST_PAREN_MATCH".to_string(),
+                "Regexp.last_match(-1)".to_string(),
+            ),
+            _ => return, // Not a perl backref global
+        };
+
+        // Add :: prefix if inside class/module
+        let preferred = self.add_constant_prefix(&base_preferred);
+
+        let offset = node.location().start_offset();
+        let msg = format!(
+            "Prefer `{}` over `{}`.",
+            preferred, original
+        );
+
+        // Check if inside braceless interpolation
+        let replacement = if self.interpolated_node_depth > 0 {
+            format!("{{{}}}", preferred)
+        } else {
+            preferred.clone()
+        };
+
+        self.push(offset, COP, true, &msg);
+        self.fixes.push((
+            offset,
+            node.location().end_offset(),
+            replacement.into_bytes(),
+        ));
+    }
+
+    /// Helper to add :: prefix if inside class/module
+    fn add_constant_prefix(&self, expr: &str) -> String {
+        if self.class_module_depth > 0 {
+            format!("::{}", expr)
+        } else {
+            expr.to_string()
+        }
+    }
+}

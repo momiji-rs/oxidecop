@@ -204,6 +204,7 @@ COPS = {
   'Lint/ImplicitStringConcatenation' => 'lint/implicit_string_concatenation',
   'Style/KeywordParametersOrder'     => 'style/keyword_parameters_order',
   'Naming/AccessorMethodName'        => 'naming/accessor_method_name',
+  'Style/PerlBackrefs'               => 'style/perl_backrefs',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
