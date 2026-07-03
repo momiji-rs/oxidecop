@@ -161,6 +161,7 @@ COPS = {
   'Style/BlockComments'              => 'style/block_comments',
   'Layout/BeginEndAlignment'         => 'layout/begin_end_alignment',
   'Style/GlobalStdStream'            => 'style/global_std_stream',
+  'Style/EmptyElse'                  => 'style/empty_else',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

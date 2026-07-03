@@ -5122,3 +5122,141 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/EmptyElse — flags a redundant `else`-clause that's either
+    /// completely empty or contains only the literal `nil`, gated by
+    /// `EnforcedStyle` (`empty`/`nil`/`both`, default `both`) and
+    /// `AllowComments` (default `false`). Ported from rubocop's
+    /// `Style::EmptyElse` (`include OnNormalIfUnless, ConfigurableEnforcedStyle`).
+    ///
+    /// Prism quirk vs whitequark: an `if`/`elsif`/`else` chain is nested
+    /// `IfNode`s linked via `subsequent()`, just like whitequark's nested
+    /// `:if` nodes reached through `else_branch` — BUT unlike whitequark,
+    /// prism gives EVERY level (each `elsif`, not just the outermost `if`)
+    /// its own `end_keyword_loc` pointing at the real trailing `end`. Ruby's
+    /// `base_node` climbs ancestors purely to find a node whose `loc.end`
+    /// is actually set (whitequark's nested elsif nodes lack one); that
+    /// climb is unnecessary here; any level's `end_keyword_loc` already
+    /// points at the same, real `end`. So instead of visiting (and
+    /// re-deriving the chain from) every nested elsif independently like
+    /// upstream's `on_if` does, we fire once from the genuine top of the
+    /// chain (`if_keyword_loc` == "if", never "elsif") and walk `subsequent()`
+    /// down to the terminal branch ourselves — equivalent in outcome (only
+    /// the deepest level's immediate else-branch can ever be empty/nil,
+    /// exactly as upstream's per-level `empty_check`/`nil_check` guards
+    /// only fire there) without needing ancestor-climbing machinery.
+    pub(crate) fn check_empty_else_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/EmptyElse";
+        if !self.on(COP) {
+            return;
+        }
+        // `end_keyword_loc` is None for both a ternary (`a ? b : c`, no
+        // keyword either) and modifier-form (`body if cond`, keyword but no
+        // `end`) — matches upstream's `node.modifier_form? || node.ternary?`
+        // guard in one shot. The `if_keyword_loc().as_slice() != "if"` guard
+        // only lets the true top of the chain proceed (an `elsif` is visited
+        // separately by the traversal but must not re-walk/re-report here).
+        let Some(end_kw) = node.end_keyword_loc() else { return };
+        let Some(kw) = node.if_keyword_loc() else { return };
+        if kw.as_slice() != b"if" {
+            return;
+        }
+        let mut cur = node.subsequent();
+        let else_node = loop {
+            match cur {
+                None => return, // no `else` anywhere in the chain: nothing to flag
+                Some(n) => match n.as_if_node() {
+                    Some(elsif) => {
+                        cur = elsif.subsequent();
+                        continue;
+                    }
+                    None => break n.as_else_node().expect("if/unless subsequent is else or elsif"),
+                },
+            }
+        };
+        self.ee_check(COP, &else_node, end_kw.start_offset(), "if");
+    }
+
+    /// Style/EmptyElse for `unless ... else ... end` — prism's `UnlessNode`
+    /// never chains into further branches, so this is the single-level case.
+    pub(crate) fn check_empty_else_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Style/EmptyElse";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(end_kw) = node.end_keyword_loc() else { return };
+        let Some(else_node) = node.else_clause() else { return };
+        self.ee_check(COP, &else_node, end_kw.start_offset(), "if");
+    }
+
+    /// Style/EmptyElse for `case ... else ... end` — rubocop's cop only
+    /// hooks `on_case` (never `on_case_match`), so `case/in` pattern
+    /// matching is intentionally out of scope, matching upstream exactly.
+    pub(crate) fn check_empty_else_case(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Style/EmptyElse";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(else_node) = node.else_clause() else { return };
+        self.ee_check(COP, &else_node, node.end_keyword_loc().start_offset(), "case");
+    }
+
+    /// Shared detection + autocorrect for the three entry points above.
+    /// `end_start` is the start offset of the enclosing statement's own
+    /// (always-real, in prism) `end` keyword — the autocorrect removal's end
+    /// boundary, verbatim from rubocop's
+    /// `range_between(node.loc.else.begin_pos, base_node(node).loc.end.begin_pos)`.
+    /// `kind` is whitequark's `node.type.to_s` equivalent ("if" for both
+    /// `if` and `unless` — whitequark represents `unless` as an `:if` node
+    /// too — "case" for `case`), used only to resolve `Style/MissingElse`'s
+    /// cross-cop autocorrect veto below.
+    fn ee_check(&mut self, cop: &'static str, else_node: &ruby_prism::ElseNode, end_start: usize, kind: &str) {
+        let style = self.cfg.enforced_style(cop);
+        let empty_style = style == "empty" || style == "both";
+        let nil_style = style == "nil" || style == "both";
+        let stmts = else_node.statements();
+        let is_empty = stmts.is_none();
+        let is_nil_only = stmts.as_ref().is_some_and(|s| {
+            s.body().len() == 1 && s.body().first().is_some_and(|n| n.as_nil_node().is_some())
+        });
+        if !(empty_style && is_empty) && !(nil_style && is_nil_only) {
+            return;
+        }
+        let else_kw = else_node.else_keyword_loc();
+        // `comment_in_else?`: rubocop's `contains_comment?` treats the range
+        // as an INCLUSIVE line span (`range.line..range.last_line`), from the
+        // `else` keyword's line through the enclosing `end`'s line.
+        let start_line = self.idx.loc(else_kw.start_offset()).0;
+        let end_line = self.idx.loc(end_start).0;
+        let has_comment = self.comments.iter().any(|(line, _, _)| *line >= start_line && *line <= end_line);
+        // `AllowComments` only gates DETECTION; the autocorrect's own
+        // `comment_in_else?` guard below is unconditional (fires even when
+        // `AllowComments` is false, per upstream's `autocorrect` method).
+        let allow_comments = self.cfg.get(cop, "AllowComments") == Some("true");
+        if allow_comments && has_comment {
+            return;
+        }
+        let forbidden = has_comment || self.ee_missing_else_forbids(kind);
+        self.push(else_kw.start_offset(), cop, !forbidden, "Redundant `else`-clause.");
+        if !forbidden {
+            self.fixes.push((else_kw.start_offset(), end_start, Vec::new()));
+        }
+    }
+
+    /// `Style::EmptyElse#autocorrect_forbidden?`/`#missing_else_style`: reads
+    /// the `Style/MissingElse` section directly rather than through
+    /// `self.cfg.get`/`self.on`, because `Style/MissingElse` isn't one of
+    /// this engine's implemented cops and so carries no schema-driven
+    /// enabled-by-default resolution — `Config::get`'s schema fallback only
+    /// covers PARAMETER defaults, not `Enabled`. Read the raw param with
+    /// rubocop's real default.yml value (`Enabled: false`) as the fallback,
+    /// exactly like upstream's `missing_cfg.fetch('Enabled')`.
+    fn ee_missing_else_forbids(&self, kind: &str) -> bool {
+        if self.cfg.param("Style/MissingElse", "Enabled") != Some("true") {
+            return false;
+        }
+        let style = self.cfg.get("Style/MissingElse", "EnforcedStyle").unwrap_or("both");
+        style == kind || style == "both"
+    }
+}
