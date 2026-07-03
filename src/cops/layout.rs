@@ -3163,18 +3163,21 @@ impl<'a> Cops<'a> {
         let pre: Vec<usize> = if range_line >= 2 { (0..=range_line - 2).rev().collect() } else { Vec::new() };
         let post: Vec<usize> = if range_line < total_lines { (range_line..total_lines).collect() } else { Vec::new() };
 
+        // Both passes are `line_ranges.any?` in upstream: each range commits
+        // to its own first candidate line's verdict, but a false verdict from
+        // `pre` does NOT short-circuit — `post` still gets its own check.
         // First pass: any non-blank, non-standalone-comment adjacent line.
         for lines in [&pre, &post] {
-            if let Some(b) = self.sbfa_first_candidate(lines, range_col, range_src, None) {
-                return b;
+            if self.sbfa_first_candidate(lines, range_col, range_src, None) == Some(true) {
+                return true;
             }
         }
         // Second pass: same indentation as the range's own line.
         let cur_line = self.sbfa_line_bytes(range_line);
         let base_indent = Self::sbfa_first_nonspace(cur_line);
         for lines in [&pre, &post] {
-            if let Some(b) = self.sbfa_first_candidate(lines, range_col, range_src, base_indent) {
-                return b;
+            if self.sbfa_first_candidate(lines, range_col, range_src, base_indent) == Some(true) {
+                return true;
             }
         }
         false
