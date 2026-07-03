@@ -150,7 +150,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody", "Lint/AmbiguousRegexpLiteral", "Layout/BlockEndNewline",
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
-    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Style/BarePercentLiterals",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -848,6 +848,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_interpolation_check(node);
         self.check_redundant_percent_q_str(node);
         self.check_percent_q_literals(node);
+        self.check_bare_percent_literals_str(node);
         self.ll_check_str(node);
     }
     fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
@@ -858,6 +859,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_interpolation_check_dstr(node);
         self.check_redundant_percent_q_dstr(node);
         self.check_lii_dstr(node);
+        self.check_bare_percent_literals_dstr(node);
         self.ll_check_dstr(node);
         let delim = node.opening_loc().and_then(|o| match o.as_slice() {
             b"'" | b"\"" => Some(o.as_slice()[0]),

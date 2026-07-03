@@ -178,6 +178,7 @@ COPS = {
   'Lint/MixedRegexpCaptureTypes'     => 'lint/mixed_regexp_capture_types',
   'Style/NestedParenthesizedCalls'   => 'style/nested_parenthesized_calls',
   'Style/StringLiteralsInInterpolation' => 'style/string_literals_in_interpolation',
+  'Style/BarePercentLiterals'        => 'style/bare_percent_literals',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

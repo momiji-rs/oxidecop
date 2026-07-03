@@ -6509,6 +6509,77 @@ impl<'a> Cops<'a> {
         let char_off = opening.start_offset() + 1;
         self.fixes.push((char_off, char_off + 1, vec![new_char]));
     }
+
+    /// Style/BarePercentLiterals — enforces `%()` vs `%Q()` per `EnforcedStyle`
+    /// (`bare_percent` default / `percent_q`).
+    ///
+    /// Ported from rubocop's `BarePercentLiterals` cop, which checks both
+    /// `on_str` and `on_dstr` via a shared `check` method. This handles
+    /// percent-literal strings that don't require re-parsing (unlike
+    /// PercentQLiterals which must check semantic equivalence).
+    ///
+    /// The fix is a simple text replacement: swap `%Q(...)` <-> `%(...)`.
+    fn check_bare_percent_literals_impl(&mut self, opening: Option<ruby_prism::Location>, l: ruby_prism::Location) {
+        const COP: &str = "Style/BarePercentLiterals";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(open) = opening else { return };
+        let open_src = open.as_slice();
+        if !open_src.starts_with(b"%") {
+            return;
+        }
+
+        // Determine the EnforcedStyle: bare_percent (default) or percent_q
+        let enforce_percent_q = self.cfg.get(COP, "EnforcedStyle").is_some_and(|v| v == "percent_q");
+
+        // Check which style violations exist
+        let is_percent_q = open_src.starts_with(b"%Q");
+        let is_bare = open_src.starts_with(b"%") && !is_percent_q;
+
+        // Determine if we need to flag this
+        let should_flag = if enforce_percent_q {
+            // percent_q style: bare % is wrong, %Q is correct
+            is_bare
+        } else {
+            // bare_percent style: %Q is wrong, bare % is correct
+            is_percent_q
+        };
+
+        if !should_flag {
+            return;
+        }
+
+        // Generate message and replacement
+        let (message, new_prefix) = if enforce_percent_q {
+            // Bare percent should be %Q
+            ("Use `%Q` instead of `%`.", b"%Q".to_vec())
+        } else {
+            // %Q should be bare percent
+            ("Use `%` instead of `%Q`.", b"%".to_vec())
+        };
+
+        self.push(l.start_offset(), COP, true, message);
+
+        // Replace the opening delimiter: swap % <-> %Q
+        // The opening_loc contains the full delimiter like "%(", "%Q(", "%{", "%Q{", etc.
+        let mut replacement = new_prefix;
+        // Append the delimiter character(s) from the original opening
+        if open_src.len() > 2 {
+            replacement.extend_from_slice(&open_src[2..]);
+        } else if open_src.len() > 1 {
+            replacement.push(open_src[1]);
+        }
+        self.fixes.push((open.start_offset(), open.end_offset(), replacement));
+    }
+
+    pub(crate) fn check_bare_percent_literals_str(&mut self, node: &ruby_prism::StringNode<'_>) {
+        self.check_bare_percent_literals_impl(node.opening_loc(), node.location());
+    }
+
+    pub(crate) fn check_bare_percent_literals_dstr(&mut self, node: &ruby_prism::InterpolatedStringNode<'_>) {
+        self.check_bare_percent_literals_impl(node.opening_loc(), node.location());
+    }
 }
 
 impl<'a> super::Cops<'a> {
