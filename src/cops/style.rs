@@ -5812,3 +5812,80 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Style/NumericLiteralPrefix: Checks for octal, hex, binary, and decimal
+    /// literals using uppercase prefixes and corrects them to lowercase prefix
+    /// or no prefix (in case of decimals). Also ensures octal style matches
+    /// EnforcedOctalStyle config.
+    pub(crate) fn check_numeric_literal_prefix(&mut self, node: &ruby_prism::IntegerNode) {
+        const COP: &str = "Style/NumericLiteralPrefix";
+        if !self.on(COP) {
+            return;
+        }
+
+        let src = self.node_src(&node.as_node());
+        let src_str = String::from_utf8_lossy(src);
+
+        // Determine the literal type and get the message/fix
+        if let Some((msg, fix)) = self.literal_type_and_fix(&src_str) {
+            let l = node.location();
+            self.push(l.start_offset(), COP, true, msg);
+            self.fixes.push((l.start_offset(), l.end_offset(), fix.into_bytes()));
+        }
+    }
+
+    /// Determine the type of numeric literal and return (message, replacement) if
+    /// an offense should be reported.
+    fn literal_type_and_fix(&self, literal: &str) -> Option<(&'static str, String)> {
+        let octal_zero_only_regex = regex::Regex::new(r"^0[Oo][0-7]+$").ok()?;
+        let octal_regex = regex::Regex::new(r"^0O?[0-7]+$").ok()?;
+        let hex_regex = regex::Regex::new(r"^0X[0-9A-F]+$").ok()?;
+        let binary_regex = regex::Regex::new(r"^0B[01]+$").ok()?;
+        let decimal_regex = regex::Regex::new(r"^0[dD][0-9]+$").ok()?;
+
+        let octal_zero_only = self.cfg.get(
+            "Style/NumericLiteralPrefix",
+            "EnforcedOctalStyle",
+        ).map(|v| v == "zero_only").unwrap_or(false);
+
+        // Check for octal literals
+        if octal_zero_only_regex.is_match(literal) && octal_zero_only {
+            // 0O1234 or 0o1234 when we want bare 0
+            let fixed = literal.replace("0O", "0").replace("0o", "0");
+            return Some(("Use 0 for octal literals.", fixed));
+        }
+        if octal_regex.is_match(literal) && !octal_zero_only {
+            // 01234 or 0O1234 when we want 0o (lowercase)
+            if literal.starts_with("0O") {
+                let fixed = literal.replacen("0O", "0o", 1);
+                return Some(("Use 0o for octal literals.", fixed));
+            } else if literal.starts_with("0") && !literal.starts_with("0o") {
+                // Plain octal like 01234
+                let fixed = format!("0o{}", &literal[1..]);
+                return Some(("Use 0o for octal literals.", fixed));
+            }
+        }
+        if hex_regex.is_match(literal) {
+            // Has uppercase X
+            let fixed = literal.replacen("0X", "0x", 1);
+            return Some(("Use 0x for hexadecimal literals.", fixed));
+        }
+        if binary_regex.is_match(literal) {
+            // Has uppercase B
+            let fixed = literal.replacen("0B", "0b", 1);
+            return Some(("Use 0b for binary literals.", fixed));
+        }
+        if decimal_regex.is_match(literal) {
+            // Has 0d or 0D prefix - remove it
+            let fixed = if literal.starts_with("0d") {
+                literal[2..].to_string()
+            } else {
+                literal[2..].to_string()
+            };
+            return Some(("Do not use prefixes for decimal literals.", fixed));
+        }
+
+        None
+    }
+}
