@@ -48,6 +48,7 @@ def unescape_dq(s)
       case n
       when '\\' then out << '\\'
       when 'n' then out << "\n"
+      when 'r' then out << "\r"
       when 't' then out << "\t"
       when 's' then out << ' '
       when 'e' then out << "\e"
@@ -228,6 +229,34 @@ examples = []
 # cop_config hash in one and reference it from the let.
 LOCAL_HASHES = {}
 lines = File.readlines(SPEC, chomp: true)
+# `if RuboCop::Platform.windows?` guards platform-specific expectations; this
+# host is not Windows, so drop the windows branch (and the if/else/end frame)
+# and keep the else branch, mirroring what RSpec would execute here.
+out_lines = []
+skip_depth = nil
+frame_indent = nil
+lines.each do |l|
+  if skip_depth.nil? && l =~ /\A(\s*)if RuboCop::Platform\.windows\?\s*\z/
+    frame_indent = Regexp.last_match(1)
+    skip_depth = :windows_branch
+    next
+  end
+  case skip_depth
+  when :windows_branch
+    skip_depth = :else_branch if l == "#{frame_indent}else"
+    next
+  when :else_branch
+    if l == "#{frame_indent}end"
+      skip_depth = nil
+      frame_indent = nil
+      next
+    end
+    out_lines << l
+  else
+    out_lines << l
+  end
+end
+lines = out_lines
 lines.each do |l|
   LOCAL_HASHES[Regexp.last_match(1)] = Regexp.last_match(2) if l =~ /^\s*(\w+)\s*=\s*(\{.*\})\s*\z/
 end
@@ -408,7 +437,10 @@ while i < lines.length
     # A plain string arg renders by its quote's rules: double-quoted like a
     # heredoc; single-quoted only interprets \\ and \'.
     body = quote == '"' ? unescape_dq(body) : body.gsub(/\\([\\'])/, '\1')
-    body += "\n" unless body.end_with?("\n")
+    # NB: passed verbatim — no trailing-newline normalization. rubocop's
+    # expect_* DSL hands the string to ProcessedSource as-is, and EOL-
+    # sensitive cops (EndOfLine crlf last-line rule, TrailingEmptyLines)
+    # change behavior on a file that doesn't end with a newline.
     examples << { kind: :no_offense, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
                   sections: cur_sec, override: cur_ovr, ruby: cur_rb, lets: cur_lets.dup,
                   other_cops: cur_oc, src: body, expected: [] }
