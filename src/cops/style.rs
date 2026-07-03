@@ -9421,3 +9421,229 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/RedundantConditional — `if x == y then true else false` → `x == y`,
+    /// and inverted form → `!(x == y)`.
+    pub(crate) fn check_redundant_conditional(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/RedundantConditional";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Don't trigger on modifier form (e.g., `true if x`)
+        if node.if_keyword_loc().is_none() && node.end_keyword_loc().is_none() {
+            // This is a ternary, which is fine to process
+        } else if node.if_keyword_loc().is_some() && node.end_keyword_loc().is_none() {
+            // This is a modifier if/unless, skip it
+            return;
+        }
+
+        // Get the condition (predicate)
+        let condition = node.predicate();
+
+        // Check if condition is a send node with a comparison operator
+        let call_node = match condition.as_call_node() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let method_name = call_node.name().as_slice();
+        let is_comparison = matches!(
+            method_name,
+            b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<" | b"<=>"
+        );
+        if !is_comparison {
+            return;
+        }
+
+        // Get the then and else branches
+        let then_stmts = match node.statements() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let mut then_iter = then_stmts.body().iter();
+        let then_stmt = match then_iter.next() {
+            Some(s) if then_iter.next().is_none() => s,
+            _ => return,
+        };
+
+        let else_clause = match node.subsequent() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let else_node = match else_clause.as_else_node() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let else_stmts = match else_node.statements() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let mut else_iter = else_stmts.body().iter();
+        let else_stmt = match else_iter.next() {
+            Some(s) if else_iter.next().is_none() => s,
+            _ => return,
+        };
+
+        // Check if then is true and else is false, or vice versa
+        let is_true_then = then_stmt.as_true_node().is_some();
+        let is_false_then = then_stmt.as_false_node().is_some();
+        let is_true_else = else_stmt.as_true_node().is_some();
+        let is_false_else = else_stmt.as_false_node().is_some();
+
+        let (is_inverted, is_elsif) = if is_true_then && is_false_else {
+            (false, node.if_keyword_loc().is_some_and(|kw| kw.as_slice() == b"elsif"))
+        } else if is_false_then && is_true_else {
+            (true, node.if_keyword_loc().is_some_and(|kw| kw.as_slice() == b"elsif"))
+        } else {
+            return;
+        };
+
+        // Generate the replacement message and fix
+        let cond_src = self.node_src(&condition);
+        let replacement = if is_inverted {
+            format!("!({})", String::from_utf8_lossy(cond_src))
+        } else {
+            String::from_utf8_lossy(cond_src).to_string()
+        };
+
+        let msg = if is_elsif {
+            format!("This conditional expression can just be replaced by [...].")
+        } else {
+            format!("This conditional expression can just be replaced by `{}`.", replacement)
+        };
+
+        let l = node.location();
+        self.push(l.start_offset(), COP, true, msg);
+
+        // Generate autocorrect
+        let l_end = l.end_offset();
+        if is_elsif {
+            // For elsif, the body indentation should match the existing elsif body
+            // Get the indentation from the elsif body
+            let body_indent = if let Some(stmts) = node.statements() {
+                if let Some(first_stmt) = stmts.body().iter().next() {
+                    let (_, col) = self.idx.loc(first_stmt.location().start_offset());
+                    col - 1 // Convert to 0-indexed
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            let mut fix_text = b"else\n".to_vec();
+            fix_text.extend(std::iter::repeat(b' ').take(body_indent));
+            fix_text.extend_from_slice(replacement.as_bytes());
+            fix_text.push(b'\n');
+            // Add the end keyword with proper indentation (at same level as elsif)
+            let else_indent = self.idx.loc(l.start_offset()).1 - 1;
+            fix_text.extend(std::iter::repeat(b' ').take(else_indent));
+            fix_text.extend_from_slice(b"end");
+            self.fixes.push((l.start_offset(), l_end, fix_text));
+        } else {
+            // For regular if or ternary, replace with the condition (or negated condition)
+            self.fixes.push((l.start_offset(), l_end, replacement.into_bytes()));
+        }
+    }
+
+    /// Style/RedundantConditional for unless statements.
+    /// `unless x == y then true else false` → `!(x == y)` (then-clause is inverted)
+    /// `unless x == y then false else true` → `x == y` (double negation cancels)
+    pub(crate) fn check_redundant_conditional_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Style/RedundantConditional";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Don't trigger on modifier form (e.g., `true unless x`)
+        if node.end_keyword_loc().is_none() {
+            return;
+        }
+
+        // Get the condition (predicate)
+        let condition = node.predicate();
+
+        // Check if condition is a send node with a comparison operator
+        let call_node = match condition.as_call_node() {
+            Some(c) => c,
+            None => return,
+        };
+
+        let method_name = call_node.name().as_slice();
+        let is_comparison = matches!(
+            method_name,
+            b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<" | b"<=>"
+        );
+        if !is_comparison {
+            return;
+        }
+
+        // Get the then and else branches
+        let then_stmts = match node.statements() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let mut then_iter = then_stmts.body().iter();
+        let then_stmt = match then_iter.next() {
+            Some(s) if then_iter.next().is_none() => s,
+            _ => return,
+        };
+
+        let else_clause = match node.else_clause() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let else_stmts = match else_clause.statements() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let mut else_iter = else_stmts.body().iter();
+        let else_stmt = match else_iter.next() {
+            Some(s) if else_iter.next().is_none() => s,
+            _ => return,
+        };
+
+        // Check if then is true and else is false, or vice versa
+        let is_true_then = then_stmt.as_true_node().is_some();
+        let is_false_then = then_stmt.as_false_node().is_some();
+        let is_true_else = else_stmt.as_true_node().is_some();
+        let is_false_else = else_stmt.as_false_node().is_some();
+
+        // For unless, the logic is inverted:
+        // unless cond; true; else; false -> !(cond) (negation of condition)
+        // unless cond; false; else; true -> cond (double negation cancels)
+        let is_inverted = if is_true_then && is_false_else {
+            true  // unless cond true else false → !(cond)
+        } else if is_false_then && is_true_else {
+            false // unless cond false else true → cond
+        } else {
+            return;
+        };
+
+        // Generate the replacement message and fix
+        let cond_src = self.node_src(&condition);
+        let replacement = if is_inverted {
+            format!("!({})", String::from_utf8_lossy(cond_src))
+        } else {
+            String::from_utf8_lossy(cond_src).to_string()
+        };
+
+        let msg = format!("This conditional expression can just be replaced by `{}`.", replacement);
+
+        let l = node.location();
+        self.push(l.start_offset(), COP, true, msg);
+
+        // Generate autocorrect
+        self.fixes.push((l.start_offset(), l.end_offset(), replacement.into_bytes()));
+    }
+}
+
