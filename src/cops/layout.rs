@@ -3075,3 +3075,302 @@ impl<'a> Cops<'a> {
         self.check_empty_lines_around_exception_handling_keywords(Some(node.as_node()), owner_line, end_line);
     }
 }
+
+/// Layout/SpaceBeforeFirstArg (+ the `PrecedingFollowingAlignment` mixin's
+/// `aligned_with_something?` path — the only path this cop reaches).
+impl<'a> Cops<'a> {
+    /// `RuboCop::AST::Node::OPERATOR_METHODS` — used by `operator_method?` to
+    /// exempt calls like `foo + bar`/`foo[bar]` (their "first argument" is
+    /// really an operand, not something this cop should space-check).
+    const SBFA_OPERATOR_METHODS: &'static [&'static [u8]] = &[
+        b"|", b"^", b"&", b"<=>", b"==", b"===", b"=~", b">", b">=", b"<", b"<=", b"<<", b">>",
+        b"+", b"-", b"*", b"/", b"%", b"**", b"~", b"+@", b"-@", b"!@", b"~@", b"[]", b"[]=",
+        b"!", b"!=", b"!~", b"`",
+    ];
+
+    /// `on_send`/`on_csend` (prism visits both through one `CallNode`):
+    /// checks that exactly one space separates a method name from its first
+    /// argument in a parenthesis-less call.
+    pub(crate) fn check_space_before_first_arg(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/SpaceBeforeFirstArg";
+        if !self.on(COP) {
+            return;
+        }
+        // `regular_method_call_with_arguments?`: has args, and is neither an
+        // operator method (`foo + bar`, `foo[bar]`) nor a setter (`foo.x = y`
+        // — prism's `equal_loc` is the setter_method?/`loc?(:operator)` signal).
+        let name = node.name().as_slice();
+        let Some(args) = node.arguments() else { return };
+        if args.arguments().iter().next().is_none() {
+            return;
+        }
+        if Self::SBFA_OPERATOR_METHODS.contains(&name) || node.equal_loc().is_some() {
+            return;
+        }
+        // `node.parenthesized?`
+        if node.opening_loc().is_some() {
+            return;
+        }
+        let first_arg = args.arguments().iter().next().unwrap();
+        let arg_start = first_arg.location().start_offset();
+
+        // `range_with_surrounding_space(first_arg, side: :left)` with the
+        // (default) `newlines: true, continuations: false, whitespace: false`
+        // options: eat a run of spaces/tabs, THEN a run of newlines.
+        let mut space_start = arg_start;
+        while space_start > 0 && matches!(self.src[space_start - 1], b' ' | b'\t') {
+            space_start -= 1;
+        }
+        while space_start > 0 && self.src[space_start - 1] == b'\n' {
+            space_start -= 1;
+        }
+        if arg_start - space_start == 1 {
+            return;
+        }
+        if !self.sbfa_expect_params_after_method_name(node, &first_arg, arg_start) {
+            return;
+        }
+        self.push(space_start, COP, true, "Put one space between the method name and the first argument.");
+        self.fixes.push((space_start, arg_start, b" ".to_vec()));
+    }
+
+    /// `expect_params_after_method_name?`.
+    fn sbfa_expect_params_after_method_name(
+        &self,
+        node: &ruby_prism::CallNode,
+        first_arg: &ruby_prism::Node,
+        arg_start: usize,
+    ) -> bool {
+        // `no_space_between_method_name_and_first_argument?`
+        if let Some(sel) = node.message_loc() {
+            if sel.end_offset() == arg_start {
+                return true;
+            }
+        }
+        // `same_line?(first_arg, node)` — a send node's own line is where its
+        // FULL expression starts (receiver chain included, per prism's
+        // translation — unlike block nodes, a `CallNode`'s location starts at
+        // the receiver, not the selector).
+        let node_line = self.idx.loc(node.location().start_offset()).0;
+        let arg_line = self.idx.loc(arg_start).0;
+        if node_line != arg_line {
+            return false;
+        }
+        let allow_for_alignment = self.cfg.get("Layout/SpaceBeforeFirstArg", "AllowForAlignment") != Some("false");
+        !(allow_for_alignment && self.sbfa_aligned_with_something(first_arg))
+    }
+
+    /// `PrecedingFollowingAlignment#aligned_with_something?` ->
+    /// `aligned_with_adjacent_line?(range, method(:aligned_token?))`.
+    fn sbfa_aligned_with_something(&self, node: &ruby_prism::Node) -> bool {
+        let loc = node.location();
+        let begin = loc.start_offset();
+        let end = loc.end_offset();
+        let range_line = self.idx.loc(begin).0; // 1-based
+        let range_col = begin - self.idx.starts[range_line - 1]; // 0-based byte column
+        let range_src = &self.src[begin..end];
+        let total_lines = self.idx.starts.len();
+
+        // pre = (range.line - 2).downto(0); post = range.line.upto(lines.size - 1)
+        // (both are 0-based line indices; `range.line` is 1-based, so `post`
+        // starting AT `range_line` really means "one past the range's own
+        // 0-based index", i.e. the next line).
+        let pre: Vec<usize> = if range_line >= 2 { (0..=range_line - 2).rev().collect() } else { Vec::new() };
+        let post: Vec<usize> = if range_line < total_lines { (range_line..total_lines).collect() } else { Vec::new() };
+
+        // First pass: any non-blank, non-standalone-comment adjacent line.
+        for lines in [&pre, &post] {
+            if let Some(b) = self.sbfa_first_candidate(lines, range_col, range_src, None) {
+                return b;
+            }
+        }
+        // Second pass: same indentation as the range's own line.
+        let cur_line = self.sbfa_line_bytes(range_line);
+        let base_indent = Self::sbfa_first_nonspace(cur_line);
+        for lines in [&pre, &post] {
+            if let Some(b) = self.sbfa_first_candidate(lines, range_col, range_src, base_indent) {
+                return b;
+            }
+        }
+        false
+    }
+
+    /// `aligned_with_line?`: scans `lines` (0-based) for the first one that
+    /// is non-blank, isn't a standalone comment line, and (when `indent` is
+    /// given) has that exact indentation — then commits to that single
+    /// line's `aligned_token?` verdict. `None` means no such line exists.
+    fn sbfa_first_candidate(
+        &self,
+        lines: &[usize],
+        range_col: usize,
+        range_src: &[u8],
+        indent: Option<usize>,
+    ) -> Option<bool> {
+        for &lineno0 in lines {
+            let line1 = lineno0 + 1;
+            if self.sbfa_standalone_comment_line(line1) {
+                continue;
+            }
+            let text = self.sbfa_line_bytes(line1);
+            let Some(idx0) = Self::sbfa_first_nonspace(text) else { continue };
+            if let Some(want) = indent {
+                if want != idx0 {
+                    continue;
+                }
+            }
+            return Some(Self::sbfa_aligned_token(range_col, range_src, text));
+        }
+        None
+    }
+
+    /// `aligned_token?` = `aligned_words?` (a word starts at the same column
+    /// on the adjacent line, or an identical token sits there) OR
+    /// `aligned_equals_operator?`.
+    fn sbfa_aligned_token(range_col: usize, range_src: &[u8], line: &[u8]) -> bool {
+        if Self::sbfa_aligned_words(range_col, range_src, line) {
+            return true;
+        }
+        Self::sbfa_aligned_equals_operator(range_col, range_src, line)
+    }
+
+    fn sbfa_aligned_words(range_col: usize, range_src: &[u8], line: &[u8]) -> bool {
+        if range_col >= 1 {
+            if let (Some(&a), Some(&b)) = (line.get(range_col - 1), line.get(range_col)) {
+                if Self::sbfa_rb_space(a) && !Self::sbfa_rb_space(b) {
+                    return true;
+                }
+            }
+        }
+        let end = range_col + range_src.len();
+        end <= line.len() && &line[range_col..end] == range_src
+    }
+
+    /// `aligned_equals_operator?` -> `aligned_with_preceding_equals?` /
+    /// `aligned_with_append_operator?`. Both of those only ever fire when the
+    /// checked RANGE's own source ends with `=` or equals `<<` verbatim —
+    /// for this cop the range is always an argument's source, which is
+    /// syntactically never either of those in real code (an argument can't
+    /// itself be a bare trailing `=`), so this is a fast, exact `false` in
+    /// every case this cop can actually reach. The rare, unreachable-in-
+    /// practice branch is still ported (a best-effort scan for the first
+    /// assignment/comparison-ish token on the line, skipping quoted
+    /// strings/comments) so the code path is complete rather than silently
+    /// dropped.
+    fn sbfa_aligned_equals_operator(range_col: usize, range_src: &[u8], line: &[u8]) -> bool {
+        let ends_with_eq = range_src.last() == Some(&b'=');
+        let is_lshift = range_src == b"<<";
+        if !ends_with_eq && !is_lshift {
+            return false;
+        }
+        let Some((tok_is_lshift, tok_is_equal_sign, tok_end_col)) = Self::sbfa_first_alignment_token(line) else {
+            return false;
+        };
+        let range_last_col = range_col + range_src.len();
+        if range_last_col != tok_end_col {
+            return false;
+        }
+        (is_lshift && tok_is_equal_sign) || (ends_with_eq && (tok_is_lshift || tok_is_equal_sign))
+    }
+
+    /// Best-effort `tokens_within(line_range).detect { ASSIGNMENT_OR_COMPARISON_TOKENS }`:
+    /// the first `=`, `==`, `===`, `!=`, `<=`, `>=`, compound-assignment
+    /// (`tOP_ASGN`), or `<<` on the line, skipping over quoted-string and
+    /// comment contents so operators inside strings aren't mistaken for real
+    /// tokens. Returns (is_lshift, is_equal_sign, end_col).
+    fn sbfa_first_alignment_token(line: &[u8]) -> Option<(bool, bool, usize)> {
+        const TOKENS: &[(&[u8], bool, bool)] = &[
+            (b"**=", false, true),
+            (b"<<=", false, true),
+            (b">>=", false, true),
+            (b"&&=", false, true),
+            (b"||=", false, true),
+            (b"===", false, false),
+            (b"==", false, false),
+            (b"!=", false, false),
+            (b"<=", false, false),
+            (b">=", false, false),
+            (b"<<", true, false),
+            (b"+=", false, true),
+            (b"-=", false, true),
+            (b"*=", false, true),
+            (b"/=", false, true),
+            (b"%=", false, true),
+            (b"&=", false, true),
+            (b"|=", false, true),
+            (b"^=", false, true),
+        ];
+        let n = line.len();
+        let mut i = 0usize;
+        while i < n {
+            match line[i] {
+                b'#' => break,
+                b'\'' => {
+                    i = Self::sbfa_skip_quoted(line, i, b'\'');
+                    continue;
+                }
+                b'"' => {
+                    i = Self::sbfa_skip_quoted(line, i, b'"');
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(&(tok, is_lshift, is_eq)) = TOKENS.iter().find(|(tok, ..)| line[i..].starts_with(tok)) {
+                return Some((is_lshift, is_eq, i + tok.len()));
+            }
+            if line[i] == b'=' {
+                // bare `=` (tEQL) — but not `=>` (hash rocket) or `=~` (match op).
+                let next = line.get(i + 1).copied();
+                if next != Some(b'>') && next != Some(b'~') {
+                    return Some((false, true, i + 1));
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn sbfa_skip_quoted(line: &[u8], start: usize, quote: u8) -> usize {
+        let n = line.len();
+        let mut i = start + 1;
+        while i < n {
+            if line[i] == b'\\' && i + 1 < n {
+                i += 2;
+                continue;
+            }
+            if line[i] == quote {
+                return i + 1;
+            }
+            i += 1;
+        }
+        n
+    }
+
+    fn sbfa_rb_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+    }
+
+    fn sbfa_first_nonspace(bytes: &[u8]) -> Option<usize> {
+        bytes.iter().position(|b| !Self::sbfa_rb_space(*b))
+    }
+
+    /// `processed_source.lines[line - 1]` — 1-based `line`'s text, excluding
+    /// its trailing newline (or an empty slice past EOF).
+    fn sbfa_line_bytes(&self, line: usize) -> &[u8] {
+        match self.idx.starts.get(line - 1) {
+            Some(&s) => &self.src[s..self.line_end(line)],
+            None => &[],
+        }
+    }
+
+    /// `aligned_comment_lines`: does a comment begin its own line (only
+    /// whitespace precedes it on that physical line)?
+    fn sbfa_standalone_comment_line(&self, line: usize) -> bool {
+        self.comments.iter().any(|&(l, s, _)| {
+            if l != line {
+                return false;
+            }
+            let Some(&line_start) = self.idx.starts.get(line - 1) else { return false };
+            self.src[line_start..s].iter().all(|b| b.is_ascii_whitespace())
+        })
+    }
+}
