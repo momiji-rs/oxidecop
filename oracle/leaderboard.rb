@@ -206,6 +206,7 @@ COPS = {
   'Naming/AccessorMethodName'        => 'naming/accessor_method_name',
   'Style/PerlBackrefs'               => 'style/perl_backrefs',
   'Lint/RaiseException'              => 'lint/raise_exception',
+  'Lint/RedundantWithObject'         => 'lint/redundant_with_object',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
