@@ -4387,3 +4387,170 @@ impl<'a> super::Cops<'a> {
         matches!(call.name().as_slice(), b"count" | b"length" | b"size")
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/NilLambda — a lambda/proc/`Proc.new` whose body always
+    /// evaluates to a bare `nil` (explicitly, or via `return`/`next`/`break
+    /// nil`) can be replaced by an empty lambda/proc. Ports upstream's
+    /// `nil_return?` node-pattern (`{ ({return next break} nil) (nil) }`)
+    /// applied to `node.body`, gated by `Node#lambda_or_proc?`.
+    ///
+    /// Two prism shapes cover the whitequark `on_block(node)` single
+    /// callback: `lambda`/`proc`/`Proc.new` with a literal `{ }`/`do...end`
+    /// block is a `CallNode` whose `.block()` is a `BlockNode` (handled
+    /// here, from `visit_call_node`); stabby `-> { }`/`->(x) { }` is its own
+    /// `LambdaNode` with no enclosing call at all (handled by
+    /// `check_nil_lambda_stabby`, from `visit_lambda_node`).
+    pub(crate) fn check_nil_lambda_call(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/NilLambda";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(kind) = nil_lambda_kind(node) else { return };
+        let Some(block) = node.block().and_then(|b| b.as_block_node()) else { return };
+        let Some(body_loc) = nil_lambda_body_loc(block.body()) else { return };
+        let single_line = !self.src[block.opening_loc().start_offset()..block.closing_loc().end_offset()]
+            .contains(&b'\n');
+        self.emit_nil_lambda(node.location().start_offset(), kind, body_loc, single_line);
+    }
+
+    /// Stabby lambda literal (`-> { }`) — always the `lambda` kind, per
+    /// `BlockNode#lambda?` (`send_node.method?(:lambda)`, which is what
+    /// whitequork's parser translation gives every `->` literal).
+    pub(crate) fn check_nil_lambda_stabby(&mut self, node: &ruby_prism::LambdaNode) {
+        const COP: &str = "Style/NilLambda";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body_loc) = nil_lambda_body_loc(node.body()) else { return };
+        let single_line =
+            !self.src[node.opening_loc().start_offset()..node.closing_loc().end_offset()].contains(&b'\n');
+        self.emit_nil_lambda(node.location().start_offset(), "lambda", body_loc, single_line);
+    }
+
+    /// Shared offense + autocorrect: `RangeHelp#range_with_surrounding_space`
+    /// (single-line blocks — strip the body plus immediately adjacent
+    /// horizontal whitespace, then any newlines) or
+    /// `range_by_whole_lines(..., include_final_newline: true)` (multiline —
+    /// strip the body's WHOLE line, trailing newline included).
+    fn emit_nil_lambda(
+        &mut self,
+        start: usize,
+        kind: &str,
+        body_loc: ruby_prism::Location,
+        single_line: bool,
+    ) {
+        const COP: &str = "Style/NilLambda";
+        self.push(start, COP, true, format!("Use an empty {kind} instead of always returning nil."));
+        let (b_start, b_end) = (body_loc.start_offset(), body_loc.end_offset());
+        let (rs, re) = if single_line {
+            nil_lambda_surrounding_space(self.src, b_start, b_end)
+        } else {
+            nil_lambda_whole_lines(self.src, b_start, b_end)
+        };
+        self.fixes.push((rs, re, Vec::new()));
+    }
+}
+
+/// Which kind of nil-lambda-eligible call `node` is — `lambda`/`proc` (bare,
+/// no receiver) or `Proc.new`/`::Proc.new` — or `None` if it's neither.
+/// Mirrors upstream's combined `Node#lambda_or_proc?` as applied to a
+/// `CallNode` already known to carry a literal block, keeping the two kinds
+/// (for the message text) distinct instead of collapsing to one bool.
+fn nil_lambda_kind(call: &ruby_prism::CallNode) -> Option<&'static str> {
+    let name = call.name().as_slice();
+    if call.receiver().is_none() && name == b"lambda" {
+        return Some("lambda");
+    }
+    if call.receiver().is_none() && name == b"proc" {
+        return Some("proc");
+    }
+    if name == b"new" && call.receiver().is_some_and(|r| nil_lambda_is_proc_const(&r)) {
+        return Some("proc");
+    }
+    None
+}
+
+/// Upstream's `#global_const?(:Proc)`: a bare `Proc` constant, or one
+/// anchored at the top level (`::Proc`).
+fn nil_lambda_is_proc_const(node: &ruby_prism::Node) -> bool {
+    if let Some(c) = node.as_constant_read_node() {
+        return c.name().as_slice() == b"Proc";
+    }
+    if let Some(c) = node.as_constant_path_node() {
+        return c.parent().is_none() && c.name().is_some_and(|n| n.as_slice() == b"Proc");
+    }
+    false
+}
+
+/// Upstream's `nil_return?` node-pattern (`{ ({return next break} nil) (nil) }`)
+/// applied to the block/lambda body — `None` for an empty body, a
+/// multi-statement body (whitequork wraps those in a `begin` node the
+/// pattern never matches), or any other single-statement shape; `Some` of
+/// the SINGLE offending statement's own source range otherwise (never the
+/// body wrapper's range — matches `node.body.source_range` when `node.body`
+/// is that lone statement, unwrapped).
+fn nil_lambda_body_loc(body: Option<ruby_prism::Node>) -> Option<ruby_prism::Location> {
+    let stmts = body?.as_statements_node()?;
+    let items: Vec<_> = stmts.body().iter().collect();
+    if items.len() != 1 {
+        return None;
+    }
+    nil_lambda_is_nil_return(&items[0]).then(|| items[0].location())
+}
+
+/// Does `node` match `({return next break} nil)` or bare `(nil)`?
+fn nil_lambda_is_nil_return(node: &ruby_prism::Node) -> bool {
+    if node.as_nil_node().is_some() {
+        return true;
+    }
+    let args = if let Some(r) = node.as_return_node() {
+        r.arguments()
+    } else if let Some(n) = node.as_next_node() {
+        n.arguments()
+    } else if let Some(b) = node.as_break_node() {
+        b.arguments()
+    } else {
+        return false;
+    };
+    let Some(args) = args else { return false };
+    let items: Vec<_> = args.arguments().iter().collect();
+    items.len() == 1 && items[0].as_nil_node().is_some()
+}
+
+/// `RangeHelp#range_with_surrounding_space(range)` at its default
+/// (`side: :both, newlines: true, whitespace: false`) — extend both ends
+/// over immediately adjacent horizontal whitespace, then over newlines (but
+/// not any further generic whitespace).
+fn nil_lambda_surrounding_space(src: &[u8], mut start: usize, mut end: usize) -> (usize, usize) {
+    while start > 0 && matches!(src[start - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    while start > 0 && src[start - 1] == b'\n' {
+        start -= 1;
+    }
+    while end < src.len() && matches!(src[end], b' ' | b'\t') {
+        end += 1;
+    }
+    while end < src.len() && src[end] == b'\n' {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// `RangeHelp#range_by_whole_lines(range, include_final_newline: true)` —
+/// expand to the full line(s) the range spans, plus the trailing newline.
+fn nil_lambda_whole_lines(src: &[u8], start: usize, end: usize) -> (usize, usize) {
+    let mut s = start;
+    while s > 0 && src[s - 1] != b'\n' {
+        s -= 1;
+    }
+    let mut e = end;
+    while e < src.len() && src[e] != b'\n' {
+        e += 1;
+    }
+    if e < src.len() {
+        e += 1;
+    }
+    (s, e)
+}
