@@ -153,6 +153,7 @@ COPS = {
   'Style/RedundantSelf'              => 'style/redundant_self',
   'Lint/UselessTimes'                => 'lint/useless_times',
   'Layout/EmptyLinesAroundAccessModifier' => 'layout/empty_lines_around_access_modifier',
+  'Lint/ToJSON'                      => 'lint/to_json',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

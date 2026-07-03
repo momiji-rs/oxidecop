@@ -6016,3 +6016,39 @@ impl<'pr> ruby_prism::Visit<'pr> for UtBodyScan<'pr> {
         }
     }
 }
+impl<'a> Cops<'a> {
+    /// Lint/ToJSON — checks that `#to_json` includes an optional argument
+    /// to be parsable via JSON.generate(obj).
+    pub(crate) fn check_to_json(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Lint/ToJSON";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is a `to_json` method with no arguments
+        if node.name().as_slice() != b"to_json" {
+            return;
+        }
+
+        // Check if arguments are empty
+        let has_params = node
+            .parameters()
+            .is_some_and(|p| !p.requireds().is_empty() || !p.optionals().is_empty()
+                || p.rest().is_some() || !p.posts().is_empty()
+                || !p.keywords().is_empty() || p.keyword_rest().is_some()
+                || p.block().is_some());
+
+        if has_params {
+            return;
+        }
+
+        let anchor = node.location().start_offset();
+        self.push(anchor, COP, true, "`#to_json` requires an optional argument to be parsable via JSON.generate(obj).");
+
+        // Autocorrect: insert `(*_args)` after the method name
+        let name_loc = node.name_loc();
+        let insert_pos = name_loc.end_offset();
+        self.fixes.push((insert_pos, insert_pos, b"(*_args)".to_vec()));
+    }
+}
+
