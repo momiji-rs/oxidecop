@@ -6052,3 +6052,27 @@ impl<'a> Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Security/YAMLLoad — `YAML.load` without `permitted_classes` is unsafe
+    /// in Ruby 3.0 and below. In Ruby 3.1+ (Psych 4), `YAML.load` is safe by default.
+    pub(crate) fn check_yaml_load(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Security/YAMLLoad";
+        if !self.on(COP) || self.cfg.target_ruby() > 3.0 {
+            return;
+        }
+        let name = node.name().as_slice();
+        if name != b"load" {
+            return;
+        }
+        let recv_const = node.receiver().and_then(|r| const_name_root(&r));
+        if recv_const.as_deref() != Some("YAML") {
+            return;
+        }
+        if let Some(sel) = node.message_loc() {
+            self.push(sel.start_offset(), COP, true,
+                "Prefer using `YAML.safe_load` over `YAML.load`.");
+            self.fixes.push((sel.start_offset(), sel.end_offset(), b"safe_load".to_vec()));
+        }
+    }
+}
