@@ -5052,3 +5052,73 @@ fn block_comment_reindent(s: &str) -> String {
     }
     out
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/GlobalStdStream — `STDIN`/`STDOUT`/`STDERR` → `$stdin`/`$stdout`/
+    /// `$stderr`. Called from `visit_constant_read_node` for a bare
+    /// constant, and from `visit_constant_path_node` only when
+    /// `node.parent().is_none()` (a `::`-rooted constant with no further
+    /// namespace, e.g. `::STDOUT`). Any deeper namespacing (`Foo::STDOUT`,
+    /// `::Foo::STDOUT`, `foo::STDOUT`) is always a `ConstantPathNode` with
+    /// `parent().is_some()`, so neither call site ever reaches this
+    /// function for it — that structural split (prism gives `::STDOUT` a
+    /// `parent: None` directly, instead of whitequark's explicit `cbase`
+    /// child two levels down for deeper paths) stands in for upstream's
+    /// `namespaced?` guard without needing to walk a `cbase` chain.
+    pub(crate) fn check_global_std_stream(&mut self, name: &[u8], start: usize, end: usize) {
+        const COP: &str = "Style/GlobalStdStream";
+        if !self.on(COP) {
+            return;
+        }
+        let gvar_name: &[u8] = match name {
+            b"STDIN" => b"$stdin",
+            b"STDOUT" => b"$stdout",
+            b"STDERR" => b"$stderr",
+            _ => return,
+        };
+        // upstream's `const_to_gvar_assignment?` exemption — see
+        // `check_global_std_stream_gvasgn`.
+        if self.gss_gvasgn_skip.contains(&start) {
+            return;
+        }
+        self.push(
+            start,
+            COP,
+            true,
+            format!(
+                "Use `{}` instead of `{}`.",
+                String::from_utf8_lossy(gvar_name),
+                String::from_utf8_lossy(name)
+            ),
+        );
+        self.fixes.push((start, end, gvar_name.to_vec()));
+    }
+
+    /// Style/GlobalStdStream — upstream's `const_to_gvar_assignment?`
+    /// node-pattern match `(gvasgn %1 (const nil? _))`: a plain
+    /// `$stdout = STDOUT`-style assignment (bare `ConstantReadNode` value,
+    /// matching gvar name) is exempt from the offense. Only a bare
+    /// `ConstantReadNode` value ever qualifies — a `::`-rooted
+    /// `ConstantPathNode` value (e.g. `$stdin = ::STDIN`) has a non-nil
+    /// `cbase` namespace in whitequark terms, fails the pattern's
+    /// `(const nil? _)` guard, and is NOT exempt (confirmed against live
+    /// rubocop 1.88.0: `$stdin = ::STDIN` DOES register an offense).
+    /// Called eagerly from `visit_global_variable_write_node` before it
+    /// descends into `node.value()`, so `gss_gvasgn_skip` is already
+    /// populated by the time the constant itself is visited.
+    pub(crate) fn check_global_std_stream_gvasgn(&mut self, gvar_name: &[u8], value: &ruby_prism::Node) {
+        if !self.on("Style/GlobalStdStream") {
+            return;
+        }
+        let Some(c) = value.as_constant_read_node() else { return };
+        let expected: &[u8] = match c.name().as_slice() {
+            b"STDIN" => b"$stdin",
+            b"STDOUT" => b"$stdout",
+            b"STDERR" => b"$stderr",
+            _ => return,
+        };
+        if expected == gvar_name {
+            self.gss_gvasgn_skip.insert(c.location().start_offset());
+        }
+    }
+}

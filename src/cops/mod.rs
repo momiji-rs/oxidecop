@@ -162,6 +162,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SymbolProc", "Style/UnpackFirst", "Style/ZeroLengthPredicate",
     "Lint/RegexpAsCondition", "Style/MultilineIfModifier",
     "Layout/EmptyLinesAroundAccessModifier",
+    "Style/GlobalStdStream",
 ];
 
 impl Engine {
@@ -615,6 +616,16 @@ pub(crate) struct Cops<'a> {
     // `Struct.new`/`Data.define` constructor — consumed by the immediately
     // following `visit_block_node` call.
     pub(crate) el_am_ctor_block: bool,
+    // Style/GlobalStdStream: start offsets of bare `STDIN`/`STDOUT`/`STDERR`
+    // ConstantReadNode values already known to be the RHS of a matching
+    // `$stdin`/`$stdout`/`$stderr` plain global-var assignment (rubocop's
+    // `const_to_gvar_assignment?` node-pattern) — populated eagerly in
+    // `visit_global_variable_write_node` before descending into the value,
+    // so it's already complete by the time the constant itself is visited.
+    // A `::STDIN`-style ConstantPathNode value never qualifies (its
+    // whitequark namespace child is a non-nil `cbase`, not `nil?`), so only
+    // ConstantReadNode offsets are ever inserted here.
+    pub(crate) gss_gvasgn_skip: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1032,6 +1043,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_global_variable_write_node(&mut self, node: &ruby_prism::GlobalVariableWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
         self.check_self_assignment_gvar(node.location().start_offset(), node.name().as_slice(), &node.value());
+        self.check_global_std_stream_gvasgn(node.name().as_slice(), &node.value());
         assignment_write!(self, node);
         ruby_prism::visit_global_variable_write_node(self, node);
     }
@@ -1190,6 +1202,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let l = node.location();
             self.check_unified_integer(klass, l.start_offset(), l.end_offset());
         }
+        let l = node.location();
+        self.check_global_std_stream(klass, l.start_offset(), l.end_offset());
     }
     fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
         // only a bare ::-rooted constant counts, not a namespaced one
@@ -1200,6 +1214,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                     let l = node.location();
                     self.check_unified_integer(klass, l.start_offset(), l.end_offset());
                 }
+                let l = node.location();
+                self.check_global_std_stream(klass, l.start_offset(), l.end_offset());
             }
         }
         ruby_prism::visit_constant_path_node(self, node);
@@ -2054,6 +2070,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         el_am_block_line: None,
         el_am_block_owns_next_stmts: false,
         el_am_ctor_block: false,
+        gss_gvasgn_skip: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);
