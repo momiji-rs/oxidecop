@@ -3573,3 +3573,121 @@ fn ci_word_at(rest: &[u8], word: &[u8]) -> bool {
         && &rest[..word.len()] == word
         && rest.get(word.len()).is_none_or(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
 }
+
+// ============================================================================
+// Layout/DotPosition
+// ============================================================================
+impl<'a> Cops<'a> {
+    /// Layout/DotPosition — `.`/`&.` position in multi-line method chains
+    /// (rubocop's `on_send`/`on_csend`; prism unifies both into one
+    /// `CallNode`, `is_safe_navigation`/the raw operator text telling them
+    /// apart). `call_operator_loc` can also hold `::`, but rubocop-ast's
+    /// `dot?`/`safe_navigation?` only match a literal `.`/`&.` source — `::`
+    /// chains are never flagged, mirrored below by comparing the raw bytes.
+    pub(crate) fn check_dot_position(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/DotPosition";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(dot_loc) = node.call_operator_loc() else { return };
+        let op = dot_loc.as_slice();
+        if op != b"." && op != b"&." {
+            return;
+        }
+        let Some(receiver) = node.receiver() else { return };
+
+        // `selector_range`: the message location, or — for the implicit
+        // `#call` form (`l.(1)`, no method name) — the opening paren.
+        let selector_off = node
+            .message_loc()
+            .or_else(|| node.opening_loc())
+            .map(|l| l.start_offset())
+            .unwrap_or_else(|| dot_loc.end_offset());
+
+        let dot_off = dot_loc.start_offset();
+        let (dot_line, _) = self.idx.loc(dot_off);
+        let (selector_line, _) = self.idx.loc(selector_off);
+        let receiver_end_off = receiver.location().end_offset();
+        let (receiver_end_line_plain, _) = self.idx.loc(receiver_end_off);
+
+        // `same_line?(selector_range, end_range(node.receiver))`.
+        if selector_line == receiver_end_line_plain {
+            return;
+        }
+
+        // `receiver_end_line`: a receiver whose last argument (or the
+        // receiver itself) is a heredoc effectively "ends" on the heredoc's
+        // closing-delimiter line — prism's own node span, though, ends right
+        // after the parens on the physical line the call was written on.
+        let receiver_line = dot_position_receiver_end_line(self, &receiver).unwrap_or(receiver_end_line_plain);
+
+        // `line_between?`: a >1 line gap (comment or blank line) is left alone.
+        if selector_line as isize - receiver_line.max(dot_line) as isize > 1 {
+            return;
+        }
+
+        let trailing = self.cfg.get(COP, "EnforcedStyle") == Some("trailing");
+        let correct = if trailing { dot_line != selector_line } else { dot_line == selector_line };
+        if correct {
+            return;
+        }
+
+        let op_str = std::str::from_utf8(op).unwrap_or(".");
+        let message = if trailing {
+            format!("Place the {op_str} on the previous line, together with the method call receiver.")
+        } else {
+            format!("Place the {op_str} on the next line, together with the method name.")
+        };
+        self.push(dot_off, COP, true, message);
+
+        // --- autocorrect ---
+        // `processed_source[dot.line - 1].strip == '.'` — rubocop compares
+        // against the LITERAL string '.', not `dot.source`, so a `&.` alone
+        // on its own line does NOT take the whole-line branch. Ported as-is.
+        let dot_end_off = dot_loc.end_offset();
+        let line_start = self.idx.starts[dot_line - 1];
+        let next_line_start = self.idx.starts.get(dot_line).copied().unwrap_or(self.src.len());
+        let stripped = std::str::from_utf8(&self.src[line_start..next_line_start]).unwrap_or("").trim();
+        if stripped.as_bytes() == b"." {
+            self.fixes.push((line_start, next_line_start, Vec::new()));
+        } else {
+            self.fixes.push((dot_off, dot_end_off, Vec::new()));
+        }
+        if trailing {
+            self.fixes.push((receiver_end_off, receiver_end_off, op.to_vec()));
+        } else {
+            self.fixes.push((selector_off, selector_off, op.to_vec()));
+        }
+    }
+}
+
+/// `DotPosition#receiver_end_line`: `None` unless the receiver — or, when the
+/// receiver is itself a call, one of its arguments — is a heredoc, in which
+/// case the line is the heredoc's closing-delimiter line rather than the
+/// receiver's own (textually earlier) span end.
+fn dot_position_receiver_end_line(cops: &Cops, node: &ruby_prism::Node) -> Option<usize> {
+    if let Some(call) = node.as_call_node() {
+        return call
+            .arguments()
+            .and_then(|args| args.arguments().iter().filter_map(|arg| dot_position_heredoc_line(cops, &arg)).max());
+    }
+    dot_position_heredoc_line(cops, node)
+}
+
+/// Line number of a heredoc node's closing delimiter (the `HEREDOC` token
+/// line itself — prism's `closing_loc` also spans the trailing newline, but
+/// its START is exactly the terminator line rubocop's `heredoc_end.line` names).
+fn dot_position_heredoc_line(cops: &Cops, node: &ruby_prism::Node) -> Option<usize> {
+    let closing = if let Some(n) = node.as_string_node() {
+        if n.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) { n.closing_loc() } else { None }
+    } else if let Some(n) = node.as_interpolated_string_node() {
+        if n.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) { n.closing_loc() } else { None }
+    } else if let Some(n) = node.as_x_string_node() {
+        if n.opening_loc().as_slice().starts_with(b"<<") { Some(n.closing_loc()) } else { None }
+    } else if let Some(n) = node.as_interpolated_x_string_node() {
+        if n.opening_loc().as_slice().starts_with(b"<<") { Some(n.closing_loc()) } else { None }
+    } else {
+        None
+    };
+    closing.map(|c| cops.idx.loc(c.start_offset()).0)
+}

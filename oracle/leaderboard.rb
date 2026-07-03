@@ -137,6 +137,7 @@ COPS = {
   'Style/EachForSimpleLoop'          => 'style/each_for_simple_loop',
   'Lint/RedundantWithIndex'          => 'lint/redundant_with_index',
   'Layout/CommentIndentation'        => 'layout/comment_indentation',
+  'Layout/DotPosition'               => 'layout/dot_position',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
