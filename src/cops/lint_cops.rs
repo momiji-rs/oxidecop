@@ -4115,3 +4115,305 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+/// `body.begin_type? ? body.children : body` then `.last`: prism always
+/// wraps a def body in a `StatementsNode` unless it's the bare form of an
+/// implicit `rescue`/`ensure` directly on the `def` (a `BeginNode` with no
+/// wrapping `StatementsNode`) — that `BeginNode` plays the role of
+/// `last_expr` itself and can never match the setter-call shape below,
+/// exactly mirroring whitequark's `:rescue`/`:ensure` (not `:begin`) body
+/// types.
+fn usc_last_expression(body: ruby_prism::Node) -> ruby_prism::Node {
+    if let Some(stmts) = body.as_statements_node() {
+        if let Some(last) = stmts.body().iter().last() {
+            return last;
+        }
+    }
+    body
+}
+
+/// rubocop-ast's `Node::VARIABLES` (`lvar`/`ivar`/`cvar`/`gvar` READS): the
+/// node kinds `rhs_node.variable?` recognizes when copying a prior
+/// assignment's tracked status across `x = y`. Names include prism's sigils
+/// (`@foo`, `@@foo`, `$foo`) exactly like rubocop's symbol names, so they
+/// can share one flat map with plain lvar names without colliding.
+fn usc_variable_read_name<'pr>(node: &ruby_prism::Node<'pr>) -> Option<&'pr [u8]> {
+    if let Some(n) = node.as_local_variable_read_node() {
+        return Some(n.name().as_slice());
+    }
+    if let Some(n) = node.as_instance_variable_read_node() {
+        return Some(n.name().as_slice());
+    }
+    if let Some(n) = node.as_class_variable_read_node() {
+        return Some(n.name().as_slice());
+    }
+    if let Some(n) = node.as_global_variable_read_node() {
+        return Some(n.name().as_slice());
+    }
+    None
+}
+
+/// rubocop-ast's `ASSIGNMENT_TYPES` (`lvasgn`/`ivasgn`/`cvasgn`/`gvasgn`) —
+/// but as multiple-assignment TARGET nodes (masgn slots are prism's
+/// `*TargetNode`s, not `*WriteNode`s). Nested destructuring
+/// (`MultiTargetNode`) and splats (`SplatNode`) are deliberately excluded,
+/// matching upstream's `next unless ASSIGNMENT_TYPES.include?(lhs_node.type)`.
+fn usc_assignment_target_name<'pr>(node: &ruby_prism::Node<'pr>) -> Option<&'pr [u8]> {
+    if let Some(n) = node.as_local_variable_target_node() {
+        return Some(n.name().as_slice());
+    }
+    if let Some(n) = node.as_instance_variable_target_node() {
+        return Some(n.name().as_slice());
+    }
+    if let Some(n) = node.as_class_variable_target_node() {
+        return Some(n.name().as_slice());
+    }
+    if let Some(n) = node.as_global_variable_target_node() {
+        return Some(n.name().as_slice());
+    }
+    None
+}
+
+/// rubocop-ast's `LITERALS` (`TRUTHY_LITERALS + FALSEY_LITERALS`) as used by
+/// `constructor?`'s `node.literal?` check — every literal node shape prism
+/// exposes, including both plain and interpolated string/symbol/regexp/xstr
+/// variants (whitequark folds each pair into one node type; prism splits
+/// them).
+fn usc_is_literal(node: &ruby_prism::Node) -> bool {
+    node.as_string_node().is_some()
+        || node.as_interpolated_string_node().is_some()
+        || node.as_x_string_node().is_some()
+        || node.as_interpolated_x_string_node().is_some()
+        || node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_interpolated_symbol_node().is_some()
+        || node.as_array_node().is_some()
+        || node.as_hash_node().is_some()
+        || node.as_regular_expression_node().is_some()
+        || node.as_interpolated_regular_expression_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+        || node.as_nil_node().is_some()
+        || node.as_range_node().is_some()
+        || node.as_imaginary_node().is_some()
+        || node.as_rational_node().is_some()
+}
+
+/// rubocop-ast's `constructor?`: a literal, or a plain (non-safe-navigation)
+/// `.new` call — `send_type?` is false for `csend` (`Top&.new`), so safe
+/// navigation is deliberately excluded here too (verified live: rubocop
+/// 1.88.0 does NOT flag `top = Top&.new; top.attr = 5`).
+fn usc_constructor(node: &ruby_prism::Node) -> bool {
+    if usc_is_literal(node) {
+        return true;
+    }
+    node.as_call_node().is_some_and(|c| !c.is_safe_navigation() && c.name().as_slice() == b"new")
+}
+
+/// Ported from upstream's private `MethodVariableTracker`: walks the ENTIRE
+/// method body tracking, per variable, whether its current value is a
+/// locally-constructed object (a literal or `.new` call) as of each
+/// assignment — so a later read (`y = x`) can copy `x`'s status, and a
+/// setter call at the end can look up its receiver's final tracked status.
+///
+/// Mirrors upstream's `scan`/`throw :skip_children`: overridden `visit_*`
+/// methods that DON'T call the generated `ruby_prism::visit_*_node` free
+/// function stop descent into that node's children (matching `throw`); the
+/// ones that DO call it keep descending (matching plain fallthrough in
+/// `process_assignment_node`'s `case`). Node kinds with no override at all
+/// (e.g. constant assignment, attribute/index `op_asgn`) aren't in
+/// `ASSIGNMENT_TYPES` upstream either — they fall through to `return`
+/// without a throw, so the `Visit` trait's own default recursion already
+/// reproduces that "keep walking, do nothing here" behavior for free.
+struct UscTracker<'pr> {
+    local: HashMap<&'pr [u8], bool>,
+}
+impl<'pr> UscTracker<'pr> {
+    fn set(&mut self, name: &'pr [u8], val: bool) {
+        self.local.insert(name, val);
+    }
+    /// `process_assignment`: `rhs_node.variable?` copies the prior tracked
+    /// status (or `false`/unset) across a plain read; anything else falls
+    /// to `constructor?`.
+    fn process_assignment(&mut self, name: &'pr [u8], rhs: &ruby_prism::Node<'pr>) {
+        let val = match usc_variable_read_name(rhs) {
+            Some(rn) => self.local.get(rn).copied().unwrap_or(false),
+            None => usc_constructor(rhs),
+        };
+        self.set(name, val);
+    }
+}
+impl<'pr> ruby_prism::Visit<'pr> for UscTracker<'pr> {
+    /// `process_multiple_assignment`: iterate the top-level destructuring
+    /// slots (`lefts` ++ optional `rest` ++ `rights` — prism's split of
+    /// whitequark's flat `mlhs.children`) so each maps to the right-hand
+    /// side element at the same position, but ONLY when the rhs is itself
+    /// an array literal; any other rhs shape (e.g. a bare method call
+    /// relying on an implicit `to_a`) blanket-marks every slot `true`,
+    /// exactly like upstream. Always `throw :skip_children` (no
+    /// default-traversal call).
+    fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        let mut slots: Vec<ruby_prism::Node> = node.lefts().iter().collect();
+        if let Some(rest) = node.rest() {
+            slots.push(rest);
+        }
+        slots.extend(node.rights().iter());
+
+        let rhs = node.value();
+        let rhs_elems: Option<Vec<ruby_prism::Node>> =
+            rhs.as_array_node().map(|a| a.elements().iter().collect());
+
+        for (i, lhs) in slots.iter().enumerate() {
+            let Some(name) = usc_assignment_target_name(lhs) else { continue };
+            match rhs_elems.as_ref().and_then(|elems| elems.get(i)) {
+                Some(rhs_node) => self.process_assignment(name, rhs_node),
+                None => self.set(name, true),
+            }
+        }
+    }
+
+    // `process_logical_operator_assignment` for a variable target: process
+    // + `throw :skip_children` (no default-traversal call).
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+    }
+    fn visit_instance_variable_or_write_node(&mut self, node: &ruby_prism::InstanceVariableOrWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+    }
+    fn visit_instance_variable_and_write_node(&mut self, node: &ruby_prism::InstanceVariableAndWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+    }
+    fn visit_class_variable_or_write_node(&mut self, node: &ruby_prism::ClassVariableOrWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+    }
+    fn visit_class_variable_and_write_node(&mut self, node: &ruby_prism::ClassVariableAndWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+    }
+    fn visit_global_variable_or_write_node(&mut self, node: &ruby_prism::GlobalVariableOrWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+    }
+    fn visit_global_variable_and_write_node(&mut self, node: &ruby_prism::GlobalVariableAndWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+    }
+
+    // `process_binary_operator_assignment` for a variable target: ALWAYS
+    // marks `true` regardless of the rhs (upstream never inspects it) +
+    // `throw :skip_children`.
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        self.set(node.name().as_slice(), true);
+    }
+    fn visit_instance_variable_operator_write_node(
+        &mut self,
+        node: &ruby_prism::InstanceVariableOperatorWriteNode<'pr>,
+    ) {
+        self.set(node.name().as_slice(), true);
+    }
+    fn visit_class_variable_operator_write_node(&mut self, node: &ruby_prism::ClassVariableOperatorWriteNode<'pr>) {
+        self.set(node.name().as_slice(), true);
+    }
+    fn visit_global_variable_operator_write_node(&mut self, node: &ruby_prism::GlobalVariableOperatorWriteNode<'pr>) {
+        self.set(node.name().as_slice(), true);
+    }
+
+    // Plain `x = ...` (the `*ASSIGNMENT_TYPES` case in
+    // `process_assignment_node`): process, but keep descending (upstream's
+    // `case` doesn't throw here) — so a constructor buried inside the rhs
+    // of a nested assignment is still found.
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+        ruby_prism::visit_instance_variable_write_node(self, node);
+    }
+    fn visit_class_variable_write_node(&mut self, node: &ruby_prism::ClassVariableWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+        ruby_prism::visit_class_variable_write_node(self, node);
+    }
+    fn visit_global_variable_write_node(&mut self, node: &ruby_prism::GlobalVariableWriteNode<'pr>) {
+        let rhs = node.value();
+        self.process_assignment(node.name().as_slice(), &rhs);
+        ruby_prism::visit_global_variable_write_node(self, node);
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// Lint/UselessSetterCall — a local var holding a freshly-built object
+    /// whose setter call is the final expression of a method body is almost
+    /// certainly a bug: the method's return value silently becomes the
+    /// setter's result (e.g. `5`) instead of the object. Ported from
+    /// upstream's `on_def` (aliased `on_defs` — prism's `DefNode` already
+    /// covers both; a singleton def just has a receiver) plus its private
+    /// `MethodVariableTracker` (see the free functions/`UscTracker` above).
+    ///
+    /// Always registered as correctable — this cop `extend`s `AutoCorrector`
+    /// and every offense gets a correction (the safety caveats upstream
+    /// documents are about false positives/return-value changes, not about
+    /// whether a fix is offered).
+    pub(crate) fn check_useless_setter_call(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Lint/UselessSetterCall";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = node.body() else { return };
+        let last_expr = usc_last_expression(body);
+
+        // `[(send (lvar _) ...) setter_method?]` — a plain (non-safe-nav)
+        // call whose receiver is a bare local-variable read, and which is
+        // ITSELF an assignment: prism's `equal_loc` is `setter_method?`'s
+        // `loc?(:operator)` (`x.attr = 5`, `x[:k] = 5`; never `x.attr == 5`).
+        let Some(call) = last_expr.as_call_node() else { return };
+        if call.is_safe_navigation() || call.equal_loc().is_none() {
+            return;
+        }
+        let Some(receiver) = call.receiver() else { return };
+        let Some(lvar) = receiver.as_local_variable_read_node() else { return };
+        let var_name = lvar.name().as_slice();
+
+        // `usc_last_expression` consumed the first `node.body()`; re-fetch
+        // for the tracker's full-body scan (cheap — just re-reads a pointer).
+        let Some(scan_body) = node.body() else { return };
+        let mut tracker = UscTracker { local: HashMap::new() };
+        {
+            use ruby_prism::Visit;
+            tracker.visit(&scan_body);
+        }
+        if !tracker.local.get(var_name).copied().unwrap_or(false) {
+            return;
+        }
+
+        let recv_loc = receiver.location();
+        let var_src = String::from_utf8_lossy(self.node_src(&receiver)).into_owned();
+        self.push(
+            recv_loc.start_offset(),
+            COP,
+            true,
+            format!("Useless setter call to local variable `{var_src}`."),
+        );
+
+        // `corrector.insert_after(last_expr, "\n#{indent(last_expr)}#{loc_name.source}")`
+        // — upstream's `indent` helper is `' ' * node.loc.column` (a
+        // 0-based character count); `self.idx.loc` columns are 1-based.
+        let call_loc = call.location();
+        let (_, col) = self.idx.loc(call_loc.start_offset());
+        let indent = " ".repeat(col.saturating_sub(1));
+        let insertion = format!("\n{indent}{var_src}");
+        self.fixes.push((call_loc.end_offset(), call_loc.end_offset(), insertion.into_bytes()));
+    }
+}
