@@ -3980,3 +3980,138 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((l.start_offset(), l.end_offset(), replacement));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/RedundantWithIndex — checks for redundant `with_index` in blocks
+    /// where the index parameter is not used. Handles three block types:
+    /// - Regular blocks with 0 or 1 parameters
+    /// - Numblocks with 1 parameter (only _1, no _2)
+    /// - Itblocks (implicit `it`)
+    pub(crate) fn check_redundant_with_index(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/RedundantWithIndex";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !matches!(name, b"each_with_index" | b"with_index") {
+            return;
+        }
+
+        // Mirrors ruby's check:
+        // return unless node.receiver  (must have receiver)
+        // return if node.method?(:with_index) && !node.receiver.receiver  (if with_index, receiver must have a receiver)
+        let Some(recv) = node.receiver() else { return };
+        if name == b"with_index" {
+            // `node.receiver.receiver`: with_index's own receiver must itself
+            // have a receiver (a genuine chain like ary.each.with_index) —
+            // `ary.with_index` parses as a receiver-less call and is skipped.
+            let has_inner_receiver = recv.as_call_node().and_then(|c| c.receiver()).is_some();
+            if !has_inner_receiver {
+                return;
+            }
+        }
+        // Must have a block
+        let Some(block_node) = node.block().and_then(|b| b.as_block_node()) else { return };
+
+        // Determine the block type and check parameter count
+        let should_flag = match block_node.parameters() {
+            None => {
+                // Block with no parameters: `{ }` — always flag
+                true
+            }
+            Some(params_node) => {
+                if let Some(np) = params_node.as_numbered_parameters_node() {
+                    // Numblock with numbered parameters (_1, _2, ...)
+                    // Only flag if it has exactly 1 parameter
+                    np.maximum() == 1
+                } else if params_node.as_it_parameters_node().is_some() {
+                    // Itblock with implicit `it` parameter: always flag (1 parameter)
+                    true
+                } else if let Some(block_params) = params_node.as_block_parameters_node() {
+                    // Regular block: check parameter count (req + opt + rest)
+                    // BlockParametersNode wraps a ParametersNode
+                    if let Some(params) = block_params.parameters() {
+                        let req = params.requireds().iter().count();
+                        let opt = params.optionals().iter().count();
+                        let rest = if params.rest().is_some() { 1 } else { 0 };
+                        (req + opt + rest) <= 1
+                    } else {
+                        // No parameters in the ParametersNode (shouldn't happen for BlockParametersNode)
+                        true
+                    }
+                } else {
+                    // Unknown parameter type, skip
+                    false
+                }
+            }
+        };
+        if should_flag {
+            self.push_redundant_with_index_offense(node);
+        }
+    }
+
+    fn push_redundant_with_index_offense(&mut self, call: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/RedundantWithIndex";
+        let name = call.name().as_slice();
+        let (message, start) = if name == b"each_with_index" {
+            // For each_with_index, the offense is at the selector and we replace it with "each"
+            let sel = match call.message_loc() {
+                Some(loc) => (loc.start_offset(), loc.end_offset()),
+                None => return,
+            };
+            ("Use `each` instead of `each_with_index`.", sel.0)
+        } else {
+            // For with_index, the offense is at the method name
+            let sel = match call.message_loc() {
+                Some(loc) => loc.start_offset(),
+                None => return,
+            };
+            ("Remove redundant `with_index`.", sel)
+        };
+        self.push(start, COP, true, message);
+
+        // Build the fix
+        if name == b"each_with_index" {
+            // Replace selector with "each"
+            let (sel_start, sel_end) = match call.message_loc() {
+                Some(loc) => (loc.start_offset(), loc.end_offset()),
+                None => return,
+            };
+            self.fixes.push((sel_start, sel_end, b"each".to_vec()));
+        } else {
+            // For .with_index, we need to remove the entire method call including arguments
+            // but NOT the block
+            let sel_start = match call.message_loc() {
+                Some(loc) => loc.start_offset(),
+                None => return,
+            };
+
+            // Find the dot before the selector
+            if sel_start == 0 {
+                return;
+            }
+            let dot_start = sel_start - 1;
+            if self.src[dot_start] != b'.' {
+                return;
+            }
+
+            // Determine the end: the end of the method call (including arguments, excluding block)
+            // If there's a block node, we need to find where the call really ends (before the block)
+            let call_end = if let Some(block_node) = call.block().and_then(|b| b.as_block_node()) {
+                // Block exists, so find the end of the call (before the block and its space)
+                let block_start = block_node.location().start_offset();
+                // Walk backwards to find the end of the call, skipping whitespace
+                let mut i = block_start;
+                while i > dot_start && (self.src[i - 1] == b' ' || self.src[i - 1] == b'\t') {
+                    i -= 1;
+                }
+                i
+            } else {
+                // No block, so use the call's full location
+                call.location().end_offset()
+            };
+
+            self.fixes.push((dot_start, call_end, Vec::new()));
+        }
+    }
+}
