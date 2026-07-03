@@ -227,6 +227,16 @@ impl Config {
         if let Some(only) = &self.only {
             return only.iter().any(|o| o == cop || cop.starts_with(&format!("{o}/")));
         }
+        self.cop_config_enabled(cop)
+    }
+    /// The cop's raw config-file enablement (`Config#cop_enabled?`: `for_cop(name)['Enabled']`)
+    /// — unlike `enabled()`, NOT gated by CLI `--only`/`--except`. Real
+    /// rubocop keeps these separate: `--only`/`--except` restrict which cops
+    /// the `Team` instantiates as active investigators for the run, but a
+    /// DIFFERENT cop's own logic asking "is `Layout/LineLength` enabled?"
+    /// (e.g. `StatementModifier#max_line_length`) reads straight off the
+    /// `Config` object and is unaffected by the run's `--only` filter.
+    pub fn cop_config_enabled(&self, cop: &str) -> bool {
         match self.sections.get(cop).and_then(|s| s.get("Enabled")) {
             Some(v) => v != "false",
             None => !self.all_disabled_by_default,

@@ -171,6 +171,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/NestedModifier",
     "Layout/MultilineArrayBraceLayout", "Layout/MultilineHashBraceLayout",
     "Layout/MultilineMethodDefinitionBraceLayout",
+    "Style/WhileUntilModifier",
 ];
 
 impl Engine {
@@ -1445,6 +1446,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         {
             self.check_nested_modifier("while", node.predicate(), node.statements(), false);
         }
+        self.check_while_until_modifier(
+            &node.as_node(),
+            node.keyword_loc(),
+            node.predicate(),
+            node.statements(),
+            node.closing_loc(),
+            "while",
+        );
         self.cond_depth += 1;
         ruby_prism::visit_while_node(self, node);
         self.cond_depth -= 1;
@@ -1465,6 +1474,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         {
             self.check_nested_modifier("until", node.predicate(), node.statements(), false);
         }
+        self.check_while_until_modifier(
+            &node.as_node(),
+            node.keyword_loc(),
+            node.predicate(),
+            node.statements(),
+            node.closing_loc(),
+            "until",
+        );
         self.cond_depth += 1;
         ruby_prism::visit_until_node(self, node);
         self.cond_depth -= 1;

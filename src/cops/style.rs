@@ -7364,3 +7364,418 @@ fn nm_add_parens_to_method_args(cops: &super::Cops<'_>, call: &ruby_prism::CallN
     expr.push(b')');
     expr
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/WhileUntilModifier — the mirror image of `MultilineIfModifier`:
+    /// a FULL `while`/`until ... end` whose single-statement body would
+    /// still fit `Layout/LineLength`'s `Max` once flattened into modifier
+    /// form (`body while cond`). Ported from the `StatementModifier` mixin's
+    /// `single_line_as_modifier?`, with `WhileUntilModifier#non_eligible_body?`
+    /// adding the `body&.conditional?` guard on top of the mixin's own
+    /// `super` checks.
+    ///
+    /// `node.modifier_form?` (`loc.end.nil?`) becomes prism's
+    /// `closing_loc().is_none()` — a modifier-form `while`/`until` parses to
+    /// the SAME `WhileNode`/`UntilNode` type, just without a `end` keyword
+    /// location, so bail immediately when there's no closing to anchor on.
+    ///
+    /// `body.begin_type?` (whitequark's IMPLICIT multi-statement wrapper,
+    /// used only when a loop body holds more than one top-level statement)
+    /// has no prism counterpart node — prism never wraps a multi-statement
+    /// body in an extra node, it just puts >1 entries in `statements().body()`
+    /// directly. So that check becomes `body_list.len() != 1` here. This is
+    /// NOT the same thing as an explicit `begin...end` used as the (single)
+    /// loop body, which prism represents as a `BeginNode` occupying that one
+    /// slot — whitequark calls that `kwbegin`, a different type that
+    /// `begin_type?` does NOT match, so such a body stays eligible.
+    ///
+    /// `body&.conditional?` (`if`/`unless`/`while`/`until`/`case`/`case-in`)
+    /// covers whitequark's unified `:if` type (which also represents
+    /// `unless` and ternaries) by checking prism's `IfNode` AND `UnlessNode`
+    /// separately.
+    ///
+    /// `condition.each_node.any?(&:lvasgn_type?)` (reject a condition that
+    /// assigns a local variable anywhere in its subtree, e.g. `while (x = get)`)
+    /// walks the predicate with a tiny `Visit` impl that only overrides the
+    /// local-variable-write/target visitors — deliberately narrower than
+    /// "any assignment": ivar/cvar/gvar/const assignment inside the
+    /// condition is untouched by this check, matching `lvasgn_type?`'s
+    /// specificity to LOCAL variables (the only kind whose modifier-form
+    /// visibility actually changes).
+    ///
+    /// The disable-directive short-circuit in the mixin's
+    /// `comment_disables_cop?` (used to decide whether a first-line comment
+    /// counts as "real" text to preserve/reject on) is intentionally
+    /// skipped: whether or not a first-line comment IS a
+    /// `# rubocop:disable`/`:todo` for this cop (or `all`), the final
+    /// visible offense list is identical either way — a real disable
+    /// directive suppresses the offense downstream regardless of whether
+    /// THIS cop's own eligibility math would have registered one. Treating
+    /// every first-line comment as literal sidesteps re-parsing the
+    /// directive regexp for a distinction that cannot change output.
+    ///
+    /// Autocorrect mirrors `to_modifier_form` (`body keyword cond`,
+    /// parenthesized when the corrected expression would otherwise bind
+    /// looser than its surrounding context, plus the preserved first-line
+    /// comment) via `wum_parenthesize`'s best-effort backward source scan —
+    /// see its doc comment for the caveat (no true AST-parent chain is
+    /// available at this call site; this is UNEXERCISED by the fixture,
+    /// which contains only `expect_no_offenses` examples).
+    pub(crate) fn check_while_until_modifier(
+        &mut self,
+        node: &ruby_prism::Node,
+        keyword_loc: ruby_prism::Location,
+        predicate: ruby_prism::Node,
+        statements: Option<ruby_prism::StatementsNode>,
+        closing_loc: Option<ruby_prism::Location>,
+        keyword: &'static str,
+    ) {
+        const COP: &str = "Style/WhileUntilModifier";
+        if !self.on(COP) {
+            return;
+        }
+        // `node.modifier_form?`
+        let Some(closing) = closing_loc else { return };
+
+        let node_loc = node.location();
+        let node_start = node_loc.start_offset();
+        let node_end = node_loc.end_offset();
+
+        // ---- non_eligible_node? ----
+        if wum_nonempty_line_count(&self.src[node_start..node_end]) > 3 {
+            return;
+        }
+        let (first_line, _) = self.idx.loc(node_start);
+        let (last_line, _) = self.idx.loc(node_end.saturating_sub(1));
+        if self.wum_line_with_comment(last_line) {
+            return;
+        }
+        let first_comment = self.wum_first_line_comment(first_line);
+        let code_after = self.wum_code_after(closing);
+        if first_comment.is_some() && code_after.is_some() {
+            return;
+        }
+
+        // ---- non_eligible_body? (body.nil? / empty_source? / begin_type? /
+        // contains_comment?), plus WhileUntilModifier's `conditional?` guard ----
+        let Some(stmts) = statements else { return }; // body.nil?
+        let body_list: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        if body_list.len() != 1 {
+            return; // 0 statements (empty) or >1 (whitequark's implicit `begin`)
+        }
+        let body = &body_list[0];
+        let body_loc = body.location();
+        if body_loc.start_offset() == body_loc.end_offset() {
+            return; // empty_source?
+        }
+        if wum_is_conditional(body) {
+            return;
+        }
+        let (body_first_line, _) = self.idx.loc(body_loc.start_offset());
+        let (body_last_line, _) = self.idx.loc(body_loc.end_offset().saturating_sub(1));
+        if (body_first_line..=body_last_line).any(|l| self.wum_line_with_comment(l)) {
+            return; // contains_comment?(body.source_range)
+        }
+
+        // ---- non_eligible_condition?: any local-variable assignment inside ----
+        if wum_condition_has_lvasgn(&predicate) {
+            return;
+        }
+
+        // ---- modifier_fits_on_single_line? ----
+        let replacement =
+            self.wum_to_modifier_form(body, &predicate, keyword, first_comment.as_deref(), node_start, node_end);
+        let keyword_start = keyword_loc.start_offset();
+        if let Some(max) = self.wum_max_line_length() {
+            let len = self.wum_length_in_modifier_form(keyword_start, &replacement, code_after.as_deref());
+            if len > max {
+                return;
+            }
+        }
+
+        // ---- offense + autocorrect ----
+        self.push(
+            keyword_start,
+            COP,
+            true,
+            format!("Favor modifier `{keyword}` usage when having a single-line body."),
+        );
+        self.fixes.push((node_start, node_end, replacement.into_bytes()));
+    }
+
+    fn wum_line_with_comment(&self, line: usize) -> bool {
+        self.comments.iter().any(|(l, _, _)| *l == line)
+    }
+
+    fn wum_first_line_comment(&self, line: usize) -> Option<&'a [u8]> {
+        self.comments.iter().find(|(l, _, _)| *l == line).map(|(_, s, e)| &self.src[*s..*e])
+    }
+
+    /// `code_after`: whatever remains on the `end` keyword's own physical
+    /// line, after the keyword — empty-string yields `None` (`unless
+    /// code.empty?`), but a non-empty run of pure whitespace is still
+    /// `Some` (rubocop never `.strip`s it).
+    fn wum_code_after(&self, closing: ruby_prism::Location) -> Option<&'a [u8]> {
+        let end_off = closing.end_offset();
+        let (line, _) = self.idx.loc(closing.start_offset());
+        let line_end = self.wum_line_end_offset(line);
+        if end_off >= line_end {
+            return None;
+        }
+        let code = &self.src[end_off..line_end];
+        if code.is_empty() { None } else { Some(code) }
+    }
+
+    /// Byte offset one past the last non-newline character of `line`
+    /// (1-based), i.e. excluding the trailing `\n`/`\r\n`.
+    fn wum_line_end_offset(&self, line: usize) -> usize {
+        if line < self.idx.starts.len() {
+            let mut e = self.idx.starts[line] - 1;
+            if e > 0 && self.src[e - 1] == b'\r' {
+                e -= 1;
+            }
+            e
+        } else {
+            self.src.len()
+        }
+    }
+
+    fn wum_to_modifier_form(
+        &self,
+        body: &ruby_prism::Node,
+        predicate: &ruby_prism::Node,
+        keyword: &str,
+        first_comment: Option<&[u8]>,
+        node_start: usize,
+        node_end: usize,
+    ) -> String {
+        let body_src = String::from_utf8_lossy(self.node_src(body));
+        let cond_src = String::from_utf8_lossy(self.node_src(predicate));
+        let expr = format!("{body_src} {keyword} {cond_src}");
+        let parenthesized =
+            if self.wum_parenthesize(node_start, node_end) { format!("({expr})") } else { expr };
+        match first_comment {
+            Some(c) => format!("{parenthesized} {}", String::from_utf8_lossy(c)),
+            None => parenthesized,
+        }
+    }
+
+    /// `parenthesize?`: parenthesize the corrected modifier expression when
+    /// dropping it in place, unparenthesized, would change the meaning of
+    /// its surrounding expression (assignment RHS, `and`/`or`/`&&`/`||`
+    /// operand, array/hash-literal element, bare method-call argument, or
+    /// the receiver of a chained call like `end.freeze`) — all cases where
+    /// modifier-`while`/`until`'s low precedence would otherwise swallow
+    /// more than the original full-form statement did.
+    ///
+    /// Ported WITHOUT a real AST-parent chain (none is tracked by this
+    /// visitor): a best-effort scan of the raw source immediately
+    /// surrounding the node — backward from its start (skipping
+    /// whitespace/newlines) for assignment/operator/argument contexts, and
+    /// forward from its end for the `parent.send_type?` receiver case
+    /// (`end.method` / `end&.method`, immediately adjacent with no
+    /// intervening whitespace since Ruby doesn't allow a newline before a
+    /// leading `.`/`&.`). This is coarser than `node.parent` (e.g. it
+    /// cannot distinguish a `(` that opens a method call's argument list
+    /// from one that opens a plain parenthesized group), but a full-form
+    /// `while`/`until` used as an expression's operand/argument/RHS/receiver
+    /// is already an unusual construct, and this path is UNEXERCISED by the
+    /// fixture (see the cop-level doc comment).
+    fn wum_parenthesize(&self, node_start: usize, node_end: usize) -> bool {
+        if self.src[node_end..].starts_with(b".") || self.src[node_end..].starts_with(b"&.") {
+            return true;
+        }
+        let mut i = node_start;
+        while i > 0 && matches!(self.src[i - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            i -= 1;
+        }
+        if i == 0 {
+            return false;
+        }
+        let before = &self.src[..i];
+        for op in [
+            &b"&&="[..], b"||=", b"**=", b"<<=", b">>=", b"+=", b"-=", b"*=", b"/=", b"%=",
+            b"&=", b"|=", b"^=",
+        ] {
+            if before.ends_with(op) {
+                return true;
+            }
+        }
+        if before.ends_with(b"=")
+            && !before.ends_with(b"==")
+            && !before.ends_with(b"!=")
+            && !before.ends_with(b"<=")
+            && !before.ends_with(b">=")
+            && !before.ends_with(b"=>")
+        {
+            return true;
+        }
+        if before.ends_with(b"&&") || before.ends_with(b"||") {
+            return true;
+        }
+        if wum_ends_with_word(before, b"and") || wum_ends_with_word(before, b"or") {
+            return true;
+        }
+        // Array-literal element, hash-pair value, or a `,`-separated slot in
+        // some other list: `,`/`[` are unambiguous (an index target like
+        // `a[while ...]` is itself a `send` argument, same verdict).
+        if before.ends_with(b",") || before.ends_with(b"[") {
+            return true;
+        }
+        // `(` is ambiguous: a method-call's argument-list opener (`foo(` —
+        // `parent.send_type?`, true) vs. a bare grouping paren already
+        // present in the source (`(while ...)` — parent is neither
+        // assignment/operator/array/pair/send, false; re-parenthesizing
+        // would be redundant). Distinguish by what touches the `(` itself:
+        // a call's `(` is never preceded by whitespace or another opening
+        // bracket/operator.
+        if before.ends_with(b"(") {
+            let paren_at = before.len() - 1;
+            return paren_at > 0
+                && matches!(before[paren_at - 1],
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b']' | b')' | b'?' | b'!');
+        }
+        false
+    }
+
+    /// `config.cop_enabled?('Layout/LineLength')` — deliberately `cfg`'s raw
+    /// config-file enablement, NOT `self.on()`: the latter also folds in
+    /// this RUN's `--only`/`--except` restriction, but real rubocop's own
+    /// `max_line_length` reads `Layout/LineLength`'s enablement straight off
+    /// the `Config` object regardless of which cops `--only` narrowed this
+    /// invocation down to.
+    fn wum_max_line_length(&self) -> Option<usize> {
+        if !self.cfg.cop_config_enabled("Layout/LineLength") {
+            return None;
+        }
+        Some(
+            self.cfg
+                .get("Layout/LineLength", "Max")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(120),
+        )
+    }
+
+    /// `length_in_modifier_form`: the length (in rubocop's `line_length`
+    /// sense — characters, plus a tab-indentation surcharge) of the
+    /// keyword's own physical line with the `while`/`until ... end` block
+    /// replaced in place by its modifier-form rendering, and any trailing
+    /// `code_after` (text following the original `end` on its line) still
+    /// appended.
+    fn wum_length_in_modifier_form(
+        &self,
+        kw_start: usize,
+        replacement: &str,
+        code_after: Option<&[u8]>,
+    ) -> usize {
+        let (line, _) = self.idx.loc(kw_start);
+        let line_start = self.idx.starts[line - 1];
+        let mut full = self.src[line_start..kw_start].to_vec();
+        full.extend_from_slice(replacement.as_bytes());
+        if let Some(ca) = code_after {
+            full.extend_from_slice(ca);
+        }
+        self.wum_line_length(&full)
+    }
+
+    fn wum_line_length(&self, line: &[u8]) -> usize {
+        let nchars =
+            if line.is_ascii() { line.len() } else { String::from_utf8_lossy(line).chars().count() };
+        nchars + self.wum_indentation_difference(line)
+    }
+
+    /// `indentation_difference`: 0 unless the (simulated) line itself
+    /// starts with a tab, in which case each leading tab bills at
+    /// `tab_width` columns instead of 1 (tabs elsewhere on the line, or on
+    /// a line that doesn't START with one, are never adjusted).
+    fn wum_indentation_difference(&self, line: &[u8]) -> usize {
+        if line.first() != Some(&b'\t') {
+            return 0;
+        }
+        let tab_width = self.wum_tab_width();
+        let leading_tabs = line.iter().take_while(|&&b| b == b'\t').count();
+        leading_tabs * tab_width.saturating_sub(1)
+    }
+
+    /// `tab_indentation_width`: `Layout/IndentationStyle`'s `IndentationWidth`
+    /// if configured, else `configured_indentation_width`
+    /// (`Layout/IndentationWidth`'s `Width`, default 2).
+    fn wum_tab_width(&self) -> usize {
+        self.cfg
+            .param("Layout/IndentationStyle", "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+}
+
+/// `nonempty_line_count`: `source.lines.grep(/\S/).size` — count of the
+/// node's own physical lines (its exact byte range, not the surrounding
+/// full lines) containing at least one non-whitespace byte.
+fn wum_nonempty_line_count(src: &[u8]) -> usize {
+    src.split(|&b| b == b'\n').filter(|line| line.iter().any(|&b| !b.is_ascii_whitespace())).count()
+}
+
+/// `body&.conditional?` (`CONDITIONALS = if/while/until/case/case_match`),
+/// split across prism's `IfNode` (covers whitequark's unified `if`/ternary)
+/// and the separately-typed `UnlessNode`.
+fn wum_is_conditional(node: &ruby_prism::Node) -> bool {
+    node.as_if_node().is_some()
+        || node.as_unless_node().is_some()
+        || node.as_while_node().is_some()
+        || node.as_until_node().is_some()
+        || node.as_case_node().is_some()
+        || node.as_case_match_node().is_some()
+}
+
+/// `condition.each_node.any?(&:lvasgn_type?)`: does the predicate's subtree
+/// contain a local-variable write (plain, `op=`/`&&=`/`||=`) or a
+/// local-variable target (an `mlhs` slot in multiple assignment, `for`
+/// loops, or pattern-match binds)? These are the prism node shapes whose
+/// whitequark translation surfaces (or contains, for the target-only forms)
+/// an `lvasgn` node.
+fn wum_condition_has_lvasgn(predicate: &ruby_prism::Node) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_local_variable_write_node(&mut self, _node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_local_variable_operator_write_node(
+            &mut self,
+            _node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>,
+        ) {
+            self.found = true;
+        }
+        fn visit_local_variable_and_write_node(
+            &mut self,
+            _node: &ruby_prism::LocalVariableAndWriteNode<'pr>,
+        ) {
+            self.found = true;
+        }
+        fn visit_local_variable_or_write_node(
+            &mut self,
+            _node: &ruby_prism::LocalVariableOrWriteNode<'pr>,
+        ) {
+            self.found = true;
+        }
+        fn visit_local_variable_target_node(&mut self, _node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.found = true;
+        }
+    }
+    let mut finder = Finder { found: false };
+    use ruby_prism::Visit;
+    finder.visit(predicate);
+    finder.found
+}
+
+/// Does `before` end with word `w` at a word boundary (not itself preceded
+/// by an identifier/digit character, so `"band"` doesn't match `"and"`)?
+fn wum_ends_with_word(before: &[u8], w: &[u8]) -> bool {
+    if !before.ends_with(w) {
+        return false;
+    }
+    let start = before.len() - w.len();
+    start == 0 || !matches!(before[start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+}
