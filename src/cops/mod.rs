@@ -1569,8 +1569,6 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // nested inside a block/def) — methods don't see enclosing locals.
         let rs_names = node.parameters().map(|p| style::rs_params_of(&p)).unwrap_or_default();
         self.rs_scope_stack.push(std::rc::Rc::new(std::cell::RefCell::new(rs_names)));
-        ruby_prism::visit_def_node(self, node);
-        self.rs_scope_stack.pop();
         // A `def` is never a `in_macro_scope?` wrapper — any bare
         // public/private/protected/module_function inside one (however
         // deeply, through transparent if/begin/block wrappers) is just a
@@ -1578,6 +1576,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.el_am_scope.push(false);
         ruby_prism::visit_def_node(self, node);
         self.el_am_scope.pop();
+        self.rs_scope_stack.pop();
         self.class_children_stack.pop();
         self.def_depth -= 1;
         self.ll_exit_collection();
