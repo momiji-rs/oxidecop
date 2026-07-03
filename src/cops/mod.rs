@@ -168,7 +168,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/NestedMethodDefinition", "Lint/RandOne", "Lint/UriEscapeUnescape",
     "Lint/UriRegexp", "Lint/UnifiedInteger", "Naming/MethodName", "Style/ArrayJoin", "Style/Dir",
     "Style/Documentation", "Style/EvenOdd", "Style/FrozenStringLiteralComment",
-    "Style/NegatedIf", "Style/NegatedUnless", "Style/NestedFileDirname", "Style/NilComparison",
+    "Style/LambdaCall", "Style/NegatedIf", "Style/NegatedUnless", "Style/NestedFileDirname", "Style/NilComparison",
     "Style/NumericLiterals", "Style/NumericPredicate", "Style/RandomWithOffset",
     "Style/RedundantReturn", "Style/StringChars", "Style/StringLiterals", "Style/StringLiteralsInInterpolation",
     "Style/SymbolProc", "Style/UnpackFirst", "Style/ZeroLengthPredicate",
@@ -2134,6 +2134,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_send(node);
         self.check_useless_times(node);
         self.check_attr(node);
+        self.check_lambda_call(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
         let n = node.as_node();

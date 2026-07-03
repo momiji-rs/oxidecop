@@ -10104,3 +10104,137 @@ impl<'a> super::Cops<'a> {
         );
     }
 }
+impl<'a> super::Cops<'a> {
+
+    /// Style/LambdaCall — checks for use of the lambda.(args) syntax.
+    /// EnforcedStyle: call (default, `x.()` → `x.call`) / braces (`x.call` → `x.()`).
+    pub(crate) fn check_lambda_call(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/LambdaCall";
+        if !self.on(COP) {
+            return;
+        }
+        // Only hook on "call" method
+        if node.name().as_slice() != b"call" {
+            return;
+        }
+        // Must have a receiver
+        let Some(_) = node.receiver() else { return };
+
+        // Determine current style: implicit is no message_loc, explicit has message_loc
+        let is_implicit = node.message_loc().is_none();
+
+        // Get enforced style from config: defaults to "call"
+        let enforced_style = self.cfg.enforced_style(COP);
+
+        // Determine if this is an offense
+        let is_offense = if enforced_style == "braces" {
+            !is_implicit   // prefer .(), so explicit is bad
+        } else {
+            is_implicit    // prefer .call (default), so implicit is bad
+        };
+
+        if !is_offense {
+            return;
+        }
+
+        // Generate the preferred form
+        let src = self.node_src(&node.as_node());
+        let current = std::str::from_utf8(src).unwrap_or("<source>");
+
+        let prefer = if let Some(receiver_node) = node.receiver() {
+            let receiver_bytes = self.node_src(&receiver_node);
+            let receiver = std::str::from_utf8(receiver_bytes).unwrap_or("");
+
+            // Get the dot operator (. or &.)
+            let dot = if let Some(dot_loc) = node.message_loc() {
+                // For explicit calls, message_loc starts at the "c" in "call"
+                // We need to get everything before it as the dot
+                let msg_start = dot_loc.start_offset();
+                let recv_end = receiver_node.location().end_offset();
+                let dot_bytes = &self.src[recv_end..msg_start];
+                std::str::from_utf8(dot_bytes).unwrap_or(".")
+            } else {
+                // For implicit calls, we need to find the dot from the source
+                // x.() format - find the dot before the parens
+                if let Some(paren_idx) = src.iter().position(|&b| b == b'(') {
+                    let before_paren = &src[..paren_idx];
+                    // The dot should be right before the opening paren
+                    if before_paren.ends_with(b"&.") {
+                        "&."
+                    } else if before_paren.ends_with(b".") {
+                        "."
+                    } else {
+                        "."
+                    }
+                } else {
+                    "."
+                }
+            };
+
+            // Extract arguments from the source
+            let args_str = if let Some(args) = node.arguments() {
+                let mut arg_parts = Vec::new();
+                for arg in args.arguments().iter() {
+                    let arg_bytes = self.node_src(&arg);
+                    if let Ok(arg_str) = std::str::from_utf8(arg_bytes) {
+                        arg_parts.push(arg_str.to_string());
+                    }
+                }
+                if arg_parts.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", arg_parts.join(", "))
+                }
+            } else {
+                // No parenthesized arguments - check if there are space-separated args
+                // by looking at the source between "call" and end
+                if is_implicit {
+                    String::new()
+                } else {
+                    // For explicit .call, we might have "x.call a, b" (no parens)
+                    // We need to extract everything after "call" as arguments
+                    let msg_loc = node.message_loc().unwrap();
+                    let call_end = msg_loc.end_offset();
+                    let node_end = node.location().end_offset();
+                    if call_end < node_end {
+                        let arg_bytes = &self.src[call_end..node_end];
+                        if let Ok(arg_str) = std::str::from_utf8(arg_bytes) {
+                            let trimmed = arg_str.trim_start();
+                            if !trimmed.is_empty() {
+                                format!("({})", trimmed)
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                }
+            };
+
+            if enforced_style == "braces" {
+                // Convert x.call() to x.()
+                let args_inner = args_str.trim_start_matches('(').trim_end_matches(')');
+                format!("{}{}({})", receiver, dot, args_inner)
+            } else {
+                // Convert x.() to x.call()
+                format!("{}{}{}{}", receiver, dot, "call", args_str)
+            }
+        } else {
+            current.to_string()
+        };
+
+        let l = node.location();
+        self.push(
+            l.start_offset(),
+            COP,
+            true,
+            format!("Prefer the use of `{}` over `{}`.", prefer, current),
+        );
+
+        let prefer_bytes = prefer.as_bytes().to_vec();
+        self.fixes.push((l.start_offset(), l.end_offset(), prefer_bytes));
+    }
+}
