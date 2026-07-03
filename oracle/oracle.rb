@@ -226,6 +226,11 @@ def parse_config_sections(joined)
       merges_cop_config = true
       val = m2[1]
     end
+    # A bare `cop_config` reference: the section IS the example's cop_config.
+    if val == 'cop_config'
+      merges_cop_config = true
+      val = '{}'
+    end
     # `RuboCop::ConfigLoader.default_configuration['SEC']` — the section is
     # the cop's real defaults; flag it so scoring keeps defaults applying
     # (no __replace_defaults__) instead of an empty replacing section.
