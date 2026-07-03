@@ -5160,3 +5160,80 @@ impl<'a> super::Cops<'a> {
         self.push(node.location().start_offset(), COP, false, "Empty block detected.");
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Lint/DuplicateMagicComment — detect duplicate magic comments at the
+    /// beginning of the file. Encoding and frozen_string_literal comments are
+    /// tracked separately.
+    pub(crate) fn check_duplicate_magic_comment(&mut self, first_code_line: Option<usize>) {
+        const COP: &str = "Lint/DuplicateMagicComment";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Collect leading magic comments: lines before the first code line
+        let mut encoding_seen = false;
+        let mut frozen_string_literal_seen = false;
+
+        for (line, start, end) in self.comments {
+            // Only process comments before the first code line
+            if let Some(fcl) = first_code_line {
+                if *line >= fcl {
+                    break;
+                }
+            }
+
+            let comment_text = String::from_utf8_lossy(&self.src[*start..*end]);
+
+            // Determine if this is a magic comment and what type
+            if is_encoding_magic_comment(&comment_text) {
+                if encoding_seen {
+                    // This is a duplicate encoding magic comment
+                    self.push(*start, COP, true, "Duplicate magic comment detected.");
+                    // Remove the entire line including newline
+                    let (line_s, _) = self.idx.loc(*start);
+                    let (line_e, _) = self.idx.loc(end.saturating_sub(1));
+                    let fix_start = self.idx.starts[line_s - 1];
+                    let fix_end = self.idx.starts.get(line_e).copied().unwrap_or(self.src.len());
+                    self.fixes.push((fix_start, fix_end, Vec::new()));
+                } else {
+                    encoding_seen = true;
+                }
+            } else if is_frozen_string_literal_magic_comment(&comment_text) {
+                if frozen_string_literal_seen {
+                    // This is a duplicate frozen_string_literal magic comment
+                    self.push(*start, COP, true, "Duplicate magic comment detected.");
+                    // Remove the entire line including newline
+                    let (line_s, _) = self.idx.loc(*start);
+                    let (line_e, _) = self.idx.loc(end.saturating_sub(1));
+                    let fix_start = self.idx.starts[line_s - 1];
+                    let fix_end = self.idx.starts.get(line_e).copied().unwrap_or(self.src.len());
+                    self.fixes.push((fix_start, fix_end, Vec::new()));
+                } else {
+                    frozen_string_literal_seen = true;
+                }
+            }
+        }
+    }
+}
+
+/// Check if a comment text is an encoding magic comment.
+/// Patterns: `# encoding: value` or `# coding: value` (case-insensitive)
+fn is_encoding_magic_comment(comment: &str) -> bool {
+    // Simple pattern: # followed by optional whitespace, then encoding/coding, then colon
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)^\s*#\s*(?:en)?coding:\s*").unwrap()
+    });
+    re.is_match(comment)
+}
+
+/// Check if a comment text is a frozen_string_literal magic comment.
+/// Patterns: `# frozen_string_literal: true/false` or similar variations (case-insensitive)
+fn is_frozen_string_literal_magic_comment(comment: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)^\s*#\s*frozen[_-]string[_-]literal:\s*").unwrap()
+    });
+    re.is_match(comment)
+}
