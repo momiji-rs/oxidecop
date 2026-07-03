@@ -330,6 +330,19 @@ while i < lines.length
   if l =~ /before\s*\{\s*config\['#{Regexp.escape(COP)}'\]\s*=\s*(\{.*\})\s*\}/ && cfg_stack.any?
     cfg_stack.last[5] = extract_hash(Regexp.last_match(1))
   end
+  # `before { cop_config['Key'] = value }` mutates ONE key of the shared
+  # cop_config: splice the pair into the frame's cop_config hash text.
+  if l =~ /before\s*\{\s*cop_config\[(['"])([^'"]+)\1\]\s*=\s*([^\[\]{}]+?)\s*\}/ && cfg_stack.any?
+    key = Regexp.last_match(2)
+    val = Regexp.last_match(3).strip
+    base = cfg_stack.last[1]
+    cfg_stack.last[1] =
+      if base.nil? || base == 'default'
+        "{ '#{key}' => #{val} }"
+      else
+        base.sub(/\}\s*\z/, ", '#{key}' => #{val} }")
+      end
+  end
   # A scalar `let(:name) { true/false/42/'str' }` — cop_config values often
   # reference these (`'SplitStrings' => split_strings`); record them per scope
   # so the reference resolves like RSpec would.
