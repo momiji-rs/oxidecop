@@ -183,7 +183,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/WhileUntilModifier",
     "Lint/ImplicitStringConcatenation",
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
-    "Style/NonNilCheck",
+    "Style/NonNilCheck", "Style/MixinUsage",
 ];
 
 impl Engine {
@@ -1738,6 +1738,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.interp_depth -= 1;
     }
     fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
+        self.check_mixin_usage(&node.statements().as_node());
         self.class_children_stack.push(Self::direct_child_classes(&Some(node.statements().as_node())));
         self.exception_siblings_stack.push(Self::direct_child_defs(&Some(node.statements().as_node())));
         let top_body = node.statements().body();

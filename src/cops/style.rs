@@ -9966,3 +9966,134 @@ impl<'a> super::Cops<'a> {
             && self.cfg.get("Style/NilComparison", "EnforcedStyle") == Some("comparison")
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/MixinUsage: `include`/`extend`/`prepend` with exactly one
+    /// constant argument, found where upstream's `in_top_level_scope?`
+    /// node-pattern would be true. That pattern walks a `send` node's
+    /// (whitequark) ancestors — `root?` (no parent at all) OR a parent
+    /// that's one of `{kwbegin begin if def}` AND is *itself*
+    /// `in_top_level_scope?` — all the way up to the file root. `ruby_prism`
+    /// nodes have no back-pointer to their parent, so this is ported as a
+    /// dedicated top-down walk from the program root instead of a bottom-up
+    /// climb: once a node's real structural position falls outside that
+    /// ancestor set, no offense is reachable anywhere beneath it (eligibility
+    /// only ever flows downward from the root, never recovers), so ineligible
+    /// subtrees are pruned rather than fully traversed. `StatementsNode` is
+    /// whitequark-transparent unconditionally (a single statement is spliced
+    /// in directly with no wrapper node at all; more than one becomes
+    /// `:begin`, which is itself in the allow-list) — so it's walked the same
+    /// way regardless of how many statements it holds.
+    pub(crate) fn check_mixin_usage(&mut self, node: &ruby_prism::Node) {
+        if !self.on("Style/MixinUsage") {
+            return;
+        }
+        self.mixin_usage_walk(node);
+    }
+
+    fn mixin_usage_walk(&mut self, node: &ruby_prism::Node) {
+        if let Some(stmts) = node.as_statements_node() {
+            for stmt in stmts.body().iter() {
+                self.mixin_usage_walk(&stmt);
+            }
+        } else if let Some(def) = node.as_def_node() {
+            // `def self.foo` is whitequark's distinct `:defs` node type —
+            // never in the allow-list, so it (and everything in its body) is
+            // opaque regardless of position. Only a receiver-less `def`
+            // (whitequark `:def`) is transparent, and only through its body
+            // — parameters/defaults sit on a different (non-allow-listed)
+            // branch and are never visited here.
+            if def.receiver().is_none() {
+                if let Some(body) = def.body() {
+                    self.mixin_usage_walk(&body);
+                }
+            }
+        } else if let Some(ifn) = node.as_if_node() {
+            // Covers `if`, `elsif` (via `subsequent` recursing back into this
+            // same arm) and ternaries alike — all one prism `IfNode` shape.
+            if let Some(then_stmts) = ifn.statements() {
+                self.mixin_usage_walk(&then_stmts.as_node());
+            }
+            if let Some(sub) = ifn.subsequent() {
+                self.mixin_usage_walk(&sub);
+            }
+        } else if let Some(un) = node.as_unless_node() {
+            if let Some(then_stmts) = un.statements() {
+                self.mixin_usage_walk(&then_stmts.as_node());
+            }
+            if let Some(else_clause) = un.else_clause() {
+                if let Some(else_stmts) = else_clause.statements() {
+                    self.mixin_usage_walk(&else_stmts.as_node());
+                }
+            }
+        } else if let Some(en) = node.as_else_node() {
+            // Reached via `IfNode#subsequent`'s final `else` branch — in
+            // whitequark that's just the enclosing `if`'s third child, not a
+            // separate node type, so its statements inherit the same
+            // transparency as the `if`/`unless` that owns it.
+            if let Some(stmts) = en.statements() {
+                self.mixin_usage_walk(&stmts.as_node());
+            }
+        } else if let Some(begin) = node.as_begin_node() {
+            // A bare `begin...end` (no rescue/else/ensure) is whitequark's
+            // `:kwbegin` wrapping its body directly — transparent. Any
+            // rescue/else/ensure clause means the body's real whitequork
+            // parent is a `:rescue`/`:ensure` node instead (`:kwbegin`, if
+            // present at all, sits one level further out wrapping THAT node)
+            // — never `:kwbegin` itself, so it's opaque. A keyword-less
+            // `BeginNode` (a `def`'s implicit rescue/ensure body — see the
+            // module's prism-vs-whitequark trap notes) only ever occurs
+            // together with one of these clauses, so checking the three
+            // clauses alone is sufficient.
+            if begin.rescue_clause().is_none() && begin.else_clause().is_none() && begin.ensure_clause().is_none() {
+                if let Some(stmts) = begin.statements() {
+                    self.mixin_usage_walk(&stmts.as_node());
+                }
+            }
+        } else if let Some(call) = node.as_call_node() {
+            self.check_mixin_usage_call(&call);
+            // A call's receiver/arguments/block are never allow-listed
+            // types — no offense is reachable beneath them, so don't widen
+            // the walk into them.
+        }
+        // Everything else (class/module/singleton-class bodies, block/
+        // lambda bodies, while/until/case/case-in/for bodies, and any other
+        // expression position) is opaque: no offense can occur underneath,
+        // so it's simply left unwalked.
+    }
+
+    fn check_mixin_usage_call(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/MixinUsage";
+        if node.receiver().is_some() {
+            return;
+        }
+        let statement = match node.name().as_slice() {
+            b"include" => "include",
+            b"extend" => "extend",
+            b"prepend" => "prepend",
+            _ => return,
+        };
+        // A block turns the call into whitequark's `:block` wrapper node —
+        // the `send` node's real parent becomes that (non-allow-listed) node,
+        // so it's never top-level no matter how eligible its own position
+        // would otherwise be.
+        if node.block().is_some() {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let arg_list = args.arguments();
+        if arg_list.iter().count() != 1 {
+            return;
+        }
+        let arg = arg_list.iter().next().expect("count checked above");
+        if arg.as_constant_read_node().is_none() && arg.as_constant_path_node().is_none() {
+            return;
+        }
+        self.push(
+            node.location().start_offset(),
+            COP,
+            false,
+            format!("`{statement}` is used at the top level. Use inside `class` or `module`."),
+        );
+    }
+}

@@ -211,6 +211,7 @@ COPS = {
   'Style/MultilineMemoization'       => 'style/multiline_memoization',
   'Style/NegatedUnless'              => 'style/negated_unless',
   'Style/NonNilCheck'                => 'style/non_nil_check',
+  'Style/MixinUsage'                 => 'style/mixin_usage',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
