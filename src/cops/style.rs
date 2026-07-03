@@ -3773,3 +3773,123 @@ fn acceptable_q(src: &[u8]) -> bool {
 fn acceptable_capital_q(src: &[u8], is_str_type: bool) -> bool {
     src.contains(&b'"') && (looks_interpolated(src) || (is_str_type && double_quotes_required(src)))
 }
+impl<'a> super::Cops<'a> {
+    /// Style/EachForSimpleLoop — Checks for loops which iterate a constant
+    /// number of times, using a `Range` literal and `#each`. This can be done
+    /// more readably using `Integer#times`. Only applies if the block takes no
+    /// parameters.
+    pub(crate) fn check_each_for_simple_loop(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/EachForSimpleLoop";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is a call to .each
+        if node.name().as_slice() != b"each" {
+            return;
+        }
+
+        // Get the receiver and check if it's a range
+        let Some(receiver) = node.receiver() else {
+            return;
+        };
+
+        // Try to get a range node (may be wrapped in ParenthesesNode or BeginNode)
+        let range_node = if let Some(rn) = receiver.as_range_node() {
+            rn
+        } else if let Some(pn) = receiver.as_parentheses_node() {
+            let Some(pn_body) = pn.body() else { return };
+            let Some(pn_stmts) = pn_body.as_statements_node() else { return };
+            let mut iter = pn_stmts.body().iter();
+            let Some(first) = iter.next() else { return };
+            // Only match if there's a single statement in the parentheses
+            if iter.next().is_some() {
+                return;
+            }
+            match first.as_range_node() {
+                Some(rn) => rn,
+                None => return,
+            }
+        } else if let Some(bn) = receiver.as_begin_node() {
+            let Some(bn_stmts) = bn.statements() else { return };
+            let mut iter = bn_stmts.body().iter();
+            let Some(first) = iter.next() else { return };
+            // Only match if there's a single statement in the begin block
+            if iter.next().is_some() {
+                return;
+            }
+            match first.as_range_node() {
+                Some(rn) => rn,
+                None => return,
+            }
+        } else {
+            return;
+        };
+
+        // Extract start and end values from the range
+        let Some(left) = range_node.left() else { return };
+        let Some(right) = range_node.right() else { return };
+
+        // Parse integer values
+        let int_of = |n: &ruby_prism::Node| -> Option<i64> {
+            let l = n.location();
+            std::str::from_utf8(&self.src[l.start_offset()..l.end_offset()])
+                .ok()?
+                .replace('_', "")
+                .parse()
+                .ok()
+        };
+
+        let Some(start_val) = int_of(&left) else { return };
+        let Some(end_val) = int_of(&right) else { return };
+
+        // Check if block has no parameters
+        let has_block = node.block().and_then(|b| b.as_block_node()).is_some();
+        if !has_block {
+            return;
+        }
+
+        let block = node.block().and_then(|b| b.as_block_node()).unwrap();
+
+        // Block must have no parameters (empty args)
+        let params_empty = if let Some(params) = block.parameters() {
+            // Check if it's empty block parameters (pipes present but no params)
+            if let Some(bp) = params.as_block_parameters_node() {
+                bp.parameters().is_none() && bp.locals().iter().next().is_none()
+            } else {
+                // No block parameters node means no pipes at all
+                false
+            }
+        } else {
+            // No parameters node means no pipes at all - this is what we want
+            true
+        };
+
+        if !params_empty {
+            return;
+        }
+
+        // Calculate the number of iterations
+        let is_exclusive = range_node.operator_loc().as_slice() == b"...";
+        let count = if is_exclusive {
+            end_val - start_val
+        } else {
+            end_val - start_val + 1
+        };
+
+        // Push the offense
+        let message = "Use `Integer#times` for a simple loop which iterates a fixed number of times.";
+        self.push(node.location().start_offset(), COP, true, message);
+
+        // Add the autocorrection
+        // Replace from the start of the call to the start of the block with "N.times "
+        let block_start = block.location().start_offset();
+        let replacement = format!("{}.times ", count);
+        self.fixes.push((
+            node.location().start_offset(),
+            block_start,
+            replacement.into_bytes(),
+        ));
+    }
+}
+
