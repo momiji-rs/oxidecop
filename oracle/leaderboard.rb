@@ -174,6 +174,7 @@ COPS = {
   'Style/MissingRespondToMissing'    => 'style/missing_respond_to_missing',
   'Style/HashLikeCase'               => 'style/hash_like_case',
   'Style/PercentQLiterals'           => 'style/percent_q_literals',
+  'Lint/PercentStringArray'          => 'lint/percent_string_array',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

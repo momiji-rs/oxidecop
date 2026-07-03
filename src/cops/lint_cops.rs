@@ -6441,3 +6441,113 @@ fn has_create_additions_key(node: &ruby_prism::Node) -> bool {
     false
 }
 
+impl<'a> super::Cops<'a> {
+    /// Lint/PercentStringArray — detects quotes and commas in %w/%W arrays,
+    /// e.g. `%w('foo', "bar")`, which are likely unintended (a mistranslated
+    /// array of string literals) rather than meant to be part of the
+    /// resulting strings.
+    ///
+    /// rubocop's detection operates on each element's *unescaped* (cooked)
+    /// value — e.g. for `%W("a\255\255")` the escape `\255` is interpreted
+    /// to a raw byte before the quote/comma regexes run — while correction
+    /// trims the *raw source* of every element (interpolated or not) once
+    /// any element triggers an offense. See `psa_contains_quotes_or_commas`
+    /// for the quote/comma heuristic (mirrors rubocop's `QUOTES_AND_COMMAS`).
+    ///
+    /// Elements containing real interpolation (`InterpolatedStringNode`)
+    /// never contribute to detection: rubocop's own implementation derives
+    /// the "literal" for such nodes from `child.children.first.to_s`, which
+    /// for a `dstr` node is a debug s-expression of the first child node
+    /// (not its text), so it practically never matches. Live-probed against
+    /// rubocop 1.88.0: `%W("#{a}")`, `%W(#{a},)`, `%W("#{a}",)` all yield no
+    /// offense in isolation, but such elements still get their surrounding
+    /// quotes stripped by the corrector once another element triggers the
+    /// offense (e.g. `%W('foo', "#{a}")` corrects to `%W(foo #{a})`).
+    pub(crate) fn check_percent_string_array(&mut self, node: &ruby_prism::ArrayNode) {
+        const COP: &str = "Lint/PercentStringArray";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is a %w or %W array.
+        let Some(open_loc) = node.opening_loc() else { return };
+        let open = open_loc.as_slice();
+        if !open.starts_with(b"%w") && !open.starts_with(b"%W") {
+            return;
+        }
+
+        let elements: Vec<_> = node.elements().iter().collect();
+
+        // Detection: only plain (non-interpolated) string elements
+        // contribute, using their unescaped (cooked) value.
+        let has_issue = elements.iter().any(|element| {
+            element
+                .as_string_node()
+                .is_some_and(|s| psa_contains_quotes_or_commas(s.unescaped()))
+        });
+
+        if !has_issue {
+            return;
+        }
+
+        let l = node.location();
+        self.push(
+            l.start_offset(),
+            COP,
+            true,
+            "Within `%w`/`%W`, quotes and ',' are unnecessary and may be \
+             unwanted in the resulting strings.",
+        );
+
+        // Correction: applies to every element's raw source (quotes/escapes
+        // uninterpreted), regardless of whether it triggered detection.
+        for element in &elements {
+            let el = element.location();
+            let raw = self.node_src(element);
+
+            // Trailing: an optional quote followed by an optional comma,
+            // matched greedily from the right (mirrors `/['"]?,?$/`).
+            let trailing_len = if raw.len() >= 2
+                && matches!(raw[raw.len() - 2], b'\'' | b'"')
+                && raw[raw.len() - 1] == b','
+            {
+                2
+            } else if matches!(raw.last(), Some(&b',') | Some(&b'\'') | Some(&b'"')) {
+                1
+            } else {
+                0
+            };
+            if trailing_len > 0 {
+                self.fixes.push((el.end_offset() - trailing_len, el.end_offset(), Vec::new()));
+            }
+
+            // Leading: a single leading quote char (mirrors `/^['"]/`).
+            if matches!(raw.first(), Some(&b'\'') | Some(&b'"')) {
+                self.fixes.push((el.start_offset(), el.start_offset() + 1, Vec::new()));
+            }
+        }
+    }
+}
+
+/// Mirrors rubocop's `QUOTES_AND_COMMAS` patterns: a value's cooked content
+/// is suspicious if it ends with ',', or is entirely wrapped in matching
+/// single or double quotes. Values with no alphanumeric content at all
+/// (e.g. a lone quote or comma) are treated as likely false positives
+/// (`%w(' " ! = # ,)` etc.) and ignored, matching rubocop's alnum guard.
+fn psa_contains_quotes_or_commas(literal: &[u8]) -> bool {
+    if !literal.iter().any(u8::is_ascii_alphanumeric) {
+        return false;
+    }
+    if literal.last() == Some(&b',') {
+        return true;
+    }
+    if literal.len() >= 2 {
+        let first = literal[0];
+        let last = literal[literal.len() - 1];
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            return true;
+        }
+    }
+    false
+}
+
