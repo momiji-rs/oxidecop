@@ -146,7 +146,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody", "Lint/AmbiguousRegexpLiteral", "Layout/BlockEndNewline",
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
-    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -538,6 +538,14 @@ pub(crate) struct Cops<'a> {
     // reported — upstream's unguarded one-level elsif recursion can revisit
     // the same else branch; Base#add_offense dedups by range there.
     pub(crate) else_layout_seen: HashSet<usize>,
+    // Lint/EmptyConditionalBody: the start offset of the SOLE top-level
+    // program statement, when there is exactly one — rubocop's
+    // `empty_if_branch?` treats a totally parent-less if/unless (the only
+    // statement in the whole file, nothing wrapping it: no def/class/module/
+    // block/begin/assignment/etc.) differently from every other case, which
+    // this lets us test with a single offset comparison instead of tracking
+    // "am I inside any container" via a pile of depth counters.
+    pub(crate) top_level_sole_stmt: Option<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -834,6 +842,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_assignment_in_condition(&node.predicate());
         self.check_negated_if(node);
         self.check_duplicate_elsif_condition(node);
+        self.check_empty_conditional_body(node);
         self.check_safe_navigation_with_empty(&node.predicate());
         if let Some(kw) = node.if_keyword_loc() {
             if matches!(kw.as_slice(), b"if" | b"elsif") {
@@ -879,6 +888,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_assignment_in_condition(&node.predicate());
         self.check_safe_navigation_with_empty(&node.predicate());
         self.check_unless_else(node);
+        self.check_empty_conditional_body_unless(node);
         self.check_multiline_if_then(
             node.then_keyword_loc(),
             node.end_keyword_loc(),
@@ -1233,6 +1243,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
         self.class_children_stack.push(Self::direct_child_classes(&Some(node.statements().as_node())));
         self.exception_siblings_stack.push(Self::direct_child_defs(&Some(node.statements().as_node())));
+        let top_body = node.statements().body();
+        self.top_level_sole_stmt = if top_body.len() == 1 {
+            top_body.first().map(|n| n.location().start_offset())
+        } else {
+            None
+        };
         ruby_prism::visit_program_node(self, node);
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
@@ -1737,6 +1753,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         uc_instance_eval_depth: 0,
         el_offended: HashSet::new(),
         else_layout_seen: HashSet::new(),
+        top_level_sole_stmt: None,
     };
 
     let t = tick(&T_PREP, t);

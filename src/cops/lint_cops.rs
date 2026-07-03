@@ -4417,3 +4417,240 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((call_loc.end_offset(), call_loc.end_offset(), insertion.into_bytes()));
     }
 }
+
+/// Given whatever immediately follows an if/elsif level (another `elsif`
+/// IfNode, or a literal `else` ElseNode), the start offset of ITS OWN
+/// keyword — this is what whitequark's `node.loc.else` (present on any
+/// if/elsif node that has a subsequent branch) points at, regardless of
+/// whether that branch is another `elsif` or the final `else`.
+fn subsequent_keyword_start(sub: &ruby_prism::Node) -> usize {
+    if let Some(elsif) = sub.as_if_node() {
+        elsif.if_keyword_loc().map(|k| k.start_offset()).unwrap_or_else(|| elsif.location().start_offset())
+    } else if let Some(else_node) = sub.as_else_node() {
+        else_node.else_keyword_loc().start_offset()
+    } else {
+        sub.location().start_offset()
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// Lint/EmptyConditionalBody — an `if`/`elsif`/`unless` branch with no
+    /// body. `AllowComments` (default true) suppresses the offense when a
+    /// comment sits in the branch's own byte range (rubocop's
+    /// `CommentsHelp#contains_comments?`/`find_end_line`, same family as
+    /// `check_empty_when`'s port, but `find_end_line`'s `node.if_type?`
+    /// branch needs its OWN translation here since it's if/elsif-specific).
+    ///
+    /// whitequark parses `if`/`elsif`/`unless` all as the SAME `:if` node
+    /// type (an `elsif` is just the previous node's `else_branch` nesting
+    /// another `:if`), so upstream's `on_if` fires once per level via the
+    /// AST walk. Prism keeps `elsif` as IfNode#subsequent chaining (so it's
+    /// visited again on its own — this function's caller in `mod.rs` skips
+    /// re-entering when `if_keyword` reads `elsif`) but gives `unless` an
+    /// entirely separate UnlessNode type, handled by the sibling function
+    /// `check_empty_conditional_body_unless` below.
+    ///
+    /// Two traps drove the design (verified against live `rubocop`, see
+    /// worker notes): (1) `node.loc.end` (whitequark) is set ONLY on the
+    /// outermost if/unless — every nested `elsif` node has `loc.end == nil`
+    /// — so the `same_line?(loc.begin, loc.end)` single-line skip (`if
+    /// cond;end`, `if cond; else body end`) can only ever fire at the HEAD
+    /// level, never on an `elsif` (matches the fixture: `elsif cond_b;end`
+    /// DOES get flagged, even though textually it "fits on one line" up to
+    /// the shared `end`). Prism's every level reports the SAME real
+    /// `end_keyword_loc`, so that trap is replicated by gating the
+    /// same-line check on `is_head`. (2) whitequark's `elsif` node's own
+    /// `source_range` stops right before the (shared) `end`/next-keyword —
+    /// but only its START offset is ever compared (the oracle rebuilds
+    /// line:col purely from `self.push`'s single offset, never the
+    /// message's range width), so the END-boundary discrepancy from prism
+    /// giving `elsif` nodes a location that runs all the way through `end`
+    /// never actually matters here.
+    pub(crate) fn check_empty_conditional_body(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Lint/EmptyConditionalBody";
+        if !self.on(COP) {
+            return;
+        }
+        // Ternary `?:` has no if/elsif keyword and always has both branches
+        // (mandatory syntax) — never reachable here. Only walk from the
+        // HEAD of a chain; each nested `elsif` is a full IfNode of its own
+        // and gets visited again by the normal traversal, which would
+        // re-walk (and re-offend on) the same tail twice.
+        let Some(head_kw) = node.if_keyword_loc() else { return };
+        if head_kw.as_slice() == b"elsif" {
+            return;
+        }
+        // A modifier `if`/`unless` (no `end`) always has a body (that's what
+        // makes it a modifier), so this is unreachable in practice — guard
+        // anyway rather than unwrap.
+        let Some(end_kw) = node.end_keyword_loc() else { return };
+        let end_kw_start = end_kw.start_offset();
+        let end_kw_line = self.idx.loc(end_kw_start).0;
+        let allow_comments = self.cfg.get(COP, "AllowComments") != Some("false");
+
+        let mut level_start = head_kw.start_offset();
+        let mut predicate = node.predicate();
+        let mut statements = node.statements();
+        let mut subsequent = node.subsequent();
+        let mut prev_statements: Option<ruby_prism::StatementsNode> = None;
+        let mut is_head = true;
+
+        loop {
+            let has_body = statements.is_some();
+            // whitequark's `same_line?(node.loc.begin, node.loc.end)`: only
+            // ever true at the head (see doc comment above) — `node.loc.end`
+            // is this level's OWN end, which only the head genuinely has.
+            let same_line_skip = is_head && {
+                let cond_end = predicate.location().end_offset();
+                self.idx.loc(cond_end).0 == end_kw_line
+            };
+
+            if !has_body && !same_line_skip {
+                let start_line = self.idx.loc(level_start).0;
+                let end_line = match &subsequent {
+                    Some(sub) => self.idx.loc(subsequent_keyword_start(sub)).0,
+                    None => end_kw_line,
+                };
+                let skip_via_comments = allow_comments
+                    && self.comments.iter().any(|(line, _, _)| *line >= start_line && *line < end_line);
+
+                if !skip_via_comments {
+                    let keyword = if is_head { "if" } else { "elsif" };
+
+                    // `can_simplify_conditional?`: an immediate, non-empty
+                    // literal `else` (an `elsif` subsequent, or an empty
+                    // `else`, never qualifies — matches
+                    // `node.else_branch && node.loc.else.source == 'else'`).
+                    let else_node = subsequent.as_ref().and_then(|s| s.as_else_node());
+                    let can_simplify =
+                        else_node.as_ref().is_some_and(|e| e.statements().is_some_and(|st| !st.body().is_empty()));
+
+                    self.push(level_start, COP, can_simplify, format!("Avoid `{keyword}` branches without a body."));
+
+                    if can_simplify {
+                        let else_node = else_node.unwrap();
+                        let ekw = else_node.else_keyword_loc();
+                        // `node.inverse_keyword`: "unless" at the head (this
+                        // branch is always literally `if` there), empty for
+                        // an `elsif` (upstream's `case` has no `elsif` arm).
+                        let inverse_kw = if is_head { "unless" } else { "" };
+                        let cond_start = predicate.location().start_offset();
+                        let cond_end = predicate.location().end_offset();
+                        let mut replacement = Vec::new();
+                        replacement.extend_from_slice(inverse_kw.as_bytes());
+                        replacement.push(b' ');
+                        replacement.extend_from_slice(&self.src[cond_start..cond_end]);
+                        self.fixes.push((ekw.start_offset(), ekw.end_offset(), replacement));
+
+                        // `empty_if_branch?`: at the head, true unless this
+                        // if-statement is the SOLE top-level statement in
+                        // the whole file (no def/class/module/block/etc.
+                        // wraps it, no sibling statements needing a `begin`
+                        // wrapper — the only case where whitequark's
+                        // `node.parent` is genuinely nil). For an `elsif`
+                        // level, it mirrors the PRECEDING level's own body:
+                        // true when that body is empty, or is itself a
+                        // single bodyless nested `if` (upstream's
+                        // `if_branch.if_type? && !if_branch.body`).
+                        let empty_if_branch = if is_head {
+                            self.top_level_sole_stmt != Some(node.location().start_offset())
+                        } else {
+                            match &prev_statements {
+                                None => true,
+                                Some(stmts) => {
+                                    stmts.body().len() == 1
+                                        && stmts
+                                            .body()
+                                            .first()
+                                            .and_then(|n| n.as_if_node())
+                                            .is_some_and(|inner| inner.statements().is_none())
+                                }
+                            }
+                        };
+
+                        let remove_range = if empty_if_branch {
+                            (level_start, ekw.start_offset())
+                        } else {
+                            (level_start, self.line_end_incl_newline(cond_end))
+                        };
+                        self.fixes.push((remove_range.0, remove_range.1, Vec::new()));
+                    }
+                }
+            }
+
+            let Some(sub) = subsequent.take() else { break };
+            let Some(elsif) = sub.as_if_node() else { break };
+            prev_statements = statements;
+            level_start = elsif.if_keyword_loc().map(|k| k.start_offset()).unwrap_or_else(|| elsif.location().start_offset());
+            predicate = elsif.predicate();
+            statements = elsif.statements();
+            subsequent = elsif.subsequent();
+            is_head = false;
+        }
+    }
+
+    /// Lint/EmptyConditionalBody for `unless` — prism's UnlessNode never
+    /// chains (`unless` has no `elsif`), so this is a single-level version
+    /// of `check_empty_conditional_body` above: the same-line skip and
+    /// `empty_if_branch?`'s "sole top-level statement" check both always
+    /// apply at "head" (there IS no other level).
+    pub(crate) fn check_empty_conditional_body_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Lint/EmptyConditionalBody";
+        if !self.on(COP) {
+            return;
+        }
+        if node.statements().is_some() {
+            return;
+        }
+        let Some(end_kw) = node.end_keyword_loc() else { return };
+        let kw_start = node.keyword_loc().start_offset();
+        let cond_end = node.predicate().location().end_offset();
+        if self.idx.loc(cond_end).0 == self.idx.loc(end_kw.start_offset()).0 {
+            return;
+        }
+
+        let allow_comments = self.cfg.get(COP, "AllowComments") != Some("false");
+        if allow_comments {
+            let start_line = self.idx.loc(kw_start).0;
+            let end_line = match node.else_clause() {
+                Some(ref e) => self.idx.loc(e.else_keyword_loc().start_offset()).0,
+                None => self.idx.loc(end_kw.start_offset()).0,
+            };
+            if self.comments.iter().any(|(line, _, _)| *line >= start_line && *line < end_line) {
+                return;
+            }
+        }
+
+        let else_clause = node.else_clause();
+        let can_simplify =
+            else_clause.as_ref().is_some_and(|e| e.statements().is_some_and(|st| !st.body().is_empty()));
+
+        self.push(kw_start, COP, can_simplify, "Avoid `unless` branches without a body.");
+
+        if can_simplify {
+            let else_node = else_clause.unwrap();
+            let ekw = else_node.else_keyword_loc();
+            let cond_start = node.predicate().location().start_offset();
+            let mut replacement = b"if ".to_vec();
+            replacement.extend_from_slice(&self.src[cond_start..cond_end]);
+            self.fixes.push((ekw.start_offset(), ekw.end_offset(), replacement));
+
+            let empty_if_branch = self.top_level_sole_stmt != Some(node.location().start_offset());
+            let remove_range = if empty_if_branch {
+                (kw_start, ekw.start_offset())
+            } else {
+                (kw_start, self.line_end_incl_newline(cond_end))
+            };
+            self.fixes.push((remove_range.0, remove_range.1, Vec::new()));
+        }
+    }
+
+    /// `RangeHelp#range_by_whole_lines`-ish extension used by
+    /// `deletion_range`: the offset one past the end of the line containing
+    /// `pos` (i.e. including that line's own trailing newline), or the end
+    /// of the buffer if `pos` is on the last, newline-less line.
+    fn line_end_incl_newline(&self, pos: usize) -> usize {
+        let line0 = self.idx.loc(pos).0 - 1;
+        self.idx.starts.get(line0 + 1).copied().unwrap_or(self.src.len())
+    }
+}
