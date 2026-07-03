@@ -146,6 +146,7 @@ COPS = {
   'Lint/EmptyBlock'                  => 'lint/empty_block',
   'Lint/DuplicateMagicComment'       => 'lint/duplicate_magic_comment',
   'Style/NilLambda'                  => 'style/nil_lambda',
+  'Lint/UselessMethodDefinition'     => 'lint/useless_method_definition',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

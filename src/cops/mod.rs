@@ -146,7 +146,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody", "Lint/AmbiguousRegexpLiteral", "Layout/BlockEndNewline",
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
-    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -546,6 +546,10 @@ pub(crate) struct Cops<'a> {
     // this lets us test with a single offset comparison instead of tracking
     // "am I inside any container" via a pile of depth counters.
     pub(crate) top_level_sole_stmt: Option<usize>,
+    // Lint/UselessMethodDefinition: start offsets of DefNodes that are a
+    // direct argument of a NON-access-modifier call (`do_something def m`) —
+    // upstream's method_definition_with_modifier? skip.
+    pub(crate) def_macro_args: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1320,6 +1324,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_lines_around_exception_handling_keywords_def(node);
         self.check_disjunctive_assignment_in_constructor(node);
         self.check_useless_setter_call(node);
+        self.check_useless_method_definition(node);
         self.check_metrics_complexity_def(node);
         self.check_def_with_parentheses(node);
         self.check_space_after_method_name(node);
@@ -1452,6 +1457,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_or_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // Lint/UselessMethodDefinition: register def-arguments of generic
+        // macro calls (anything but a receiver-less access modifier).
+        if let Some(args) = node.arguments() {
+            let is_access_modifier = node.receiver().is_none()
+                && matches!(node.name().as_slice(), b"private" | b"protected" | b"public" | b"module_function");
+            if !is_access_modifier {
+                for a in args.arguments().iter() {
+                    if a.as_def_node().is_some() {
+                        self.def_macro_args.insert(a.location().start_offset());
+                    }
+                }
+            }
+        }
         self.check_binary_operator_with_identical_operands(node);
         self.check_float_comparison(node);
         if self.ll_active {
@@ -1774,6 +1792,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         el_offended: HashSet::new(),
         else_layout_seen: HashSet::new(),
         top_level_sole_stmt: None,
+        def_macro_args: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);

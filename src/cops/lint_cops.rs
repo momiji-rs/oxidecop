@@ -5237,3 +5237,137 @@ fn is_frozen_string_literal_magic_comment(comment: &str) -> bool {
     });
     re.is_match(comment)
 }
+impl<'a> super::Cops<'a> {
+
+    /// Lint/UselessMethodDefinition — method whose body is just `super`
+    /// (with matching args or bare).
+    pub(crate) fn check_useless_method_definition(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Lint/UselessMethodDefinition";
+        if !self.on(COP) {
+            return;
+        }
+
+        // `method_definition_with_modifier?`: skip when the def is a direct
+        // argument of a call UNLESS that call is an access modifier
+        // (private/protected/public/module_function) — `do_something def m`
+        // is a generic macro whose semantics we can't see.
+        if self.def_macro_args.contains(&node.location().start_offset()) {
+            return;
+        }
+
+        // Skip if method has rest arguments (*args) or optional arguments (x = default)
+        // or keyword arguments with defaults
+        if let Some(params) = node.parameters() {
+            // Check for rest arguments
+            if params.rest().is_some() {
+                return;
+            }
+            // Check for optional arguments
+            if !params.optionals().is_empty() {
+                return;
+            }
+            // Check for keyword rest arguments
+            if params.keyword_rest().is_some() {
+                return;
+            }
+            // Check for keyword arguments (any keywords mean there are defaults or **kwargs)
+            if !params.keywords().is_empty() {
+                return;
+            }
+        }
+
+        // Check if body is just `super` or `super(...)`
+        if !self.is_delegating_to_super(node) {
+            return;
+        }
+
+        let anchor = node.location().start_offset();
+        self.push(anchor, COP, true, "Useless method definition detected.");
+
+        // Fix: remove the entire method definition
+        let loc = node.location();
+        self.fixes.push((loc.start_offset(), loc.end_offset(), Vec::new()));
+    }
+
+    fn is_delegating_to_super(&self, def_node: &ruby_prism::DefNode) -> bool {
+        let Some(body) = &def_node.body() else {
+            return false;
+        };
+
+        // Try multiple ways to find a super node
+        // First, check if body is directly a super
+        if let Some(super_node) = body.as_super_node() {
+            return self.check_super_matches_params(&super_node, def_node);
+        }
+
+        // Check if body is a bare/forwarding super
+        if body.as_forwarding_super_node().is_some() {
+            // Forwarding super (bare super) always delegates
+            return true;
+        }
+
+        // Otherwise, check if it's wrapped in a StatementsNode
+        if let Some(stmts) = body.as_statements_node() {
+            let stmts_list: Vec<_> = stmts.body().iter().collect();
+
+            // Only flag if ONLY statement is super
+            if stmts_list.len() != 1 {
+                return false;
+            }
+
+            if let Some(super_node) = stmts_list[0].as_super_node() {
+                return self.check_super_matches_params(&super_node, def_node);
+            }
+
+            // Also check for forwarding super in statements
+            if stmts_list[0].as_forwarding_super_node().is_some() {
+                // Forwarding super always delegates
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn check_super_matches_params(&self, super_node: &ruby_prism::SuperNode, def_node: &ruby_prism::DefNode) -> bool {
+        // Get super arguments
+        let super_args: Vec<&[u8]> = match super_node.arguments() {
+            None => {
+                // Bare super with no parentheses - delegates all args
+                vec![]
+            }
+            Some(args_node) => {
+                // Super with parentheses (even if empty) - extract arguments
+                args_node
+                    .arguments()
+                    .iter()
+                    .map(|arg| self.node_src(&arg))
+                    .collect()
+            }
+        };
+
+        // Get method parameters
+        let method_args = self.get_method_args(def_node);
+
+        // Check if delegating:
+        // Super with same args count and matching source matches the method signature
+        method_args.len() == super_args.len()
+            && method_args
+                .iter()
+                .zip(super_args.iter())
+                .all(|(m, s)| *m == *s)
+    }
+
+    fn get_method_args(&self, def_node: &ruby_prism::DefNode) -> Vec<&[u8]> {
+        let mut args = Vec::new();
+
+        if let Some(params) = def_node.parameters() {
+            // Only required arguments count for matching with super(args)
+            for param in params.requireds().iter() {
+                args.push(self.node_src(&param));
+            }
+        }
+
+        args
+    }
+}
