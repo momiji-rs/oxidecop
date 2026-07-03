@@ -711,7 +711,11 @@ examples.each_with_index do |ex, n|
   # message at the right location matches.
   full_ok = exp_full.size == act_full.size &&
             exp_full.zip(act_full).all? do |(el, ec, em), (al, ac, am)|
-              el == al && ec == ac && (em == '[...]' || em == am)
+              # `[...]` elides a message (whole, or as a prefix-match
+              # suffix: `Use %q only [...]`), like real expect_offense.
+              msg_ok = em == '[...]' || em == am ||
+                       (em.end_with?(' [...]') && am.start_with?(em.delete_suffix(' [...]')))
+              el == al && ec == ac && msg_ok
             end
 
   g[:loc] += 1 if loc_ok
