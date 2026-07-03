@@ -8752,3 +8752,161 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((l.start_offset(), l.end_offset(), fixed.into_bytes()));
     }
 }
+
+// ---- Style/Encoding helpers: full `RuboCop::MagicComment` port ----
+//
+// Unlike `fsl_value` above (which only needs the frozen_string_literal
+// setting), this cop needs `encoding_specified?`/`valid?` from ALL THREE
+// magic-comment dialects (emacs `-*- k: v; ... -*-`, vim `# vim: k=v, ...`,
+// and the simple `# key: value` form) — a leading comment that specifies
+// some OTHER magic setting (frozen_string_literal, rbs_inline,
+// shareable_constant_value, typed) still counts as "valid" and must not
+// stop the scan, while a non-magic comment or code line does.
+struct EncodingLine {
+    /// The `coding`/`encoding`/`fileencoding` value, lowercased.
+    encoding: Option<String>,
+    /// The line rewritten with the encoding directive stripped out — `""`
+    /// means the whole line should be deleted (mirrors `MagicComment
+    /// #without`). Only meaningful when `encoding` is `Some`.
+    without_encoding: String,
+}
+
+/// Mirrors `MagicComment.parse(line).valid?` (dialect-dispatched `any?`) plus
+/// enough of each dialect's `#encoding`/`#without` to drive the cop. Returns
+/// `None` for a line that is not a valid magic comment at all — the caller
+/// (like rubocop's `comments` method) stops scanning as soon as this happens.
+fn parse_encoding_line(text: &str) -> Option<EncodingLine> {
+    if !text.starts_with('#') {
+        return None;
+    }
+
+    static EMACS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if let Some(caps) = re(&EMACS, r"-\*-(.+)-\*-").captures(text) {
+        let tokens: Vec<String> = caps[1].split(';').map(|t| t.trim().to_string()).collect();
+
+        static ENC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static FSL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static SCV: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static PREFIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let enc_re = re(&ENC, r"^(?:en)?coding\s*:\s*([[:alnum:]_-]+)$");
+        let fsl_re = re(&FSL, r"^frozen[_-]string[_-]literal\s*:\s*[[:alnum:]_-]+$");
+        let scv_re = re(&SCV, r"^shareable[_-]constant[_-]value\s*:\s*[[:alnum:]_-]+$");
+
+        let encoding = tokens.iter().find_map(|t| enc_re.captures(t).map(|c| c[1].to_lowercase()));
+        let other = tokens.iter().any(|t| fsl_re.is_match(t) || scv_re.is_match(t));
+        if encoding.is_none() && !other {
+            return None;
+        }
+
+        let prefix_re = re(&PREFIX, r"^(?:en)?coding");
+        let remaining: Vec<&str> = tokens.iter().filter(|t| !prefix_re.is_match(t)).map(String::as_str).collect();
+        let without_encoding =
+            if remaining.is_empty() { String::new() } else { format!("# -*- {} -*-", remaining.join(";")) };
+        return Some(EncodingLine { encoding, without_encoding });
+    }
+
+    static VIM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if let Some(caps) = re(&VIM, r"#\s*vim:\s*(.+)").captures(text) {
+        let tokens: Vec<String> = caps[1].split(", ").map(|t| t.trim().to_string()).collect();
+
+        static ENC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static PREFIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let enc_re = re(&ENC, r"^fileencoding\s*=\s*([[:alnum:]_-]+)$");
+        // The `fileencoding` keyword only works when there's at least one
+        // other token in the comment.
+        let encoding = (tokens.len() > 1)
+            .then(|| tokens.iter().find_map(|t| enc_re.captures(t).map(|c| c[1].to_lowercase())))
+            .flatten();
+        encoding.as_ref()?;
+
+        let prefix_re = re(&PREFIX, r"^fileencoding");
+        let remaining: Vec<&str> = tokens.iter().filter(|t| !prefix_re.is_match(t)).map(String::as_str).collect();
+        let without_encoding =
+            if remaining.is_empty() { String::new() } else { format!("# vim: {}", remaining.join(", ")) };
+        return Some(EncodingLine { encoding, without_encoding });
+    }
+
+    // Simple `# key: value` form (case-insensitive).
+    static ENC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static FSL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SCV: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RBS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static TYPED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static WITHOUT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let enc_re =
+        re(&ENC, r"(?i)^\s*#\s*(?:frozen_string_literal:\s*(?:true|false))?\s*(?:en)?coding: ([[:alnum:]_-]+)");
+    let fsl_re = re(&FSL, r"(?i)^\s*#\s*frozen[_-]string[_-]literal:\s*[[:alnum:]_-]+\s*$");
+    let scv_re = re(&SCV, r"(?i)^\s*#\s*shareable[_-]constant[_-]value:\s*[[:alnum:]_-]+\s*$");
+    let rbs_re = re(&RBS, r"(?i)^\s*#\s*rbs_inline:\s*([[:alnum:]_-]+)\s*$");
+    let typed_re = re(&TYPED, r"(?i)^\s*#\s*typed:\s*[[:alnum:]_-]+\s*$");
+
+    let encoding = enc_re.captures(text).map(|c| c[1].to_lowercase());
+    let fsl = fsl_re.is_match(text);
+    let scv = scv_re.is_match(text);
+    // `valid_rbs_inline_value?` requires the un-downcased captured value to
+    // literally be "enabled" or "disabled".
+    let rbs = rbs_re.captures(text).is_some_and(|c| matches!(&c[1], "enabled" | "disabled"));
+    let typed = typed_re.is_match(text);
+    if encoding.is_none() && !fsl && !scv && !rbs && !typed {
+        return None;
+    }
+
+    let without_re = re(&WITHOUT, r"(?i)^#\s*(?:en)?coding");
+    let without_encoding = if without_re.is_match(text) { String::new() } else { text.to_string() };
+    Some(EncodingLine { encoding, without_encoding })
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/Encoding — a redundant `# encoding: utf-8` / `# coding: utf-8`
+    /// (or emacs/vim equivalent) magic comment. Text-based: scans physical
+    /// source lines from the top, exactly like rubocop's `comments` method —
+    /// a shebang line is skipped, and the scan stops dead at the first line
+    /// that isn't a valid magic comment of ANY kind (blank line, plain
+    /// comment, or code).
+    pub(crate) fn check_encoding(&mut self) {
+        const COP: &str = "Style/Encoding";
+        if !self.on(COP) {
+            return;
+        }
+        if self.src.is_empty() {
+            return;
+        }
+
+        let starts = &self.idx.starts;
+        // `processed_source.lines` never yields a final phantom empty line
+        // for a source that ends with a trailing newline.
+        let num_lines = if *self.src.last().unwrap() == b'\n' { starts.len() - 1 } else { starts.len() };
+
+        for line_no in 1..=num_lines {
+            let start = starts[line_no - 1];
+            let end = self.line_end(line_no);
+            let bytes = &self.src[start..end];
+            if bytes.starts_with(b"#!") {
+                continue;
+            }
+            let text = String::from_utf8_lossy(bytes);
+            let Some(parsed) = parse_encoding_line(&text) else {
+                break;
+            };
+            let Some(encoding) = parsed.encoding else {
+                continue;
+            };
+            if !encoding.eq_ignore_ascii_case("utf-8") {
+                continue;
+            }
+
+            self.push(start, COP, true, "Unnecessary utf-8 encoding comment.");
+            if parsed.without_encoding.is_empty() {
+                // `range_with_surrounding_space(range, side: :right)`: eat the
+                // line's own newline plus any further blank lines after it.
+                let mut del_end = end;
+                while del_end < self.src.len() && self.src[del_end] == b'\n' {
+                    del_end += 1;
+                }
+                self.fixes.push((start, del_end, Vec::new()));
+            } else {
+                self.fixes.push((start, end, parsed.without_encoding.into_bytes()));
+            }
+        }
+    }
+}
