@@ -198,6 +198,7 @@ COPS = {
   'Style/ModuleFunction'             => 'style/module_function',
   'Style/SingleArgumentDig'          => 'style/single_argument_dig',
   'Style/Encoding'                   => 'style/encoding',
+  'Style/RedundantFetchBlock'        => 'style/redundant_fetch_block',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -8910,3 +8910,177 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+impl<'a> super::Cops<'a> {
+
+    /// Style/RedundantFetchBlock: detects fetch(key) { literal } patterns
+    /// and suggests fetch(key, literal) instead.
+    pub(crate) fn check_redundant_fetch_block(&mut self, call: &ruby_prism::CallNode) {
+        const COP: &str = "Style/RedundantFetchBlock";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Only calls carrying a literal block qualify
+        let Some(node) = call.block().and_then(|b| b.as_block_node()) else { return };
+        let node = &node;
+
+        // Check if the method is 'fetch'
+        if call.name().as_slice() != b"fetch" {
+            return;
+        }
+
+        // Check if fetch already has an argument (should have exactly 1 argument for the key)
+        let Some(args) = call.arguments() else { return };
+
+        // fetch should have exactly one argument (the key)
+        let args_count = args.arguments().iter().count();
+        if args_count != 1 {
+            return;
+        }
+
+        // Check if block has parameters - if it does, we don't match
+        if let Some(params) = node.parameters() {
+            if let Some(bp) = params.as_block_parameters_node() {
+                if bp.parameters().is_some() {
+                    return;
+                }
+            }
+        }
+
+        // Check if it's Rails.cache.fetch - skip if it is
+        if self.is_rails_cache_fetch(&call) {
+            return;
+        }
+
+        // Get the block body. An EMPTY block (`fetch(:key) {}`) matches
+        // upstream's `${nil?}` body slot: report it and correct to
+        // `fetch(key, nil)`.
+        let Some(body) = node.body() else {
+            let key_node = args.arguments().iter().next().unwrap();
+            let key_src = String::from_utf8_lossy(self.node_src(&key_node)).into_owned();
+            let msg = format!("Use `fetch({key_src}, nil)` instead of `fetch({key_src}) {{}}`.");
+            let sel = call.message_loc().map(|m| m.start_offset()).unwrap_or_else(|| call.location().start_offset());
+            self.push(sel, COP, true, msg);
+            // replace from the selector through the block close
+            let end = call.location().end_offset();
+            self.fixes.push((sel, end, format!("fetch({key_src}, nil)").into_bytes()));
+            return;
+        };
+
+        // Prism always wraps a block body in a StatementsNode — extract the
+        // single statement (multi-statement bodies never match).
+        let body_node = if let Some(stmts) = body.as_statements_node() {
+            let mut it = stmts.body().iter();
+            let Some(first) = it.next() else { return };
+            if it.next().is_some() {
+                return;
+            }
+            first
+        } else {
+            body
+        };
+        let body_node = &body_node;
+
+        // Check for interpolated symbols (:"...#{...}")
+        if let Some(sym) = body_node.as_interpolated_symbol_node() {
+            if sym.parts().iter().any(|p| p.as_embedded_statements_node().is_some()) {
+                return;
+            }
+        }
+
+        // Determine if we should check for this literal type
+        let should_report = if body_node.as_nil_node().is_some() {
+            true
+        } else if body_node.as_integer_node().is_some() {
+            true
+        } else if body_node.as_float_node().is_some() {
+            true
+        } else if body_node.as_symbol_node().is_some() {
+            true
+        } else if body_node.as_rational_node().is_some() {
+            true
+        } else if body_node.as_imaginary_node().is_some() {
+            true
+        } else if body_node.as_true_node().is_some() {
+            true
+        } else if body_node.as_false_node().is_some() {
+            true
+        } else if body_node.as_string_node().is_some() {
+            self.frozen_string_literal_enabled()
+        } else if body_node.as_constant_read_node().is_some() || body_node.as_constant_path_node().is_some() {
+            self.cfg.get(COP, "SafeForConstants").map_or(false, |v| v == "true")
+        } else {
+            false
+        };
+
+        if !should_report {
+            return;
+        }
+
+        // Build the message
+        let key_node = args.arguments().iter().next().unwrap();
+        let key_src = self.node_src(&key_node);
+        let body_src = self.node_src(&body_node);
+
+        let is_nil = body_node.as_nil_node().is_some();
+
+        let default_src = if is_nil {
+            "nil".to_string()
+        } else {
+            String::from_utf8_lossy(body_src).into_owned()
+        };
+
+        let good = format!("fetch({}, {})", String::from_utf8_lossy(key_src), default_src);
+
+        // For empty block
+        let bad_msg = if is_nil {
+            format!("Use `fetch({}, nil)` instead of `fetch({}) {{}}`.",
+                String::from_utf8_lossy(key_src),
+                String::from_utf8_lossy(key_src))
+        } else {
+            format!("Use `{}` instead of `fetch({}) {{ {} }}`.",
+                good,
+                String::from_utf8_lossy(key_src),
+                String::from_utf8_lossy(body_src))
+        };
+
+        // Report the offense with the range from 'fetch' keyword to end of block
+        if let Some(msg_loc) = call.message_loc() {
+            let start = msg_loc.start_offset();
+            let end = node.closing_loc().end_offset();
+
+            self.push(start, COP, true, &bad_msg);
+
+            // Add the fix
+            let replacement = if is_nil {
+                format!("fetch({}, nil)", String::from_utf8_lossy(key_src))
+            } else {
+                format!("fetch({}, {})", String::from_utf8_lossy(key_src), String::from_utf8_lossy(body_src))
+            };
+
+            self.fixes.push((start, end, replacement.into_bytes()));
+        }
+    }
+
+    /// Helper to check if this is Rails.cache.fetch
+    fn is_rails_cache_fetch(&self, call: &ruby_prism::CallNode) -> bool {
+        let Some(receiver) = call.receiver() else { return false };
+
+        // Check for Rails.cache pattern: (send (const _ :Rails) :cache)
+        if let Some(call_recv) = receiver.as_call_node() {
+            if call_recv.name().as_slice() != b"cache" {
+                return false;
+            }
+            if let Some(inner_recv) = call_recv.receiver() {
+                if inner_recv.as_constant_read_node().is_some() {
+                    if let Some(const_node) = inner_recv.as_constant_read_node() {
+                        return const_node.name().as_slice() == b"Rails";
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+}
