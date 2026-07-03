@@ -115,7 +115,27 @@ impl Cache {
             let c: usize = it.next()?.parse().ok()?;
             let cop = crate::cops::intern_cop(it.next()?)?;
             let correctable = it.next()? == "1";
-            let message = it.next()?.replace("\\t", "\t").replace("\\n", "\n").replace("\\\\", "\\");
+            // single-pass decode — sequential replaces corrupt messages
+            // whose text contains a literal backslash before 'n'/'t'
+            let raw = it.next()?;
+            let mut message = String::with_capacity(raw.len());
+            let mut chars = raw.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.next() {
+                        Some('t') => message.push('\t'),
+                        Some('n') => message.push('\n'),
+                        Some('\\') => message.push('\\'),
+                        Some(other) => {
+                            message.push('\\');
+                            message.push(other);
+                        }
+                        None => message.push('\\'),
+                    }
+                } else {
+                    message.push(c);
+                }
+            }
             out.push(Offense { line: l, col: c, cop, correctable, message });
         }
         Some(out)
