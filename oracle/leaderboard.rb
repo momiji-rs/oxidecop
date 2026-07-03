@@ -189,6 +189,7 @@ COPS = {
   'Layout/MultilineArrayBraceLayout' => 'layout/multiline_array_brace_layout',
   'Layout/MultilineHashBraceLayout'  => 'layout/multiline_hash_brace_layout',
   'Layout/MultilineMethodDefinitionBraceLayout' => 'layout/multiline_method_definition_brace_layout',
+  'Layout/DefEndAlignment'           => 'layout/def_end_alignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -4879,3 +4879,176 @@ fn mlbl_subtree_has_heredoc(node: &ruby_prism::Node) -> bool {
     f.visit(node);
     f.found
 }
+
+impl<'a> super::Cops<'a> {
+    /// Layout/DefEndAlignment — checks whether a `def`/`defs`'s `end` is
+    /// aligned with the `def` keyword (`EnforcedStyleAlignWith: def`) or
+    /// with the start of the enclosing statement (`start_of_line`, the
+    /// default). Ported from the `EndKeywordAlignment` mixin's
+    /// `check_end_kw_in_node`/`check_end_kw_alignment` plus the cop's own
+    /// `on_send`/`autocorrect` overrides for the `private def foo; end`
+    /// modifier form.
+    ///
+    /// `on_def` (plain, unwrapped defs): upstream builds a ONE-entry hash
+    /// `{ style => node.loc.keyword }` — regardless of which style is
+    /// configured, the sole alignment target is always the `def` keyword's
+    /// own location (a plain `def` line already begins with `def`, so
+    /// `start_of_line` never needs a distinct "start of the physical line"
+    /// computation here). Style only matters once a modifier call wraps the
+    /// def — see `check_def_end_alignment_send`.
+    pub(crate) fn check_def_end_alignment(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Layout/DefEndAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let def_start = node.location().start_offset();
+        // A def-modifier chain (`private def foo; end`) already claimed
+        // this def via `on_send` — visited before we ever recurse down
+        // into the def itself — rubocop's `ignore_node`/`ignored_node?`.
+        if self.dea_ignored.contains(&def_start) {
+            return;
+        }
+        // Endless methods (`def foo = 1`) have no `end` keyword.
+        let Some(end_loc) = node.end_keyword_loc() else { return };
+        let kw_loc = node.def_keyword_loc();
+        let style = self.cfg.get(COP, "EnforcedStyleAlignWith").unwrap_or("start_of_line");
+        self.dea_report(COP, def_start, end_loc, kw_loc.start_offset(), kw_loc.end_offset(), true, style);
+    }
+
+    /// `on_send` + `def_modifier?` + `each_descendant(:any_def).first`: a
+    /// receiverless call whose (possibly further-nested) sole first
+    /// argument is ultimately a `def`/`defs` node — `private def foo; end`,
+    /// or a multi-level chain like `foo bar def m; end`. Every qualifying
+    /// call in such a chain reaches this (outermost visited first, since
+    /// our traversal is top-down); only the FIRST one to see a given def
+    /// actually checks/offends — `ignore_node` makes every later visit
+    /// (including the def's own `on_def`) a no-op.
+    pub(crate) fn check_def_end_alignment_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/DefEndAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let Some((method_def, parent_start)) = dea_def_modifier(node) else { return };
+        let def_start = method_def.location().start_offset();
+        // The immediate (one-level) wrapping call — used only by the
+        // AUTOCORRECT anchor (`node.parent&.send_type?`), which can differ
+        // from the DETECTION target below in a multi-level chain: upstream
+        // anchors the offense MESSAGE to the outermost call in the chain,
+        // but its own `autocorrect` override anchors the FIX to the def's
+        // direct parent — a real (if obscure) upstream quirk, ported as-is.
+        self.dea_parent.insert(def_start, parent_start);
+        if self.dea_ignored.contains(&def_start) {
+            return;
+        }
+        self.dea_ignored.insert(def_start);
+        let Some(end_loc) = method_def.end_keyword_loc() else { return };
+        let kw_loc = method_def.def_keyword_loc();
+        let style = self.cfg.get(COP, "EnforcedStyleAlignWith").unwrap_or("start_of_line");
+        let (align_start, align_end, literal_def) = if style == "def" {
+            (kw_loc.start_offset(), kw_loc.end_offset(), true)
+        } else {
+            // `start_of_line`: align with THIS call's own start (the
+            // outermost qualifying call in the chain — inner calls are
+            // already ignored by the time they'd reach here) through the
+            // end of the `def` keyword — upstream's `range_between(expr.
+            // begin_pos, method_def.loc.keyword.end_pos)`.
+            (node.location().start_offset(), kw_loc.end_offset(), false)
+        };
+        self.dea_report(COP, def_start, end_loc, align_start, align_end, literal_def, style);
+    }
+
+    /// Shared match/offense/autocorrect core for both entry points above —
+    /// `check_end_kw_alignment` + `add_offense_for_misalignment` +
+    /// `matching_ranges`/`same_line?`/`column_offset_between`. No offense
+    /// when `end` shares a line with the align target OR sits in the same
+    /// column; otherwise reports with upstream's byte-for-byte message
+    /// format and pushes the `AlignmentCorrector.align_end` fix.
+    fn dea_report(
+        &mut self,
+        cop: &'static str,
+        def_start: usize,
+        end_loc: ruby_prism::Location,
+        align_start: usize,
+        align_end: usize,
+        literal_def: bool,
+        style: &str,
+    ) {
+        let end_pos = end_loc.start_offset();
+        let (end_line, end_col) = self.idx.loc(end_pos);
+        let (align_line, align_col) = self.idx.loc(align_start);
+        if align_line == end_line || align_col == end_col {
+            return;
+        }
+        let align_source = if literal_def {
+            "def".to_string()
+        } else {
+            String::from_utf8_lossy(&self.src[align_start..align_end]).into_owned()
+        };
+        let msg = format!(
+            "`end` at {}, {} is not aligned with `{}` at {}, {}.",
+            end_line,
+            end_col - 1,
+            align_source,
+            align_line,
+            align_col - 1
+        );
+        self.push(end_pos, cop, true, &msg);
+
+        // `autocorrect`: style `def` (or a plain, unwrapped def) aligns to
+        // the def's own column; `start_of_line` on a modifier-chain def
+        // aligns to the IMMEDIATE wrapping call's column instead (may
+        // differ from `align_col` above in a multi-level chain).
+        let correction_col = if style == "start_of_line" {
+            match self.dea_parent.get(&def_start) {
+                Some(&parent_start) => self.idx.loc(parent_start).1,
+                None => align_col,
+            }
+        } else {
+            align_col
+        };
+        self.dea_autocorrect(end_pos, end_line, correction_col);
+    }
+
+    /// `AlignmentCorrector.align_end`: replace the `end` line's leading
+    /// whitespace with `target_col` indentation characters when the line
+    /// starts with nothing but whitespace before `end`; otherwise (e.g. a
+    /// body statement sharing the line via `;`) leave that prefix untouched
+    /// and insert a newline + fresh indentation right before `end` instead.
+    fn dea_autocorrect(&mut self, end_pos: usize, end_line: usize, target_col_1idx: usize) {
+        let target_col0 = target_col_1idx.saturating_sub(1);
+        let line_start = self.idx.starts[end_line - 1];
+        let prefix = &self.src[line_start..end_pos];
+        let use_tabs = self.cfg.enforced_style("Layout/IndentationStyle") == "tabs";
+        let indentation = vec![if use_tabs { b'\t' } else { b' ' }; target_col0];
+        if prefix.iter().all(|&b| b == b' ' || b == b'\t') {
+            self.fixes.push((line_start, end_pos, indentation));
+        } else {
+            let mut repl = Vec::with_capacity(1 + indentation.len());
+            repl.push(b'\n');
+            repl.extend(indentation);
+            self.fixes.push((end_pos, end_pos, repl));
+        }
+    }
+}
+
+/// `def_modifier`: peels a chain of receiverless calls whose (only ever the
+/// FIRST) argument is itself either the target `def`/`defs` node or another
+/// such call, mirroring rubocop-ast's `MethodDispatchNode#def_modifier`
+/// (`private def foo; end`, or a nested `foo bar def m; end`). Returns the
+/// target def node together with the START OFFSET of its immediate
+/// (one-level) wrapping call — always the innermost link in the chain,
+/// regardless of which level `call` itself is (calling this on any link
+/// walks the rest of the way down).
+fn dea_def_modifier<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<(ruby_prism::DefNode<'pr>, usize)> {
+    if call.receiver().is_some() {
+        return None;
+    }
+    let first = call.arguments()?.arguments().iter().next()?;
+    if let Some(def) = first.as_def_node() {
+        return Some((def, call.location().start_offset()));
+    }
+    if let Some(inner) = first.as_call_node() {
+        return dea_def_modifier(&inner);
+    }
+    None
+}

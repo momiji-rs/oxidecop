@@ -151,6 +151,7 @@ const IMPLEMENTED: &[&str] = &[
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
     "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Style/BarePercentLiterals", "Lint/RequireParentheses", "Style/CaseEquality", "Style/RedundantException", "Lint/ErbNewArguments", "Lint/OrderedMagicComments",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Layout/DefEndAlignment",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -671,6 +672,21 @@ pub(crate) struct Cops<'a> {
     // never needs this: its "node" is the parameters list, whose parent is
     // always the `def`/`defs`, never a call.
     pub(crate) mlbl_call_child: HashSet<usize>,
+    // Layout/DefEndAlignment: def-node start offsets already handled (either
+    // via an enclosing `def`-modifier chain's `on_send`, or via `on_def`
+    // itself) — rubocop's `ignore_node`/`ignored_node?`. A def-modifier chain
+    // (`foo bar def m; end`) fires `on_send` once per qualifying call in the
+    // chain (outermost visited first); only the first actually checks/offends
+    // — every other visit (including the def's own `on_def`) short-circuits.
+    pub(crate) dea_ignored: HashSet<usize>,
+    // Layout/DefEndAlignment: def-node start offset -> the start offset of
+    // the immediate (single-level) wrapping call, when the def is the
+    // resolved target of a `def`-modifier chain — rubocop's
+    // `node.parent&.send_type?` used by the cop's OWN `autocorrect` override,
+    // which anchors the `end` correction to the immediate parent even when
+    // the offense message (computed from the outermost call in a multi-level
+    // chain) reports a different column.
+    pub(crate) dea_parent: HashMap<usize, usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1666,6 +1682,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
         self.check_ascii_def(node);
         self.check_multiline_method_definition_brace_layout(node);
+        self.check_def_end_alignment(node);
         self.check_missing_respond_to_missing(node);
         self.check_trailing_method_end_statement(node);
         self.check_optional_boolean_parameter(node);
@@ -1843,6 +1860,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        self.check_def_end_alignment_send(node);
         self.check_redundant_self(node);
         self.check_binary_operator_with_identical_operands(node);
         self.check_float_comparison(node);
@@ -2220,6 +2238,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         el_am_ctor_block: false,
         gss_gvasgn_skip: HashSet::new(),
         mlbl_call_child: HashSet::new(),
+        dea_ignored: HashSet::new(),
+        dea_parent: HashMap::new(),
     };
 
     let t = tick(&T_PREP, t);
