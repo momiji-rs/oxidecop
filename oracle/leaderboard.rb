@@ -192,6 +192,7 @@ COPS = {
   'Layout/DefEndAlignment'           => 'layout/def_end_alignment',
   'Style/WhileUntilModifier'         => 'style/while_until_modifier',
   'Style/ExponentialNotation'        => 'style/exponential_notation',
+  'Style/StructInheritance'          => 'style/struct_inheritance',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

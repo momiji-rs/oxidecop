@@ -7926,3 +7926,114 @@ impl<'a> super::Cops<'a> {
         self.push(start, COP, false, message);
     }
 }
+impl<'a> super::Cops<'a> {
+
+    pub(crate) fn check_struct_inheritance(&mut self, node: &ruby_prism::ClassNode) {
+        const COP: &str = "Style/StructInheritance";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(parent_class) = node.superclass() else { return };
+
+        // Check if parent_class matches the pattern for Struct.new (with or without a block)
+        static STRUCT_PATTERN: OnceLock<Pat> = OnceLock::new();
+        let pattern = matcher(&STRUCT_PATTERN,
+            "{(send (const {nil? cbase} :Struct) :new ...) \
+              (block (send (const {nil? cbase} :Struct) :new ...) ...)}");
+
+        if nodepattern::matches(pattern, &parent_class, self.src).is_none() {
+            return;
+        }
+
+        let parent_loc = parent_class.location();
+        let msg = "Don't extend an instance initialized by `Struct.new`. Use a block to customize the struct.";
+        self.push(parent_loc.start_offset(), COP, true, msg);
+
+        // Fix 1: Remove the "class" keyword with surrounding space
+        let keyword_loc = node.class_keyword_loc();
+        let kw_start = keyword_loc.start_offset();
+        let kw_end = keyword_loc.end_offset();
+        // Find the space after "class"
+        let mut space_end = kw_end;
+        while space_end < self.src.len() && self.src[space_end] == b' ' {
+            space_end += 1;
+        }
+        self.fixes.push((kw_start, space_end, vec![]));
+
+        // Fix 2: Replace "<" with "="
+        if let Some(op_loc) = node.inheritance_operator_loc() {
+            self.fixes.push((op_loc.start_offset(), op_loc.end_offset(), b"=".to_vec()));
+        }
+
+        // Fix 3: Handle the parent class body transformation
+        self.correct_struct_parent(node, &parent_class);
+    }
+
+    fn correct_struct_parent(&mut self, class_node: &ruby_prism::ClassNode, parent: &ruby_prism::Node) {
+        // Check if parent is a CallNode with a block (do...end already present)
+        if let Some(call_node) = parent.as_call_node() {
+            if let Some(block_node) = call_node.block().and_then(|b| b.as_block_node()) {
+                // Remove the " end" keyword with preceding space from the block
+                let close_loc = block_node.closing_loc();
+                let close_start = close_loc.start_offset();
+                let close_end = close_loc.end_offset();
+                // Find preceding space (not newlines per Ruby's range_with_surrounding_space)
+                let mut space_start = close_start;
+                if close_start > 0 && self.src[close_start - 1] == b' ' {
+                    space_start = close_start - 1;
+                }
+                self.fixes.push((space_start, close_end, vec![]));
+                return;
+            }
+        }
+
+        if class_node.body().is_none() {
+            // Class body is empty - remove from parent.end to class.end
+            let parent_end = parent.location().end_offset();
+            let class_end = class_node.location().end_offset();
+            self.fixes.push((parent_end, class_end, vec![]));
+        } else if let Some(call_node) = parent.as_call_node() {
+            // Check if the call is unparenthesized by looking at the source code
+            let has_args = call_node.arguments().is_some_and(|a| a.arguments().iter().next().is_some());
+
+            // Check if unparenthesized: the source after "new" should not start with "("
+            let is_unparenthesized = if let Some(msg_loc) = call_node.message_loc() {
+                let after_msg = msg_loc.end_offset();
+                let src_after = if after_msg < self.src.len() {
+                    self.src[after_msg]
+                } else {
+                    b' '
+                };
+                src_after != b'('
+            } else {
+                false
+            };
+
+            if has_args && is_unparenthesized {
+                // Wrap with parentheses and convert to "do"
+                let args_src = call_node.arguments()
+                    .map(|a| {
+                        a.arguments().iter()
+                            .map(|arg| String::from_utf8_lossy(&self.src[arg.location().start_offset()..arg.location().end_offset()]).to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                let selector_end = call_node.message_loc()
+                    .map(|loc| loc.end_offset())
+                    .unwrap_or(parent.location().start_offset());
+                let parent_end = parent.location().end_offset();
+                let replacement = format!("({}) do", args_src);
+                self.fixes.push((selector_end, parent_end, replacement.into_bytes()));
+            } else {
+                // Just insert " do" after parent
+                let parent_end = parent.location().end_offset();
+                self.fixes.push((parent_end, parent_end, b" do".to_vec()));
+            }
+        } else {
+            // Fallback: insert " do" after parent
+            let parent_end = parent.location().end_offset();
+            self.fixes.push((parent_end, parent_end, b" do".to_vec()));
+        }
+    }
+}
