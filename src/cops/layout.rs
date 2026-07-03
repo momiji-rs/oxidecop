@@ -2750,3 +2750,77 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Layout/SpaceAroundEqualsInParameterDefault — Checks that the equals signs
+    /// in parameter default assignments have or don't have surrounding space
+    /// depending on configuration (EnforcedStyle: space or no_space).
+    pub(crate) fn check_space_around_equals_in_parameter_default(&mut self, node: &ruby_prism::OptionalParameterNode) {
+        const COP: &str = "Layout/SpaceAroundEqualsInParameterDefault";
+        if !self.on(COP) {
+            return;
+        }
+
+        let style = self.cfg.enforced_style(COP);
+        let node_loc = node.location();
+        let start = node_loc.start_offset();
+        let end = node_loc.end_offset();
+
+        // Find the equals sign within the node's source
+        let equals_pos = self.src[start..end]
+            .iter()
+            .position(|&b| b == b'=')
+            .map(|p| start + p);
+
+        let Some(eq_pos) = equals_pos else {
+            return;
+        };
+
+        // Check spacing before the equals sign (space after the parameter name)
+        let space_before = eq_pos > 0 && self.src[eq_pos - 1].is_ascii_whitespace();
+
+        // Check spacing after the equals sign
+        let space_after = eq_pos + 1 < self.src.len() && self.src[eq_pos + 1].is_ascii_whitespace();
+
+        let is_correct = match style {
+            "space" => space_before && space_after,
+            "no_space" => !space_before && !space_after,
+            _ => return,
+        };
+
+        if is_correct {
+            return;
+        }
+
+        // Calculate param_end: position right after the parameter name
+        let mut param_end = eq_pos - 1;
+        while param_end > start && self.src[param_end].is_ascii_whitespace() {
+            param_end -= 1;
+        }
+        param_end += 1; // Move to after the last non-whitespace char
+
+        // Find the range: from end of the parameter name to start of the value
+        let mut value_start = eq_pos + 1;
+        while value_start < end && self.src[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+
+        // Report offense at the start of the range (param_end)
+        let msg = if style == "space" {
+            "Surrounding space missing in default value assignment.".to_string()
+        } else {
+            "Surrounding space detected in default value assignment.".to_string()
+        };
+
+        self.push(param_end, COP, true, msg);
+
+        // Create the fix: replace the range from end of parameter name to start of value
+        let replacement = if style == "space" {
+            b" = ".to_vec()
+        } else {
+            b"=".to_vec()
+        };
+
+        self.fixes.push((param_end, value_start, replacement));
+    }
+}
