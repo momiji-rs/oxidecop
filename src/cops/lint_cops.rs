@@ -8270,3 +8270,100 @@ fn is_invalid_rescue_type(node: &ruby_prism::Node) -> bool {
         || node.as_array_node().is_some()
         || node.as_hash_node().is_some()
 }
+
+// Lint/SuppressedException: `rescue` clauses with an effectively-empty body.
+//
+// Upstream's `on_resbody` fires once per `:resbody` AST node. Both the
+// clause form (`begin ... rescue ... end`, `def ... rescue ... end`,
+// `foo do ... rescue ... end`) and the modifier form (`expr rescue expr2`)
+// translate to that SAME node shape upstream (prism's `Prism::Translation::
+// Parser` maps both `RescueNode` and `RescueModifierNode` onto `:resbody`),
+// so the three guards below (real body / AllowComments / AllowNil) apply
+// identically to both — we just have two entry points, one per prism node
+// type, sharing the guard logic inline since their "body" shapes differ
+// (`RescueNode#statements` is an optional `StatementsNode`; a modifier's
+// `rescue_expression` is a single, always-present node).
+impl<'a> super::Cops<'a> {
+    /// `RescueNode` — the clause form (`rescue` inside `begin`/`def`/a block).
+    /// The offense anchors on the `rescue` keyword, matching upstream (whose
+    /// `:resbody` node's own source range always starts there).
+    pub(crate) fn check_suppressed_exception(&mut self, node: &ruby_prism::RescueNode) {
+        const COP: &str = "Lint/SuppressedException";
+        if !self.on(COP) {
+            return;
+        }
+        let nil_body = Self::se_nil_statements(&node.statements());
+        // `return if node.body && !nil_body?(node)` — a present, non-nil
+        // body means this clause isn't suppressing anything.
+        if node.statements().is_some() && !nil_body {
+            return;
+        }
+        self.se_finish(node.keyword_loc().start_offset(), nil_body);
+    }
+
+    /// `RescueModifierNode` — `expr rescue fallback`. Its body
+    /// (`rescue_expression`) is a mandatory field, so upstream's `node.body`
+    /// guard can never trigger here; only the nil-body shape matters.
+    pub(crate) fn check_suppressed_exception_modifier(&mut self, node: &ruby_prism::RescueModifierNode) {
+        const COP: &str = "Lint/SuppressedException";
+        if !self.on(COP) {
+            return;
+        }
+        let nil_body = node.rescue_expression().as_nil_node().is_some();
+        if !nil_body {
+            return;
+        }
+        self.se_finish(node.keyword_loc().start_offset(), nil_body);
+    }
+
+    /// Shared tail of `on_resbody`: the AllowComments / AllowNil guards, then
+    /// `add_offense`. `start` is always the `rescue` keyword's offset.
+    fn se_finish(&mut self, start: usize, nil_body: bool) {
+        const COP: &str = "Lint/SuppressedException";
+        let first_line = self.idx.loc(start).0;
+        if self.cfg.get(COP, "AllowComments") == Some("true") && self.se_comment_between(first_line) {
+            return;
+        }
+        if self.cfg.get(COP, "AllowNil") == Some("true") && nil_body {
+            return;
+        }
+        self.push(start, COP, false, "Do not suppress exceptions.");
+    }
+
+    /// `nil_body?`: is the resbody's body exactly a single `nil` literal
+    /// (not present at all doesn't count as "nil", and neither does a
+    /// `nil`-then-something-else multi-statement body).
+    fn se_nil_statements(statements: &Option<ruby_prism::StatementsNode>) -> bool {
+        match statements {
+            None => false,
+            Some(stmts) => {
+                let body = stmts.body();
+                body.len() == 1 && body.iter().next().is_some_and(|n| n.as_nil_node().is_some())
+            }
+        }
+    }
+
+    /// `comment_between_rescue_and_end?`: does any actual source line from
+    /// `first_line + 1` through the nearest enclosing `kwbegin`/`any_def`/
+    /// `any_block` ancestor's closing line (tracked in `se_ancestor_end_lines`
+    /// by `visit_begin_node`/`visit_def_node`/`visit_block_node`) consist of
+    /// nothing but a comment? No such ancestor (e.g. a bare top-level `x
+    /// rescue nil`) means upstream's `each_ancestor(...).first` is nil, so
+    /// this short-circuits to false.
+    fn se_comment_between(&self, first_line: usize) -> bool {
+        let Some(&end_line) = self.se_ancestor_end_lines.last() else { return false };
+        (first_line + 1..=end_line).any(|ln| self.se_line_is_comment_only(ln))
+    }
+
+    /// `Util#comment_line?`: the RAW source line (not comment-token spans)
+    /// matches `/^\s*#/` — a trailing `code # comment` line does NOT count.
+    fn se_line_is_comment_only(&self, line: usize) -> bool {
+        let Some(&start) = self.idx.starts.get(line.wrapping_sub(1)) else { return false };
+        let end = self.idx.starts.get(line).copied().unwrap_or(self.src.len());
+        let text = &self.src[start..end];
+        text.iter()
+            .find(|&&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            .is_some_and(|&b| b == b'#')
+    }
+}
+

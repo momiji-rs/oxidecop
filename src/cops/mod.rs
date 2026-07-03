@@ -184,7 +184,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/ImplicitStringConcatenation",
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
     "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
-    "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation",
+    "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException",
 ];
 
 impl Engine {
@@ -778,6 +778,11 @@ pub(crate) struct Cops<'a> {
     // is visited, and populates this for its receiver, before the receiver
     // itself is ever reached).
     pub(crate) mmcbl_heredoc_chain: HashMap<usize, (usize, usize)>,
+    // Lint/SuppressedException: enclosing `kwbegin`/`any_def`/`any_block`
+    // ancestor closing lines (outermost first) — `each_ancestor(:kwbegin,
+    // :any_def, :any_block).first` needs only the NEAREST one's closing
+    // line, so a simple stack (pushed on entry, popped on exit) suffices.
+    pub(crate) se_ancestor_end_lines: Vec<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1462,7 +1467,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
         self.check_rescue_exception(node);
         self.check_rescue_type(node);
+        self.check_suppressed_exception(node);
         ruby_prism::visit_rescue_node(self, node);
+    }
+    fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
+        self.check_suppressed_exception_modifier(node);
+        ruby_prism::visit_rescue_modifier_node(self, node);
     }
     fn visit_flip_flop_node(&mut self, node: &ruby_prism::FlipFlopNode<'pr>) {
         self.check_flip_flop(node);
@@ -1552,6 +1562,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if is_metrics_ctor_block {
             self.metrics_in_struct_data_define_block.push(true);
         }
+        // Lint/SuppressedException's ancestor search: `:any_block` — closing
+        // line is the block's own delimiter (`end` or `}`).
+        let block_end_line = self.idx.loc(node.closing_loc().start_offset()).0;
+        self.se_ancestor_end_lines.push(block_end_line);
         if let Some(params) = node.parameters() {
             self.visit(&params);
         }
@@ -1562,6 +1576,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
             self.visit(&body);
         }
+        self.se_ancestor_end_lines.pop();
         self.rs_scope_stack.pop();
         self.rs_block_stack.pop();
         if is_ctor_block {
@@ -1655,10 +1670,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let kwbegin = node.begin_keyword_loc().is_some();
         if kwbegin {
             self.usage_block_depth += 1;
+            // Lint/SuppressedException's ancestor search: an explicit
+            // `begin...end` is a `:kwbegin` ancestor; the closing line is
+            // its `end` keyword (always present when `begin_keyword_loc` is).
+            let end_line = node
+                .end_keyword_loc()
+                .map(|l| self.idx.loc(l.start_offset()).0)
+                .unwrap_or_else(|| self.idx.loc(node.location().end_offset()).0);
+            self.se_ancestor_end_lines.push(end_line);
         }
         ruby_prism::visit_begin_node(self, node);
         if kwbegin {
             self.usage_block_depth -= 1;
+            self.se_ancestor_end_lines.pop();
         }
     }
     fn visit_ensure_node(&mut self, node: &ruby_prism::EnsureNode<'pr>) {
@@ -1912,7 +1936,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // deeply, through transparent if/begin/block wrappers) is just a
         // regular method call, not an access-modifier declaration.
         self.el_am_scope.push(false);
+        // Lint/SuppressedException's ancestor search: `:any_def` — closing
+        // line is the `end` keyword, or (endless def) the node's own last line.
+        let def_end_line = node
+            .end_keyword_loc()
+            .map(|l| self.idx.loc(l.start_offset()).0)
+            .unwrap_or_else(|| self.idx.loc(node.location().end_offset()).0);
+        self.se_ancestor_end_lines.push(def_end_line);
         ruby_prism::visit_def_node(self, node);
+        self.se_ancestor_end_lines.pop();
         self.el_am_scope.pop();
         self.rs_scope_stack.pop();
         self.class_children_stack.pop();
@@ -2515,6 +2547,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         class_module_depth: 0,
         non_nil_ignored: HashSet::new(),
         mmcbl_heredoc_chain: HashMap::new(),
+        se_ancestor_end_lines: Vec::new(),
     };
 
     let t = tick(&T_PREP, t);

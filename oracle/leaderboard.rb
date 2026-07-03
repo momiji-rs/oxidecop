@@ -219,6 +219,7 @@ COPS = {
   'Naming/HeredocDelimiterCase'      => 'naming/heredoc_delimiter_case',
   'Lint/RescueType'                  => 'lint/rescue_type',
   'Style/CommentAnnotation'          => 'style/comment_annotation',
+  'Lint/SuppressedException'         => 'lint/suppressed_exception',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
