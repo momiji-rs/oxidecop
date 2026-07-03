@@ -201,6 +201,7 @@ COPS = {
   'Style/RedundantFetchBlock'        => 'style/redundant_fetch_block',
   'Metrics/ParameterLists'           => 'metrics/parameter_lists',
   'Layout/ClosingHeredocIndentation' => 'layout/closing_heredoc_indentation',
+  'Lint/ImplicitStringConcatenation' => 'lint/implicit_string_concatenation',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

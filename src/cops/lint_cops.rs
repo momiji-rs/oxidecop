@@ -7189,3 +7189,171 @@ pub(crate) fn is_struct_data_constructor(node: &ruby_prism::CallNode, src: &[u8]
     }
 }
 
+impl<'a> super::Cops<'a> {
+    /// Lint/ImplicitStringConcatenation — adjacent string literals on the
+    /// same line (`'a' 'b'`), which prism (like whitequark) folds into a
+    /// single `InterpolatedStringNode` whose `parts` are the individual
+    /// quoted pieces. Ported from `on_dstr`'s `each_bad_cons`: every
+    /// consecutive pair of parts that are BOTH themselves string literals
+    /// (`StringNode` or a further-nested `InterpolatedStringNode` — i.e. a
+    /// part with its OWN quotes, whether plain or containing real `#{}`
+    /// interpolation) and sit on the same source line is an offense.
+    ///
+    /// Unlike whitequark, prism never splits a single multi-line plain
+    /// string literal into synthetic `str`/`str` parts — a bare `'abc\ndef'`
+    /// stays one `StringNode` and never even reaches this visitor — so
+    /// upstream's `ending_delimiter` guard (worked around whitequark's
+    /// quirk) has no prism equivalent and is intentionally not ported.
+    ///
+    /// The message suffix (`FOR_ARRAY`/`FOR_METHOD`) mirrors upstream's
+    /// `node.parent&.array_type?` / `node.parent&.send_type?`: computed once
+    /// per container node from `isc_array_child`/`isc_send_child` (populated
+    /// eagerly by `visit_array_node`/`visit_call_node`), then reused for
+    /// every offense the container produces.
+    ///
+    /// Autocorrect: `corrector.replace(lhs.end.join(rhs.begin), ' + ')`,
+    /// except when either side's own string VALUE (recursively, like
+    /// upstream's `str_content`) is empty — then that side is deleted
+    /// outright (the triple-quote `"""string"""` case).
+    pub(crate) fn check_implicit_string_concatenation(&mut self, node: &ruby_prism::InterpolatedStringNode) {
+        const COP: &str = "Lint/ImplicitStringConcatenation";
+        if !self.on(COP) {
+            return;
+        }
+        let parts: Vec<ruby_prism::Node> = node.parts().iter().collect();
+        if parts.len() < 2 {
+            return;
+        }
+        let node_start = node.location().start_offset();
+        let suffix: &str = if self.isc_array_child.contains(&node_start) {
+            " Or, if they were intended to be separate array elements, separate them with a comma."
+        } else if self.isc_send_child.contains(&node_start) {
+            " Or, if they were intended to be separate method arguments, separate them with a comma."
+        } else {
+            ""
+        };
+        for pair in parts.windows(2) {
+            let lhs = &pair[0];
+            let rhs = &pair[1];
+            if !isc_is_string_part(lhs) || !isc_is_string_part(rhs) {
+                continue;
+            }
+            let ll = lhs.location();
+            let rl = rhs.location();
+            let lhs_last_line = self.idx.loc(ll.end_offset().saturating_sub(1)).0;
+            let rhs_first_line = self.idx.loc(rl.start_offset()).0;
+            if lhs_last_line != rhs_first_line {
+                continue;
+            }
+            let lhs_disp = String::from_utf8_lossy(&self.isc_display_str(lhs)).into_owned();
+            let rhs_disp = String::from_utf8_lossy(&self.isc_display_str(rhs)).into_owned();
+            let message = format!(
+                "Combine {lhs_disp} and {rhs_disp} into a single string literal, rather than using implicit string concatenation.{suffix}"
+            );
+            self.push(ll.start_offset(), COP, true, message);
+
+            if self.isc_value(lhs).is_empty() {
+                self.fixes.push((ll.start_offset(), ll.end_offset(), Vec::new()));
+            } else if self.isc_value(rhs).is_empty() {
+                self.fixes.push((rl.start_offset(), rl.end_offset(), Vec::new()));
+            } else {
+                self.fixes.push((ll.end_offset(), rl.start_offset(), b" + ".to_vec()));
+            }
+        }
+    }
+
+    /// `Node#value` (`StrNode#value` / rubocop-ast's `DstrNode#value`) — the
+    /// string's own semantic VALUE: a plain `StringNode` contributes its
+    /// unescaped content; a nested `InterpolatedStringNode` recurses over its
+    /// own parts using each part's OWN value when it has one (another
+    /// str/dstr-like part), else falls back to that part's raw source
+    /// (`DstrNode#value`'s `child.respond_to?(:value) ? child.value :
+    /// child.source`) — covers a part that's real `#{}` interpolation. Used
+    /// only for the autocorrect empty-value check (`lhs_node.value == ''`).
+    fn isc_value(&self, part: &ruby_prism::Node) -> Vec<u8> {
+        if let Some(s) = part.as_string_node() {
+            s.unescaped().to_vec()
+        } else if let Some(d) = part.as_interpolated_string_node() {
+            d.parts().iter().flat_map(|p| self.isc_value(&p)).collect()
+        } else {
+            self.node_src(part).to_vec()
+        }
+    }
+
+    /// The cop's own private `str_content` helper — DIFFERENT from
+    /// `Node#value` above despite the similar recursion shape. A plain
+    /// `StringNode` contributes its unescaped content; a nested
+    /// `InterpolatedStringNode` recurses over its own parts; any other part
+    /// (real `#{}` interpolation) contributes NOTHING, mirroring upstream's
+    /// `return unless node.respond_to?(:str_type?)` guard, which — walking a
+    /// non-str/dstr node's OWN children generically — bottoms out at bare
+    /// `nil`/`Symbol` leaves (a call's receiver-less receiver, its selector)
+    /// that don't respond to `str_type?` either, so a `#{...}` part with no
+    /// string literal nested inside it collapses to `''` rather than its
+    /// source text. Used only by `display_str`'s inspect fallback.
+    fn isc_str_content(&self, part: &ruby_prism::Node) -> Vec<u8> {
+        if let Some(s) = part.as_string_node() {
+            s.unescaped().to_vec()
+        } else if let Some(d) = part.as_interpolated_string_node() {
+            d.parts().iter().flat_map(|p| self.isc_str_content(&p)).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// `display_str` — the part's raw source UNLESS it spans multiple lines,
+    /// in which case upstream substitutes `str_content(node).inspect` (its
+    /// semantic value, Ruby-`String#inspect`-quoted) so the message doesn't
+    /// spill a literal newline into the offense text.
+    fn isc_display_str(&self, part: &ruby_prism::Node) -> Vec<u8> {
+        let src = self.node_src(part);
+        if src.contains(&b'\n') {
+            isc_ruby_inspect(&self.isc_str_content(part))
+        } else {
+            src.to_vec()
+        }
+    }
+}
+
+/// `string_literal?` — a part counts as a string literal (safe to pair up
+/// for implicit-concatenation detection) whether it's a plain quoted piece
+/// or itself a quoted piece with real `#{}` interpolation inside; only a
+/// bare embedded-expression part (no quotes of its own) fails this.
+fn isc_is_string_part(part: &ruby_prism::Node) -> bool {
+    part.as_string_node().is_some() || part.as_interpolated_string_node().is_some()
+}
+
+/// A close approximation of Ruby's `String#inspect` for the common escapes
+/// (backslash/quote/whitespace control chars, `#{`/`#@`/`#$` sigils, other
+/// control bytes as `\xHH`); valid UTF-8 multibyte text passes through
+/// unescaped, matching MRI's behavior for printable characters.
+fn isc_ruby_inspect(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 2);
+    out.push(b'"');
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            0x1b => out.extend_from_slice(b"\\e"),
+            0x07 => out.extend_from_slice(b"\\a"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0x0b => out.extend_from_slice(b"\\v"),
+            b'#' if matches!(bytes.get(i + 1), Some(b'{') | Some(b'@') | Some(b'$')) => {
+                out.push(b'\\');
+                out.push(b'#');
+            }
+            0x00..=0x1f | 0x7f => out.extend_from_slice(format!("\\x{b:02X}").as_bytes()),
+            _ => out.push(b),
+        }
+        i += 1;
+    }
+    out.push(b'"');
+    out
+}
+
