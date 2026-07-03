@@ -155,6 +155,7 @@ COPS = {
   'Layout/EmptyLinesAroundAccessModifier' => 'layout/empty_lines_around_access_modifier',
   'Lint/ToJSON'                      => 'lint/to_json',
   'Security/YAMLLoad'                => 'security/yaml_load',
+  'Style/StabbyLambdaParentheses'    => 'style/stabby_lambda_parentheses',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -4887,3 +4887,79 @@ const RS_KERNEL_METHODS: &[&[u8]] = &[
     b"set_trace_func", b"sleep", b"spawn", b"sprintf", b"srand", b"syscall", b"system",
     b"test", b"throw", b"trace_var", b"trap", b"untrace_var", b"warn",
 ];
+
+impl<'a> super::Cops<'a> {
+    /// Style/StabbyLambdaParentheses — checks for parentheses around stabby
+    /// lambda arguments. Two styles: `require_parentheses` (default) requires
+    /// parentheses around non-empty parameter lists; `require_no_parentheses`
+    /// forbids them.
+    ///
+    /// Ported from rubocop's `StabbyLambdaParentheses` cop using
+    /// `ConfigurableEnforcedStyle` mixin.
+    pub(crate) fn check_stabby_lambda_parentheses(&mut self, node: &ruby_prism::LambdaNode<'_>) {
+        const COP: &str = "Style/StabbyLambdaParentheses";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Only process if there are parameters
+        let Some(params) = node.parameters() else { return };
+        let Some(bp) = params.as_block_parameters_node() else { return };
+
+        // Skip if parameters node is empty (no actual parameters)
+        if bp.parameters().is_none() && bp.locals().iter().next().is_none() {
+            return;
+        }
+
+        // Determine the style: default is "require_parentheses"
+        let enforce_parentheses = self
+            .cfg
+            .get(COP, "EnforcedStyle")
+            .map(|v| v != "require_no_parentheses")
+            .unwrap_or(true);
+
+        // Check if parentheses are present
+        let has_parens = bp.opening_loc().is_some();
+
+        // Determine if we should flag this
+        let should_flag = if enforce_parentheses {
+            !has_parens // Missing parentheses when require_parentheses
+        } else {
+            has_parens // Has parentheses when require_no_parentheses
+        };
+
+        if !should_flag {
+            return;
+        }
+
+        // Get the location of the entire parameters node
+        let params_loc = bp.location();
+        let offense_start = params_loc.start_offset();
+
+        // Determine message based on style
+        let msg = if enforce_parentheses {
+            "Wrap stabby lambda arguments with parentheses."
+        } else {
+            "Do not wrap stabby lambda arguments with parentheses."
+        };
+
+        self.push(offense_start, COP, true, msg);
+
+        // Generate the fix
+        if enforce_parentheses {
+            // Add parentheses around the parameters
+            let params_end = params_loc.end_offset();
+            self.fixes.push((offense_start, offense_start, b"(".to_vec()));
+            self.fixes.push((params_end, params_end, b")".to_vec()));
+        } else {
+            // Remove parentheses
+            let open_loc = bp.opening_loc().unwrap();
+            let close_loc = bp.closing_loc().unwrap();
+            let open_start = open_loc.start_offset();
+            let close_end = close_loc.end_offset();
+
+            self.fixes.push((open_start, open_loc.end_offset(), Vec::new()));
+            self.fixes.push((close_loc.start_offset(), close_end, Vec::new()));
+        }
+    }
+}
