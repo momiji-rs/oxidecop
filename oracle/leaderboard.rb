@@ -177,6 +177,7 @@ COPS = {
   'Lint/PercentStringArray'          => 'lint/percent_string_array',
   'Lint/MixedRegexpCaptureTypes'     => 'lint/mixed_regexp_capture_types',
   'Style/NestedParenthesizedCalls'   => 'style/nested_parenthesized_calls',
+  'Style/StringLiteralsInInterpolation' => 'style/string_literals_in_interpolation',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -99,6 +99,9 @@ pub(crate) struct Hot {
     /// 1 = single_quotes, 2 = double_quotes, 0 = anything else
     pub(crate) string_style: u8,
     pub(crate) consistent_quotes: bool,
+    pub(crate) string_literals_in_interpolation: bool,
+    /// 1 = single_quotes, 2 = double_quotes, 0 = anything else
+    pub(crate) string_interp_style: u8,
     pub(crate) numeric_literals: bool,
     pub(crate) min_digits: usize,
     pub(crate) numeric_strict: bool,
@@ -159,7 +162,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Documentation", "Style/EvenOdd", "Style/FrozenStringLiteralComment",
     "Style/NegatedIf", "Style/NestedFileDirname", "Style/NilComparison",
     "Style/NumericLiterals", "Style/NumericPredicate", "Style/RandomWithOffset",
-    "Style/RedundantReturn", "Style/StringChars", "Style/StringLiterals",
+    "Style/RedundantReturn", "Style/StringChars", "Style/StringLiterals", "Style/StringLiteralsInInterpolation",
     "Style/SymbolProc", "Style/UnpackFirst", "Style/ZeroLengthPredicate",
     "Lint/RegexpAsCondition", "Style/MultilineIfModifier",
     "Layout/EmptyLinesAroundAccessModifier",
@@ -270,6 +273,12 @@ impl Engine {
             },
             consistent_quotes: cfg.param("Style/StringLiterals", "ConsistentQuotesInMultiline")
                 == Some("true"),
+            string_literals_in_interpolation: is_on("Style/StringLiteralsInInterpolation"),
+            string_interp_style: match cfg.enforced_style("Style/StringLiteralsInInterpolation") {
+                "single_quotes" => 1,
+                "double_quotes" => 2,
+                _ => 0,
+            },
             numeric_literals: is_on("Style/NumericLiterals"),
             min_digits: cfg.int("Style/NumericLiterals", "MinDigits"),
             numeric_strict: cfg.param("Style/NumericLiterals", "Strict") == Some("true"),
@@ -832,6 +841,7 @@ macro_rules! assignment_path_operator_write {
 impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
         self.check_string_literals(node);
+        self.check_string_literals_in_interpolation(node);
         self.check_character_literal(node);
         self.check_gvar_artifact(node);
         self.check_heredoc_delimiter_naming(node.opening_loc(), node.closing_loc());

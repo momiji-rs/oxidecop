@@ -6631,3 +6631,85 @@ fn npc_leading_space_start(src: &[u8], mut pos: usize) -> usize {
     }
     pos
 }
+impl<'a> super::Cops<'a> {
+    /// Style/StringLiteralsInInterpolation — strings inside `#{}` interpolations
+    /// must match the configured quote style. Only runs when inside an
+    /// interpolation (interp_depth > 0). Similar to check_string_literals but
+    /// operates on strings within interpolations and uses different messaging.
+    pub(crate) fn check_string_literals_in_interpolation(&mut self, node: &ruby_prism::StringNode) {
+        const COP: &str = "Style/StringLiteralsInInterpolation";
+        if !self.hot.string_literals_in_interpolation || self.interp_depth == 0 {
+            return;
+        }
+        let Some(open) = node.opening_loc() else { return };
+        let src = self.node_src(&node.as_node());
+        let l = node.location();
+        let c = node.content_loc().as_slice();
+
+        match self.hot.string_interp_style {
+            1 if open.as_slice() == b"\"" => {
+                // Prefer single quotes, but have double quotes
+                if !double_quotes_required(src) {
+                    self.push(l.start_offset(), COP, true, "Prefer single-quoted strings inside interpolations.");
+                    if !c.contains(&b'\n') {
+                        // Same fix logic as check_string_literals: double -> single
+                        let mut runtime = Vec::new();
+                        let mut i = 0;
+                        while i < c.len() {
+                            if c[i] == b'\\' && matches!(c.get(i + 1), Some(b'"') | Some(b'\\')) {
+                                runtime.push(c[i + 1]);
+                                i += 2;
+                            } else {
+                                runtime.push(c[i]);
+                                i += 1;
+                            }
+                        }
+                        let mut esc = Vec::new();
+                        for b in &runtime {
+                            if *b == b'\\' {
+                                esc.extend_from_slice(b"\\\\");
+                            } else {
+                                esc.push(*b);
+                            }
+                        }
+                        let mut rep = vec![b'\''];
+                        let mut i = 0;
+                        while i < esc.len() {
+                            if esc[i] == b'\\' && esc.get(i + 1) == Some(&b'"') {
+                                rep.push(b'"');
+                                i += 2;
+                            } else {
+                                rep.push(esc[i]);
+                                i += 1;
+                            }
+                        }
+                        rep.push(b'\'');
+                        self.fixes.push((l.start_offset(), l.end_offset(), rep));
+                    }
+                }
+            }
+            2 if open.as_slice() == b"'" => {
+                // Prefer double quotes, but have single quotes
+                if !single_quotes_required(src) {
+                    self.push(l.start_offset(), COP, true, "Prefer double-quoted strings inside interpolations.");
+                    // Single -> double fix
+                    let mut rep = vec![b'"'];
+                    let mut i = 0;
+                    while i < c.len() {
+                        if c[i] == b'\\' && c.get(i + 1) == Some(&b'\'') {
+                            rep.push(b'\'');
+                            i += 2;
+                        } else {
+                            rep.push(c[i]);
+                            i += 1;
+                        }
+                    }
+                    rep.push(b'"');
+                    self.fixes.push((l.start_offset(), l.end_offset(), rep));
+                }
+            }
+            _ => {}
+        }
+    }
+
+}
