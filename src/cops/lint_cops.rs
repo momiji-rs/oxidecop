@@ -4654,3 +4654,441 @@ impl<'a> super::Cops<'a> {
         self.idx.starts.get(line0 + 1).copied().unwrap_or(self.src.len())
     }
 }
+
+// ---- Lint/LiteralInInterpolation helpers ----
+//
+// Ports `RuboCop::Cop::Lint::LiteralInInterpolation` (rubocop 1.88.0)
+// verbatim, including its `autocorrected_value`/`autocorrected_value_in_hash`
+// per-type dispatch and the regexp-slash backslash-rebalancing formula.
+
+/// rubocop's `prints_as_self?`: basic literals print their own source when
+/// stringified; composites (array/hash/range) do too iff every element does.
+/// `__FILE__`/`__LINE__`/`__ENCODING__`/`__END__` need no special-casing
+/// here (unlike upstream's whitequark-AST `special_keyword?`): prism gives
+/// them their own node types (`SourceFileNode`/`SourceLineNode`/
+/// `SourceEncodingNode`/a plain `CallNode`), none of which match below.
+fn lii_prints_as_self(node: &ruby_prism::Node) -> bool {
+    if node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_string_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+        || node.as_nil_node().is_some()
+        || node.as_rational_node().is_some()
+        || node.as_imaginary_node().is_some()
+    {
+        return true;
+    }
+    if let Some(arr) = node.as_array_node() {
+        return arr.elements().iter().all(|e| lii_prints_as_self(&e));
+    }
+    if let Some(h) = node.as_hash_node() {
+        return h.elements().iter().all(|e| {
+            e.as_assoc_node()
+                .is_some_and(|a| lii_prints_as_self(&a.key()) && lii_prints_as_self(&a.value()))
+        });
+    }
+    if let Some(r) = node.as_range_node() {
+        return r.left().map_or(true, |l| lii_prints_as_self(&l))
+            && r.right().map_or(true, |rr| lii_prints_as_self(&rr));
+    }
+    false
+}
+
+/// `space_literal?`: an empty/whitespace-only plain string.
+fn lii_is_space_literal(node: &ruby_prism::Node) -> bool {
+    node.as_string_node()
+        .is_some_and(|s| std::str::from_utf8(s.unescaped()).is_ok_and(|v| v.trim().is_empty()))
+}
+
+/// rubocop's `escape_string_content`: `/[\\"]|#(?=[@{$])/` -> backslash-
+/// prefix the match. Operates on already-*decoded* string bytes.
+fn lii_escape_string_content(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' || b == b'"' {
+            out.push(b'\\');
+            out.push(b);
+        } else if b == b'#' && matches!(bytes.get(i + 1), Some(b'@') | Some(b'{') | Some(b'$')) {
+            out.push(b'\\');
+            out.push(b'#');
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The generic `node.source.gsub('"', '\"')` fallback used throughout the
+/// upstream cop for composite/else cases: raw source text, quotes escaped.
+fn lii_escape_quotes_raw(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for &b in bytes {
+        if b == b'"' {
+            out.push(b'\\');
+        }
+        out.push(b);
+    }
+    out
+}
+
+/// `node.children.last.to_i.to_s` for an `int` node — decimal string,
+/// underscores/base-prefixes stripped, sign preserved. Uses i128 (Ruby
+/// Integer literals are arbitrary precision; ones exceeding i128 are not
+/// handled — not exercised by the fixture).
+fn lii_int_decimal(node: &ruby_prism::IntegerNode, src: &[u8]) -> String {
+    let l = node.location();
+    let raw = String::from_utf8_lossy(&src[l.start_offset()..l.end_offset()]).replace('_', "");
+    let (neg, raw) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest.to_string()),
+        None => (false, raw),
+    };
+    let (radix, digits): (u32, &str) = if node.is_hexadecimal() {
+        (16, raw.trim_start_matches("0x").trim_start_matches("0X"))
+    } else if node.is_binary() {
+        (2, raw.trim_start_matches("0b").trim_start_matches("0B"))
+    } else if node.is_octal() {
+        let stripped = raw.trim_start_matches("0o").trim_start_matches("0O");
+        if stripped.len() != raw.len() {
+            (8, stripped)
+        } else {
+            // legacy `0377`-style octal (leading zero, no `o`)
+            (8, raw.trim_start_matches('0'))
+        }
+    } else {
+        (10, raw.as_str())
+    };
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let value = i128::from_str_radix(digits, radix).unwrap_or(0);
+    if neg { (-value).to_string() } else { value.to_string() }
+}
+
+/// `node.children.last.to_f.to_s` for a `float` node — Ruby always keeps at
+/// least one fractional digit (`2.0.to_s == "2.0"`).
+fn lii_float_to_s(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() };
+    }
+    let s = format!("{value}");
+    if s.contains('.') || s.contains('e') || s.contains('E') { s } else { format!("{s}.0") }
+}
+
+/// Is `name` (the *decoded* symbol content) a valid bare identifier that
+/// `Symbol#inspect` prints without quotes? Approximates MRI's
+/// `rb_str_symname_p` for the common cases the fixture exercises (plain
+/// identifiers/ivars/cvars/gvars/operator method names) — exotic method
+/// names (e.g. unusual operator combinations) are not exhaustively covered.
+fn lii_is_plain_symbol_name(name: &[u8]) -> bool {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"^(?:[A-Za-z_][A-Za-z0-9_]*[?!=]?|@[A-Za-z_][A-Za-z0-9_]*|@@[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z_][A-Za-z0-9_]*|\+@|-@|\+|-|\*\*|\*|/|%|==|===|!=|<=>|<<|>>|<=|>=|<|>|&|\||\^|~|!|=~|!~|\[\]=|\[\])$",
+        )
+        .unwrap()
+    });
+    std::str::from_utf8(name).is_ok_and(|s| re.is_match(s))
+}
+
+/// `node.value.inspect` for a `sym` node — bare `:name` for plain
+/// identifiers, else a quoted `:"name"` form (minimal backslash/quote
+/// escaping of the name itself; the caller re-escapes via
+/// `lii_escape_string_content` for embedding, matching upstream's
+/// `escape_string_content(node.value.inspect)`).
+fn lii_symbol_inspect(name: &[u8]) -> Vec<u8> {
+    if lii_is_plain_symbol_name(name) {
+        let mut v = vec![b':'];
+        v.extend_from_slice(name);
+        v
+    } else {
+        let mut v = vec![b':', b'"'];
+        for &b in name {
+            if b == b'\\' || b == b'"' {
+                v.push(b'\\');
+            }
+            v.push(b);
+        }
+        v.push(b'"');
+        v
+    }
+}
+
+/// `autocorrected_value_for_string`.
+fn lii_value_for_string(node: &ruby_prism::StringNode, src: &[u8]) -> Vec<u8> {
+    if std::str::from_utf8(node.unescaped()).is_err() {
+        let l = node.location();
+        let mut s = src[l.start_offset()..l.end_offset()].to_vec();
+        if s.first() == Some(&b'"') {
+            s.remove(0);
+        }
+        if s.last() == Some(&b'"') {
+            s.pop();
+        }
+        return s;
+    }
+    lii_escape_string_content(node.unescaped())
+}
+
+/// `autocorrected_value_for_symbol` — prism's `value_loc` already gives the
+/// exact content range (no `:`/quotes), so this is just raw-source
+/// quote-escaping of that slice (matches upstream's begin/end-pos math).
+fn lii_value_for_symbol(node: &ruby_prism::SymbolNode, src: &[u8]) -> Vec<u8> {
+    let l = node.value_loc().unwrap_or_else(|| node.location());
+    lii_escape_quotes_raw(&src[l.start_offset()..l.end_offset()])
+}
+
+/// `autocorrected_value_for_array` — non-percent arrays are replaced
+/// verbatim (raw source, quotes escaped, NOT re-serialized element by
+/// element); `%w`/`%W`/`%i`/`%I` arrays are re-rendered from their
+/// whitespace-split *content* as a plain string array (rubocop does not
+/// semantically distinguish `%i`/`%I` from `%w`/`%W` here — see fixture).
+fn lii_value_for_array(node: &ruby_prism::ArrayNode, src: &[u8]) -> Vec<u8> {
+    let is_percent = node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"%"));
+    if !is_percent {
+        let l = node.location();
+        return lii_escape_quotes_raw(&src[l.start_offset()..l.end_offset()]);
+    }
+    let open = node.opening_loc().unwrap();
+    let close = node.closing_loc().unwrap();
+    let content = &src[open.end_offset()..close.start_offset()];
+    let words: Vec<&[u8]> =
+        content.split(|b: &u8| b.is_ascii_whitespace()).filter(|w| !w.is_empty()).collect();
+    let mut rendered = vec![b'['];
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 {
+            rendered.extend_from_slice(b", ");
+        }
+        rendered.push(b'"');
+        rendered.extend_from_slice(w);
+        rendered.push(b'"');
+    }
+    rendered.push(b']');
+    lii_escape_quotes_raw(&rendered)
+}
+
+/// `autocorrected_value_for_hash`.
+fn lii_value_for_hash(node: &ruby_prism::HashNode, src: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'{'];
+    for (i, el) in node.elements().iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b", ");
+        }
+        let Some(assoc) = el.as_assoc_node() else { continue };
+        out.extend(lii_value_in_hash(&assoc.key(), src));
+        out.extend_from_slice(b"=>");
+        out.extend(lii_value_in_hash(&assoc.value(), src));
+    }
+    out.push(b'}');
+    out
+}
+
+/// `autocorrected_value_in_hash` — a *different* (more conservative)
+/// per-type dispatch used for keys/values nested inside a hash; notably
+/// `str` is escaped as `\"...\"` (each embedded `"` becomes `\\\"`) rather
+/// than via `escape_string_content`.
+fn lii_value_in_hash(node: &ruby_prism::Node, src: &[u8]) -> Vec<u8> {
+    if let Some(n) = node.as_integer_node() {
+        return lii_int_decimal(&n, src).into_bytes();
+    }
+    if let Some(n) = node.as_float_node() {
+        return lii_float_to_s(n.value()).into_bytes();
+    }
+    if let Some(n) = node.as_string_node() {
+        // `"\\\"#{value.gsub('"') { '\\\\\"' }}\\\""` — each embedded `"`
+        // becomes THREE backslashes + a quote (verified against the actual
+        // cop method, not hand-transcribed: a manual first pass here
+        // under-escaped by one backslash and was caught by a live
+        // rubocop-vs-oxidecop diff on the nested-hash fixture example).
+        let mut out = vec![b'\\', b'"'];
+        for &b in n.unescaped() {
+            if b == b'"' {
+                out.push(b'\\');
+                out.push(b'\\');
+                out.push(b'\\');
+                out.push(b'"');
+            } else {
+                out.push(b);
+            }
+        }
+        out.push(b'\\');
+        out.push(b'"');
+        return out;
+    }
+    if let Some(n) = node.as_symbol_node() {
+        return lii_escape_string_content(&lii_symbol_inspect(n.unescaped()));
+    }
+    if let Some(n) = node.as_array_node() {
+        return lii_value_for_array(&n, src);
+    }
+    if let Some(n) = node.as_hash_node() {
+        return lii_value_for_hash(&n, src);
+    }
+    let l = node.location();
+    lii_escape_quotes_raw(&src[l.start_offset()..l.end_offset()])
+}
+
+/// `autocorrected_value` — the top-level per-type dispatch for the offending
+/// literal itself.
+fn lii_autocorrected_value(node: &ruby_prism::Node, src: &[u8]) -> Vec<u8> {
+    if let Some(n) = node.as_integer_node() {
+        return lii_int_decimal(&n, src).into_bytes();
+    }
+    if let Some(n) = node.as_float_node() {
+        return lii_float_to_s(n.value()).into_bytes();
+    }
+    if let Some(n) = node.as_string_node() {
+        return lii_value_for_string(&n, src);
+    }
+    if let Some(n) = node.as_symbol_node() {
+        return lii_value_for_symbol(&n, src);
+    }
+    if let Some(n) = node.as_array_node() {
+        return lii_value_for_array(&n, src);
+    }
+    if let Some(n) = node.as_hash_node() {
+        return lii_value_for_hash(&n, src);
+    }
+    if node.as_nil_node().is_some() {
+        return Vec::new();
+    }
+    let l = node.location();
+    lii_escape_quotes_raw(&src[l.start_offset()..l.end_offset()])
+}
+
+/// `handle_special_regexp_chars` — only invoked for `/../`-slash-delimited
+/// regexps whose expanded value contains a `/`; re-balances backslash runs
+/// immediately preceding a slash so the compiled `Regexp`'s behavior
+/// survives removing the interpolation.
+fn lii_handle_regexp_slashes(value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len());
+    let mut backslashes = 0usize;
+    for &b in value {
+        if b == b'\\' {
+            backslashes += 1;
+        } else if b == b'/' {
+            let needed = 2 * ((backslashes + 1) / 4) + 1;
+            out.extend(std::iter::repeat(b'\\').take(needed));
+            out.push(b'/');
+            backslashes = 0;
+        } else {
+            out.extend(std::iter::repeat(b'\\').take(backslashes));
+            backslashes = 0;
+            out.push(b);
+        }
+    }
+    out.extend(std::iter::repeat(b'\\').take(backslashes));
+    out
+}
+
+impl<'a> super::Cops<'a> {
+    /// Lint/LiteralInInterpolation — `"result is #{10}"` → `"result is 10"`.
+    /// Hooked from each of the four interpolation-capable container types
+    /// (dstr/dsym/xstr/regexp), mirroring the `Interpolation` mixin's
+    /// `on_dstr`/`on_xstr`/`on_dsym`/`on_regexp` → `each_child_node(:begin)`:
+    /// each container only inspects its OWN direct `#{...}` children —
+    /// nested interpolations are handled independently when the walker
+    /// separately reaches their own (nested) container node.
+    fn check_lii(
+        &mut self,
+        es: &ruby_prism::EmbeddedStatementsNode,
+        is_regexp: bool,
+        regexp_slash: bool,
+        ends_heredoc: bool,
+    ) {
+        const COP: &str = "Lint/LiteralInInterpolation";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(stmts) = es.statements() else { return };
+        let Some(final_node) = stmts.body().last() else { return };
+
+        if !lii_prints_as_self(&final_node) {
+            return;
+        }
+        // `array_in_regexp?`: arrays interpolated directly into a regexp are
+        // handled by `Lint/ArrayLiteralInRegexp` instead.
+        if is_regexp && final_node.as_array_node().is_some() {
+            return;
+        }
+        // `space_literal? && ends_heredoc_line?`: an explicit space literal
+        // at the very end of a heredoc line is left alone (interacts with
+        // Layout/TrailingWhitespace instead).
+        if ends_heredoc && lii_is_space_literal(&final_node) {
+            return;
+        }
+
+        let mut expanded = lii_autocorrected_value(&final_node, self.src);
+        if is_regexp && regexp_slash && expanded.contains(&b'/') {
+            expanded = lii_handle_regexp_slashes(&expanded);
+        }
+
+        // `in_array_percent_literal?`: inside a `%W`/`%I` array element,
+        // don't strip an interpolation whose expansion is empty or
+        // contains whitespace (it would silently merge/split words).
+        let es_l = es.location();
+        let in_percent_array = self
+            .percent_arr_spans
+            .iter()
+            .any(|(s, e)| es_l.start_offset() >= *s && es_l.start_offset() < *e);
+        if in_percent_array && (expanded.is_empty() || expanded.iter().any(u8::is_ascii_whitespace)) {
+            return;
+        }
+
+        let anchor = final_node.location().start_offset();
+        self.push(anchor, COP, true, "Literal interpolation detected.");
+
+        // nested dstr final node ("this is #{"#{1}"}"): upstream skips the
+        // correction here — "fixed in next iteration".
+        if final_node.as_interpolated_string_node().is_some() {
+            return;
+        }
+        self.fixes.push((es_l.start_offset(), es_l.end_offset(), expanded));
+    }
+
+    pub(crate) fn check_lii_dstr(&mut self, node: &ruby_prism::InterpolatedStringNode) {
+        let is_heredoc = node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<"));
+        let parts: Vec<ruby_prism::Node> = node.parts().iter().collect();
+        for (i, p) in parts.iter().enumerate() {
+            let Some(es) = p.as_embedded_statements_node() else { continue };
+            // `ends_heredoc_line?`, reformulated in prism-native terms: for
+            // squiggly/plain heredocs, a physical line's own newline shows
+            // up as the very next `parts()` element (a bare `"\n"` string)
+            // — this holds iff nothing else follows the `#{...}` on the
+            // line.
+            let ends_heredoc = is_heredoc
+                && parts
+                    .get(i + 1)
+                    .and_then(|n| n.as_string_node())
+                    .is_some_and(|s| s.unescaped().first() == Some(&b'\n'));
+            self.check_lii(&es, false, false, ends_heredoc);
+        }
+    }
+
+    pub(crate) fn check_lii_dsym(&mut self, node: &ruby_prism::InterpolatedSymbolNode) {
+        for p in node.parts().iter() {
+            let Some(es) = p.as_embedded_statements_node() else { continue };
+            self.check_lii(&es, false, false, false);
+        }
+    }
+
+    pub(crate) fn check_lii_ixstr(&mut self, node: &ruby_prism::InterpolatedXStringNode) {
+        for p in node.parts().iter() {
+            let Some(es) = p.as_embedded_statements_node() else { continue };
+            self.check_lii(&es, false, false, false);
+        }
+    }
+
+    pub(crate) fn check_lii_iregexp(&mut self, node: &ruby_prism::InterpolatedRegularExpressionNode) {
+        let slash = node.opening_loc().as_slice() == b"/";
+        for p in node.parts().iter() {
+            let Some(es) = p.as_embedded_statements_node() else { continue };
+            self.check_lii(&es, true, slash, false);
+        }
+    }
+}
