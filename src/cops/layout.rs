@@ -3981,3 +3981,234 @@ impl<'a> super::Cops<'a> {
             .unwrap_or(2)
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Layout/EmptyLinesAroundAccessModifier — ported from rubocop's cop of
+    /// the same name (`on_send` + a handful of private helpers), run here
+    /// inside `visit_statements_node` (sibling-context style, like
+    /// `check_empty_lines_around_attribute_accessor` above — see its doc
+    /// comment for why "the next element in this exact statement list" is
+    /// already prism's equivalent of upstream's guarded `right_sibling`).
+    ///
+    /// A bare `public`/`protected`/`private`/`module_function` call — no
+    /// receiver, no arguments — is upstream's `bare_access_modifier?`. A
+    /// literal block (`private { ... }`) and a `&sym`/`&blk` block-pass
+    /// (`private(&:foo)`) both land in prism's `CallNode::block()` (the trap
+    /// noted in the brief: `&:sym` isn't a `BlockNode`), and BOTH disqualify
+    /// the call here — matching upstream's combined `bare_access_modifier? &&
+    /// !block_literal?` gate: a literal block never has a bare shape in
+    /// prism's own AST to begin with (irrelevant), while whitequark's
+    /// `bare_access_modifier_declaration?` pattern already treats a
+    /// block-pass as an extra child making it NON-bare, and non-bare access
+    /// modifiers are never processed by `on_send` at all. Either way the
+    /// verdict is "skip entirely", so a single `call.block().is_some()` check
+    /// covers both upstream code paths.
+    ///
+    /// Beyond the bare shape, upstream's `bare_access_modifier?` also
+    /// requires `in_macro_scope?` — a recursive parent-chain walk through
+    /// class/module/sclass (always true), a `Class.new`/`Module.new`/
+    /// `Struct.new`/`Data.define` block (always true), or transparently
+    /// through kwbegin/any-block/if-branch wrappers, bottoming out at the
+    /// top-level program (true) or a `def` (false, and NOT a wrapper, so it
+    /// blocks the recursion). See the `el_am_scope` field doc in mod.rs for
+    /// how that recursion is translated into a push/pop stack maintained by
+    /// `visit_class_node`/`visit_module_node`/`visit_singleton_class_node`/
+    /// `visit_def_node`/`visit_block_node` (transparent wrappers — any other
+    /// block, an explicit `begin...end`, an `if`/`unless` branch — simply
+    /// don't touch the stack, which is exactly "inherit the enclosing
+    /// scope").
+    pub(crate) fn check_empty_lines_around_access_modifier(&mut self, stmts: &ruby_prism::StatementsNode<'_>) {
+        const COP: &str = "Layout/EmptyLinesAroundAccessModifier";
+        // One-shot flag `visit_block_node` set right before descending into
+        // THIS exact statements list, if (and only if) it's a block's own
+        // body — consumed unconditionally, cop-enabled or not, so a later
+        // unrelated statements list never sees a stale value.
+        let is_block_body = std::mem::take(&mut self.el_am_block_owns_next_stmts);
+        if !self.on(COP) {
+            return;
+        }
+        if !self.el_am_scope.last().copied().unwrap_or(true) {
+            return;
+        }
+        let body: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        let style = self.cfg.enforced_style(COP); // "around" (default) / "only_before"
+        for i in 0..body.len() {
+            let Some(call) = body[i].as_call_node() else { continue };
+            if call.receiver().is_some() || call.arguments().is_some() || call.block().is_some() {
+                continue;
+            }
+            let name_id = call.name();
+            let name = name_id.as_slice();
+            if !matches!(name, b"public" | b"protected" | b"private" | b"module_function") {
+                continue;
+            }
+            let loc = call.location();
+            let start = loc.start_offset();
+            let first_line = self.idx.loc(start).0;
+            let last_line = self.idx.loc(loc.end_offset().saturating_sub(1)).0;
+            // `same_line?(node, node.right_sibling)`
+            if body.get(i + 1).is_some_and(|n| self.idx.loc(n.location().start_offset()).0 == first_line) {
+                continue;
+            }
+            let expected = if style == "only_before" {
+                self.el_am_allowed_only_before(name, first_line, last_line)
+            } else {
+                self.el_am_previous_line_empty(first_line) && self.el_am_next_line_empty(last_line)
+            };
+            if expected {
+                continue;
+            }
+            let modifier = String::from_utf8_lossy(name);
+            let message = if style == "only_before" {
+                if self.el_am_next_line_empty(last_line) {
+                    format!("Remove a blank line after `{modifier}`.")
+                } else {
+                    format!("Keep a blank line before `{modifier}`.")
+                }
+            } else if self.el_am_block_start(first_line) || self.el_am_class_def(first_line) {
+                format!("Keep a blank line after `{modifier}`.")
+            } else {
+                format!("Keep a blank line before and after `{modifier}`.")
+            };
+            self.push(start, COP, true, message);
+
+            // autocorrect — `range_by_whole_lines(node.source_range)`: the
+            // access modifier is always a single physical line (a bare call
+            // has no room for a newline), so this is just that one line.
+            let line_start = self.idx.starts[first_line - 1];
+            let line_end = self.line_end(last_line);
+            if self.el_am_should_insert_before(is_block_body, &body, i, first_line) {
+                self.fixes.push((line_start, line_start, b"\n".to_vec()));
+            }
+            if self.el_am_should_insert_after(is_block_body, &body, i) {
+                if style == "only_before" {
+                    // `next_empty_line_range`: the blank line's own lone
+                    // terminator — a 1-byte removal collapses it.
+                    if self.el_am_next_line_empty_and_exists(last_line) {
+                        let blank_start = self.idx.starts[last_line];
+                        self.fixes.push((blank_start, blank_start + 1, Vec::new()));
+                    }
+                } else if !self.el_am_next_line_empty(last_line) {
+                    self.fixes.push((line_end, line_end, b"\n".to_vec()));
+                }
+            }
+        }
+    }
+
+    /// `block_start?`: is `line` the line right after the most-recently-seen
+    /// block's own opening line? (rubocop's `@block_line` — see the field
+    /// doc for its non-restoring overwrite semantics.)
+    fn el_am_block_start(&self, line: usize) -> bool {
+        self.el_am_block_line.is_some_and(|b| line == b + 1)
+    }
+
+    /// `class_def?`: is `line` right after the most-recently-seen class-like
+    /// construct's own first line? (rubocop's `@class_or_module_def_first_line`.)
+    fn el_am_class_def(&self, line: usize) -> bool {
+        self.el_am_class_first_line.is_some_and(|f| line == f + 1)
+    }
+
+    /// `body_end?`, folded into `next_line_empty?` below: is `line` right
+    /// before the most-recently-seen class-like construct's own last line?
+    /// (rubocop's `@class_or_module_def_last_line`.)
+    fn el_am_body_end(&self, line: usize) -> bool {
+        self.el_am_class_last_line.is_some_and(|l| line + 1 == l)
+    }
+
+    /// `comment_line?`: the WHOLE line, ignoring leading whitespace, is a
+    /// comment (`/^\s*#/` — purely textual, same as upstream).
+    fn el_am_comment_line(&self, line: usize) -> bool {
+        let Some(&s) = self.idx.starts.get(line - 1) else { return false };
+        let e = self.line_end(line);
+        match self.src[s..e].iter().position(|b| !b.is_ascii_whitespace()) {
+            Some(p) => self.src[s + p] == b'#',
+            None => false,
+        }
+    }
+
+    /// `previous_line_empty?`: scans upward from `first_line`, skipping
+    /// full-comment lines. Nothing found (start of file, or everything above
+    /// is a comment) counts as empty. Otherwise empty iff `first_line` is
+    /// right after a block/class start, or the found line is blank.
+    fn el_am_previous_line_empty(&self, first_line: usize) -> bool {
+        let mut found: Option<usize> = None;
+        for line in (1..first_line).rev() {
+            if self.el_am_comment_line(line) {
+                continue;
+            }
+            found = Some(line);
+            break;
+        }
+        let Some(line) = found else { return true };
+        self.el_am_block_start(first_line) || self.el_am_class_def(first_line) || self.el_attr_line_blank(line)
+    }
+
+    /// `next_line_empty?`.
+    fn el_am_next_line_empty(&self, last_line: usize) -> bool {
+        self.el_am_body_end(last_line) || self.el_attr_line_blank(last_line + 1)
+    }
+
+    /// `next_line_empty_and_exists?`.
+    fn el_am_next_line_empty_and_exists(&self, last_line: usize) -> bool {
+        self.el_am_next_line_empty(last_line) && (last_line + 1) != self.idx.starts.len()
+    }
+
+    /// The exact text of `line` (no trimming), or `None` past EOF.
+    fn el_am_line_text(&self, line: usize) -> Option<&[u8]> {
+        let &s = self.idx.starts.get(line - 1)?;
+        Some(&self.src[s..self.line_end(line)])
+    }
+
+    /// `allowed_only_before_style?`.
+    fn el_am_allowed_only_before(&self, name: &[u8], first_line: usize, last_line: usize) -> bool {
+        // `special_modifier?`: bare `private`/`protected` only (not `public`
+        // or `module_function`).
+        if matches!(name, b"private" | b"protected") {
+            if self.el_am_line_text(last_line + 1).is_some_and(|t| t == b"end") {
+                return true;
+            }
+            if self.el_am_next_line_empty_and_exists(last_line) {
+                return false;
+            }
+        }
+        self.el_am_previous_line_empty(first_line)
+    }
+
+    /// `no_empty_lines_around_block_body?` — Layout/EmptyLinesAroundBlockBody's
+    /// OWN `EnforcedStyle`, defaulting (per its schema) to `no_empty_lines`.
+    fn el_am_no_empty_lines_around_block_body(&self) -> bool {
+        self.cfg.get("Layout/EmptyLinesAroundBlockBody", "EnforcedStyle") == Some("no_empty_lines")
+    }
+
+    /// `should_insert_line_before?`. `body`/`i` stand in for upstream's
+    /// `node.parent.children`/`node == node.parent.children[i]` — prism's
+    /// uniform `StatementsNode` makes "sole child" (`body.len() == 1`, no
+    /// whitequark `:begin` wrapper) and "first child" (`i == 0`) the same
+    /// distinction upstream draws via `node.parent.begin_type?`.
+    fn el_am_should_insert_before(
+        &self,
+        is_block_body: bool,
+        body: &[ruby_prism::Node],
+        i: usize,
+        first_line: usize,
+    ) -> bool {
+        if self.el_am_previous_line_empty(first_line) {
+            return false;
+        }
+        if !(is_block_body && self.el_am_no_empty_lines_around_block_body()) {
+            return true;
+        }
+        if body.len() == 1 {
+            return true;
+        }
+        i != 0
+    }
+
+    /// `should_insert_line_after?`.
+    fn el_am_should_insert_after(&self, is_block_body: bool, body: &[ruby_prism::Node], i: usize) -> bool {
+        if !(is_block_body && self.el_am_no_empty_lines_around_block_body()) {
+            return true;
+        }
+        i != body.len() - 1
+    }
+}

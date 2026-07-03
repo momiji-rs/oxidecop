@@ -146,7 +146,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody", "Lint/AmbiguousRegexpLiteral", "Layout/BlockEndNewline",
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
-    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -161,6 +161,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RedundantReturn", "Style/StringChars", "Style/StringLiterals",
     "Style/SymbolProc", "Style/UnpackFirst", "Style/ZeroLengthPredicate",
     "Lint/RegexpAsCondition", "Style/MultilineIfModifier",
+    "Layout/EmptyLinesAroundAccessModifier",
 ];
 
 impl Engine {
@@ -580,6 +581,40 @@ pub(crate) struct Cops<'a> {
     // parent types). Populated eagerly in `visit_call_node` before descending,
     // so it's already complete by the time a nested `send` is visited.
     pub(crate) ut_call_child: HashSet<usize>,
+    // Layout/EmptyLinesAroundAccessModifier: whether the bare access
+    // modifier currently under consideration sits somewhere that traces
+    // back — through class/module/sclass/block/kwbegin/if branches — to a
+    // class-like or top-level context (rubocop-ast's `in_macro_scope?`).
+    // Pushed/popped around class/module/sclass (always TRUE) and `def`
+    // (always FALSE); a `Class.new`/`Module.new`/`Struct.new`/`Data.define`
+    // block ALSO pushes TRUE unconditionally. Every other construct (any
+    // other block, an explicit `begin...end`, an `if`/`unless` branch) is
+    // transparent — it doesn't touch the stack at all, which is exactly
+    // upstream's `kwbegin begin any_block (if _condition <%0 _>)
+    // #in_macro_scope?` recursion (prism gives every branch/body its own
+    // `StatementsNode`, so there's no whitequark "sole statement" to chase
+    // up through `parent.parent` for). An empty stack means "top-level
+    // program" (root), which is always TRUE.
+    pub(crate) el_am_scope: Vec<bool>,
+    // rubocop's `@class_or_module_def_first_line`/`@class_or_module_def_last_line`
+    // ivars — NOT a stack: plain fields overwritten (never restored) every
+    // time a class/module/sclass node is entered, exactly mirroring
+    // upstream's non-nesting-aware ivar bug-for-bug.
+    pub(crate) el_am_class_first_line: Option<usize>,
+    pub(crate) el_am_class_last_line: Option<usize>,
+    // rubocop's `@block_line` ivar — same non-restoring overwrite semantics,
+    // updated on every block (any flavor: `do`/`end`, `{}`, numbered params,
+    // `it`).
+    pub(crate) el_am_block_line: Option<usize>,
+    // One-shot flag consumed by the very next `visit_statements_node` call —
+    // mirrors `block_owns_next_stmts` (Lint/ConstantDefinitionInBlock) but
+    // kept separate so the two cops don't fight over the same flag.
+    pub(crate) el_am_block_owns_next_stmts: bool,
+    // One-shot flag set by `visit_call_node` right before descending into a
+    // block it owns, when that block is a `Class.new`/`Module.new`/
+    // `Struct.new`/`Data.define` constructor — consumed by the immediately
+    // following `visit_block_node` call.
+    pub(crate) el_am_ctor_block: bool,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1207,6 +1242,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ll_check_semicolons(node);
         self.check_constant_definition_in_block(node);
         self.check_empty_lines_around_attribute_accessor(node);
+        self.check_empty_lines_around_access_modifier(node);
         self.check_unreachable_code(node);
         self.stmts_stack.push(node.location().start_offset());
         ruby_prism::visit_statements_node(self, node);
@@ -1245,17 +1281,32 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
             None => self.rs_scope_stack.push(std::rc::Rc::new(std::cell::RefCell::new(rs_names))),
         }
+        // Layout/EmptyLinesAroundAccessModifier's `@block_line` — updated for
+        // EVERY block flavor (do/end, {}, numbered params, `it`), regardless
+        // of whether it's a class-constructor block.
+        self.el_am_block_line = Some(self.idx.loc(node.location().start_offset()).0);
+        // Consume the ctor flag `visit_call_node` set right before calling
+        // into us — a `Class.new`/`Module.new`/`Struct.new`/`Data.define`
+        // block is unconditionally "in macro scope" (see `el_am_scope` docs).
+        let is_ctor_block = std::mem::take(&mut self.el_am_ctor_block);
+        if is_ctor_block {
+            self.el_am_scope.push(true);
+        }
         if let Some(params) = node.parameters() {
             self.visit(&params);
         }
         if let Some(body) = node.body() {
             if body.as_statements_node().is_some() {
                 self.block_owns_next_stmts = true;
+                self.el_am_block_owns_next_stmts = true;
             }
             self.visit(&body);
         }
         self.rs_scope_stack.pop();
         self.rs_block_stack.pop();
+        if is_ctor_block {
+            self.el_am_scope.pop();
+        }
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
@@ -1427,8 +1478,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
+        // Layout/EmptyLinesAroundAccessModifier's `@class_or_module_def_first_line`/
+        // `@class_or_module_def_last_line` — `parent_class.first_line` (the
+        // superclass expression) when there is one, else the class node's own
+        // first line (its `class` keyword).
+        self.el_am_class_first_line = Some(self.idx.loc(
+            node.superclass().map(|s| s.location().start_offset()).unwrap_or(l.start_offset()),
+        ).0);
+        self.el_am_class_last_line = Some(self.idx.loc(l.end_offset().saturating_sub(1)).0);
+        self.el_am_scope.push(true);
         // Default walk — covers the superclass expression too, not just the body.
         ruby_prism::visit_class_node(self, node);
+        self.el_am_scope.pop();
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
         self.leave_namespace();
@@ -1444,7 +1505,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
+        let ml = node.location();
+        self.el_am_class_first_line = Some(self.idx.loc(ml.start_offset()).0);
+        self.el_am_class_last_line = Some(self.idx.loc(ml.end_offset().saturating_sub(1)).0);
+        self.el_am_scope.push(true);
         ruby_prism::visit_module_node(self, node);
+        self.el_am_scope.pop();
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
         self.leave_namespace();
@@ -1505,6 +1571,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.rs_scope_stack.push(std::rc::Rc::new(std::cell::RefCell::new(rs_names)));
         ruby_prism::visit_def_node(self, node);
         self.rs_scope_stack.pop();
+        // A `def` is never a `in_macro_scope?` wrapper — any bare
+        // public/private/protected/module_function inside one (however
+        // deeply, through transparent if/begin/block wrappers) is just a
+        // regular method call, not an access-modifier declaration.
+        self.el_am_scope.push(false);
+        ruby_prism::visit_def_node(self, node);
+        self.el_am_scope.pop();
         self.class_children_stack.pop();
         self.def_depth -= 1;
         self.ll_exit_collection();
@@ -1584,13 +1657,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(), node.body().is_some(), false, true);
         self.check_trailing_body_on_class(node.class_keyword_loc().start_offset(), l.end_offset(), node.body());
+        // Layout/EmptyLinesAroundAccessModifier's `@class_or_module_def_first_line`
+        // uses `node.identifier.source_range.first_line` — the `<<` expression
+        // (usually `self`), not the `class` keyword.
+        self.el_am_class_first_line = Some(self.idx.loc(node.expression().location().start_offset()).0);
+        self.el_am_class_last_line = Some(self.idx.loc(l.end_offset().saturating_sub(1)).0);
         // The expression (`class << HERE`) is outside the scoping context.
         self.visit(&node.expression());
         // `class << self` is a scoping context — nested defs inside are allowed.
         self.scoping_depth += 1;
+        self.el_am_scope.push(true);
         if let Some(b) = node.body() {
             self.visit(&b);
         }
+        self.el_am_scope.pop();
         self.scoping_depth -= 1;
     }
     fn visit_alias_method_node(&mut self, node: &ruby_prism::AliasMethodNode<'pr>) {
@@ -1813,6 +1893,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_metrics_complexity_define_method(node, &bn);
                 self.check_empty_lines_around_exception_handling_keywords_block(node, &bn);
             }
+            // Consumed by the `visit_block_node` call this triggers below
+            // (`&:sym` block-pass args aren't block nodes, so this is false
+            // whenever `b` isn't one — no visit_block_node ever fires for it).
+            self.el_am_ctor_block = b.as_block_node().is_some() && lint_cops::is_class_constructor(node, self.src);
             self.check_multiline_block_chain(node);
             self.check_empty_block_call(node);
             // A block is "scoping" (allows nested defs) if it's a class
@@ -1958,6 +2042,12 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         rs_narrow: Vec::new(),
         rs_block_stack: Vec::new(),
         ut_call_child: HashSet::new(),
+        el_am_scope: Vec::new(),
+        el_am_class_first_line: None,
+        el_am_class_last_line: None,
+        el_am_block_line: None,
+        el_am_block_owns_next_stmts: false,
+        el_am_ctor_block: false,
     };
 
     let t = tick(&T_PREP, t);
