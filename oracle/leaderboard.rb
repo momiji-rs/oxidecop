@@ -208,6 +208,7 @@ COPS = {
   'Lint/RaiseException'              => 'lint/raise_exception',
   'Lint/RedundantWithObject'         => 'lint/redundant_with_object',
   'Style/RedundantConditional'       => 'style/redundant_conditional',
+  'Style/MultilineMemoization'       => 'style/multiline_memoization',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

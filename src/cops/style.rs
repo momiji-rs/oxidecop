@@ -9647,3 +9647,125 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Style/MultilineMemoization: `foo ||= (...)` / `foo ||= begin ... end`
+    /// spanning multiple lines must use whichever wrapper the
+    /// `EnforcedStyle` prefers (`keyword`, the default, wants `begin`/`end`;
+    /// `braces` wants `(`/`)`). Ported from rubocop's `on_or_asgn` +
+    /// `bad_rhs?` + `message` + `keyword_autocorrect`.
+    ///
+    /// rubocop-ast unifies EVERY `||=` shape (lvar/ivar/cvar/gvar/const/
+    /// const-path/attr-writer/index) into a single `or_asgn` node type;
+    /// prism keeps them as 8 distinct node kinds (`LocalVariableOrWriteNode`
+    /// &c.), so this is hooked from all 8 `visit_*_or_write_node` overrides
+    /// in `mod.rs`, each passing its own node's start offset (matching
+    /// upstream's `add_offense(node)` on the WHOLE `or_asgn`, never just the
+    /// RHS — confirmed against the fixture: the offense's first-line carets
+    /// always run from the assignment's own start through end-of-line) and
+    /// its RHS value node.
+    ///
+    /// Verified live against rubocop 1.88.0 (see `ruby -rrubocop -e` probe
+    /// in the branch notes) that whitequark's parser wraps ANY parenthesized
+    /// `||=` RHS in a `:begin` node regardless of statement count — `(bar)`
+    /// alone gets one just like `(bar; baz)` — so prism's `ParenthesesNode`
+    /// (always emitted for explicit `(...)`) is a faithful 1:1 stand-in for
+    /// `rhs.begin_type?`, and `BeginNode` (prism's `begin...end`,
+    /// `rescue_clause`/`else_clause`/`ensure_clause` all optional) stands in
+    /// for `rhs.kwbegin_type?`.
+    pub(crate) fn check_multiline_memoization(&mut self, node_start: usize, rhs: &ruby_prism::Node) {
+        const COP: &str = "Style/MultilineMemoization";
+        if !self.on(COP) {
+            return;
+        }
+        let loc = rhs.location();
+        // `Node#multiline?`: the node's own first/last source line differ —
+        // NOT the enclosed body's lines (an empty `()`/`begin end` can never
+        // satisfy this since opening/closing then share a line).
+        let start_line = self.idx.loc(loc.start_offset()).0;
+        let end_line = self.idx.loc(loc.end_offset().saturating_sub(1)).0;
+        if start_line == end_line {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        if style == "braces" {
+            let Some(begin_node) = rhs.as_begin_node() else { return };
+            let (Some(bk), Some(ek)) = (begin_node.begin_keyword_loc(), begin_node.end_keyword_loc()) else {
+                return;
+            };
+            self.push(node_start, COP, true, "Wrap multiline memoization blocks in `(` and `)`.");
+            self.fixes.push((bk.start_offset(), bk.end_offset(), b"(".to_vec()));
+            self.fixes.push((ek.start_offset(), ek.end_offset(), b")".to_vec()));
+        } else {
+            let Some(paren) = rhs.as_parentheses_node() else { return };
+            self.push(node_start, COP, true, "Wrap multiline memoization blocks in `begin` and `end`.");
+            self.mm_keyword_autocorrect(&paren);
+        }
+    }
+
+    /// `Alignment#configured_indentation_width`: the cop's own
+    /// `IndentationWidth` param if a user set one (never a schema default —
+    /// `Style/MultilineMemoization` has no such param in rubocop's
+    /// `default.yml`), else `Layout/IndentationWidth`'s `Width` (schema
+    /// default 2).
+    fn mm_indentation_width(&self) -> usize {
+        self.cfg
+            .get("Style/MultilineMemoization", "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| self.cfg.int("Layout/IndentationWidth", "Width"))
+    }
+
+    /// The raw bytes of 1-based source `line`, line-terminator excluded —
+    /// rubocop's `Source::Buffer#source_line`.
+    fn mm_source_line(&self, line: usize) -> &'a [u8] {
+        let start = self.idx.starts[line - 1];
+        let end = self.idx.starts.get(line).map(|&s| s - 1).unwrap_or(self.src.len());
+        &self.src[start..end]
+    }
+
+    /// `MultilineMemoization#keyword_autocorrect`/`keyword_begin_str`/
+    /// `keyword_end_str`, ported verbatim: replaces just the `(`/`)` TOKENS
+    /// (never the enclosed body) with `begin`/`end`, each conditionally
+    /// carrying its own inserted newline + indentation depending on what
+    /// already shares that token's line.
+    fn mm_keyword_autocorrect(&mut self, paren: &ruby_prism::ParenthesesNode) {
+        let open = paren.opening_loc();
+        let close = paren.closing_loc();
+        // `node.loc.column`: the RHS node's OWN start column (0-based) —
+        // for a `ParenthesesNode` that's exactly the `(`'s column, since the
+        // node's location starts there.
+        let node_col = self.idx.loc(paren.location().start_offset()).1 - 1;
+        let indent_width = self.mm_indentation_width();
+
+        // keyword_begin_str: if a newline immediately follows the `(`,
+        // just `begin` (the following line's own indentation is untouched);
+        // otherwise `begin` needs its own newline + fresh indentation before
+        // whatever content directly abutted the `(`.
+        let begin_repl: Vec<u8> = if self.src.get(open.end_offset()) == Some(&b'\n') {
+            b"begin".to_vec()
+        } else {
+            let mut v = b"begin\n".to_vec();
+            v.extend(std::iter::repeat_n(b' ', node_col + indent_width));
+            v
+        };
+        self.fixes.push((open.start_offset(), open.end_offset(), begin_repl));
+
+        // keyword_end_str: if the `)`'s own line has any non-whitespace,
+        // non-`)` content (i.e. the closing paren directly follows body
+        // content on that line), `end` needs its own newline + the RHS
+        // node's original indentation; otherwise the `)` sits alone (save
+        // for leading whitespace) and `end` can just replace it in place.
+        let end_line = self.idx.loc(close.start_offset()).0;
+        let line_has_other_content =
+            self.mm_source_line(end_line).iter().any(|&b| !b.is_ascii_whitespace() && b != b')');
+        let end_repl: Vec<u8> = if line_has_other_content {
+            let mut v = b"\n".to_vec();
+            v.extend(std::iter::repeat_n(b' ', node_col));
+            v.extend_from_slice(b"end");
+            v
+        } else {
+            b"end".to_vec()
+        };
+        self.fixes.push((close.start_offset(), close.end_offset(), end_repl));
+    }
+}
