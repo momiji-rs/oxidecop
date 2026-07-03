@@ -6796,3 +6796,82 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+impl<'a> super::Cops<'a> {
+
+    /// Lint/RequireParentheses: checks for method calls without parentheses
+    /// where the last argument is a && or || expression (for predicate methods)
+    /// or the first argument is a ternary with && or || in its condition.
+    pub(crate) fn check_require_parentheses(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/RequireParentheses";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Skip if parenthesized or no arguments
+        if node.closing_loc().is_some_and(|c| c.as_slice() == b")") {
+            return;
+        }
+        let Some(args) = node.arguments() else {
+            return;
+        };
+        let arguments = args.arguments();
+        if arguments.is_empty() {
+            return;
+        }
+
+        let method_name = node.name().as_slice();
+
+        // Skip if it's a [] or assignment method
+        if method_name == b"[]" {
+            return;
+        }
+        if node.equal_loc().is_some() {
+            // This is an assignment method like `foo = bar`
+            return;
+        }
+
+        // Check if first argument is a ternary with && or || in condition
+        if let Some(first) = arguments.first() {
+            if let Some(if_node) = first.as_if_node() {
+                // Check if it's a ternary (no if_keyword_loc means it's a `?:` ternary)
+                if if_node.if_keyword_loc().is_none() {
+                    // It's a ternary. Check if condition is && or ||
+                    let condition = &if_node.predicate();
+                    if Self::is_operator_keyword_and_or(&condition) {
+                        // Check if method is not [] or assignment
+                        if method_name != b"[]" && node.equal_loc().is_none() {
+                            // Report: range from call start to condition end
+                            self.push(node.location().start_offset(), COP, false,
+                                "Use parentheses in the method call to avoid confusion about precedence.");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if it's a predicate method with && or || in last argument
+        if method_name.ends_with(b"?") {
+            if let Some(last) = arguments.last() {
+                if Self::is_operator_keyword_and_or(&last) {
+                    self.push(node.location().start_offset(), COP, false,
+                        "Use parentheses in the method call to avoid confusion about precedence.");
+                }
+            }
+        }
+    }
+
+    /// Helper: check if a node is an AndNode or OrNode using && or || (not and/or).
+    fn is_operator_keyword_and_or(node: &ruby_prism::Node) -> bool {
+        if let Some(and_node) = node.as_and_node() {
+            // In Prism, the operator field contains the operator text.
+            // We want to flag when it's && (operator keyword), not and
+            return and_node.operator_loc().as_slice() == b"&&";
+        }
+        if let Some(or_node) = node.as_or_node() {
+            // Check if it's || (operator keyword), not or
+            return or_node.operator_loc().as_slice() == b"||";
+        }
+        false
+    }
+}
