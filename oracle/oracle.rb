@@ -208,7 +208,9 @@ end
 # Parse `RuboCop::Config.new('Section' => {...}, ...)` out of a spec block:
 # returns { section => [hash_text, merges_cop_config] } or nil.
 def parse_config_sections(joined)
-  m = joined.match(/RuboCop::Config\.new\((.*)\)/m)
+  # \s* tolerates a chain split across lines (`RuboCop::Config\n  .new(...)`,
+  # joined with a space by the block collector).
+  m = joined.match(/RuboCop::Config\s*\.\s*new\((.*)\)/m)
   return nil unless m
 
   sections = {}
