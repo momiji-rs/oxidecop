@@ -152,7 +152,7 @@ const IMPLEMENTED: &[&str] = &[
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize", "Metrics/ParameterLists",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
     "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Style/BarePercentLiterals", "Lint/RequireParentheses", "Style/CaseEquality", "Style/RedundantException", "Lint/ErbNewArguments", "Lint/OrderedMagicComments",
-    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Layout/DefEndAlignment", "Style/ExponentialNotation", "Style/StructInheritance", "Style/ExpandPathArguments", "Style/ModuleFunction", "Style/Encoding", "Style/RedundantFetchBlock", "Metrics/ParameterLists",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Layout/DefEndAlignment", "Style/ExponentialNotation", "Style/StructInheritance", "Style/ExpandPathArguments", "Style/ModuleFunction", "Style/Encoding", "Style/RedundantFetchBlock", "Metrics/ParameterLists", "Layout/ClosingHeredocIndentation",
     "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Style/RedundantSelfAssignment", "Layout/DefEndAlignment",
     "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFetchBlock", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Style/BarePercentLiterals", "Lint/RequireParentheses", "Style/CaseEquality", "Style/RedundantException", "Lint/ErbNewArguments", "Lint/OrderedMagicComments",
     "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFetchBlock", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes", "Layout/EmptyLinesAroundAccessModifier", "Lint/ToJSON", "Security/YAMLLoad", "Style/StabbyLambdaParentheses", "Lint/StructNewOverride", "Lint/Loop", "Style/BlockComments", "Layout/BeginEndAlignment", "Style/EmptyElse", "Layout/EmptyLineBetweenDefs", "Style/SelfAssignment", "Style/SingleLineMethods", "Style/PreferredHashMethods", "Style/NumericLiteralPrefix", "Security/Open", "Security/JSONLoad", "Style/Sample", "Style/HashLikeCase", "Style/PercentQLiterals", "Lint/PercentStringArray", "Lint/MixedRegexpCaptureTypes", "Style/NestedParenthesizedCalls", "Layout/DefEndAlignment",
@@ -176,6 +176,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/MultilineArrayBraceLayout", "Layout/MultilineHashBraceLayout",
     "Layout/MultilineMethodDefinitionBraceLayout",
     "Style/WhileUntilModifier", "Style/SingleArgumentDig",
+    "Style/WhileUntilModifier", "Layout/ClosingHeredocIndentation",
 ];
 
 impl Engine {
@@ -711,6 +712,20 @@ pub(crate) struct Cops<'a> {
     // the offense message (computed from the outermost call in a multi-level
     // chain) reports a different column.
     pub(crate) dea_parent: HashMap<usize, usize>,
+    // Layout/ClosingHeredocIndentation: a CallNode's own start offset -> the
+    // climbed-chain root it inherits from an ENCLOSING call that found it as
+    // its receiver or a (non-safe-nav) argument — `find_node_used_heredoc_
+    // argument`'s `node.parent&.send_type?` climb, computed top-down in
+    // `visit_call_node` (outer calls are visited, and populate this, before
+    // the inner call they wrap is ever reached).
+    pub(crate) chi_call_root: HashMap<usize, usize>,
+    // Layout/ClosingHeredocIndentation: a heredoc's opening-token start
+    // offset -> (resolved root call's own start offset, is_argument) once
+    // the heredoc is found to be that call's receiver (`chained?`, `false`)
+    // or a direct positional argument (`argument?`, `true`) — the only two
+    // cases `argument_indentation_correct?` special-cases; everything else
+    // falls back to the plain opening-vs-closing-line comparison.
+    pub(crate) chi_heredoc_ctx: HashMap<usize, (usize, bool)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -905,6 +920,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_character_literal(node);
         self.check_gvar_artifact(node);
         self.check_heredoc_delimiter_naming(node.opening_loc(), node.closing_loc());
+        self.check_closing_heredoc_indentation(node.opening_loc(), node.closing_loc());
         self.check_interpolation_check(node);
         self.check_redundant_percent_q_str(node);
         self.check_percent_q_literals(node);
@@ -916,6 +932,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // quoted string parts — the ConsistentQuotesInMultiline check.
         self.check_string_concat(node);
         self.check_heredoc_delimiter_naming(node.opening_loc(), node.closing_loc());
+        self.check_closing_heredoc_indentation(node.opening_loc(), node.closing_loc());
         self.check_interpolation_check_dstr(node);
         self.check_redundant_percent_q_dstr(node);
         self.check_lii_dstr(node);
@@ -951,12 +968,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_interpolated_x_string_node(&mut self, node: &ruby_prism::InterpolatedXStringNode<'pr>) {
         self.check_space_inside_percent_literal_delimiters_ixstr(node);
         self.check_lii_ixstr(node);
+        self.check_closing_heredoc_indentation(Some(node.opening_loc()), Some(node.closing_loc()));
         self.xstr_interp_base.push(self.interp_depth);
         ruby_prism::visit_interpolated_x_string_node(self, node);
         self.xstr_interp_base.pop();
     }
     fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
         self.check_heredoc_delimiter_naming(Some(node.opening_loc()), Some(node.closing_loc()));
+        self.check_closing_heredoc_indentation(Some(node.opening_loc()), Some(node.closing_loc()));
         self.check_space_inside_percent_literal_delimiters_xstr(node);
         ruby_prism::visit_x_string_node(self, node);
     }
@@ -2086,6 +2105,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // a non-safe-nav call only) — see `mlbl_call_child`.
         let mlbl_track = self.on("Layout/MultilineArrayBraceLayout")
             || self.on("Layout/MultilineHashBraceLayout");
+        // Layout/ClosingHeredocIndentation: this call's own climbed-chain
+        // root — inherited from an enclosing call that already claimed THIS
+        // call as its receiver/argument, or (the common case) itself when
+        // there is no such enclosing call. `None` when the cop is off.
+        let chi_root = self
+            .on("Layout/ClosingHeredocIndentation")
+            .then(|| self.chi_call_root.get(&node_off).copied().unwrap_or(node_off));
         if let Some(r) = node.receiver() {
             if track_args {
                 self.assumed_arg_offsets.insert(r.location().start_offset());
@@ -2095,6 +2121,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
             if mlbl_track {
                 self.mlbl_call_child.insert(r.location().start_offset());
+            }
+            if let Some(root) = chi_root {
+                // `chained?`: heredoc-as-receiver counts regardless of THIS
+                // call's own safe-navigation (`parent.call_type?` is true for
+                // both `send` and `csend`); climbing PAST a further-nested
+                // call in receiver position still requires plain `send`.
+                if let Some(hoff) = layout::chi_heredoc_offset(&r) {
+                    self.chi_heredoc_ctx.insert(hoff, (root, false));
+                } else if !node.is_safe_navigation() && r.as_call_node().is_some() {
+                    self.chi_call_root.insert(r.location().start_offset(), root);
+                }
             }
             self.visit(&r);
         }
@@ -2132,6 +2169,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
                 if mlbl_track && !node.is_safe_navigation() {
                     self.mlbl_call_child.insert(arg.location().start_offset());
+                }
+                // `argument?`: requires THIS call to be plain `send` (not
+                // `csend`) — a safe-nav call's arguments are never
+                // `argument?` true, and climbing never passes through one.
+                if let (Some(root), false) = (chi_root, node.is_safe_navigation()) {
+                    if let Some(hoff) = layout::chi_heredoc_offset(&arg) {
+                        self.chi_heredoc_ctx.insert(hoff, (root, true));
+                    } else if arg.as_call_node().is_some() {
+                        self.chi_call_root.insert(arg.location().start_offset(), root);
+                    }
                 }
                 self.visit(&arg);
             }
@@ -2315,6 +2362,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         mlbl_call_child: HashSet::new(),
         dea_ignored: HashSet::new(),
         dea_parent: HashMap::new(),
+        chi_call_root: HashMap::new(),
+        chi_heredoc_ctx: HashMap::new(),
     };
 
     let t = tick(&T_PREP, t);

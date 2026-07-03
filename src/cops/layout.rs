@@ -5052,3 +5052,120 @@ fn dea_def_modifier<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<(ruby_prism
     }
     None
 }
+
+/// Layout/ClosingHeredocIndentation's own heredoc-type test, factored out so
+/// `visit_call_node` (in `mod.rs`) can eagerly recognize a heredoc sitting in
+/// receiver/argument position while populating `chi_call_root`/
+/// `chi_heredoc_ctx` — mirrors `dot_position_heredoc_line`'s node-kind
+/// dispatch, but returns the OPENING token's start offset (the coordinate
+/// this cop keys everything on) rather than the closing line.
+pub(crate) fn chi_heredoc_offset(node: &ruby_prism::Node) -> Option<usize> {
+    let opening = if let Some(n) = node.as_string_node() {
+        n.opening_loc()
+    } else if let Some(n) = node.as_interpolated_string_node() {
+        n.opening_loc()
+    } else if let Some(n) = node.as_x_string_node() {
+        Some(n.opening_loc())
+    } else if let Some(n) = node.as_interpolated_x_string_node() {
+        Some(n.opening_loc())
+    } else {
+        None
+    }?;
+    opening.as_slice().starts_with(b"<<").then(|| opening.start_offset())
+}
+
+impl<'a> super::Cops<'a> {
+    /// Layout/ClosingHeredocIndentation — a `<<~`/`<<-` heredoc's closing
+    /// delimiter must line up with either (a) the physical line the heredoc
+    /// itself opens on (the plain case: `on_heredoc`'s default comparison),
+    /// or, when the heredoc is a call's receiver (`chained?`) or a direct
+    /// positional argument (`argument?`), (b) the line the OUTERMOST call in
+    /// that direct chain of nested calls itself starts on — upstream's
+    /// `argument_indentation_correct?` / `find_node_used_heredoc_argument`.
+    /// Bare `<<`/`<<"..."` heredocs (`SIMPLE_HEREDOC`) are never checked.
+    ///
+    /// The chain-climbing half is precomputed in `visit_call_node`, top-down,
+    /// into `chi_heredoc_ctx` (this heredoc's opening offset -> (root call's
+    /// own start offset, is_argument)) before this ever runs — by the time a
+    /// heredoc node is visited every enclosing call that could claim it has
+    /// already been visited.
+    pub(crate) fn check_closing_heredoc_indentation(
+        &mut self,
+        opening_loc: Option<ruby_prism::Location>,
+        closing_loc: Option<ruby_prism::Location>,
+    ) {
+        const COP: &str = "Layout/ClosingHeredocIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(opening) = opening_loc else { return };
+        let op = opening.as_slice();
+        if !op.starts_with(b"<<") {
+            return;
+        }
+        // `SIMPLE_HEREDOC = '<<'`: skip unless the marker right after `<<` is
+        // `~` or `-` (quoting, e.g. `<<~"ID"`, doesn't change this).
+        if !matches!(op.get(2), Some(b'~') | Some(b'-')) {
+            return;
+        }
+        let Some(closing) = closing_loc else { return };
+
+        let node_start = opening.start_offset();
+        let opening_indent = self.chi_indent_level(node_start);
+        let closing_indent = self.chi_indent_level(closing.start_offset());
+        if opening_indent == closing_indent {
+            return;
+        }
+
+        // `argument_indentation_correct?`: only when the heredoc is a call's
+        // receiver or argument, compared against that call's (climbed) root.
+        let is_argument = match self.chi_heredoc_ctx.get(&node_start) {
+            Some(&(root, is_argument)) => {
+                if self.chi_indent_level(root) == closing_indent {
+                    return;
+                }
+                is_argument
+            }
+            None => false,
+        };
+
+        let opening_line = self.chi_line_text(node_start);
+        let closing_line = self.chi_line_text(closing.start_offset());
+        let message = if is_argument {
+            format!(
+                "`{}` is not aligned with `{}` or beginning of method definition.",
+                closing_line.trim(),
+                opening_line.trim()
+            )
+        } else {
+            format!("`{}` is not aligned with `{}`.", closing_line.trim(), opening_line.trim())
+        };
+        self.push(closing.start_offset(), COP, true, message);
+
+        // `indented_end`: replace the closing line's own leading run of
+        // `closing_indent` spaces with `opening_indent` spaces — a plain
+        // prefix swap, since `chi_line_text`'s start-of-line offset is
+        // exactly where that leading whitespace begins.
+        let line_start = self.idx.starts[self.idx.loc(closing.start_offset()).0 - 1];
+        self.fixes.push((line_start, line_start + closing_indent, vec![b' '; opening_indent]));
+    }
+
+    /// `indent_level`: count of leading ASCII spaces (NOT tabs — the cop's
+    /// own override, `source_line[/\A */].length`, shadows the `Heredoc`
+    /// mixin's whitespace-line-minimum version) on the physical line `off`
+    /// sits on.
+    fn chi_indent_level(&self, off: usize) -> usize {
+        let line = self.idx.loc(off).0;
+        let start = self.idx.starts[line - 1];
+        self.src[start..].iter().take_while(|&&b| b == b' ').count()
+    }
+
+    /// `Range#source_line`: the full physical line `off` sits on, no
+    /// trailing newline.
+    fn chi_line_text(&self, off: usize) -> &'a str {
+        let line = self.idx.loc(off).0;
+        let start = self.idx.starts[line - 1];
+        let end = self.line_end(line);
+        std::str::from_utf8(&self.src[start..end]).unwrap_or("")
+    }
+}
