@@ -5222,8 +5222,15 @@ impl<'a> super::Cops<'a> {
         }
         let Some(open) = node.opening_loc() else { return };
         let Some(close) = node.closing_loc() else { return };
-        let children: Vec<ruby_prism::Node> =
+        let mut children: Vec<ruby_prism::Node> =
             node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        // whitequark's send args include a `&block` pass as the last argument;
+        // prism keeps it out of `arguments()` (in `block()`), so fold it back.
+        if let Some(block) = node.block() {
+            if block.as_block_argument_node().is_some() {
+                children.push(block);
+            }
+        }
         const MSGS: MlblMessages = MlblMessages {
             same_line: "Closing method call brace must be on the same line as the last argument \
                 when opening brace is on the same line as the first argument.",
