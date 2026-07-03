@@ -6076,3 +6076,84 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+/// `Struct.instance_methods.sort` under Ruby 4.0.0 — rubocop's
+/// `STRUCT_METHOD_NAMES`, ported verbatim (same order, same entries) so any
+/// future upstream table refresh is a straight diff against this list.
+const STRUCT_METHOD_NAMES: &[&[u8]] = &[
+    b"!", b"!=", b"!~", b"<=>", b"==", b"===", b"[]", b"[]=", b"__id__", b"__send__", b"all?",
+    b"any?", b"chain", b"chunk", b"chunk_while", b"class", b"clone", b"collect", b"collect_concat",
+    b"compact", b"count", b"cycle", b"deconstruct", b"deconstruct_keys",
+    b"define_singleton_method", b"detect", b"dig", b"display", b"drop", b"drop_while", b"dup",
+    b"each", b"each_cons", b"each_entry", b"each_pair", b"each_slice", b"each_with_index",
+    b"each_with_object", b"entries", b"enum_for", b"eql?", b"equal?", b"extend", b"filter",
+    b"filter_map", b"find", b"find_all", b"find_index", b"first", b"flat_map", b"freeze",
+    b"frozen?", b"grep", b"grep_v", b"group_by", b"hash", b"include?", b"inject", b"inspect",
+    b"instance_eval", b"instance_exec", b"instance_of?", b"instance_variable_defined?",
+    b"instance_variable_get", b"instance_variable_set", b"instance_variables", b"is_a?",
+    b"itself", b"kind_of?", b"lazy", b"length", b"map", b"max", b"max_by", b"member?", b"members",
+    b"method", b"methods", b"min", b"min_by", b"minmax", b"minmax_by", b"nil?", b"none?",
+    b"object_id", b"one?", b"partition", b"private_methods", b"protected_methods",
+    b"public_method", b"public_methods", b"public_send", b"reduce", b"reject",
+    b"remove_instance_variable", b"respond_to?", b"reverse_each", b"select", b"send",
+    b"singleton_class", b"singleton_method", b"singleton_methods", b"size", b"slice_after",
+    b"slice_before", b"slice_when", b"sort", b"sort_by", b"sum", b"take", b"take_while", b"tally",
+    b"tap", b"then", b"to_a", b"to_enum", b"to_h", b"to_s", b"to_set", b"uniq", b"values",
+    b"values_at", b"yield_self", b"zip",
+];
+
+impl<'a> super::Cops<'a> {
+    /// Lint/StructNewOverride — a `Struct.new(:member, ...)` (bare or
+    /// `::`-prefixed receiver) member name that shadows a built-in `Struct`
+    /// instance method is easy to do by accident and produces surprising
+    /// results. Mirrors rubocop's `on_send`: RESTRICT_ON_SEND is `:new`, the
+    /// receiver must be a bare/`::`-rooted `Struct` (the `struct_new`
+    /// node-matcher), and EVERY argument is walked — the first is exempt
+    /// only when it's a string (the optional explicit class name); any
+    /// argument that isn't a symbol or string literal is silently skipped
+    /// (this is how the trailing `keyword_init: true` hash is ignored).
+    pub(crate) fn check_struct_new_override(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/StructNewOverride";
+        if node.name().as_slice() != b"new" || node.is_safe_navigation() || !self.on(COP) {
+            return;
+        }
+        let Some(recv) = node.receiver() else { return };
+        if const_name_root(&recv).as_deref() != Some("Struct") {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        for (index, arg) in args.arguments().iter().enumerate() {
+            // Ignore if the first argument is a class name (a string).
+            if index == 0 && arg.as_string_node().is_some() {
+                continue;
+            }
+            // `member_name.inspect` / `member_name.to_s` — for both symbol
+            // and string nodes here the raw (unescaped) bytes ARE the
+            // member name; only the `.inspect` quoting differs by type.
+            // Safe to build unquoted since every name that reaches the
+            // format! below is a member of STRUCT_METHOD_NAMES, and none of
+            // those tokens need escaping when symbol- or string-quoted.
+            let (name, inspected): (Vec<u8>, String) = if let Some(s) = arg.as_symbol_node() {
+                let n = s.unescaped().to_vec();
+                let inspected = format!(":{}", String::from_utf8_lossy(&n));
+                (n, inspected)
+            } else if let Some(s) = arg.as_string_node() {
+                let n = s.unescaped().to_vec();
+                let inspected = format!("\"{}\"", String::from_utf8_lossy(&n));
+                (n, inspected)
+            } else {
+                continue;
+            };
+            if !STRUCT_METHOD_NAMES.contains(&name.as_slice()) {
+                continue;
+            }
+            let method_name = String::from_utf8_lossy(&name);
+            self.push(
+                arg.location().start_offset(),
+                COP,
+                false,
+                format!("`{inspected}` member overrides `Struct#{method_name}` and it may be unexpected."),
+            );
+        }
+    }
+}
