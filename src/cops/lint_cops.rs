@@ -6875,3 +6875,167 @@ impl<'a> super::Cops<'a> {
         false
     }
 }
+/// True for both an explicit `{...}` hash literal and a bare/braceless
+/// keyword-argument list (`foo(bar: 1)`) — rubocop-ast's prism translation
+/// normalizes both to a `:hash`-type node, which is what
+/// `argument.hash_type?` tests against in the original cop.
+fn erb_new_is_hash_like(node: &ruby_prism::Node) -> bool {
+    node.as_hash_node().is_some() || node.as_keyword_hash_node().is_some()
+}
+
+/// The (possibly braceless) hash's `key: value` pairs, uniformly across
+/// `HashNode` and `KeywordHashNode` — both just wrap `AssocNode` elements
+/// (a `**splat` element isn't an `AssocNode` and is silently skipped, same
+/// as rubocop's `pairs` helper only iterating true pairs).
+fn erb_new_hash_pairs<'a>(node: &ruby_prism::Node<'a>) -> Vec<ruby_prism::AssocNode<'a>> {
+    let elements: Vec<ruby_prism::Node<'a>> = if let Some(h) = node.as_hash_node() {
+        h.elements().iter().collect()
+    } else if let Some(h) = node.as_keyword_hash_node() {
+        h.elements().iter().collect()
+    } else {
+        Vec::new()
+    };
+    elements.into_iter().filter_map(|e| e.as_assoc_node()).collect()
+}
+
+/// `build_kwargs` — `[trim_mode_arg, eoutvar_arg]`, each `Some("trim_mode:
+/// <value source>")`/`Some("eoutvar: <value source>")` when the trailing
+/// hash-like argument carries that key (bare-label form only: the key node's
+/// `unescaped` symbol name, matching rubocop's `pair.key.source == 'trim_mode'`
+/// string compare — a `:trim_mode => x` explicit-arrow key has a `source` of
+/// `":trim_mode"` in the original and so never matches either; ported
+/// faithfully rather than "fixed"). Any OTHER keys in that hash are dropped
+/// from the correction, same as upstream.
+fn erb_new_build_kwargs(last_argument: &ruby_prism::Node, src: &[u8]) -> [Option<String>; 2] {
+    let mut trim_mode = None;
+    let mut eoutvar = None;
+    if erb_new_is_hash_like(last_argument) {
+        for pair in erb_new_hash_pairs(last_argument) {
+            let Some(key_sym) = pair.key().as_symbol_node() else { continue };
+            let value_src = String::from_utf8_lossy(&src[pair.value().location().start_offset()..pair.value().location().end_offset()]).into_owned();
+            match key_sym.unescaped() {
+                b"trim_mode" => trim_mode = Some(format!("trim_mode: {value_src}")),
+                b"eoutvar" => eoutvar = Some(format!("eoutvar: {value_src}")),
+                _ => {}
+            }
+        }
+    }
+    [trim_mode, eoutvar]
+}
+
+/// `override_by_legacy_args` — the raw positional 3rd/4th arguments
+/// (`arguments[2]`/`arguments[3]`), when present and not themselves
+/// hash-like, take precedence over anything `build_kwargs` produced.
+fn erb_new_override_by_legacy_args(
+    mut kwargs: [Option<String>; 2],
+    arguments: &[ruby_prism::Node],
+    src: &[u8],
+) -> [Option<String>; 2] {
+    if let Some(a2) = arguments.get(2) {
+        if !erb_new_is_hash_like(a2) {
+            let s = String::from_utf8_lossy(&src[a2.location().start_offset()..a2.location().end_offset()]).into_owned();
+            kwargs[0] = Some(format!("trim_mode: {s}"));
+        }
+    }
+    if let Some(a3) = arguments.get(3) {
+        if !erb_new_is_hash_like(a3) {
+            let s = String::from_utf8_lossy(&src[a3.location().start_offset()..a3.location().end_offset()]).into_owned();
+            kwargs[1] = Some(format!("eoutvar: {s}"));
+        }
+    }
+    kwargs
+}
+
+impl<'a> super::Cops<'a> {
+    /// Lint/ErbNewArguments — `ERB.new` positional 2nd/3rd/4th arguments
+    /// (safe_level/trim_mode/eoutvar) are deprecated since Ruby 2.6;
+    /// safe_level has no keyword replacement (just flagged), trim_mode and
+    /// eoutvar get rewritten to `trim_mode:`/`eoutvar:` keyword arguments.
+    /// `minimum_target_ruby_version 2.6` gates the whole cop.
+    ///
+    /// Matches `(send (const {nil? cbase} :ERB) :new $...)` — bare `ERB` or
+    /// top-level `::ERB`, via the shared `const_name_root` helper (it
+    /// already treats a parent-less `ConstantPathNode`, i.e. `::ERB`, the
+    /// same as a bare `ConstantReadNode`).
+    ///
+    /// Offense anchor: the offending positional argument node's own start
+    /// offset (rubocop's `add_offense(argument, ...)` default location is
+    /// `argument.loc.expression`). Message text is chosen purely by
+    /// POSITION within the 2nd..4th argument slice (index 0/1/2), not by
+    /// what the argument actually is — mirrors rubocop's
+    /// `arguments[1..3].each_with_index`.
+    ///
+    /// Autocorrect always rewrites the FULL argument list (first argument's
+    /// start through the last argument's end) to `str[, trim_mode: ...][,
+    /// eoutvar: ...]`, recomputed fresh for every qualifying offense (the
+    /// original attaches the identical `corrector.replace` block to each
+    /// `add_offense` call); pushing the same byte-identical fix multiple
+    /// times is harmless — `apply_fixes` applies the first one it processes
+    /// for a given range and then skips the rest as overlapping, and since
+    /// every copy has identical bytes the result is the same either way.
+    pub(crate) fn check_erb_new_arguments(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/ErbNewArguments";
+        if !self.on(COP) || self.cfg.target_ruby() < 2.6 {
+            return;
+        }
+        if node.name().as_slice() != b"new" {
+            return;
+        }
+        let Some(recv) = node.receiver() else { return };
+        if const_name_root(&recv).as_deref() != Some("ERB") {
+            return;
+        }
+        let Some(args_node) = node.arguments() else { return };
+        let arguments: Vec<ruby_prism::Node> = args_node.arguments().iter().collect();
+        if arguments.is_empty() {
+            return;
+        }
+        // correct_arguments?: a single argument, or exactly 2 where the
+        // 2nd is already hash-like (all keyword args).
+        if arguments.len() == 1 || (arguments.len() == 2 && erb_new_is_hash_like(&arguments[1])) {
+            return;
+        }
+
+        let hi = arguments.len().min(4);
+        let offending: Vec<(usize, &ruby_prism::Node)> = arguments[1..hi]
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| !erb_new_is_hash_like(a))
+            .collect();
+        if offending.is_empty() {
+            return;
+        }
+
+        // Shared correction: recomputed once, pushed per offending argument.
+        let str_src = String::from_utf8_lossy(self.node_src(&arguments[0])).into_owned();
+        let last_argument = arguments.last().unwrap();
+        let kwargs = erb_new_build_kwargs(last_argument, self.src);
+        let overridden = erb_new_override_by_legacy_args(kwargs, &arguments, self.src);
+        let mut parts = vec![str_src];
+        parts.extend(overridden.into_iter().flatten());
+        let good_arguments = parts.join(", ");
+        let range_start = arguments[0].location().start_offset();
+        let range_end = last_argument.location().end_offset();
+
+        for (i, argument) in offending {
+            let arg_value = String::from_utf8_lossy(self.node_src(argument)).into_owned();
+            let message = match i {
+                0 => "Passing safe_level with the 2nd argument of `ERB.new` is deprecated. \
+                      Do not use it, and specify other arguments as keyword arguments."
+                    .to_string(),
+                1 => format!(
+                    "Passing trim_mode with the 3rd argument of `ERB.new` is deprecated. Use \
+                     keyword argument like `ERB.new(str, trim_mode: {arg_value})` instead."
+                ),
+                2 => format!(
+                    "Passing eoutvar with the 4th argument of `ERB.new` is deprecated. Use \
+                     keyword argument like `ERB.new(str, eoutvar: {arg_value})` instead."
+                ),
+                _ => unreachable!(),
+            };
+            self.push(argument.location().start_offset(), COP, true, message);
+            self.fixes.push((range_start, range_end, good_arguments.clone().into_bytes()));
+        }
+    }
+}
+
