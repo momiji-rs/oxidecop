@@ -167,6 +167,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RegexpAsCondition", "Style/MultilineIfModifier",
     "Layout/EmptyLinesAroundAccessModifier",
     "Style/GlobalStdStream", "Style/MissingRespondToMissing",
+    "Style/NestedModifier",
 ];
 
 impl Engine {
@@ -526,6 +527,14 @@ pub(crate) struct Cops<'a> {
     // reported — avoids duplicate offenses when the same nested ternary appears
     // in multiple outer ternaries.
     pub(crate) nested_ternary_reported: HashSet<usize>,
+    // Style/NestedModifier: byte ranges (start, end) of modifier if/unless/
+    // while/until nodes already flagged as the INNER half of a nested-modifier
+    // pair — rubocop's `ignore_node`/`part_of_ignored_node?`. A candidate
+    // node whose start offset falls inside one of these ranges is skipped;
+    // since an ignored node's own range spans everything nested beneath it
+    // (body-wise), this transitively suppresses deeper pairs in a long
+    // modifier chain, matching upstream's ancestor-walking `part_of_ignored_node?`.
+    pub(crate) nested_modifier_ignored: Vec<(usize, usize)>,
     // Layout/AssignmentIndentation: maps a chained assignment's own start
     // offset (`bar` in `foo = bar = baz`) to the start offset of its
     // immediate same-line enclosing assignment (`foo`) — see
@@ -1018,6 +1027,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // (see check_multiline_if_modifier's doc comment).
         if node.end_keyword_loc().is_none() && node.if_keyword_loc().is_some() {
             self.check_multiline_if_modifier("if", node.location(), node.predicate(), node.statements());
+            self.check_nested_modifier("if", node.predicate(), node.statements(), true);
         }
         self.cond_depth += 1;
         ruby_prism::visit_if_node(self, node);
@@ -1056,6 +1066,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // pre-order: nested modifiers dedup via multiline_if_mod_seen.
         if node.end_keyword_loc().is_none() {
             self.check_multiline_if_modifier("unless", node.location(), node.predicate(), node.statements());
+            self.check_nested_modifier("unless", node.predicate(), node.statements(), true);
         }
         self.cond_depth += 1;
         ruby_prism::visit_unless_node(self, node);
@@ -1397,6 +1408,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.check_while_until_do(&node.predicate(), node.do_keyword_loc(), node.location(),
             node.statements().map(|s| s.location().start_offset()), "while");
+        // pre-order: a genuine modifier `while` (not the `begin...end while`
+        // post-condition-loop shape, which prism flags via `is_begin_modifier`
+        // and rubocop-ast gives a distinct `:while_post` type that's never
+        // `basic_conditional?`) has its body before its keyword.
+        if !node.is_begin_modifier()
+            && node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset())
+        {
+            self.check_nested_modifier("while", node.predicate(), node.statements(), false);
+        }
         self.cond_depth += 1;
         ruby_prism::visit_while_node(self, node);
         self.cond_depth -= 1;
@@ -1411,6 +1431,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.check_while_until_do(&node.predicate(), node.do_keyword_loc(), node.location(),
             node.statements().map(|s| s.location().start_offset()), "until");
+        // pre-order: see visit_while_node's note on `is_begin_modifier`.
+        if !node.is_begin_modifier()
+            && node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset())
+        {
+            self.check_nested_modifier("until", node.predicate(), node.statements(), false);
+        }
         self.cond_depth += 1;
         ruby_prism::visit_until_node(self, node);
         self.cond_depth -= 1;
@@ -2146,6 +2172,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         regexp_bang_ignore: Vec::new(),
         multiline_if_mod_seen: HashSet::new(),
         nested_ternary_reported: HashSet::new(),
+        nested_modifier_ignored: Vec::new(),
         assignment_leftmost: HashMap::new(),
         block_owns_next_stmts: false,
         rel_path,

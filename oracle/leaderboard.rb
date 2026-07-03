@@ -185,6 +185,7 @@ COPS = {
   'Naming/AsciiIdentifiers'          => 'naming/ascii_identifiers',
   'Lint/ErbNewArguments'             => 'lint/erb_new_arguments',
   'Lint/OrderedMagicComments'        => 'lint/ordered_magic_comments',
+  'Style/NestedModifier'             => 'style/nested_modifier',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

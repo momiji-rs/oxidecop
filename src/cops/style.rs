@@ -7102,3 +7102,265 @@ impl<'a> super::Cops<'a> {
             || node.as_interpolated_x_string_node().is_some()
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/NestedModifier — nested modifier `if`/`unless`/`while`/`until`
+    /// (`something if a if b`): a modifier conditional whose immediate
+    /// syntactic PARENT is itself another modifier conditional. Ported from
+    /// rubocop's `on_if`/`on_while`/`on_until` (all aliased to the same
+    /// `check(node)`): `modifier?(node) && modifier?(node.parent)` where
+    /// `modifier?` is `node&.basic_conditional? && node.modifier_form?`.
+    ///
+    /// rubocop's `node.parent` needs no tracking here: a modifier
+    /// conditional's ONLY two AST children are its condition and its
+    /// (single-statement) body, and — verified live against real rubocop —
+    /// any parenthesized sub-expression wraps in an intervening `begin`
+    /// node that breaks the direct parent/child edge, so the ONLY way a
+    /// modifier node's true immediate parent can itself be a modifier
+    /// conditional is if it IS that parent's condition or its sole body
+    /// statement. Unparenthesized modifier chains are strictly
+    /// left-associative (`a if b if c` parses as `(a if b) if c`), so in
+    /// practice only the body slot ever matches — but this is called from
+    /// every outer modifier node's own visit (pre-order, before recursing),
+    /// inspecting its OWN body's sole statement for a qualifying inner, which
+    /// is exactly equivalent to rubocop's parent-pointer check without
+    /// needing one.
+    ///
+    /// Ported to prism: `node.body` (rubocop's whitequark AST, where `unless`
+    /// is just an `:if` node with swapped branches, and a single-statement
+    /// body is the statement itself, not wrapped) is
+    /// `body_stmts.body().first()` here, matched against `IfNode`/
+    /// `UnlessNode`/`WhileNode`/`UntilNode` via `nested_modifier_info`. A
+    /// `begin...end while/until cond` post-condition loop is a DIFFERENT
+    /// rubocop-ast node type (`:while_post`/`:until_post`, never
+    /// `basic_conditional?`); prism instead flags it via
+    /// `is_begin_modifier()` on the same `WhileNode`/`UntilNode` type, which
+    /// `nested_modifier_info` excludes to match.
+    ///
+    /// Suppression: rubocop's `ignore_node`/`part_of_ignored_node?` means a
+    /// long chain (`a until b while c unless d if e`) reports only ONE
+    /// offense — the outermost qualifying pair — since flagging the inner of
+    /// that pair marks its ENTIRE range (which, being a modifier node,
+    /// starts at its own body and so contains every node nested beneath it)
+    /// as ignored; any deeper candidate's start offset then falls inside
+    /// that range and is skipped. `nested_modifier_ignored` reproduces this
+    /// with plain byte-range containment instead of an ancestor walk.
+    ///
+    /// Autocorrect ports `autocorrect`/`new_expression`/`replacement_operator`/
+    /// `left_hand_operand`/`right_hand_operand`/`add_parentheses_to_method_arguments`/
+    /// `requires_parens?` verbatim, and only ever fires when BOTH the inner
+    /// and outer are `if`/`unless` (rubocop's `node.if_type? &&
+    /// node.parent.if_type?` — both compile to the same whitequark `:if`
+    /// type; `while`/`until` never qualify, matching the "not correctable"
+    /// spec examples). The corrector replaces from the inner's keyword
+    /// through the OUTER's condition end (`range_between(node.loc.keyword
+    /// .begin_pos, node.parent.condition.source_range.end_pos)`) with
+    /// `"#{outer.keyword} #{lh} #{op} #{rh}"`.
+    pub(crate) fn check_nested_modifier(
+        &mut self,
+        outer_keyword: &str,
+        outer_cond: ruby_prism::Node,
+        outer_body_stmts: Option<ruby_prism::StatementsNode>,
+        outer_is_if_type: bool,
+    ) {
+        const COP: &str = "Style/NestedModifier";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = outer_body_stmts.and_then(|s| s.body().iter().next()) else { return };
+        let Some((inner_keyword, inner_kw_loc, inner_cond, inner_is_if_type)) =
+            nested_modifier_info(&body)
+        else {
+            return;
+        };
+
+        let body_loc = body.location();
+        let (inner_start, inner_end) = (body_loc.start_offset(), body_loc.end_offset());
+        if self.nested_modifier_ignored.iter().any(|&(s, e)| inner_start >= s && inner_start < e) {
+            return;
+        }
+
+        // rubocop's CLI only shows `[Correctable]` when the corrector block
+        // actually produces a change; since that's exactly the `if_type?`
+        // pair condition `autocorrect` checks below, compute it up front.
+        let correctable = inner_is_if_type && outer_is_if_type;
+        self.push(inner_kw_loc.start_offset(), COP, correctable, "Avoid using nested modifiers.");
+        self.nested_modifier_ignored.push((inner_start, inner_end));
+
+        if !correctable {
+            return; // `autocorrect`'s `return unless node.if_type? && node.parent.if_type?`
+        }
+
+        // `replacement_operator`
+        let operator: &[u8] = if outer_keyword == "if" { b"&&" } else { b"||" };
+
+        // `left_hand_operand`: outer's own condition, source verbatim,
+        // parenthesized only if it's an `or`/`||` AND the operator is `&&`.
+        let outer_cond_src = self.node_src(&outer_cond).to_vec();
+        let lh = if outer_cond.as_or_node().is_some() && operator == b"&&" {
+            let mut v = Vec::with_capacity(outer_cond_src.len() + 2);
+            v.push(b'(');
+            v.extend_from_slice(&outer_cond_src);
+            v.push(b')');
+            v
+        } else {
+            outer_cond_src
+        };
+
+        // `right_hand_operand`
+        let mut rh = if let Some(call) = inner_cond.as_call_node().filter(|c| {
+            c.arguments().is_some_and(|a| a.arguments().iter().next().is_some())
+                && !nm_is_operator_method(c.name().as_slice())
+        }) {
+            nm_add_parens_to_method_args(self, &call)
+        } else {
+            self.node_src(&inner_cond).to_vec()
+        };
+        if nm_requires_parens(&inner_cond) {
+            let mut v = Vec::with_capacity(rh.len() + 2);
+            v.push(b'(');
+            v.extend_from_slice(&rh);
+            v.push(b')');
+            rh = v;
+        }
+        if inner_keyword != outer_keyword {
+            let mut v = Vec::with_capacity(rh.len() + 1);
+            v.push(b'!');
+            v.extend_from_slice(&rh);
+            rh = v;
+        }
+
+        // `new_expression`
+        let mut replacement = Vec::new();
+        replacement.extend_from_slice(outer_keyword.as_bytes());
+        replacement.push(b' ');
+        replacement.extend_from_slice(&lh);
+        replacement.push(b' ');
+        replacement.extend_from_slice(operator);
+        replacement.push(b' ');
+        replacement.extend_from_slice(&rh);
+
+        let range_start = inner_kw_loc.start_offset();
+        let range_end = outer_cond.location().end_offset();
+        self.fixes.push((range_start, range_end, replacement));
+    }
+}
+
+/// Identifies whether `node` is a modifier-form `if`/`unless`/`while`/
+/// `until` — the shapes `Style/NestedModifier` treats as a potential INNER
+/// (or, from the caller's own guard, OUTER) half of a nested pair — and
+/// returns its rubocop-visible `keyword`, the `Location` `add_offense`
+/// anchors on, its condition node, and whether it's an `if_type?` node
+/// (`if`/`unless`, both the same whitequark `:if` type — `while`/`until`
+/// never satisfy `node.if_type?` and so never autocorrect).
+fn nested_modifier_info<'pr>(
+    node: &ruby_prism::Node<'pr>,
+) -> Option<(&'static str, ruby_prism::Location<'pr>, ruby_prism::Node<'pr>, bool)> {
+    if let Some(n) = node.as_if_node() {
+        let kw = n.if_keyword_loc()?; // absent for ternaries
+        if n.end_keyword_loc().is_some() {
+            return None;
+        }
+        return Some(("if", kw, n.predicate(), true));
+    }
+    if let Some(n) = node.as_unless_node() {
+        if n.end_keyword_loc().is_some() {
+            return None;
+        }
+        return Some(("unless", n.keyword_loc(), n.predicate(), true));
+    }
+    if let Some(n) = node.as_while_node() {
+        if n.is_begin_modifier() {
+            return None;
+        }
+        let kw_start = n.keyword_loc().start_offset();
+        if !n.statements().is_some_and(|s| s.location().start_offset() < kw_start) {
+            return None;
+        }
+        return Some(("while", n.keyword_loc(), n.predicate(), false));
+    }
+    if let Some(n) = node.as_until_node() {
+        if n.is_begin_modifier() {
+            return None;
+        }
+        let kw_start = n.keyword_loc().start_offset();
+        if !n.statements().is_some_and(|s| s.location().start_offset() < kw_start) {
+            return None;
+        }
+        return Some(("until", n.keyword_loc(), n.predicate(), false));
+    }
+    None
+}
+
+/// `requires_parens?`: `node.or_type? || !(COMPARISON_OPERATORS &
+/// node.children).empty?` — true for an `or`/`||` node, or a comparison
+/// send (`==`, `===`, `!=`, `<=`, `>=`, `>`, `<`).
+fn nm_requires_parens(node: &ruby_prism::Node) -> bool {
+    if node.as_or_node().is_some() {
+        return true;
+    }
+    node.as_call_node().is_some_and(|c| {
+        matches!(c.name().as_slice(), b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<")
+    })
+}
+
+/// `MethodIdentifierPredicates::OPERATOR_METHODS` (`operator_method?`).
+fn nm_is_operator_method(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"|" | b"^"
+            | b"&"
+            | b"<=>"
+            | b"=="
+            | b"==="
+            | b"=~"
+            | b">"
+            | b">="
+            | b"<"
+            | b"<="
+            | b"<<"
+            | b">>"
+            | b"+"
+            | b"-"
+            | b"*"
+            | b"/"
+            | b"%"
+            | b"**"
+            | b"~"
+            | b"+@"
+            | b"-@"
+            | b"!@"
+            | b"~@"
+            | b"[]"
+            | b"[]="
+            | b"!"
+            | b"!="
+            | b"!~"
+            | b"`"
+    )
+}
+
+/// `add_parentheses_to_method_arguments`: rebuild `recv.method(args, ...)`
+/// verbatim from a `send`'s parts (used when the condition is a
+/// non-operator method call with arguments but no parens of its own, e.g.
+/// `[1, 2].include? a` -> `[1, 2].include?(a)`).
+fn nm_add_parens_to_method_args(cops: &super::Cops<'_>, call: &ruby_prism::CallNode) -> Vec<u8> {
+    let mut expr = Vec::new();
+    if let Some(recv) = call.receiver() {
+        expr.extend_from_slice(cops.node_src(&recv));
+        expr.push(b'.');
+    }
+    expr.extend_from_slice(call.name().as_slice());
+    expr.push(b'(');
+    if let Some(args) = call.arguments() {
+        let items: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        for (i, arg) in items.iter().enumerate() {
+            if i > 0 {
+                expr.extend_from_slice(b", ");
+            }
+            expr.extend_from_slice(cops.node_src(arg));
+        }
+    }
+    expr.push(b')');
+    expr
+}
