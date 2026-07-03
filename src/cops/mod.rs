@@ -136,7 +136,7 @@ pub fn intern_cop(name: &str) -> Option<&'static str> {
 const IMPLEMENTED: &[&str] = &[
     "Lint/DuplicateRequire", "Naming/BinaryOperatorParameterName",
     "Naming/ClassAndModuleCamelCase", "Naming/ConstantName", "Style/MultilineIfThen",
-    "Style/Not", "Style/StderrPuts", "Style/WhileUntilDo", "Style/ColonMethodCall",
+    "Style/Not", "Style/StderrPuts", "Style/WhileUntilDo", "Style/ColonMethodCall", "Style/Attr",
     "Lint/EmptyClass", "Lint/DeprecatedClassMethods", "Layout/EmptyLineAfterMagicComment",
     "Layout/EmptyLines", "Style/EmptyLiteral", "Style/Semicolon", "Style/GlobalVars",
     "Layout/SpaceAfterComma", "Layout/SpaceBeforeSemicolon", "Layout/SpaceBeforeComma",
@@ -530,6 +530,10 @@ pub(crate) struct Cops<'a> {
     // (rubocop's `@instance_eval_count`) — inside one, a bare redefinable
     // call's target `self` is unknown, so the warning is suppressed.
     pub(crate) uc_instance_eval_depth: usize,
+    // Style/Attr: stack of whether each enclosing class/module has a custom
+    // `attr` method defined — used to skip the cop when a custom implementation
+    // is present (rubocop's `define_attr_method?`).
+    pub(crate) style_attr_custom_method_stack: Vec<bool>,
     // Layout/EmptyLinesAroundClassBody / EmptyLinesAroundModuleBody:
     // (cop, start-offset) pairs already offended-on — `check_beginning` and
     // `check_ending` collapse onto the exact same physical line when a
@@ -753,6 +757,24 @@ impl<'a> Cops<'a> {
                     .collect()
             })
             .unwrap_or_default()
+    }
+    /// Check if the body of a class/module contains a custom `attr` method definition.
+    fn has_custom_attr_method_in_body(body: &Option<ruby_prism::Node>) -> bool {
+        body.as_ref()
+            .and_then(|b| b.as_statements_node())
+            .map(|stmts| {
+                stmts
+                    .body()
+                    .iter()
+                    .any(|n| {
+                        if let Some(def) = n.as_def_node() {
+                            def.name().as_slice() == b"attr"
+                        } else {
+                            false
+                        }
+                    })
+            })
+            .unwrap_or(false)
     }
     /// AllowComments guard: skip when enabled and a comment sits inside the block
     /// body (opening line through the line before the closer, so a trailing
@@ -1516,8 +1538,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ).0);
         self.el_am_class_last_line = Some(self.idx.loc(l.end_offset().saturating_sub(1)).0);
         self.el_am_scope.push(true);
+        // Style/Attr: check if this class has a custom `attr` method
+        let has_custom_attr = Self::has_custom_attr_method_in_body(&node.body());
+        self.style_attr_custom_method_stack.push(has_custom_attr);
         // Default walk — covers the superclass expression too, not just the body.
         ruby_prism::visit_class_node(self, node);
+        self.style_attr_custom_method_stack.pop();
         self.el_am_scope.pop();
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
@@ -1538,7 +1564,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.el_am_class_first_line = Some(self.idx.loc(ml.start_offset()).0);
         self.el_am_class_last_line = Some(self.idx.loc(ml.end_offset().saturating_sub(1)).0);
         self.el_am_scope.push(true);
+        // Style/Attr: check if this module has a custom `attr` method
+        let has_custom_attr = Self::has_custom_attr_method_in_body(&node.body());
+        self.style_attr_custom_method_stack.push(has_custom_attr);
         ruby_prism::visit_module_node(self, node);
+        self.style_attr_custom_method_stack.pop();
         self.el_am_scope.pop();
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
@@ -1808,6 +1838,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_sample(node);
         self.check_self_assignment_send(node);
         self.check_useless_times(node);
+        self.check_attr(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
         let n = node.as_node();
@@ -2072,6 +2103,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         rel_path,
         uc_redefined: HashSet::new(),
         uc_instance_eval_depth: 0,
+        style_attr_custom_method_stack: Vec::new(),
         el_offended: HashSet::new(),
         else_layout_seen: HashSet::new(),
         top_level_sole_stmt: None,

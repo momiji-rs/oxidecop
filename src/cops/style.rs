@@ -6104,3 +6104,89 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/Attr — `attr :name` → `attr_reader :name`, `attr :name, true` → `attr_accessor :name`,
+    /// `attr :name, false` → `attr_reader :name`. The `attr` method with a single argument
+    /// creates a reader (like `attr_reader`), but with a second boolean argument it creates
+    /// an accessor (deprecated in Ruby 1.9). Use `attr_reader` or `attr_accessor` to make intent explicit.
+    pub(crate) fn check_attr(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/Attr";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Must be bare `attr` with no receiver
+        if node.receiver().is_some() {
+            return;
+        }
+
+        // Must be named `attr`
+        if node.name().as_slice() != b"attr" {
+            return;
+        }
+
+        // Must have arguments
+        let Some(args) = node.arguments() else { return };
+        if args.arguments().is_empty() {
+            return;
+        }
+
+        // Check if there's a custom `attr` method defined in any enclosing class/module.
+        // If so, skip the offense (the custom method takes precedence).
+        if self.has_custom_attr_method() {
+            return;
+        }
+
+        // Get the replacement method name based on the second argument
+        let last_arg = args.arguments().iter().last();
+        let replacement = if let Some(arg) = last_arg {
+            // Check if the second argument (if only 2+ args) is a boolean
+            if args.arguments().len() > 1 {
+                if let Some(_) = arg.as_true_node() {
+                    "attr_accessor".to_string()
+                } else if let Some(_) = arg.as_false_node() {
+                    "attr_reader".to_string()
+                } else {
+                    "attr_reader".to_string()
+                }
+            } else {
+                // Single argument or non-boolean second argument
+                "attr_reader".to_string()
+            }
+        } else {
+            "attr_reader".to_string()
+        };
+
+        let message = format!("Do not use `attr`. Use `{}` instead.", replacement);
+        let msg_loc = node.message_loc().map(|l| l.start_offset()).unwrap_or_else(|| node.location().start_offset());
+
+        self.push(msg_loc, COP, true, message);
+
+        // Autocorrect: replace `attr` with the replacement method
+        if let Some(msg_loc) = node.message_loc() {
+            self.fixes.push((msg_loc.start_offset(), msg_loc.end_offset(), replacement.into_bytes()));
+
+            // If there's a second argument that's a boolean, remove it
+            if args.arguments().len() > 1 {
+                let arg_list: Vec<_> = args.arguments().iter().collect();
+                if let Some(first_arg) = arg_list.first() {
+                    if let Some(last_arg) = arg_list.last() {
+                        if last_arg.as_true_node().is_some() || last_arg.as_false_node().is_some() {
+                            // Find the position after the first argument
+                            let first_arg_end = first_arg.location().end_offset();
+                            // Remove from after the first argument to the end of the last argument
+                            self.fixes.push((first_arg_end, last_arg.location().end_offset(), Vec::new()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if there's a custom `attr` method defined in any enclosing class/module.
+    fn has_custom_attr_method(&self) -> bool {
+        // Check the stack - if any enclosing class/module has a custom attr method, return true
+        self.style_attr_custom_method_stack.iter().any(|&has_custom| has_custom)
+    }
+}
