@@ -827,3 +827,70 @@ impl<'a> super::Cops<'a> {
     }
 
 }
+impl<'a> super::Cops<'a> {
+    /// Naming/AccessorMethodName — avoid get_* and set_* prefixes for
+    /// accessor methods. get_x with no args / set_x with one arg naming warnings.
+    pub(crate) fn check_accessor_method_name(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Naming/AccessorMethodName";
+        if !self.on(COP) {
+            return;
+        }
+
+        let name = node.name().as_slice();
+        let name_str = String::from_utf8_lossy(name);
+
+        // Skip method names ending with !, ?, or =
+        if name_str.ends_with('!') || name_str.ends_with('?') || name_str.ends_with('=') {
+            return;
+        }
+
+        let name_loc = node.name_loc();
+
+        // Check for bad reader: get_* with no arguments
+        if name_str.starts_with("get_") {
+            let has_args = node.parameters().is_some_and(|p| {
+                p.requireds().iter().next().is_some()
+                    || p.optionals().iter().next().is_some()
+                    || p.rest().is_some()
+                    || p.posts().iter().next().is_some()
+                    || p.keywords().iter().next().is_some()
+                    || p.keyword_rest().is_some()
+                    || p.block().is_some()
+            });
+
+            if !has_args {
+                self.push(
+                    name_loc.start_offset(),
+                    COP,
+                    false,
+                    "Do not prefix reader method names with `get_`.".to_string(),
+                );
+                return;
+            }
+        }
+
+        // Check for bad writer: set_* with exactly one required argument
+        if name_str.starts_with("set_") {
+            let Some(p) = node.parameters() else { return };
+
+            // Must have exactly one required argument
+            let reqs: Vec<_> = p.requireds().iter().collect();
+            if reqs.len() == 1
+                && p.optionals().iter().next().is_none()
+                && p.rest().is_none()
+                && p.posts().iter().next().is_none()
+                && p.keywords().iter().next().is_none()
+                && p.keyword_rest().is_none()
+                && p.block().is_none()
+            {
+                self.push(
+                    name_loc.start_offset(),
+                    COP,
+                    false,
+                    "Do not prefix writer method names with `set_`.".to_string(),
+                );
+            }
+        }
+    }
+
+}
