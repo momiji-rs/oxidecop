@@ -2707,46 +2707,31 @@ impl<'a> Cops<'a> {
             return;
         }
 
-        // Only check lambdas with parenthesized parameters
+        // Upstream's `arrow_lambda_with_args?`: ANY lambda with arguments,
+        // parenthesized or not (`-> x do` counts; `->() {}` has an empty
+        // args list and does not).
         let Some(params) = node.parameters() else { return };
         let Some(bp) = params.as_block_parameters_node() else { return };
-        let Some(open_loc) = bp.opening_loc() else { return };
+        if bp.parameters().is_none() {
+            return;
+        }
 
-        // Get the arrow location (->)
-        let node_loc = node.location();
-        let arrow_end = node_loc.start_offset() + 2; // "->" is 2 bytes
-
-        // Get the opening paren location
-        let paren_start = open_loc.start_offset();
-
-        // Find the space between arrow and paren
-        let space_start = arrow_end;
-        let space_end = paren_start;
-
-        // Check what's between arrow and paren
-        let has_space = if space_start < space_end {
-            let space_bytes = &self.src[space_start..space_end];
-            space_bytes.iter().any(|&b| b == b' ')
-        } else {
-            false // no space between
-        };
+        let arrow_end = node.operator_loc().end_offset();
+        // whitequark's `parent.children[1]` range: the args node, whose span
+        // includes the parens when present — prism's BlockParametersNode.
+        let args_start = bp.location().start_offset();
+        // `arrow.end.join(parentheses.begin)` — emptiness, not space content.
+        let has_space = args_start > arrow_end;
 
         let style = self.cfg.enforced_style(COP);
-
         if style == "require_space" && !has_space {
-            // No space when space is required: flag from -> to closing paren
             let msg = "Use a space between `->` and `(` in lambda literals.";
-            self.push(node_loc.start_offset(), COP, true, msg);
-
-            // Fix: insert space before (
-            self.fixes.push((paren_start, paren_start, b" ".to_vec()));
+            self.push(node.location().start_offset(), COP, true, msg);
+            self.fixes.push((args_start, args_start, b" ".to_vec()));
         } else if style == "require_no_space" && has_space {
-            // Space when no space is required: flag only the space
             let msg = "Do not use spaces between `->` and `(` in lambda literals.";
-            self.push(space_start, COP, true, msg);
-
-            // Fix: remove the space(s)
-            self.fixes.push((space_start, space_end, Vec::new()));
+            self.push(arrow_end, COP, true, msg);
+            self.fixes.push((arrow_end, args_start, Vec::new()));
         }
     }
 }
