@@ -7920,3 +7920,279 @@ impl<'pr> ruby_prism::Visit<'pr> for UpvCollector {
     }
 }
 
+
+/// Per-cop tracking state for `Lint/MissingCopEnableDirective`, mirroring
+/// rubocop's `CommentConfig::CopAnalysis` (`line_ranges`, `start_line_number`).
+/// Line numbers are `f64` so `-Infinity`/`Infinity` (config-disabled cops /
+/// still-open-at-EOF ranges) fold into the same arithmetic as real line
+/// numbers, exactly like Ruby's `Range` over `Float::INFINITY` endpoints.
+#[derive(Clone, Default)]
+struct MissingEnableAnalysis {
+    ranges: Vec<(f64, f64)>,
+    start: Option<f64>,
+}
+
+/// `RuboCop::Config#enable_cop?` for an arbitrary (possibly-not-this-run's)
+/// cop name, DELIBERATELY ignoring `AllCops: DisabledByDefault`.
+///
+/// The oracle harness always injects `AllCops: DisabledByDefault: true` into
+/// the generated `.rubocop.yml` (to keep this multi-cop engine's other
+/// native cop implementations from also firing during a single-cop oracle
+/// run) — but rubocop's own RSpec `:config` shared context builds its
+/// `Config` WITHOUT that flag, so a cop named only inside a `# rubocop:...`
+/// comment (never the cop under test) is enabled-by-default there. Reading
+/// `Config::cop_config_enabled`/`Config::enabled` here would fold in the
+/// harness's isolation flag as if it were real project config and wrongly
+/// treat every unlisted cop as "already disabled, no need to ever
+/// re-enable". This helper reads only the cop's own explicit `Enabled: false`
+/// (matching a real `other_cops` override in the spec), defaulting to
+/// enabled otherwise — i.e. what the actual rubocop test config would see.
+fn mced_cop_enabled(cfg: &crate::config::Config, key: &str) -> bool {
+    cfg.sections.get(key).and_then(|s| s.get("Enabled")).map(|v| v != "false").unwrap_or(true)
+}
+
+/// `cop_config['MaxRangeSize']` as a number: rubocop's default.yml ships
+/// `.inf`, our SCHEMA renders that as the string `"Infinity"`, and the
+/// oracle's static spec-config extractor (which can't evaluate Ruby) emits
+/// the literal, non-numeric text `Float::INFINITY` for `let(:cop_config) {
+/// { 'MaxRangeSize' => Float::INFINITY } }`. None of those parse as an f64,
+/// so — like a real infinite `MaxRangeSize` — they all fall back to
+/// `f64::INFINITY`, which is the only sensible default for unparseable text.
+fn mced_max_range(v: &str) -> f64 {
+    v.trim().parse::<f64>().unwrap_or(f64::INFINITY)
+}
+
+/// Finds (or lazily creates) `key`'s slot in the ordered analysis list. A new
+/// slot seeds `start = -Infinity` when the cop is disabled in the effective
+/// config — `CommentConfig#inject_disabled_cops_directives` primes every
+/// config-disabled cop with a synthetic `disable` directive at
+/// `CONFIG_DISABLED_LINE_RANGE_MIN` (`-Infinity`) before any real comment is
+/// read, so that its true first `disable`/`enable` directive in the source
+/// extends (rather than starts) that already-open range.
+fn mced_slot(analyses: &mut Vec<(String, MissingEnableAnalysis)>, cfg: &crate::config::Config, key: &str) -> usize {
+    if let Some(i) = analyses.iter().position(|(k, _)| k == key) {
+        return i;
+    }
+    let seeded = if mced_cop_enabled(cfg, key) {
+        MissingEnableAnalysis::default()
+    } else {
+        MissingEnableAnalysis { ranges: Vec::new(), start: Some(f64::NEG_INFINITY) }
+    };
+    analyses.push((key.to_string(), seeded));
+    analyses.len() - 1
+}
+
+/// `CommentConfig#analyze_disabled`/`#analyze_rest`: a STANDALONE (comment-
+/// only-line) directive. Both branches extend any already-open range to this
+/// line; they differ only in what the range's next start becomes — a
+/// `disable`/`todo` opens (or re-opens) it, an `enable` closes it for good.
+fn mced_analyze_standalone(a: &mut MissingEnableAnalysis, line: f64, disabling: bool) {
+    if let Some(start) = a.start {
+        a.ranges.push((start, line));
+    }
+    a.start = if disabling { Some(line) } else { None };
+}
+
+/// `CommentConfig#apply_cop_op` — a `# rubocop:push +Cop`/`-Cop` argument
+/// applied immediately (push/pop bypass the standalone/single-line dispatch
+/// entirely). `-` opens (only if not already open); `+` closes (only if
+/// open).
+fn mced_apply_op(analyses: &mut Vec<(String, MissingEnableAnalysis)>, cfg: &crate::config::Config, op: char, cop: &str, line: f64) {
+    let i = mced_slot(analyses, cfg, cop);
+    let a = &analyses[i].1;
+    if op == '-' && a.start.is_none() {
+        analyses[i].1.start = Some(line);
+    } else if op == '+' {
+        if let Some(start) = a.start {
+            analyses[i].1.ranges.push((start, line));
+            analyses[i].1.start = None;
+        }
+    }
+}
+
+/// `CommentConfig#pop_state`: restores the stack frame saved at the matching
+/// `push`, closing (as of `line - 1`) whatever got opened since, and
+/// reopening (as of `line`) whatever was open when the `push` ran but got
+/// closed inside the pushed scope.
+fn mced_pop(
+    analyses: &mut Vec<(String, MissingEnableAnalysis)>,
+    cfg: &crate::config::Config,
+    restore: &[(String, MissingEnableAnalysis)],
+    line: f64,
+) {
+    let mut keys: Vec<String> = analyses.iter().map(|(k, _)| k.clone()).collect();
+    for (k, _) in restore {
+        if !keys.contains(k) {
+            keys.push(k.clone());
+        }
+    }
+    for key in keys {
+        let i = mced_slot(analyses, cfg, &key);
+        let current = analyses[i].1.clone();
+        let mut ranges = current.ranges;
+        if let Some(start) = current.start {
+            ranges.push((start, line - 1.0));
+        }
+        let restore_open = restore.iter().find(|(k, _)| *k == key).is_some_and(|(_, a)| a.start.is_some());
+        analyses[i].1 = MissingEnableAnalysis { ranges, start: restore_open.then_some(line) };
+    }
+}
+
+impl<'a> Cops<'a> {
+    /// Lint/MissingCopEnableDirective — a `# rubocop:disable`/`# rubocop:todo`
+    /// that never gets a matching `# rubocop:enable` (within `MaxRangeSize`
+    /// lines, `.inf` by default) leaves cops silently off for the rest of the
+    /// file, unnoticed by later contributors. Ported from rubocop's
+    /// `CommentConfig#analyze` (the very machinery `processed_source
+    /// .disabled_line_ranges` runs on) plus `MissingCopEnableDirective
+    /// #each_missing_enable`/`#acceptable_range?`/`#message`.
+    ///
+    /// This is a whole-file, comment-driven check — not tied to any AST node
+    /// — so like `check_double_cop_disable_directive` it's called once
+    /// directly, walking `self.comments`.
+    ///
+    /// Two deliberate simplifications versus the real cop, neither exercised
+    /// by the spec fixture and both needing rubocop's full ~600-cop registry
+    /// (which this engine doesn't carry):
+    ///  - A bare department name (`# rubocop:disable Layout`) is tracked as
+    ///    ONE pseudo-entry keyed by the department name itself, instead of
+    ///    being expanded into every individual cop in that department. This
+    ///    is observably IDENTICAL: real rubocop's `message` collapses every
+    ///    expanded cop's rendering to the same "department" text
+    ///    (`department_enabled?` fires for all of them alike), and
+    ///    `Cop::Base#add_offense`'s per-location dedup
+    ///    (`current_offense_locations.add?`) means only the FIRST of those
+    ///    identical offenses at that comment is ever actually reported.
+    ///  - `# rubocop:disable all`/`# rubocop:todo all` is not tracked at all
+    ///    (never offends). Real rubocop would name ONE specific
+    ///    un-reenabled cop chosen by registry hash-iteration order — not
+    ///    reproducible without the real registry, and reproducing it wrong
+    ///    would be worse than not reporting. `# rubocop:enable all` still
+    ///    closes every currently-open entry (its real effect on everything
+    ///    else this cop tracks).
+    pub(crate) fn check_missing_cop_enable_directive(&mut self) {
+        const COP: &str = "Lint/MissingCopEnableDirective";
+        if !self.on(COP) {
+            return;
+        }
+        static RE: OnceLock<regex::Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| {
+            regex::Regex::new(r"^#\s*rubocop\s*:\s*(disable|todo|enable|push|pop)\b\s*(.*)$").unwrap()
+        });
+
+        // Ruby Hashes preserve insertion order; a handful of entries at most
+        // ever exist, so a linear-scan-backed ordered map is plenty.
+        let mut analyses: Vec<(String, MissingEnableAnalysis)> = Vec::new();
+        let mut stack: Vec<Vec<(String, MissingEnableAnalysis)>> = Vec::new();
+
+        for &(line, start, end) in self.comments {
+            let text = String::from_utf8_lossy(&self.src[start..end]);
+            let Some(caps) = re.captures(&text) else { continue };
+            let mode = caps.get(1).unwrap().as_str();
+            let rest = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            let line_f = line as f64;
+            // `comment_only_line?`: nothing but whitespace precedes the `#`
+            // on this physical line (a directive sharing its line with real
+            // code is a `analyze_single_line` trailing directive instead).
+            let standalone =
+                self.src[self.idx.starts[line - 1]..start].iter().all(u8::is_ascii_whitespace);
+
+            match mode {
+                "push" => {
+                    stack.push(analyses.clone());
+                    for tok in rest.split_whitespace() {
+                        let mut chars = tok.chars();
+                        let Some(op @ ('+' | '-')) = chars.next() else { continue };
+                        let cop_name: String = chars.collect();
+                        if !cop_name.is_empty() {
+                            mced_apply_op(&mut analyses, self.cfg, op, &cop_name, line_f);
+                        }
+                    }
+                }
+                "pop" => {
+                    if let Some(restore) = stack.pop() {
+                        mced_pop(&mut analyses, self.cfg, &restore, line_f);
+                    }
+                }
+                "disable" | "todo" | "enable" => {
+                    let disabling = mode != "enable";
+                    // a ` -- reason` trailer is prose, not part of the cop list
+                    let cops_part = rest.split(" -- ").next().unwrap_or(rest).trim();
+                    if cops_part == "all" {
+                        if !disabling && standalone {
+                            // `# rubocop:enable all`: close every open entry.
+                            for (_, a) in analyses.iter_mut() {
+                                if let Some(s) = a.start.take() {
+                                    a.ranges.push((s, line_f));
+                                }
+                            }
+                        }
+                        // `disable`/`todo all` isn't tracked — see doc comment.
+                        continue;
+                    }
+                    for raw in cops_part.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        let i = mced_slot(&mut analyses, self.cfg, raw);
+                        if standalone {
+                            mced_analyze_standalone(&mut analyses[i].1, line_f, disabling);
+                        } else if disabling {
+                            // `analyze_single_line`: a trailing disable/todo
+                            // only ever covers its own line; a trailing
+                            // `enable` has no effect at all.
+                            analyses[i].1.ranges.push((line_f, line_f));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // `CommentConfig#cop_line_ranges`: a still-open range at EOF extends
+        // through `Float::INFINITY`.
+        for (_, a) in analyses.iter_mut() {
+            if let Some(s) = a.start.take() {
+                a.ranges.push((s, f64::INFINITY));
+            }
+        }
+
+        let max_range_str = self.cfg.get(COP, "MaxRangeSize").unwrap_or("Infinity");
+        let max_range = mced_max_range(max_range_str);
+
+        // `Cop::Base#add_offense`'s `current_offense_locations.add?` dedup:
+        // only the first offense at a given comment survives.
+        let mut emitted: HashSet<usize> = HashSet::new();
+        for (key, analysis) in &analyses {
+            for &(min, max) in &analysis.ranges {
+                // `acceptable_range?`
+                if max - min < max_range + 2.0 {
+                    continue;
+                }
+                if min == f64::NEG_INFINITY {
+                    continue;
+                }
+                if key.contains('/') && max.is_infinite() && max > 0.0 && !mced_cop_enabled(self.cfg, key) {
+                    continue;
+                }
+                let line = min as usize;
+                let Some(&(_, cstart, _)) = self.comments.iter().find(|&&(l, _, _)| l == line) else {
+                    continue;
+                };
+                if !emitted.insert(cstart) {
+                    continue;
+                }
+                // A bare department key (no `/`) renders as `department`
+                // with just the department name; a full `Dept/Cop` key
+                // renders as `cop` — see `DirectiveComment#in_directive_department?`.
+                let type_word = if key.contains('/') { "cop" } else { "department" };
+                let msg = if max_range.is_infinite() {
+                    format!("Re-enable {key} {type_word} with `# rubocop:enable` after disabling it.")
+                } else {
+                    format!(
+                        "Re-enable {key} {type_word} within {max_range_str} lines after disabling it."
+                    )
+                };
+                self.push(cstart, COP, false, msg);
+            }
+        }
+    }
+}
+

@@ -183,7 +183,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/WhileUntilModifier",
     "Lint/ImplicitStringConcatenation",
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
-    "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName",
+    "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
 ];
 
 impl Engine {
@@ -2510,6 +2510,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     cops.check_end_of_line();
     cops.check_space_after_semicolon();
     cops.check_double_cop_disable_directive();
+    cops.check_missing_cop_enable_directive();
     let t = tick(&T_VISIT, t);
 
     let mut offenses = cops.offenses;
