@@ -4963,3 +4963,92 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/BlockComments — disallow `=begin`/`=end` document comments in
+    /// favor of `#`-prefixed line comments. rubocop iterates
+    /// `processed_source.comments` and flags every `comment.document?` (a
+    /// prism `EmbDocComment`); rather than threading a comment-kind tag
+    /// through `self.comments`, we lean on the fact that only an embedded
+    /// doc comment's raw text can start with the literal `=begin` — an
+    /// ordinary `#` comment never does.
+    ///
+    /// Autocorrect (`parts`/`eq_end_part` in the source) splits the comment
+    /// into three byte ranges and rewrites them independently:
+    ///   - `eq_begin` = the leading `"=begin\n"` (removed)
+    ///   - `eq_end`   = the trailing `"=end"` line (removed)
+    ///   - `contents` = everything between them, reindented with `# ` via
+    ///     `block_comment_reindent` below (verbatim port of the cop's three
+    ///     chained `gsub`s), then substituted in place.
+    /// An empty `contents` (bare `=begin`/`=end` with nothing between) is
+    /// left untouched by the replace step, so the whole block simply
+    /// vanishes.
+    pub(crate) fn check_block_comments(&mut self) {
+        const COP: &str = "Style/BlockComments";
+        if !self.on(COP) {
+            return;
+        }
+
+        // "=begin\n".len()
+        const BEGIN_LEN: usize = 7;
+        // "\n=end".len() — used to size the trailing chunk when the comment's
+        // own text ends in a newline (the overwhelmingly common case: there
+        // is more source, or a final trailing newline, after `=end`).
+        const END_LEN: usize = 5;
+
+        for &(_line, start, end) in self.comments {
+            if !self.src[start..end].starts_with(b"=begin") {
+                continue;
+            }
+
+            self.push(start, COP, true, "Do not use block comments.");
+
+            let eq_begin_end = (start + BEGIN_LEN).min(end);
+
+            let text = &self.src[start..end];
+            let eq_end_begin = if text.last() == Some(&b'\n') {
+                end.saturating_sub(END_LEN)
+            } else {
+                // Comment is the literal last bytes of the file (no trailing
+                // newline at all) — rubocop's own `chomp`-based branch hits
+                // here too, though on a whitequark-padded buffer; prism
+                // gives us the raw span, so we fall back to just the bare
+                // `"=end"` (4 bytes) with no assumed padding.
+                end.saturating_sub(4)
+            }
+            .max(eq_begin_end);
+
+            if eq_end_begin > eq_begin_end {
+                let contents = String::from_utf8_lossy(&self.src[eq_begin_end..eq_end_begin]).into_owned();
+                let replacement = block_comment_reindent(&contents);
+                self.fixes.push((eq_begin_end, eq_end_begin, replacement.into_bytes()));
+            }
+
+            self.fixes.push((start, eq_begin_end, Vec::new()));
+            self.fixes.push((eq_end_begin, end, Vec::new()));
+        }
+    }
+}
+
+/// Verbatim port of `BlockComments#parts`' content transform:
+/// `contents.source.gsub(/\A/, '# ').gsub("\n\n", "\n#\n").gsub(/\n(?=[^#])/, "\n# ")`
+fn block_comment_reindent(s: &str) -> String {
+    // gsub(/\A/, '# ') — prefix the very start of the string.
+    let prefixed = format!("# {s}");
+    // gsub("\n\n", "\n#\n") — literal, non-overlapping, left-to-right.
+    let doubled = prefixed.replace("\n\n", "\n#\n");
+    // gsub(/\n(?=[^#])/, "\n# ") — every `\n` followed by a non-`#` char
+    // (a `\n` with nothing after it, i.e. at the very end of the string,
+    // never matches the lookahead).
+    let chars: Vec<char> = doubled.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(doubled.len());
+    for (i, &c) in chars.iter().enumerate() {
+        out.push(c);
+        if c == '\n' && i + 1 < n && chars[i + 1] != '#' {
+            out.push('#');
+            out.push(' ');
+        }
+    }
+    out
+}
