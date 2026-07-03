@@ -214,6 +214,7 @@ COPS = {
   'Style/MixinUsage'                 => 'style/mixin_usage',
   'Lint/UnderscorePrefixedVariableName' => 'lint/underscore_prefixed_variable_name',
   'Lint/MissingCopEnableDirective'   => 'lint/missing_cop_enable_directive',
+  'Layout/MultilineMethodCallBraceLayout' => 'layout/multiline_method_call_brace_layout',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

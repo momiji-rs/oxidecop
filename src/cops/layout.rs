@@ -4574,6 +4574,7 @@ impl<'a> Cops<'a> {
             (open.start_offset(), open.end_offset()),
             (close.start_offset(), close.end_offset()),
             &children,
+            open.start_offset(),
         );
     }
 
@@ -4605,6 +4606,7 @@ impl<'a> Cops<'a> {
             (open.start_offset(), open.end_offset()),
             (close.start_offset(), close.end_offset()),
             &children,
+            open.start_offset(),
         );
     }
 
@@ -4640,6 +4642,7 @@ impl<'a> Cops<'a> {
             (lparen.start_offset(), lparen.end_offset()),
             (rparen.start_offset(), rparen.end_offset()),
             &children,
+            lparen.start_offset(),
         );
     }
 
@@ -4654,6 +4657,7 @@ impl<'a> Cops<'a> {
         open: (usize, usize),
         close: (usize, usize),
         children: &[ruby_prism::Node],
+        node_start: usize,
     ) {
         // `empty_literal?`
         if children.is_empty() {
@@ -4724,7 +4728,7 @@ impl<'a> Cops<'a> {
         // ITSELF a call's receiver or (non-safe-nav) positional argument —
         // rubocop declines to untangle the comment from a resumed chain.
         let last_commented = self.mlbl_comment_at_line(last_line);
-        if last_commented && self.mlbl_is_chained_or_argument(open.0) {
+        if last_commented && self.mlbl_is_chained_or_argument(node_start) {
             // Offense stands; no correction (matches upstream leaving it
             // uncorrected here).
             return;
@@ -4737,6 +4741,19 @@ impl<'a> Cops<'a> {
         let left_start = self.mlbl_left_space_start(close.0);
         self.fixes.push((left_start, close.0, Vec::new()));
 
+        // `correct_heredoc_argument_method_chain`: when THIS node is itself
+        // the dot-chained receiver of an outer call and its own first
+        // argument is a heredoc, the outer call's `.method_name` tail is
+        // uprooted from just past the closing token and reattached right
+        // after the relocated token — pushed BEFORE that token's own
+        // re-insertion below so the two same-position inserts land in the
+        // right visual order (closing token, then the chained method).
+        if let Some(&(dot_start, parent_end)) = self.mmcbl_heredoc_chain.get(&node_start) {
+            let chain_text = self.src[dot_start..parent_end].to_vec();
+            self.fixes.push((dot_start, parent_end, Vec::new()));
+            self.fixes.push((insert_at, insert_at, chain_text));
+        }
+
         if last_commented {
             // `select_content_to_be_inserted_after_last_element`: drag
             // everything from the closing token through the end of ITS own
@@ -4747,6 +4764,13 @@ impl<'a> Cops<'a> {
             self.fixes.push((close.0, line_end, Vec::new()));
             self.fixes.push((insert_at, insert_at, text));
         } else {
+            // The closing token itself must be removed from its old spot,
+            // not just the space to its left — `corrector.remove(range_
+            // with_surrounding_space(node.loc.end, side: :left))` deletes
+            // BOTH in one range upstream; the leading-space delete above
+            // only covers the space, so the token's own bytes need their
+            // own removal here.
+            self.fixes.push((close.0, close.1, Vec::new()));
             let text = self.src[close.0..close.1].to_vec();
             self.fixes.push((insert_at, insert_at, text));
         }
@@ -5167,5 +5191,56 @@ impl<'a> super::Cops<'a> {
         let start = self.idx.starts[line - 1];
         let end = self.line_end(line);
         std::str::from_utf8(&self.src[start..end]).unwrap_or("")
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// `Layout::MultilineMethodCallBraceLayout#on_send`/`#on_csend` —
+    /// `check_brace_layout(node)`, reusing the same
+    /// `MultilineLiteralBraceLayout` engine as the array/hash/method-def
+    /// cops above. The "brace" is the call's own parens (`lparen`/`rparen`
+    /// via `opening_loc`/`closing_loc`); `children(node)` is `node.arguments`
+    /// — a receiverless/braceless call (`foo 1, 2`) has neither, so
+    /// `opening_loc`/`closing_loc` being absent stands in for
+    /// `implicit_literal?`, and a call with no arguments (`puts` or
+    /// `puts()`) yields an empty `children`, which the shared engine already
+    /// treats as `empty_literal?`.
+    ///
+    /// The cop's own `single_line_ignoring_receiver?` override — `same_line?
+    /// (node.loc.begin, node.loc.end)` — short-circuits `ignored_literal?`
+    /// before it ever falls through to the base `node.single_line?` check
+    /// (which additionally spans the receiver/method-name chain). Since
+    /// `loc.begin`/`loc.end` being on different lines already forces the
+    /// full node's own span to be multi-line too, `node.single_line?` can
+    /// never add anything `single_line_ignoring_receiver?` didn't already
+    /// decide — exactly the shared engine's existing open/close-only
+    /// single-line guard, so no extra override is needed here.
+    pub(crate) fn check_multiline_method_call_brace_layout(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/MultilineMethodCallBraceLayout";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(open) = node.opening_loc() else { return };
+        let Some(close) = node.closing_loc() else { return };
+        let children: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        const MSGS: MlblMessages = MlblMessages {
+            same_line: "Closing method call brace must be on the same line as the last argument \
+                when opening brace is on the same line as the first argument.",
+            new_line: "Closing method call brace must be on the line after the last argument \
+                when opening brace is on a separate line from the first argument.",
+            always_new_line: "Closing method call brace must be on the line after the last \
+                argument.",
+            always_same_line: "Closing method call brace must be on the same line as the last \
+                argument.",
+        };
+        self.check_multiline_literal_brace(
+            COP,
+            &MSGS,
+            (open.start_offset(), open.end_offset()),
+            (close.start_offset(), close.end_offset()),
+            &children,
+            node.location().start_offset(),
+        );
     }
 }

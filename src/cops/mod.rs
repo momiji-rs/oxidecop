@@ -184,6 +184,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/ImplicitStringConcatenation",
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
     "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
+    "Layout/MultilineMethodCallBraceLayout",
 ];
 
 impl Engine {
@@ -766,6 +767,16 @@ pub(crate) struct Cops<'a> {
     // statement count. A later `on_send`-equivalent visit on the EXACT same
     // node is skipped, mirroring rubocop's node-identity `ignored_node?`.
     pub(crate) non_nil_ignored: HashSet<usize>,
+    // Layout/MultilineMethodCallBraceLayout: a CallNode's own start offset ->
+    // (dot start offset, enclosing call's own end offset) when that call is
+    // itself the DOT-CHAINED RECEIVER of an outer call (`X.method_name`) AND
+    // its own first (positional) argument is a plain, non-interpolated
+    // heredoc-opened string — `MultilineLiteralBraceCorrector#
+    // use_heredoc_argument_method_chain?`/`#correct_heredoc_argument_method_
+    // chain`. Populated top-down in `visit_call_node` (the outer chained call
+    // is visited, and populates this for its receiver, before the receiver
+    // itself is ever reached).
+    pub(crate) mmcbl_heredoc_chain: HashMap<usize, (usize, usize)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2109,6 +2120,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_nested_parenthesized_calls(node);
         self.check_require_parentheses(node);
         self.check_non_nil_check(node);
+        self.check_multiline_method_call_brace_layout(node);
         // Naming/AsciiIdentifiers scans tIDENTIFIER tokens — method call
         // selectors included (weird.なまえ); operators/[] have no message_loc
         // worth checking and setters end in =, both ASCII-guarded anyway.
@@ -2189,11 +2201,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Lint/UselessTimes: a safe-navigation call's receiver/args don't
         // count as "parent is :send" (whitequark's `:csend` != `:send`).
         let ut_track = !node.is_safe_navigation() && self.on("Lint/UselessTimes");
-        // Layout/Multiline{Array,Hash}BraceLayout: `chained?` (receiver of
-        // ANY call, safe-nav included) / `argument?` (positional argument of
-        // a non-safe-nav call only) — see `mlbl_call_child`.
+        // Layout/Multiline{Array,Hash,MethodCall}BraceLayout: `chained?`
+        // (receiver of ANY call, safe-nav included) / `argument?` (positional
+        // argument of a non-safe-nav call only) — see `mlbl_call_child`. The
+        // method-call cop additionally needs this to know whether the CALL
+        // NODE ITSELF (checked via `check_multiline_method_call_brace_layout`
+        // below) is chained onto / an argument of an outer call.
         let mlbl_track = self.on("Layout/MultilineArrayBraceLayout")
-            || self.on("Layout/MultilineHashBraceLayout");
+            || self.on("Layout/MultilineHashBraceLayout")
+            || self.on("Layout/MultilineMethodCallBraceLayout");
         // Layout/ClosingHeredocIndentation: this call's own climbed-chain
         // root — inherited from an enclosing call that already claimed THIS
         // call as its receiver/argument, or (the common case) itself when
@@ -2213,6 +2229,30 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
             if mlbl_track {
                 self.mlbl_call_child.insert(r.location().start_offset());
+            }
+            // Layout/MultilineMethodCallBraceLayout's
+            // `use_heredoc_argument_method_chain?`: THIS call (`node`) must
+            // have an actual dot (`X.foo`/`X&.foo` — a synthetic operator
+            // call like `X + 1` has no `call_operator_loc` and can't be a
+            // dot-chain at all), and the RECEIVER `r` must itself be a call
+            // whose first positional argument is a plain (non-interpolated)
+            // heredoc-opened string.
+            if self.on("Layout/MultilineMethodCallBraceLayout") {
+                if let (Some(rc), Some(dot)) = (r.as_call_node(), node.call_operator_loc()) {
+                    let heredoc_first_arg = rc
+                        .arguments()
+                        .and_then(|a| a.arguments().iter().next())
+                        .and_then(|first| first.as_string_node())
+                        .is_some_and(|s| {
+                            s.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<"))
+                        });
+                    if heredoc_first_arg {
+                        self.mmcbl_heredoc_chain.insert(
+                            r.location().start_offset(),
+                            (dot.start_offset(), node.location().end_offset()),
+                        );
+                    }
+                }
             }
             if let Some(root) = chi_root {
                 // `chained?`: heredoc-as-receiver counts regardless of THIS
@@ -2467,6 +2507,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         interpolated_node_depth: 0,
         class_module_depth: 0,
         non_nil_ignored: HashSet::new(),
+        mmcbl_heredoc_chain: HashMap::new(),
     };
 
     let t = tick(&T_PREP, t);
