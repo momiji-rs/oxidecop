@@ -9799,3 +9799,170 @@ impl<'a> super::Cops<'a> {
     }
 
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/NonNilCheck — `on_def`/`on_defs` half: predicate methods
+    /// (`foo?`) tolerate an explicit non-nil check as their trailing (or
+    /// sole) body statement — upstream's `ignore_node(body.begin_type? ?
+    /// body.children.last : body)`. Prism ALWAYS wraps a def body in a
+    /// `StatementsNode` regardless of statement count (unlike whitequark,
+    /// which only wraps 2+ statements in a `:begin`), so both branches
+    /// collapse to one lookup: the last element of that `StatementsNode`.
+    /// prism gives `def`/`defs` (singleton methods, e.g. `def Test.foo?`)
+    /// the SAME node type, so this single hook covers both `on_def` and
+    /// `on_defs`.
+    pub(crate) fn check_non_nil_check_def(&mut self, node: &ruby_prism::DefNode) {
+        if !node.name().as_slice().ends_with(b"?") {
+            return;
+        }
+        let Some(body) = node.body() else { return };
+        let last = if let Some(stmts) = body.as_statements_node() {
+            stmts.body().iter().last()
+        } else {
+            Some(body)
+        };
+        if let Some(last) = last {
+            self.non_nil_ignored.insert(last.location().start_offset());
+        }
+    }
+
+    /// Style/NonNilCheck — `on_send` half, minus `unless_and_nil_check?`
+    /// (needs the parent `UnlessNode`; see `check_non_nil_check_unless`,
+    /// called pre-order from `visit_unless_node`). Handles:
+    /// - `not_equal_to_nil?` (`(send _ :!= nil)`): ALWAYS eligible — the only
+    ///   form whose message/fix differs on `IncludeSemanticChanges`.
+    /// - `not_and_nil_check?` (`(send (send _ :nil?) :!)`, i.e. `!x.nil?` /
+    ///   `not x.nil?`, prism folds both to a `!`-named `CallNode`): eligible
+    ///   only with `IncludeSemanticChanges: true`.
+    pub(crate) fn check_non_nil_check(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/NonNilCheck";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !matches!(name, b"!=" | b"!") {
+            return;
+        }
+        // `ignored_node?`: this exact node was marked by an enclosing
+        // predicate `def` as its trailing/only body statement.
+        if self.non_nil_ignored.contains(&node.location().start_offset()) {
+            return;
+        }
+        let semantic = self.non_nil_semantic_changes(COP);
+        // `return if ... (!include_semantic_changes? && nil_comparison_style
+        // == 'comparison')` — gates EVERY `RESTRICT_ON_SEND` method, not
+        // just `!=`; harmless to check unconditionally here since the `!`
+        // branch below already requires `semantic` to fire at all (and
+        // `semantic` and `!semantic` can't both hold).
+        if !semantic && self.non_nil_comparison_style_conflicts() {
+            return;
+        }
+        let Some(receiver) = node.receiver() else { return };
+        if name == b"!=" {
+            // `(send _ :!= nil)` — any receiver, argument must be a literal
+            // `nil` (excludes `x != 0`, `x != y`, …).
+            let Some(args) = node.arguments() else { return };
+            let mut it = args.arguments().iter();
+            let Some(only) = it.next() else { return };
+            if it.next().is_some() || only.as_nil_node().is_none() {
+                return;
+            }
+            let l = node.location();
+            let recv_src = self.node_src(&receiver).to_vec();
+            let msg = if semantic {
+                "Explicit non-nil checks are usually redundant.".to_string()
+            } else {
+                format!(
+                    "Prefer `!{}.nil?` over `{}`.",
+                    String::from_utf8_lossy(&recv_src),
+                    String::from_utf8_lossy(self.node_src(&node.as_node())),
+                )
+            };
+            self.push(l.start_offset(), COP, true, msg);
+            let replacement: Vec<u8> = if semantic {
+                recv_src
+            } else {
+                let mut r = b"!".to_vec();
+                r.extend_from_slice(&recv_src);
+                r.extend_from_slice(b".nil?");
+                r
+            };
+            self.fixes.push((l.start_offset(), l.end_offset(), replacement));
+        } else {
+            // `!x.nil?` / `not x.nil?` — only with semantic changes, and
+            // only this exact shape (a bare `!x` never matches: its
+            // receiver isn't a `nil?` call).
+            if !semantic || node.arguments().is_some() {
+                return;
+            }
+            let Some(inner) = receiver.as_call_node() else { return };
+            if inner.name().as_slice() != b"nil?" || inner.arguments().is_some() {
+                return;
+            }
+            let l = node.location();
+            self.push(l.start_offset(), COP, true, "Explicit non-nil checks are usually redundant.");
+            // `inner_node.receiver ? inner_node.receiver.source : 'self'` —
+            // an implicit receiver on the inner `nil?` (`!nil?`) corrects to
+            // literal `self`.
+            let replacement: Vec<u8> = match inner.receiver() {
+                Some(inner_recv) => self.node_src(&inner_recv).to_vec(),
+                None => b"self".to_vec(),
+            };
+            self.fixes.push((l.start_offset(), l.end_offset(), replacement));
+        }
+    }
+
+    /// Style/NonNilCheck — `unless_and_nil_check?`: `unless x.nil?`, only
+    /// with `IncludeSemanticChanges: true`. Corrects `unless x.nil? ... end`
+    /// / `stmt unless x.nil?` to `if x ... end` / `if x stmt` by swapping the
+    /// `unless` keyword to `if` and replacing the `.nil?` call with its
+    /// receiver's source.
+    pub(crate) fn check_non_nil_check_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Style/NonNilCheck";
+        if !self.on(COP) || !self.non_nil_semantic_changes(COP) {
+            return;
+        }
+        // `unless_check?`: `(if (send _ :nil?) ...)` matched against the
+        // PARENT — i.e. this `nil?` call must be exactly the `unless`'s own
+        // predicate, not merely nested somewhere inside it.
+        let Some(call) = node.predicate().as_call_node() else { return };
+        if call.name().as_slice() != b"nil?" || call.arguments().is_some() {
+            return;
+        }
+        if self.non_nil_ignored.contains(&call.location().start_offset()) {
+            return;
+        }
+        // A receiver-less `nil?` (`unless nil?` — implicit `self.nil?`)
+        // makes upstream's OWN autocorrect raise (`corrector.replace(node,
+        // receiver.source)` where `receiver` is Ruby `nil`, not a node) —
+        // verified live against rubocop 1.88.0: the file comes back
+        // untouched and the run reports zero offenses for the whole file
+        // (the exception aborts the cop's entire investigation of it).
+        // Since no fixture example exercises this, and there is no sane
+        // non-crashing offense to reproduce, treat it as "no offense" here.
+        let Some(receiver) = call.receiver() else { return };
+        let l = call.location();
+        self.push(l.start_offset(), COP, true, "Explicit non-nil checks are usually redundant.");
+        let kw = node.keyword_loc();
+        self.fixes.push((kw.start_offset(), kw.end_offset(), b"if".to_vec()));
+        self.fixes.push((l.start_offset(), l.end_offset(), self.node_src(&receiver).to_vec()));
+    }
+
+    fn non_nil_semantic_changes(&self, cop: &str) -> bool {
+        self.cfg.get(cop, "IncludeSemanticChanges").is_some_and(|v| v == "true")
+    }
+
+    /// `nil_comparison_style == 'comparison'`: `Style/NilComparison`'s own
+    /// `Enabled`/`EnforcedStyle`, read directly off its config section
+    /// (`config.for_cop`). Deliberately `param()`, not `cop_config_enabled`:
+    /// `Style/NilComparison` ships `Enabled: true` in real rubocop's
+    /// default.yml, so a real `Config` object has that key set REGARDLESS of
+    /// an `AllCops: DisabledByDefault` elsewhere — `all_disabled_by_default`
+    /// only matters for cops with no baked-in default, which isn't this
+    /// cop's situation. Only an EXPLICIT `Enabled: false` on `Style/
+    /// NilComparison` itself should count as disabled here.
+    fn non_nil_comparison_style_conflicts(&self) -> bool {
+        self.cfg.param("Style/NilComparison", "Enabled") != Some("false")
+            && self.cfg.get("Style/NilComparison", "EnforcedStyle") == Some("comparison")
+    }
+}

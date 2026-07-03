@@ -183,6 +183,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/WhileUntilModifier",
     "Lint/ImplicitStringConcatenation",
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
+    "Style/NonNilCheck",
 ];
 
 impl Engine {
@@ -759,6 +760,12 @@ pub(crate) struct Cops<'a> {
     // Style/PerlBackrefs: depth of enclosing class/module nodes — used to
     // determine if Regexp constant needs :: prefix.
     pub(crate) class_module_depth: usize,
+    // Style/NonNilCheck: start offsets of nodes marked via `ignore_node` —
+    // the trailing (or sole) statement of a predicate method's (`foo?`)
+    // body, which prism always wraps in a `StatementsNode` regardless of
+    // statement count. A later `on_send`-equivalent visit on the EXACT same
+    // node is skipped, mirroring rubocop's node-identity `ignored_node?`.
+    pub(crate) non_nil_ignored: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1171,6 +1178,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_unless_else(node);
         self.check_empty_conditional_body_unless(node);
         self.check_empty_else_unless(node);
+        self.check_non_nil_check_unless(node);
         self.check_multiline_if_then(
             node.then_keyword_loc(),
             node.end_keyword_loc(),
@@ -1858,6 +1866,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_optional_arguments(node);
         self.check_method_parameter_name(node);
         self.check_keyword_parameters_order_def(node);
+        self.check_non_nil_check_def(node);
         // Default walk (receiver, params, body) one def level deeper — matches
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
         // parameter default values, which a body-only walk silently skipped.
@@ -2097,6 +2106,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_single_argument_dig(node);
         self.check_nested_parenthesized_calls(node);
         self.check_require_parentheses(node);
+        self.check_non_nil_check(node);
         // Naming/AsciiIdentifiers scans tIDENTIFIER tokens — method call
         // selectors included (weird.なまえ); operators/[] have no message_loc
         // worth checking and setters end in =, both ASCII-guarded anyway.
@@ -2454,6 +2464,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         isc_send_child: HashSet::new(),
         interpolated_node_depth: 0,
         class_module_depth: 0,
+        non_nil_ignored: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);
