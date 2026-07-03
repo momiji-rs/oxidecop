@@ -6371,3 +6371,73 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+impl<'a> super::Cops<'a> {
+    /// Security/JSONLoad — `JSON.load` and `JSON.restore` allow deserialization
+    /// of arbitrary Ruby objects, which is unsafe for untrusted input. Unless
+    /// `create_additions` is explicitly passed, we should use `JSON.parse` instead.
+    pub(crate) fn check_json_load(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Security/JSONLoad";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !matches!(name, b"load" | b"restore") {
+            return;
+        }
+        let recv_const = node.receiver().and_then(|r| const_name_root(&r));
+        if recv_const.as_deref() != Some("JSON") {
+            return;
+        }
+
+        // Check if `create_additions` keyword argument is present
+        let has_create_additions = node
+            .arguments()
+            .map(|args| {
+                args.arguments()
+                    .iter()
+                    .any(|arg| has_create_additions_key(&arg))
+            })
+            .unwrap_or(false);
+
+        if !has_create_additions {
+            if let Some(sel) = node.message_loc() {
+                let method_name = String::from_utf8_lossy(name);
+                self.push(sel.start_offset(), COP, true,
+                    format!("Prefer `JSON.parse` over `JSON.{}`.", method_name));
+                self.fixes.push((sel.start_offset(), sel.end_offset(), b"parse".to_vec()));
+            }
+        }
+    }
+}
+
+/// Check if a node or its nested hash contains the `create_additions` key
+fn has_create_additions_key(node: &ruby_prism::Node) -> bool {
+    // Hash argument containing create_additions: value
+    if let Some(hash) = node.as_hash_node() {
+        for el in hash.elements().iter() {
+            if let Some(assoc) = el.as_assoc_node() {
+                if let Some(key_sym) = assoc.key().as_symbol_node() {
+                    if key_sym.unescaped() == b"create_additions" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Keyword hash (keyword arguments wrapped in KeywordHashNode)
+    if let Some(kw_hash) = node.as_keyword_hash_node() {
+        for el in kw_hash.elements().iter() {
+            if let Some(assoc) = el.as_assoc_node() {
+                if let Some(key_sym) = assoc.key().as_symbol_node() {
+                    if key_sym.unescaped() == b"create_additions" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+

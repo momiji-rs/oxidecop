@@ -168,6 +168,7 @@ COPS = {
   'Style/PreferredHashMethods'       => 'style/preferred_hash_methods',
   'Style/NumericLiteralPrefix'       => 'style/numeric_literal_prefix',
   'Security/Open'                    => 'security/open',
+  'Security/JSONLoad'                => 'security/json_load',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
