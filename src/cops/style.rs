@@ -3893,3 +3893,300 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Style/ComparableClamp — `if x < low; low; elsif high < x; high; else; x; end`
+    /// (any of rubocop's 8 syntactic variants — `<`/`>`, either operand order,
+    /// either branch testing the min-bound or max-bound first) → `x.clamp(low, high)`.
+    /// `minimum_target_ruby_version 2.4` gates the whole cop (both checks below).
+    ///
+    /// rubocop's `on_if` fires per if-node, including each nested `elsif`
+    /// IfNode independently (an `elsif` chain is just nested `if`s in the
+    /// `else` slot, and the AST walker visits each one) — so does this: it's
+    /// called from `visit_if_node` for every `if`/`elsif`, and the pattern
+    /// match only succeeds at the ONE node whose own then-branch, whose
+    /// subsequent's then-branch, and whose subsequent's else all line up
+    /// with the two comparisons (verified empirically: a 3-way chain like
+    /// `if cond; …; elsif x>high; high; elsif low>x; low; else; x; end` only
+    /// matches at the `elsif x>high` node, not the outer `if cond` — its own
+    /// condition isn't a comparison — nor the inner `elsif low>x` — its own
+    /// `else` is the terminal value directly, not a nested if).
+    ///
+    /// Offense anchor: `node.location().start_offset()`. Verified against
+    /// live `Prism.parse` output that an `elsif` IfNode's raw location START
+    /// is the `elsif` keyword itself (unlike its raw END, which — naively —
+    /// runs through the chain's shared `end`; see the autocorrect comment
+    /// below for why that matters there but not here).
+    pub(crate) fn check_comparable_clamp_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/ComparableClamp";
+        if !self.on(COP) || self.cfg.target_ruby() < 2.4 {
+            return;
+        }
+        let Some(m) = clamp_if_match(node, self.src) else { return };
+        let prefer = format!(
+            "{}.clamp({}, {})",
+            clamp_parenthesize(&m.else_body, self.src),
+            String::from_utf8_lossy(m.min_src),
+            String::from_utf8_lossy(m.max_src),
+        );
+        let start = node.location().start_offset();
+        self.push(start, COP, true, format!("Use `{prefer}` instead of `if/elsif/else`."));
+
+        let is_elsif = node.if_keyword_loc().is_some_and(|k| k.as_slice() == b"elsif");
+        if is_elsif {
+            // rubocop's Prism→Parser translation (`visit_if_node`) omits the
+            // `end` token for an `elsif` IfNode's own `loc.expression` — it
+            // ends at the tail of the chain's final `else` VALUE instead
+            // (recursively, regardless of chain depth), never swallowing the
+            // shared `end` keyword. `else_body`'s own end offset IS that
+            // tail, since it's the innermost value already.
+            // rubocop issues this as two separate Corrector ops
+            // (`insert_before` + `replace`, both anchored at `start`) — our
+            // `Fix` model can't represent two edits sharing a start/end
+            // boundary as non-overlapping, so they're folded into one
+            // replacement spanning the same net range with the same net text.
+            let (_, col) = self.idx.loc(start);
+            let width = self.clamp_indentation_width();
+            let indent = " ".repeat(col.saturating_sub(1) + width);
+            let end = m.else_body.location().end_offset();
+            self.fixes.push((start, end, format!("else\n{indent}{prefer}").into_bytes()));
+        } else if let Some(end_kw) = node.end_keyword_loc() {
+            self.fixes.push((start, end_kw.end_offset(), prefer.into_bytes()));
+        }
+    }
+
+    /// rubocop's Alignment#configured_indentation_width: the cop's own
+    /// `IndentationWidth` param if set, else `Layout/IndentationWidth`'s
+    /// `Width` (schema default 2 — Style/ComparableClamp itself has no
+    /// params, so this always falls through to the Layout default or an
+    /// explicit user override of it).
+    fn clamp_indentation_width(&self) -> usize {
+        self.cfg
+            .get("Style/ComparableClamp", "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| self.cfg.int("Layout/IndentationWidth", "Width"))
+    }
+
+    /// Style/ComparableClamp — `[[x, low].max, high].min` (and the 3 other
+    /// shapes: max/min swapped, and the wrapped pair on either side of the
+    /// outer array). Never autocorrected: rubocop's own rationale is that a
+    /// reversed `clamp` range raises `ArgumentError`, and a min/max chain
+    /// built from arbitrary values can't be statically proven to be ordered.
+    pub(crate) fn check_comparable_clamp_min_max(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/ComparableClamp";
+        if !self.on(COP) || self.cfg.target_ruby() < 2.4 {
+            return;
+        }
+        let outer = node.name();
+        let outer = outer.as_slice();
+        if outer != b"min" && outer != b"max" {
+            return;
+        }
+        if !clamp_zero_args(node) {
+            return;
+        }
+        let Some(recv) = node.receiver() else { return };
+        let Some(arr) = recv.as_array_node() else { return };
+        let elems: Vec<ruby_prism::Node> = arr.elements().iter().collect();
+        if elems.len() != 2 {
+            return;
+        }
+        let inner_name: &[u8] = if outer == b"min" { b"max" } else { b"min" };
+        let is_inner_match = |n: &ruby_prism::Node| -> bool {
+            let Some(call) = n.as_call_node() else { return false };
+            if call.name().as_slice() != inner_name || !clamp_zero_args(&call) {
+                return false;
+            }
+            let Some(inner_arr) = call.receiver().and_then(|r| r.as_array_node()) else { return false };
+            inner_arr.elements().iter().count() == 2
+        };
+        if is_inner_match(&elems[0]) || is_inner_match(&elems[1]) {
+            self.push(node.location().start_offset(), COP, false, "Use `Comparable#clamp` instead.");
+        }
+    }
+}
+
+/// A `min`/`max` (or comparison) call with no explicit arguments — `.min`
+/// and `.min()` are structurally identical (zero args either way); a call
+/// with a block is STILL zero-arg (Prism keeps a call's block on the same
+/// `CallNode`, unlike whitequark's separate wrapping `block` node, but that
+/// wrapping happens ABOVE this send in rubocop's translated tree either way
+/// — the send node's own arg arity is unaffected either representation).
+fn clamp_zero_args(call: &ruby_prism::CallNode) -> bool {
+    match call.arguments() {
+        None => true,
+        Some(a) => a.arguments().iter().next().is_none(),
+    }
+}
+
+/// The `(if_body, elsif_body, else_body)` triple + the min/max values,
+/// once `if_elsif_else_condition?` + rubocop's `on_if` body logic both
+/// succeed. `else_body` is kept as a NODE (not just its source text) because
+/// `parenthesize_if_needed` inspects its type.
+struct ClampIfMatch<'a> {
+    else_body: ruby_prism::Node<'a>,
+    min_src: &'a [u8],
+    max_src: &'a [u8],
+}
+
+/// Ports rubocop's `if_elsif_else_condition?` node-pattern (8 alternatives)
+/// PLUS the `on_if` body's own cross-checks (`min_condition?`) into one pass:
+/// the def_node_matcher's `_x`/`_min`/`_max` metavariables are unified here
+/// by comparing SOURCE TEXT across occurrences — the same approach this
+/// codebase already uses for structural node equality (see
+/// `check_duplicate_elsif_condition`), and equivalent to whitequark's
+/// location-blind `Node#==` for the simple identifier/expression operands
+/// these patterns compare (two occurrences of the same source text are the
+/// same AST shape either way; the only gap is byte-identical-but-reformatted
+/// duplicates, e.g. `a+b` vs `a + b`, which none of rubocop's own examples
+/// exercise).
+fn clamp_if_match<'a>(node: &ruby_prism::IfNode<'a>, src: &'a [u8]) -> Option<ClampIfMatch<'a>> {
+    let if_body = clamp_single_value(node.statements())?;
+    let inner = node.subsequent()?.as_if_node()?;
+    let elsif_body = clamp_single_value(inner.statements())?;
+    let else_node = inner.subsequent()?.as_else_node()?;
+    let else_body = clamp_single_value(else_node.statements())?;
+
+    let if_body_src = clamp_node_src(&if_body, src);
+    let elsif_body_src = clamp_node_src(&elsif_body, src);
+    let else_body_src = clamp_node_src(&else_body, src);
+
+    let (is_min1, x1, bound1) = clamp_classify_branch(&node.predicate(), if_body_src, src)?;
+    let (is_min2, x2, bound2) = clamp_classify_branch(&inner.predicate(), elsif_body_src, src)?;
+
+    if is_min1 == is_min2 || x1 != x2 || x1 != else_body_src {
+        return None;
+    }
+    let (min_src, max_src) = if is_min1 { (bound1, bound2) } else { (bound2, bound1) };
+    Some(ClampIfMatch { else_body, min_src, max_src })
+}
+
+/// A branch body normalized to rubocop-ast's `if_branch`/`else_branch`
+/// shape: the sole statement when there's exactly one (rubocop only wraps
+/// 2+ statements in a `begin` node — a shape none of the fixture's examples
+/// use, and one whose `.source` could never equal a bare comparison operand
+/// anyway, so treating it as a non-match is behaviorally equivalent).
+fn clamp_single_value<'a>(stmts: Option<ruby_prism::StatementsNode<'a>>) -> Option<ruby_prism::Node<'a>> {
+    let body: Vec<ruby_prism::Node<'a>> = stmts?.body().iter().collect();
+    (body.len() == 1).then(|| body.into_iter().next().unwrap())
+}
+
+/// Normalizes a `<`/`>` comparison send into its two operands in
+/// "smaller < larger" semantic order, regardless of surface spelling
+/// (`a < b` and `b > a` both mean "a is smaller"). `None` for anything else
+/// (wrong method name, wrong arity, no receiver).
+fn clamp_comparison_operands<'a>(node: &ruby_prism::Node<'a>) -> Option<(ruby_prism::Node<'a>, ruby_prism::Node<'a>)> {
+    let call = node.as_call_node()?;
+    let is_lt = match call.name().as_slice() {
+        b"<" => true,
+        b">" => false,
+        _ => return None,
+    };
+    let recv = call.receiver()?;
+    let args: Vec<ruby_prism::Node<'a>> =
+        call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    if args.len() != 1 {
+        return None;
+    }
+    let rhs = args.into_iter().next().unwrap();
+    Some(if is_lt { (recv, rhs) } else { (rhs, recv) })
+}
+
+/// rubocop's `min_condition?`, generalized to classify EITHER branch (not
+/// just the outer `if`'s): does `cond` (a `<`/`>` comparison) relate `body`'s
+/// value as the min-bound or the max-bound? Returns
+/// `(is_min, x_source, bound_source)` — `is_min` true when `cond` has the
+/// "`body` is the value `x` must not fall below" shape (`x < body` /
+/// `body > x`), false for "`x` must not exceed `body`" (`body < x` / `x >
+/// body`). `x_source` is whichever operand ISN'T `body`, for the caller's
+/// cross-branch unification.
+fn clamp_classify_branch<'a>(
+    cond: &ruby_prism::Node<'a>,
+    body_src: &'a [u8],
+    src: &'a [u8],
+) -> Option<(bool, &'a [u8], &'a [u8])> {
+    let (smaller, larger) = clamp_comparison_operands(cond)?;
+    let small_src = clamp_node_src(&smaller, src);
+    let large_src = clamp_node_src(&larger, src);
+    if body_src == large_src {
+        Some((true, small_src, large_src))
+    } else if body_src == small_src {
+        Some((false, large_src, small_src))
+    } else {
+        None
+    }
+}
+
+fn clamp_node_src<'a>(n: &ruby_prism::Node<'a>, src: &'a [u8]) -> &'a [u8] {
+    let l = n.location();
+    &src[l.start_offset()..l.end_offset()]
+}
+
+/// rubocop's `parenthesize_if_needed`: `a + b` must become `(a + b).clamp(…)`,
+/// not `a + b.clamp(…)` (which parses as `a + (b.clamp(…))`).
+fn clamp_parenthesize(node: &ruby_prism::Node, src: &[u8]) -> String {
+    let text = String::from_utf8_lossy(clamp_node_src(node, src)).into_owned();
+    if clamp_needs_parens(node) {
+        format!("({text})")
+    } else {
+        text
+    }
+}
+
+/// `node.type?(:and, :or, :if, :range) || node.assignment? ||
+/// (node.send_type? && (node.operator_method? || node.unary_operation?))`.
+/// `:if` covers both prism `IfNode` and `UnlessNode` (rubocop's Prism→Parser
+/// translation maps both to the whitequark `:if` type, swapping branches for
+/// `unless`). `:range` covers both `..`/`...` (prism's `RangeNode` either
+/// way; whitequark's `irange`/`erange` both group under `Node#range_type?`).
+fn clamp_needs_parens(node: &ruby_prism::Node) -> bool {
+    if node.as_and_node().is_some()
+        || node.as_or_node().is_some()
+        || node.as_if_node().is_some()
+        || node.as_unless_node().is_some()
+        || node.as_range_node().is_some()
+        || clamp_is_assignment_like(node)
+    {
+        return true;
+    }
+    node.as_call_node().is_some_and(|c| clamp_is_operator_method(c.name().as_slice()))
+}
+
+/// rubocop-ast's `Node#assignment?` (`ASSIGNMENTS` = equals- + shorthand-
+/// assignment types), over Prism's per-variable-kind write node families.
+fn clamp_is_assignment_like(node: &ruby_prism::Node) -> bool {
+    node.as_local_variable_write_node().is_some()
+        || node.as_local_variable_operator_write_node().is_some()
+        || node.as_local_variable_or_write_node().is_some()
+        || node.as_local_variable_and_write_node().is_some()
+        || node.as_instance_variable_write_node().is_some()
+        || node.as_instance_variable_operator_write_node().is_some()
+        || node.as_instance_variable_or_write_node().is_some()
+        || node.as_instance_variable_and_write_node().is_some()
+        || node.as_class_variable_write_node().is_some()
+        || node.as_class_variable_operator_write_node().is_some()
+        || node.as_class_variable_or_write_node().is_some()
+        || node.as_class_variable_and_write_node().is_some()
+        || node.as_global_variable_write_node().is_some()
+        || node.as_global_variable_operator_write_node().is_some()
+        || node.as_global_variable_or_write_node().is_some()
+        || node.as_global_variable_and_write_node().is_some()
+        || node.as_constant_write_node().is_some()
+        || node.as_constant_operator_write_node().is_some()
+        || node.as_constant_or_write_node().is_some()
+        || node.as_constant_and_write_node().is_some()
+        || node.as_constant_path_write_node().is_some()
+        || node.as_constant_path_operator_write_node().is_some()
+        || node.as_constant_path_or_write_node().is_some()
+        || node.as_constant_path_and_write_node().is_some()
+        || node.as_multi_write_node().is_some()
+}
+
+/// rubocop-ast's `MethodIdentifierPredicates::OPERATOR_METHODS`.
+const CLAMP_OPERATOR_METHODS: &[&[u8]] = &[
+    b"|", b"^", b"&", b"<=>", b"==", b"===", b"=~", b">", b">=", b"<", b"<=", b"<<", b">>", b"+", b"-", b"*",
+    b"/", b"%", b"**", b"~", b"+@", b"-@", b"!@", b"~@", b"[]", b"[]=", b"!", b"!=", b"!~", b"`",
+];
+fn clamp_is_operator_method(name: &[u8]) -> bool {
+    CLAMP_OPERATOR_METHODS.contains(&name)
+}

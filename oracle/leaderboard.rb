@@ -140,6 +140,7 @@ COPS = {
   'Layout/DotPosition'               => 'layout/dot_position',
   'Lint/UselessSetterCall'           => 'lint/useless_setter_call',
   'Lint/EmptyConditionalBody'        => 'lint/empty_conditional_body',
+  'Style/ComparableClamp'            => 'style/comparable_clamp',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
