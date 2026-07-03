@@ -128,6 +128,7 @@ COPS = {
   'Layout/SpaceAroundEqualsInParameterDefault' => 'layout/space_around_equals_in_parameter_default',
   'Layout/EndOfLine'                 => 'layout/end_of_line',
   'Lint/AmbiguousBlockAssociation'   => 'lint/ambiguous_block_association',
+  'Lint/AmbiguousOperator'           => 'lint/ambiguous_operator',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

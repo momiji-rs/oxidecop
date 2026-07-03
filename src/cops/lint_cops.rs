@@ -2,7 +2,7 @@
 //! public entry point.)
 use super::Cops;
 use crate::nodepattern::{self, Pat};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 /// A rubocop `def_node_matcher` equivalent: the pattern string parses once.
@@ -3428,4 +3428,265 @@ fn is_global_const_named(node: &ruby_prism::Node, name: &[u8]) -> bool {
         return c.parent().is_none() && c.name().is_some_and(|n| n.as_slice() == name);
     }
     false
+}
+
+/// Which half of `AmbiguousOperator`'s two diagnostic shapes a prism warning
+/// maps to — mirrors the two ways upstream's `find_offense_node_by` looks
+/// for the enclosing call:
+/// - `Prefix`: the operator IS its own AST node (`*`/`&`/`**`), found by a
+///   plain `each_node(:splat, :block_pass, :kwsplat)` scan with no
+///   restriction on what encloses it (so `yield *a`/`super *a` count).
+/// - `Unary`: `+`/`-` fold directly into the argument they prefix (an int
+///   literal's own source starts at the sign, or a unary `send`'s
+///   `message_loc` does) — found only via `each_node(:send).find`, which is
+///   why `yield +1`/`super +1` register NO offense upstream even though
+///   prism still emits the warning for them (verified against real
+///   `rubocop` 1.88.0: `yield +42`/`super +42` produce zero offenses, while
+///   `yield *array`/`super *array` DO).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AmbOpKind {
+    Prefix,
+    Unary,
+}
+
+/// Parses a `ruby_prism` warning message back into the `(operator, kind)`
+/// pair `Prism::Translation::Parser#warning_diagnostic` would have produced
+/// as `Diagnostic.new(:warning, :ambiguous_prefix, { prefix: operator }, ...)`
+/// — ported from the two lex-level message shapes prism 1.9 emits for
+/// `PM_WARN_AMBIGUOUS_FIRST_ARGUMENT_{PLUS,MINUS}` and
+/// `PM_WARN_AMBIGUOUS_PREFIX_{STAR,STAR_STAR,AMPERSAND}` (verified live via
+/// `Prism.parse(...).warnings`, since the `ruby_prism` Rust crate exposes
+/// only `message`/`location`, not the warning's own type enum).
+fn ambop_operator_from_message(msg: &str) -> Option<(&'static str, AmbOpKind)> {
+    const UNARY_PREFIX: &str = "ambiguous first argument; put parentheses or a space even after `";
+    const UNARY_SUFFIX: &str = "` operator";
+    const PREFIX_PREFIX: &str = "ambiguous `";
+    const PREFIX_SUFFIX: &str = "` has been interpreted as an argument prefix";
+
+    if let Some(rest) = msg.strip_prefix(UNARY_PREFIX) {
+        if let Some(op) = rest.strip_suffix(UNARY_SUFFIX) {
+            return match op {
+                "+" => Some(("+", AmbOpKind::Unary)),
+                "-" => Some(("-", AmbOpKind::Unary)),
+                _ => None,
+            };
+        }
+    }
+    if let Some(rest) = msg.strip_prefix(PREFIX_PREFIX) {
+        if let Some(op) = rest.strip_suffix(PREFIX_SUFFIX) {
+            return match op {
+                "*" => Some(("*", AmbOpKind::Prefix)),
+                "&" => Some(("&", AmbOpKind::Prefix)),
+                "**" => Some(("**", AmbOpKind::Prefix)),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// `AmbiguousOperator::AMBIGUITIES` + `MSG_FORMAT`, verbatim (including the
+/// exact punctuation/backtick placement).
+fn ambop_message(op: &str) -> String {
+    let (actual, possible) = match op {
+        "+" => ("positive number", "an addition"),
+        "-" => ("negative number", "a subtraction"),
+        "*" => ("splat", "a multiplication"),
+        "&" => ("block", "a binary AND"),
+        "**" => ("keyword splat", "an exponent"),
+        _ => unreachable!("ambop_operator_from_message only yields known operators"),
+    };
+    format!(
+        "Ambiguous {actual} operator. Parenthesize the method arguments if it's surely a {actual} operator, or add a whitespace to the right of the `{op}` if it should be {possible}."
+    )
+}
+
+/// One enclosing argument-taking construct's shape (`CallNode`/`YieldNode`/
+/// `SuperNode`) — reconstructs the two positions `Util#add_parentheses`'s
+/// last branch (`args_begin`/`args_end`) needs, since prism nodes carry no
+/// parent pointer. `AmbiguousOperator`'s `offense_node` is always this kind
+/// of node with at least one argument (the ambiguous operator's own operand
+/// IS that argument), so the `args_type?`/`arguments.empty?`/
+/// `!respond_to?(:arguments)` branches of `add_parentheses` never fire here
+/// (unlike `AmbiguousRegexpLiteral`, which needs all of them) — every hit
+/// resolves to the `args_begin`/`args_end` shape.
+struct AmbOpFrame {
+    /// `args_begin(node)`: one byte right after the selector (`loc.keyword`
+    /// for yield/super, `loc.selector`/prism's `message_loc` otherwise).
+    message_end: usize,
+    /// `args_end(node)`: `node.source_range.end` — a prism `CallNode`'s own
+    /// `location()` already ends there (no parens/block to span past, since
+    /// the warning only fires on a bare, paren-less call).
+    own_end: usize,
+    /// Gates the `Unary` (`+`/`-`) path to real `:send` nodes only, per
+    /// `find_offense_node_by`'s second loop (`ast.each_node(:send)`) —
+    /// `yield`/`super` frames are pushed only so `Prefix` hits inside them
+    /// (from the unrestricted first loop) still resolve.
+    is_call: bool,
+    /// `unary_operator?`'s implicit gate: whitequark demotes `a&.b` to
+    /// `:csend`, which `each_node(:send)` never visits, so a safe-nav call's
+    /// own first argument can never be the `Unary` offense node.
+    is_safe_nav: bool,
+    /// This frame's first argument's own start offset, if it has one —
+    /// `send_node.first_argument` in `find_offense_node_by`.
+    first_argument_start: Option<usize>,
+}
+
+/// Walks `root` looking for prism warning offsets from `targets`, resolving
+/// each to `(operator, autocorrect range)` exactly like
+/// `AmbiguousOperator#find_offense_node_by` walks the whitequark AST:
+/// `Prefix` operators (`*`/`&`/`**`) are their own node (`SplatNode`/
+/// `BlockArgumentNode`/`AssocSplatNode`) found unconditionally; `Unary`
+/// operators (`+`/`-`) are read off a `CallNode`'s first argument and gated
+/// to non-safe-nav calls only.
+fn ambop_find_fixes(
+    root: &ruby_prism::Node,
+    targets: &HashMap<usize, (&'static str, AmbOpKind)>,
+) -> Vec<(usize, &'static str, usize, usize)> {
+    struct Walker<'t> {
+        targets: &'t HashMap<usize, (&'static str, AmbOpKind)>,
+        stack: Vec<AmbOpFrame>,
+        seen: HashSet<usize>,
+        hits: Vec<(usize, &'static str, usize, usize)>,
+    }
+    impl<'t> Walker<'t> {
+        fn resolve_prefix(&mut self, off: usize) {
+            if self.seen.contains(&off) {
+                return;
+            }
+            let Some(&(op, kind)) = self.targets.get(&off) else {
+                return;
+            };
+            if kind != AmbOpKind::Prefix {
+                return;
+            }
+            if let Some(frame) = self.stack.last() {
+                self.seen.insert(off);
+                self.hits.push((off, op, frame.message_end, frame.own_end));
+            }
+        }
+        fn check_unary(&mut self, frame: &AmbOpFrame) {
+            let Some(start) = frame.first_argument_start else {
+                return;
+            };
+            if self.seen.contains(&start) {
+                return;
+            }
+            let Some(&(op, kind)) = self.targets.get(&start) else {
+                return;
+            };
+            if kind != AmbOpKind::Unary || !frame.is_call || frame.is_safe_nav {
+                return;
+            }
+            self.seen.insert(start);
+            self.hits.push((start, op, frame.message_end, frame.own_end));
+        }
+        fn push_keyword_frame(&mut self, keyword_end: usize, own_end: usize) {
+            self.stack.push(AmbOpFrame {
+                message_end: keyword_end,
+                own_end,
+                is_call: false,
+                is_safe_nav: false,
+                first_argument_start: None,
+            });
+        }
+    }
+    impl<'pr, 't> ruby_prism::Visit<'pr> for Walker<'t> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let pushed = if let Some(msg) = node.message_loc() {
+                let frame = AmbOpFrame {
+                    message_end: msg.end_offset(),
+                    own_end: node.location().end_offset(),
+                    is_call: true,
+                    is_safe_nav: node.is_safe_navigation(),
+                    first_argument_start: node
+                        .arguments()
+                        .and_then(|a| a.arguments().first())
+                        .map(|n| n.location().start_offset()),
+                };
+                self.check_unary(&frame);
+                self.stack.push(frame);
+                true
+            } else {
+                false
+            };
+            ruby_prism::visit_call_node(self, node);
+            if pushed {
+                self.stack.pop();
+            }
+        }
+        fn visit_yield_node(&mut self, node: &ruby_prism::YieldNode<'pr>) {
+            self.push_keyword_frame(node.keyword_loc().end_offset(), node.location().end_offset());
+            ruby_prism::visit_yield_node(self, node);
+            self.stack.pop();
+        }
+        fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+            self.push_keyword_frame(node.keyword_loc().end_offset(), node.location().end_offset());
+            ruby_prism::visit_super_node(self, node);
+            self.stack.pop();
+        }
+        fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
+            self.resolve_prefix(node.location().start_offset());
+            ruby_prism::visit_splat_node(self, node);
+        }
+        fn visit_block_argument_node(&mut self, node: &ruby_prism::BlockArgumentNode<'pr>) {
+            self.resolve_prefix(node.location().start_offset());
+            ruby_prism::visit_block_argument_node(self, node);
+        }
+        fn visit_assoc_splat_node(&mut self, node: &ruby_prism::AssocSplatNode<'pr>) {
+            self.resolve_prefix(node.location().start_offset());
+            ruby_prism::visit_assoc_splat_node(self, node);
+        }
+    }
+    let mut w = Walker { targets, stack: Vec::new(), seen: HashSet::new(), hits: Vec::new() };
+    use ruby_prism::Visit;
+    w.visit(root);
+    w.hits
+}
+
+impl<'a> Cops<'a> {
+    /// Lint/AmbiguousOperator — a bare (paren-less) call/`yield`/`super`
+    /// whose first argument opens with `+`/`-`/`*`/`&`/`**` and no space
+    /// before the operand, which the LEXER can't disambiguate from a binary
+    /// operator on the receiver/previous call. Like `AmbiguousRegexpLiteral`
+    /// just above, upstream detects this off `processed_source.diagnostics`
+    /// (`reason == :ambiguous_prefix`), which under rubocop's Prism
+    /// translation comes straight from prism's own lex-level
+    /// `PM_WARN_AMBIGUOUS_FIRST_ARGUMENT_{PLUS,MINUS}` and
+    /// `PM_WARN_AMBIGUOUS_PREFIX_{STAR,STAR_STAR,AMPERSAND}` warnings (see
+    /// `Prism::Translation::Parser#warning_diagnostic`) — we ride
+    /// `ParseResult#warnings` directly rather than reimplementing prism's
+    /// lex-state machine, matching upstream byte-for-byte since it rides the
+    /// identical warning. The message text interpolates the operator itself
+    /// (recovered from the warning message — the `ruby_prism` crate exposes
+    /// no warning-type enum, only `message`/`location`).
+    ///
+    /// Only the AUTOCORRECT target needs an AST walk (`ambop_find_fixes`),
+    /// ported from `find_offense_node_by`/`unary_operator?`
+    /// (ambiguous_operator.rb) and `Util#add_parentheses`'s `args_begin`/
+    /// `args_end` branch (util.rb) — the only branch reachable here, since
+    /// `AmbiguousOperator`'s offense node always has at least one argument.
+    pub(crate) fn check_ambiguous_operator(&mut self, result: &ruby_prism::ParseResult) {
+        const COP: &str = "Lint/AmbiguousOperator";
+        if !self.on(COP) {
+            return;
+        }
+
+        let mut targets: HashMap<usize, (&'static str, AmbOpKind)> = HashMap::new();
+        for w in result.warnings() {
+            if let Some((op, kind)) = ambop_operator_from_message(w.message()) {
+                targets.insert(w.location().start_offset(), (op, kind));
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+
+        let hits = ambop_find_fixes(&result.node(), &targets);
+        for (off, op, msg_end, args_end) in hits {
+            self.push(off, COP, true, ambop_message(op));
+            self.fixes.push((msg_end, msg_end + 1, b"(".to_vec()));
+            self.fixes.push((args_end, args_end, b")".to_vec()));
+        }
+    }
 }
