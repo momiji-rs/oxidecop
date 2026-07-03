@@ -6376,3 +6376,137 @@ fn hash_like_case_body<'pr>(when_node: &ruby_prism::WhenNode<'pr>) -> Option<rub
         _ => Some(stmts.as_node()),
     }
 }
+
+/// Whether rubocop's real (whitequark/`parser`-gem) lexer would collapse
+/// this percent-literal's raw content into a single `str` token, matching
+/// `Parser::Builders::Default#collapse_string_parts?` (`parts.one?`): the
+/// lexer splits content into a fresh token right after each embedded raw
+/// `\n` (the newline stays attached to the token that ends there), and a
+/// trailing empty token — content ending exactly at a newline, or content
+/// that's entirely empty — is never emitted at all. Exactly one surviving
+/// token means `str`; zero (empty content) or 2+ (multiline content) means
+/// `dstr`.
+fn whitequark_collapses_to_str(content: &[u8]) -> bool {
+    let mut segments = 0usize;
+    let mut start = 0usize;
+    for (i, &b) in content.iter().enumerate() {
+        if b == b'\n' {
+            segments += 1;
+            start = i + 1;
+        }
+    }
+    if start < content.len() {
+        segments += 1;
+    }
+    segments == 1
+}
+
+impl<'a> Cops<'a> {
+    /// Style/PercentQLiterals — enforces `%q` vs `%Q` per `EnforcedStyle`
+    /// (`lower_case_q` default / `upper_case_q`).
+    ///
+    /// Ported from rubocop's `PercentQLiterals` cop, which mixes in
+    /// `PercentLiteral` + `ConfigurableEnforcedStyle` and only defines
+    /// `on_str` — never `on_dstr`. So this only ever fires on a genuinely
+    /// non-interpolated string literal, a prism `StringNode`. A `%Q(...)`
+    /// with real `#{}` interpolation parses as an `InterpolatedStringNode`
+    /// instead and is never checked at all, which is why the "with
+    /// interpolation" spec examples for both styles are always accepted.
+    ///
+    /// `PercentLiteral#type(node)` is `node.loc.begin.source[0..-2]` — the
+    /// opening delimiter token minus its last byte (the bracket char), e.g.
+    /// `"%Q("[0..-2] == "%Q"`. Only an exact `%Q`/`%q` (not `%w`, `%i`, bare
+    /// `%(`, etc.) is in scope; that's `type(node)` restricted to `%Q`/`%q`
+    /// in `process(node, '%Q', '%q')`.
+    pub(crate) fn check_percent_q_literals(&mut self, node: &ruby_prism::StringNode<'_>) {
+        const COP: &str = "Style/PercentQLiterals";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(opening) = node.opening_loc() else { return };
+        let ob = opening.as_slice();
+        if !ob.starts_with(b"%") {
+            return;
+        }
+        let ty = &ob[..ob.len() - 1];
+        let is_capital = match ty {
+            b"%Q" => true,
+            b"%q" => false,
+            _ => return,
+        };
+
+        // prism-vs-whitequark trap: rubocop's actual (whitequark/`parser`
+        // gem) lexer emits a fresh string-content token right after every
+        // embedded raw newline, and `Builders::Default#string_compose` only
+        // collapses to a plain `str` node (what `on_str` requires) when
+        // exactly one non-empty token survives — a trailing empty token
+        // (content ending exactly at a newline, or content that's entirely
+        // empty) is dropped rather than counted. So `%Q()` and any `%Q(...)`
+        // whose content spans 2+ raw source lines become a `dstr` under
+        // whitequark and are NEVER checked by this cop at all, even though
+        // there's no real `#{}` interpolation anywhere. Prism has no such
+        // quirk — it hands back a plain `StringNode` for both — so this has
+        // to be special-cased here rather than falling out of the node type.
+        if !whitequark_collapses_to_str(node.content_loc().as_slice()) {
+            return;
+        }
+
+        // `ConfigurableEnforcedStyle` — default `lower_case_q`.
+        let upper_style = self.cfg.get(COP, "EnforcedStyle").is_some_and(|v| v == "upper_case_q");
+
+        // `correct_literal_style?` — already in the desired style, nothing
+        // to flag.
+        if upper_style == is_capital {
+            return;
+        }
+
+        let l = node.location();
+        let start = l.start_offset();
+        let end = l.end_offset();
+        let src = &self.src[start..end];
+
+        // `ast = parse(corrected(node.source)).ast; return if node.children
+        // != ast&.children`. `corrected` swaps the case of the single letter
+        // right after `%` (guaranteed to be the first occurrence of that
+        // character anywhere in the source, so a plain byte swap at index 1
+        // matches Ruby's `src.sub(src[1], src[1].swapcase)` exactly). Then
+        // it's a genuine re-parse: escape-sequence semantics differ between
+        // `%q` (only `\\` and `\<delimiter>` are special) and `%Q` (full
+        // double-quote escapes, plus real `#{}` interpolation), so whether
+        // the content — or even the node shape (`str` vs `dstr`) — survives
+        // the swap can only be answered by actually re-parsing, not by a
+        // text heuristic.
+        let mut corrected = src.to_vec();
+        corrected[1] = if is_capital { b'q' } else { b'Q' };
+        let result = ruby_prism::parse(&corrected);
+        if result.errors().next().is_some() {
+            // Reparse failed (e.g. `%q(\u)` -> `%Q(\u)` is an invalid escape)
+            // — rubocop's `parse` returns a nil ast, so `node.children != nil`
+            // is true and the offense is skipped.
+            return;
+        }
+        let Some(program) = result.node().as_program_node() else { return };
+        let mut stmts = program.statements().body().iter();
+        let Some(first) = stmts.next() else { return };
+        if stmts.next().is_some() {
+            return;
+        }
+        // If the swap turned this into a real interpolated string (`dstr`),
+        // the node shape is entirely different from the original `str`
+        // node's children — skip. Otherwise compare the actual unescaped
+        // string content.
+        let Some(new_str) = first.as_string_node() else { return };
+        if new_str.unescaped() != node.unescaped() {
+            return;
+        }
+
+        let (message, new_char): (&str, u8) = if upper_style {
+            ("Use `%Q` instead of `%q`.", b'Q')
+        } else {
+            ("Do not use `%Q` unless interpolation is needed. Use `%q`.", b'q')
+        };
+        self.push(start, COP, true, message);
+        let char_off = opening.start_offset() + 1;
+        self.fixes.push((char_off, char_off + 1, vec![new_char]));
+    }
+}
