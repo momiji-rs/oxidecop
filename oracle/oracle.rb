@@ -220,8 +220,22 @@ def parse_config_sections(joined)
     sec = Regexp.last_match(1)
     val = Regexp.last_match(2).strip
     merges_cop_config = !val.sub!(/\.merge\(cop_config\)\s*\z/, '').nil?
+    # `cop_config.merge(H)` (reversed direction) — H's literal pairs plus the
+    # example's cop_config.
+    if (m2 = val.match(/\Acop_config\.merge\((.*)\)\z/m))
+      merges_cop_config = true
+      val = m2[1]
+    end
+    # `RuboCop::ConfigLoader.default_configuration['SEC']` — the section is
+    # the cop's real defaults; flag it so scoring keeps defaults applying
+    # (no __replace_defaults__) instead of an empty replacing section.
+    defaults_based = false
+    if val =~ /\ARuboCop::ConfigLoader\.default_configuration\[/
+      defaults_based = true
+      val = '{}'
+    end
     # a bare identifier is a let reference — resolved per example, lazily
-    sections[sec] = [val =~ /\A\w+\z/ ? val : extract_hash(val), merges_cop_config]
+    sections[sec] = [val =~ /\A\w+\z/ ? val : extract_hash(val), merges_cop_config, defaults_based]
   end
   sections.empty? ? nil : sections
 end
@@ -361,6 +375,12 @@ while i < lines.length
       end
     end
     joined = blk.join(' ')
+    # Inline simple local assignments (`c = cop_config.merge(...)`,
+    # `merged = RuboCop::ConfigLoader.default_configuration['X'].merge(cop_config)`)
+    # so bare-identifier section values resolve to their defining expression.
+    joined.scan(/(\w+)\s*=\s*((?:RuboCop::ConfigLoader\.default_configuration\[[^\]]+\]|cop_config)\.merge\([^;]*?\))(?=\s+\w+\s*=|\s+RuboCop::Config\b)/) do |name, expr|
+      joined = joined.gsub(/=>\s*#{Regexp.escape(name)}\b/, "=> #{expr}")
+    end
     if (m = joined.match(/ActiveSupportExtensionsEnabled'\s*=>\s*(true|false)/)) && cfg_stack.any?
       cfg_stack.last[3] = m[1]
     end
@@ -663,8 +683,10 @@ examples.each_with_index do |ex, n|
                                .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(resolve_section_text(h, ex[:lets] || {}))) || {}] }
     end
   elsif (sections = ex[:sections])
-    replace = true
     base = sections[COP]
+    # A section built from ConfigLoader.default_configuration[COP] carries the
+    # real defaults explicitly — model it as a non-replacing config.
+    replace = !(base && base[2])
     cop_hash = base ? parse_cfg(resolve_section_text(base[0], ex[:lets] || {})) : {}
     cop_hash.merge!(cfg_hash) if base && base[1]
     cfg_hash = resolve_cfg_variables!(cop_hash, ex[:lets] || {})
