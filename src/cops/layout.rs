@@ -4240,6 +4240,12 @@ impl<'a> super::Cops<'a> {
         let end_pos = end_loc.start_offset();
         let (end_line, end_col) = self.idx.loc(end_pos);
 
+        // A single-line begin...end can't be misaligned (upstream's
+        // EndKeywordAlignment skips when keyword and end share a line).
+        if self.idx.loc(begin_loc.start_offset()).0 == end_line {
+            return;
+        }
+
         // Determine alignment target based on style (all columns are 1-indexed for logic).
         let (align_col, align_line, align_source): (usize, usize, String) = match style {
             "begin" => {
