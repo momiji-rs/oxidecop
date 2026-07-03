@@ -184,6 +184,7 @@ COPS = {
   'Style/RedundantException'         => 'style/redundant_exception',
   'Naming/AsciiIdentifiers'          => 'naming/ascii_identifiers',
   'Lint/ErbNewArguments'             => 'lint/erb_new_arguments',
+  'Lint/OrderedMagicComments'        => 'lint/ordered_magic_comments',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

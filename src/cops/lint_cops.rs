@@ -7039,3 +7039,141 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+/// Mirrors `RuboCop::MagicComment#encoding_specified?` and, in the branch
+/// where that's false, `#valid?` (i.e. any *other* magic setting specified) —
+/// for one physical leading-comment line. Three comment dialects, tried in
+/// `MagicComment.parse`'s priority order: emacs (`-*- k: v; ... -*-`), vim
+/// (`# vim: k=v, ...` — can only ever specify `encoding`), then the simple
+/// `# key: value` form. Returns `(encoding_specified, other_magic_valid)`.
+fn ordered_magic_comment_kind(text: &str) -> (bool, bool) {
+    static EMACS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let emacs_re = EMACS.get_or_init(|| regex::Regex::new(r"-\*-(.+)-\*-").unwrap());
+
+    if let Some(caps) = emacs_re.captures(text) {
+        static EMACS_ENC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static EMACS_FSL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static EMACS_SCV: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let enc_re = EMACS_ENC
+            .get_or_init(|| regex::Regex::new(r"^(?:en)?coding\s*:\s*[A-Za-z0-9_-]+$").unwrap());
+        let fsl_re = EMACS_FSL.get_or_init(|| {
+            regex::Regex::new(r"^frozen[_-]string[_-]literal\s*:\s*[A-Za-z0-9_-]+$").unwrap()
+        });
+        let scv_re = EMACS_SCV.get_or_init(|| {
+            regex::Regex::new(r"^shareable[_-]constant[_-]value\s*:\s*[A-Za-z0-9_-]+$").unwrap()
+        });
+
+        let tokens: Vec<&str> = caps[1].split(';').map(|t| t.trim()).collect();
+        let encoding = tokens.iter().any(|t| enc_re.is_match(t));
+        // rbs_inline / typed can never be specified via an emacs comment.
+        let other = tokens.iter().any(|t| fsl_re.is_match(t) || scv_re.is_match(t));
+        return (encoding, !encoding && other);
+    }
+
+    static VIM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let vim_re = VIM.get_or_init(|| regex::Regex::new(r"#\s*vim:\s*(.+)").unwrap());
+    if let Some(caps) = vim_re.captures(text) {
+        static VIM_ENC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let enc_re = VIM_ENC
+            .get_or_init(|| regex::Regex::new(r"^fileencoding\s*=\s*[A-Za-z0-9_-]+$").unwrap());
+        let tokens: Vec<&str> = caps[1].split(", ").map(|t| t.trim()).collect();
+        // The `fileencoding` keyword is only honored when >= 2 tokens are
+        // present; a vim comment can never specify any other magic setting.
+        let encoding = tokens.len() > 1 && tokens.iter().any(|t| enc_re.is_match(t));
+        return (encoding, false);
+    }
+
+    static SIMPLE_ENC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SIMPLE_FSL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SIMPLE_SCV: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SIMPLE_RBS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SIMPLE_TYPED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+    let enc_re = SIMPLE_ENC.get_or_init(|| {
+        regex::Regex::new(r"(?i)^\s*#\s*(?:frozen_string_literal:\s*(?:true|false))?\s*(?:en)?coding: [A-Za-z0-9_-]+").unwrap()
+    });
+    let fsl_re = SIMPLE_FSL.get_or_init(|| {
+        regex::Regex::new(r"(?i)^\s*#\s*frozen[_-]string[_-]literal:\s*[A-Za-z0-9_-]+\s*$").unwrap()
+    });
+    let scv_re = SIMPLE_SCV.get_or_init(|| {
+        regex::Regex::new(r"(?i)^\s*#\s*shareable[_-]constant[_-]value:\s*[A-Za-z0-9_-]+\s*$").unwrap()
+    });
+    let rbs_re = SIMPLE_RBS
+        .get_or_init(|| regex::Regex::new(r"(?i)^\s*#\s*rbs_inline:\s*([A-Za-z0-9_-]+)\s*$").unwrap());
+    let typed_re = SIMPLE_TYPED
+        .get_or_init(|| regex::Regex::new(r"(?i)^\s*#\s*typed:\s*[A-Za-z0-9_-]+\s*$").unwrap());
+
+    let encoding = enc_re.is_match(text);
+    // `valid_rbs_inline_value?` requires the (case-sensitive, un-downcased)
+    // captured value to literally be "enabled" or "disabled".
+    let rbs = rbs_re
+        .captures(text)
+        .is_some_and(|c| matches!(&c[1], "enabled" | "disabled"));
+    let other = fsl_re.is_match(text) || scv_re.is_match(text) || rbs || typed_re.is_match(text);
+    (encoding, !encoding && other)
+}
+
+impl<'a> super::Cops<'a> {
+    /// Lint/OrderedMagicComments — the encoding magic comment (`# encoding:
+    /// ...` / `# coding: ...` / emacs / vim forms) must precede every other
+    /// leading magic comment (`frozen_string_literal`, `shareable_constant_value`,
+    /// `rbs_inline`, `typed`). Comment/text-based, like
+    /// `check_duplicate_magic_comment`.
+    pub(crate) fn check_ordered_magic_comments(&mut self, first_code_line: Option<usize>) {
+        const COP: &str = "Lint/OrderedMagicComments";
+        if !self.on(COP) {
+            return;
+        }
+        if self.src.is_empty() {
+            return;
+        }
+
+        // rubocop's `magic_comment_lines`: scan leading comments in order,
+        // remembering the latest encoding-specified line (`lines[0]`) and the
+        // latest "other magic" line (`lines[1]`) seen so far, stopping as
+        // soon as both are set.
+        let mut encoding_line: Option<usize> = None;
+        let mut other_line: Option<usize> = None;
+        for (line, start, end) in self.comments {
+            if let Some(fcl) = first_code_line {
+                if *line >= fcl {
+                    break;
+                }
+            }
+            let text = String::from_utf8_lossy(&self.src[*start..*end]);
+            let (enc, other) = ordered_magic_comment_kind(&text);
+            if enc {
+                encoding_line = Some(*line);
+            } else if other {
+                other_line = Some(*line);
+            }
+            if encoding_line.is_some() && other_line.is_some() {
+                break;
+            }
+        }
+
+        let (Some(enc_line), Some(oth_line)) = (encoding_line, other_line) else {
+            return;
+        };
+        if enc_line < oth_line {
+            return;
+        }
+
+        let enc_start = self.idx.starts[enc_line - 1];
+        let enc_end = self.line_end(enc_line);
+        let oth_start = self.idx.starts[oth_line - 1];
+        let oth_end = self.line_end(oth_line);
+
+        self.push(
+            enc_start,
+            COP,
+            true,
+            "The encoding magic comment should precede all other magic comments.",
+        );
+
+        let enc_text = self.src[enc_start..enc_end].to_vec();
+        let oth_text = self.src[oth_start..oth_end].to_vec();
+        self.fixes.push((enc_start, enc_end, oth_text));
+        self.fixes.push((oth_start, oth_end, enc_text));
+    }
+}
+
