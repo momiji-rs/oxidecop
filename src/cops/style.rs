@@ -10377,3 +10377,237 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+/// Style/TrailingUnderscoreVariable: a masgn LHS target's classification for
+/// upstream's `DISALLOW = %i[lvasgn splat]` backward scan. Prism's masgn
+/// targets (`MultiWriteNode#lefts`/`#rest`/`#rights`, and identically shaped
+/// nested groups via `MultiTargetNode`) split what whitequark represents
+/// uniformly as `(:lvasgn name)` / `(:splat inner)` / `(:mlhs ...)` children
+/// of one `mlhs` node into distinct prism node types — this enum re-unifies
+/// them for the port.
+enum TuvSlot<'pr> {
+    /// A plain local-variable target, or a splat wrapping one — carries the
+    /// var name so the caller can check the underscore-prefix rule. Upstream
+    /// derives this via a double `*variable` destructure (`var, = *variable`
+    /// then `var, = *var`); a bare `*` (no inner expression) or a splat
+    /// wrapping any non-local-variable target (ivar/cvar/gvar/const/attr/
+    /// index) ends up with a `nil` or non-identifier symbol either way, which
+    /// never satisfies `to_s.start_with?('_')` — represented here as `None`,
+    /// which always fails `tuv_qualifies`.
+    Candidate(Option<&'pr [u8]>),
+    /// A nested `(...)` destructuring group (whitequark `:mlhs`) — never
+    /// itself a DISALLOW-type candidate, so it stops the backward scan the
+    /// same way a non-underscore name does. Walked separately (via
+    /// `as_multi_target_node` directly) by `tuv_unneeded_ranges`'s
+    /// `children_offenses` pass — this variant only needs to mark the stop.
+    Nested,
+    /// Any other assignment-target kind (ivar/cvar/gvar/const/attr/index) —
+    /// not in `DISALLOW`, so it stops the scan without being a candidate.
+    Other,
+}
+
+fn tuv_classify<'pr>(n: &ruby_prism::Node<'pr>) -> TuvSlot<'pr> {
+    if let Some(lv) = n.as_local_variable_target_node() {
+        return TuvSlot::Candidate(Some(lv.name().as_slice()));
+    }
+    if n.as_multi_target_node().is_some() {
+        return TuvSlot::Nested;
+    }
+    if let Some(sp) = n.as_splat_node() {
+        let name = sp
+            .expression()
+            .and_then(|e| e.as_local_variable_target_node())
+            .map(|lv| lv.name().as_slice());
+        return TuvSlot::Candidate(name);
+    }
+    TuvSlot::Other
+}
+
+/// `(allow_named_underscore_variables && var != :_) || !var.to_s.start_with?('_')`,
+/// inverted to "does this name qualify as a trailing-underscore candidate".
+fn tuv_qualifies(name: Option<&[u8]>, allow_named: bool) -> bool {
+    match name {
+        None => false,
+        Some(n) if allow_named => n == b"_",
+        Some(n) => n.starts_with(b"_"),
+    }
+}
+
+/// Concatenates a masgn/mlhs target list in source order — prism splits what
+/// whitequark gives as one flat `mlhs.children` array into `lefts` (before
+/// any splat), an optional `rest` (the splat itself, if any), and `rights`
+/// (after the splat).
+fn tuv_collect_slots<'pr>(
+    lefts: ruby_prism::NodeList<'pr>,
+    rest: Option<ruby_prism::Node<'pr>>,
+    rights: ruby_prism::NodeList<'pr>,
+) -> Vec<ruby_prism::Node<'pr>> {
+    let mut v: Vec<ruby_prism::Node<'pr>> = lefts.iter().collect();
+    if let Some(r) = rest {
+        v.push(r);
+    }
+    v.extend(rights.iter());
+    v
+}
+
+/// Ported from `find_first_offense`/`find_first_possible_offense`: scans
+/// `slots` from the end backward, extending the run for as long as each
+/// slot is a DISALLOW-type candidate satisfying the underscore rule, and
+/// stopping (keeping the previously accumulated index) at the first slot
+/// that doesn't. Returns the run's leftmost index — or `None` if the very
+/// last slot fails, or if `splat_variable_before?` cancels the run (a
+/// `SplatNode` — qualifying or not — anywhere strictly before that index,
+/// e.g. `_, *rest, _` or `a, *b, _`).
+fn tuv_find_first_offense(slots: &[ruby_prism::Node], allow_named: bool) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for i in (0..slots.len()).rev() {
+        match tuv_classify(&slots[i]) {
+            TuvSlot::Candidate(name) if tuv_qualifies(name, allow_named) => best = Some(i),
+            _ => break,
+        }
+    }
+    let idx = best?;
+    if slots[..idx].iter().any(|s| s.as_splat_node().is_some()) {
+        return None;
+    }
+    Some(idx)
+}
+
+/// Which flavor of container `slots` belongs to — the top-level masgn
+/// (`node.masgn_type?` true upstream) or a nested `(...)` group
+/// (`node.masgn_type?` false, `node` == the mlhs node itself). Only the top
+/// level carries an `=` operator and an RHS to fall back on.
+enum TuvCtx {
+    Top { operator_start: usize, rhs_start: usize },
+    Nested,
+}
+
+/// Ported from `main_node_offense`: the offense range for the trailing run
+/// found (if any) directly among `slots` — NOT including any nested groups'
+/// own offenses, which `tuv_unneeded_ranges` collects separately.
+fn tuv_main_offense(
+    slots: &[ruby_prism::Node],
+    rparen_end: Option<usize>,
+    mlhs_start: usize,
+    ctx: &TuvCtx,
+    allow_named: bool,
+) -> Option<(usize, usize)> {
+    let idx = tuv_find_first_offense(slots, allow_named)?;
+    let offense_start = slots[idx].location().start_offset();
+
+    // `unused_variables_only?`: the run reaches all the way back to the
+    // first slot, i.e. EVERY target at this level is a trailing underscore.
+    if idx == 0 {
+        return Some(match ctx {
+            TuvCtx::Top { rhs_start, .. } => (mlhs_start, *rhs_start),
+            TuvCtx::Nested => {
+                let end = rparen_end.unwrap_or_else(|| slots[slots.len() - 1].location().end_offset());
+                (mlhs_start, end)
+            }
+        });
+    }
+
+    // `range_for_parentheses`: a parenthesized group/LHS deletes from just
+    // before the run's start through just before the closing paren — this
+    // reaches past the run's own end to swallow any further trailing
+    // targets and their commas (e.g. `(a, _, _,)` -> `(a,)` in one range).
+    if let Some(rp_end) = rparen_end {
+        return Some((offense_start - 1, rp_end - 1));
+    }
+
+    // Unparenthesized: only reachable at the top level (a nested group is
+    // always written with literal parens in valid Ruby). Deletes from the
+    // run's start through the `=` operator.
+    match ctx {
+        TuvCtx::Top { operator_start, .. } => Some((offense_start, *operator_start)),
+        TuvCtx::Nested => {
+            Some((offense_start, slots[slots.len() - 1].location().end_offset()))
+        }
+    }
+}
+
+/// Ported from `unneeded_ranges`: this level's own trailing-run offense (if
+/// any), plus every nested group's own offenses (`children_offenses`,
+/// recursed depth-first in source order).
+fn tuv_unneeded_ranges(
+    slots: &[ruby_prism::Node],
+    rparen_end: Option<usize>,
+    mlhs_start: usize,
+    ctx: &TuvCtx,
+    allow_named: bool,
+    out: &mut Vec<(usize, usize)>,
+) {
+    for s in slots {
+        if let Some(mt) = s.as_multi_target_node() {
+            tuv_unneeded_ranges_group(&mt, allow_named, out);
+        }
+    }
+    if let Some(main) = tuv_main_offense(slots, rparen_end, mlhs_start, ctx, allow_named) {
+        out.push(main);
+    }
+}
+
+fn tuv_unneeded_ranges_group(mt: &ruby_prism::MultiTargetNode, allow_named: bool, out: &mut Vec<(usize, usize)>) {
+    let slots = tuv_collect_slots(mt.lefts(), mt.rest(), mt.rights());
+    if slots.is_empty() {
+        return;
+    }
+    // A nested destructuring group is always written with literal parens in
+    // valid Ruby, but fall back to the slot span defensively.
+    let lparen_start = mt.lparen_loc().map(|l| l.start_offset());
+    let rparen_end = mt.rparen_loc().map(|l| l.end_offset());
+    let mlhs_start = lparen_start.unwrap_or_else(|| slots[0].location().start_offset());
+    tuv_unneeded_ranges(&slots, rparen_end, mlhs_start, &TuvCtx::Nested, allow_named, out);
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/TrailingUnderscoreVariable (`on_masgn`): flags trailing `_`
+    /// (or `_foo`-named, when `AllowNamedUnderscoreVariables: false`)
+    /// targets in a multiple assignment, recursing into any nested `(...)`
+    /// destructuring groups. See `tuv_main_offense`/`tuv_unneeded_ranges`
+    /// for the range math ported from `main_node_offense`/`unneeded_ranges`.
+    pub(crate) fn check_trailing_underscore_variable(&mut self, node: &ruby_prism::MultiWriteNode) {
+        const COP: &str = "Style/TrailingUnderscoreVariable";
+        if !self.on(COP) {
+            return;
+        }
+        let allow_named = self.cfg.get(COP, "AllowNamedUnderscoreVariables") != Some("false");
+
+        let slots = tuv_collect_slots(node.lefts(), node.rest(), node.rights());
+        if slots.is_empty() {
+            return;
+        }
+        let lparen_start = node.lparen_loc().map(|l| l.start_offset());
+        let rparen_end = node.rparen_loc().map(|l| l.end_offset());
+        let mlhs_start = lparen_start.unwrap_or_else(|| slots[0].location().start_offset());
+        let ctx = TuvCtx::Top {
+            operator_start: node.operator_loc().start_offset(),
+            rhs_start: node.value().location().start_offset(),
+        };
+
+        let mut ranges = Vec::new();
+        tuv_unneeded_ranges(&slots, rparen_end, mlhs_start, &ctx, allow_named, &mut ranges);
+        if ranges.is_empty() {
+            return;
+        }
+
+        // `good_code`: the message interpolates the WHOLE masgn's source
+        // text with just this range excised — computed against the top
+        // node's own source even for a nested group's offense, exactly as
+        // upstream's `on_masgn` does for every range in the flattened list.
+        let top_start = node.location().start_offset();
+        let top_src = self.node_src(&node.as_node()).to_vec();
+
+        for (start, end) in ranges {
+            let offset = start - top_start;
+            let size = end - start;
+            let mut good_code = top_src.clone();
+            good_code.drain(offset..offset + size);
+            let good_code = String::from_utf8_lossy(&good_code);
+            let msg = format!("Do not use trailing `_`s in parallel assignment. Prefer `{good_code}`.");
+            self.push(start, COP, true, msg);
+            self.fixes.push((start, end, Vec::new()));
+        }
+    }
+}

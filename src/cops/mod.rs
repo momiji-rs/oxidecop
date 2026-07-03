@@ -184,7 +184,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/ImplicitStringConcatenation",
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
     "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
-    "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException",
+    "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException", "Style/TrailingUnderscoreVariable",
 ];
 
 impl Engine {
@@ -1351,6 +1351,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let op_end = node.operator_loc().end_offset();
         self.assignment_indentation_hook(lhs_start, op_end, node.value());
         self.check_self_assignment_masgn(node);
+        self.check_trailing_underscore_variable(node);
         // Style/RedundantSelf: only plain local-var masgn targets carry a
         // usable name upstream (`child.to_a.first` on a non-lvasgn target —
         // e.g. an attr-writer or splat — yields a NODE, not a symbol, so it
