@@ -894,3 +894,113 @@ impl<'a> super::Cops<'a> {
     }
 
 }
+impl<'a> super::Cops<'a> {
+
+    /// Naming/HeredocDelimiterCase — checks that heredoc delimiters match the
+    /// configured case (uppercase or lowercase).
+    pub(crate) fn check_heredoc_delimiter_case(&mut self,
+        opening_loc: Option<ruby_prism::Location>,
+        closing_loc: Option<ruby_prism::Location>) {
+        const COP: &str = "Naming/HeredocDelimiterCase";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is a heredoc by looking at opening_loc
+        let Some(opening) = opening_loc else {
+            return;
+        };
+
+        if !opening.as_slice().starts_with(b"<<") {
+            return;
+        }
+
+        let Some(closing) = closing_loc else {
+            return;
+        };
+
+        // Extract the delimiter from the opening location
+        let opening_bytes = opening.as_slice();
+
+        // Use a regex to extract the delimiter name from the opening heredoc
+        // Pattern: <<[~-]?['"`]?([^'"`]+)['"`]?
+        static OPENING_DELIMITER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let pattern = OPENING_DELIMITER.get_or_init(|| {
+            regex::Regex::new(r#"<<[~-]?['"`]?([^'"`]+)['"`]?"#).unwrap()
+        });
+
+        let opening_str = String::from_utf8_lossy(opening_bytes);
+        let Some(caps) = pattern.captures(&opening_str) else {
+            return;
+        };
+
+        let Some(delimiter_match) = caps.get(1) else {
+            return;
+        };
+
+        let delimiter = delimiter_match.as_str();
+
+        // Skip non-word delimiters (like '+')
+        if !delimiter.chars().any(|c| c.is_alphanumeric() || c == '_') {
+            return;
+        }
+
+        // Get the enforced style from config, default to "uppercase"
+        let enforced_style = self.cfg.param(COP, "EnforcedStyle")
+            .unwrap_or("uppercase");
+
+        // Check if the delimiter matches the enforced style
+        let correct = match enforced_style {
+            "uppercase" => delimiter.chars().all(|c| !c.is_lowercase()),
+            "lowercase" => delimiter.chars().all(|c| !c.is_uppercase()),
+            _ => return, // Unknown style, skip
+        };
+
+        if correct {
+            return; // Delimiter already matches the style
+        }
+
+        // Register offense anchored on closing delimiter
+        let msg = format!("Use {} heredoc delimiters.", enforced_style);
+        self.push(closing.start_offset(), COP, true, msg);
+
+        // Prepare autocorrect: replace opening and closing delimiters
+        let corrected_delimiter = match enforced_style {
+            "uppercase" => delimiter.to_uppercase(),
+            "lowercase" => delimiter.to_lowercase(),
+            _ => return,
+        };
+
+        // Replace the opening delimiter (including quotes if present)
+        // We need to replace just the delimiter part, preserving <<[~-] and quotes
+
+        // Find the position of the delimiter within the opening string
+        if let Some(delim_start) = opening_str.find(delimiter) {
+            let delim_end = delim_start + delimiter.len();
+            let opening_start = opening.start_offset();
+
+            self.fixes.push((
+                opening_start + delim_start,
+                opening_start + delim_end,
+                corrected_delimiter.as_bytes().to_vec(),
+            ));
+        }
+
+        // Replace the closing delimiter (just the delimiter name on its own line)
+        let closing_bytes = closing.as_slice();
+        let closing_str = String::from_utf8_lossy(closing_bytes);
+
+        // The closing line is just the delimiter (possibly with leading/trailing whitespace)
+        let trimmed = closing_str.trim();
+        if trimmed == delimiter {
+            // Find the position of the delimiter within the closing line
+            if let Some(delim_pos) = closing_str.find(delimiter) {
+                self.fixes.push((
+                    closing.start_offset() + delim_pos,
+                    closing.start_offset() + delim_pos + delimiter.len(),
+                    corrected_delimiter.as_bytes().to_vec(),
+                ));
+            }
+        }
+    }
+}
