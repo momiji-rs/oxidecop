@@ -8521,3 +8521,140 @@ impl<'a> RsaReceiver<'a> {
         }
     }
 }
+
+/// `Style::ModuleFunction#extend_self_node?`: `(send nil? :extend self)` — a
+/// bare (no receiver, no block) call to `extend` with exactly one argument
+/// that is the bare `self` keyword.
+fn mf_extend_self_node(node: &ruby_prism::Node) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    if call.receiver().is_some() || call.block().is_some() {
+        return false;
+    }
+    if call.name().as_slice() != b"extend" {
+        return false;
+    }
+    let Some(args) = call.arguments() else { return false };
+    let list = args.arguments();
+    list.len() == 1 && list.first().is_some_and(|n| n.as_self_node().is_some())
+}
+
+/// `Style::ModuleFunction#module_function_node?`: `(send nil? :module_function)`
+/// — a bare (no receiver, no block, NO arguments) call to `module_function`.
+fn mf_module_function_node(node: &ruby_prism::Node) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    if call.receiver().is_some() || call.block().is_some() {
+        return false;
+    }
+    call.name().as_slice() == b"module_function" && call.arguments().is_none()
+}
+
+/// `Style::ModuleFunction#private_directive?`: `(send nil? :private ...)` —
+/// a bare (no receiver, no block) call to `private`, with any (including
+/// zero) arguments — covers both the declarative `private` and the
+/// argument form `private :foo`.
+fn mf_private_directive_node(node: &ruby_prism::Node) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    if call.receiver().is_some() || call.block().is_some() {
+        return false;
+    }
+    call.name().as_slice() == b"private"
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/ModuleFunction — checks for use of `extend self` or
+    /// `module_function` in a module, per `EnforcedStyle`: `module_function`
+    /// (default), `extend_self`, or `forbidden`.
+    ///
+    /// Ported from rubocop's `Style::ModuleFunction`
+    /// (`include ConfigurableEnforcedStyle`, `extend AutoCorrector`).
+    /// Upstream only activates when `node.body&.begin_type?` — whitequark
+    /// only wraps a module's body in a `begin` node when it has 2+
+    /// statements (a single-statement body is the bare statement node
+    /// itself). Prism's `ModuleNode#body`, in contrast, ALWAYS wraps in a
+    /// `StatementsNode` regardless of statement count — a prism-vs-whitequark
+    /// trap — so this port explicitly requires >= 2 direct statements to
+    /// match upstream's activation condition (verified live: a module
+    /// containing only `extend self` produces no offense under real
+    /// rubocop 1.88.0).
+    ///
+    /// Autocorrection (`extend AutoCorrector`) is unsafe and disabled by
+    /// default; under `forbidden` style the offense is still reported but
+    /// `next if style == :forbidden` in upstream's corrector block means no
+    /// replacement ever happens — modeled here as `correctable = false` and
+    /// no entry pushed to `self.fixes`, mirroring this file's existing
+    /// `EmptyElse`-style `!forbidden` idiom.
+    pub(crate) fn check_module_function(&mut self, node: &ruby_prism::ModuleNode) {
+        const COP: &str = "Style/ModuleFunction";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = node.body() else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        let children: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        // Mirrors `node.body&.begin_type?` — see doc comment above.
+        if children.len() < 2 {
+            return;
+        }
+
+        let style = self.cfg.get(COP, "EnforcedStyle").unwrap_or("module_function");
+        let (msg, correctable): (&'static str, bool) = match style {
+            "extend_self" => ("Use `extend self` instead of `module_function`.", true),
+            "forbidden" => ("Do not use `module_function` or `extend self`.", false),
+            _ => ("Use `module_function` instead of `extend self`.", true),
+        };
+
+        match style {
+            "extend_self" => {
+                for child in &children {
+                    if mf_module_function_node(child) {
+                        self.mf_offense(child, COP, msg, correctable, false);
+                    }
+                }
+            }
+            "forbidden" => {
+                for child in &children {
+                    if mf_extend_self_node(child) || mf_module_function_node(child) {
+                        self.mf_offense(child, COP, msg, correctable, false);
+                    }
+                }
+            }
+            // "module_function" (default) and any unrecognized value
+            // (the schema's `live()` gate already disables the cop
+            // outright for an out-of-range `EnforcedStyle`).
+            _ => {
+                // `check_module_function`: skip entirely if ANY direct
+                // statement is a `private` directive.
+                if children.iter().any(mf_private_directive_node) {
+                    return;
+                }
+                for child in &children {
+                    if mf_extend_self_node(child) {
+                        self.mf_offense(child, COP, msg, correctable, true);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pushes the offense for a matched `child` node and, when correctable,
+    /// the replacement fix. `is_extend_self` records which literal source
+    /// the matched node actually is (`extend self` vs `module_function`),
+    /// since upstream's corrector picks the replacement text from the
+    /// matched node's own shape (`if extend_self_node?(child_node) ...`),
+    /// not from the configured style.
+    fn mf_offense(
+        &mut self,
+        child: &ruby_prism::Node,
+        cop: &'static str,
+        msg: &'static str,
+        correctable: bool,
+        is_extend_self: bool,
+    ) {
+        let l = child.location();
+        self.push(l.start_offset(), cop, correctable, msg);
+        if correctable {
+            let rep: &[u8] = if is_extend_self { b"module_function" } else { b"extend self" };
+            self.fixes.push((l.start_offset(), l.end_offset(), rep.to_vec()));
+        }
+    }
+}

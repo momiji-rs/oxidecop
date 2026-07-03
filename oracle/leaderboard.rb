@@ -195,6 +195,7 @@ COPS = {
   'Style/StructInheritance'          => 'style/struct_inheritance',
   'Style/ExpandPathArguments'        => 'style/expand_path_arguments',
   'Style/RedundantSelfAssignment'    => 'style/redundant_self_assignment',
+  'Style/ModuleFunction'             => 'style/module_function',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
