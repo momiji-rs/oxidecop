@@ -196,6 +196,7 @@ COPS = {
   'Style/ExpandPathArguments'        => 'style/expand_path_arguments',
   'Style/RedundantSelfAssignment'    => 'style/redundant_self_assignment',
   'Style/ModuleFunction'             => 'style/module_function',
+  'Style/SingleArgumentDig'          => 'style/single_argument_dig',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

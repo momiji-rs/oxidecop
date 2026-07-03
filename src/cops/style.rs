@@ -8658,3 +8658,97 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/SingleArgumentDig — `x.dig(:a)` → `x[:a]`.
+    pub(crate) fn check_single_argument_dig(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/SingleArgumentDig";
+        if !self.hot.single_argument_dig || node.name().as_slice() != b"dig" {
+            return;
+        }
+
+        // Must have a receiver
+        let Some(receiver) = node.receiver() else { return };
+
+        // Safe navigation operator (&.) should be ignored
+        if node.call_operator_loc().is_some_and(|o| o.as_slice() == b"&.") {
+            return;
+        }
+
+        // Block argument forwarding (&) should be ignored
+        if node.block().is_some_and(|b| b.as_block_argument_node().is_some()) {
+            return;
+        }
+
+        // Must have exactly one argument
+        let args: Vec<ruby_prism::Node> = node
+            .arguments()
+            .map(|a| a.arguments().iter().collect())
+            .unwrap_or_default();
+        if args.len() != 1 {
+            return;
+        }
+
+        let arg = &args[0];
+
+        // Skip if argument is a ForwardingArgumentsNode (...), which represents ... forwarding
+        if arg.as_forwarding_arguments_node().is_some() {
+            return;
+        }
+
+        // Skip if argument is a SplatNode (any splat, with or without expression)
+        if arg.as_splat_node().is_some() {
+            return;
+        }
+
+        // Skip if argument is a KeywordHashNode with AssocSplatNode (** keyword forwarding)
+        if let Some(hash) = arg.as_keyword_hash_node() {
+            for elem in hash.elements().iter() {
+                if elem.as_assoc_splat_node().is_some() {
+                    return;
+                }
+            }
+        }
+
+        // Skip if argument is a block_pass (&:sym)
+        if arg.as_block_argument_node().is_some() {
+            return;
+        }
+
+        // Skip if argument is a hash
+        if arg.as_hash_node().is_some() {
+            return;
+        }
+
+        // When Style/DigChain is enabled, don't flag digs that are part of a
+        // chain (the DigChain cop owns them). The OUTER dig of a chain is
+        // visited first: it marks its dig-receiver's offset so the inner dig
+        // also knows it's part of a chain when its own turn comes.
+        if self.cfg.enabled("Style/DigChain") {
+            if let Some(recv_call) = receiver.as_call_node() {
+                if recv_call.name().as_slice() == b"dig" {
+                    self.sad_chain_receivers.insert(recv_call.location().start_offset());
+                    return;
+                }
+            }
+            if self.sad_chain_receivers.contains(&node.location().start_offset()) {
+                return;
+            }
+        }
+
+        let receiver_src = String::from_utf8_lossy(self.node_src(&receiver)).into_owned();
+        let argument_src = String::from_utf8_lossy(self.node_src(arg)).into_owned();
+        let original_src = String::from_utf8_lossy(self.node_src(&node.as_node())).into_owned();
+
+        let message = format!(
+            "Use `{receiver_src}[{argument_src}]` instead of `{original_src}`."
+        );
+
+        let l = node.location();
+        self.push(l.start_offset(), COP, true, message);
+
+        // Generate the fix
+        let fixed = format!("{receiver_src}[{argument_src}]");
+        self.fixes.push((l.start_offset(), l.end_offset(), fixed.into_bytes()));
+    }
+}

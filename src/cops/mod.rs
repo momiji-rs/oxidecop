@@ -128,6 +128,7 @@ pub(crate) struct Hot {
     /// 0 = both, 1 = prefix, 2 = postfix
     pub(crate) negated_if_style: u8,
     pub(crate) sample: bool,
+    pub(crate) single_argument_dig: bool,
 }
 
 /// Resolve a cop name string to its &'static form (cache deserialization).
@@ -172,7 +173,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/NestedModifier",
     "Layout/MultilineArrayBraceLayout", "Layout/MultilineHashBraceLayout",
     "Layout/MultilineMethodDefinitionBraceLayout",
-    "Style/WhileUntilModifier",
+    "Style/WhileUntilModifier", "Style/SingleArgumentDig",
 ];
 
 impl Engine {
@@ -315,6 +316,7 @@ impl Engine {
                 _ => 0,
             },
             sample: is_on("Style/Sample"),
+            single_argument_dig: is_on("Style/SingleArgumentDig"),
         };
         let display_style_guide = cfg.param("AllCops", "DisplayStyleGuide") == Some("true");
         let style_guide_base = cfg
@@ -382,6 +384,7 @@ impl Engine {
                     "Lint/NestedMethodDefinition" => hot.nested_method_definition = false,
                     "Style/NegatedIf" => hot.negated_if = false,
                     "Style/Sample" => hot.sample = false,
+                    "Style/SingleArgumentDig" => hot.single_argument_dig = false,
                     _ => {}
                 }
             }
@@ -596,6 +599,9 @@ pub(crate) struct Cops<'a> {
     // direct argument of a NON-access-modifier call (`do_something def m`) —
     // upstream's method_definition_with_modifier? skip.
     pub(crate) def_macro_args: HashSet<usize>,
+    // Style/SingleArgumentDig: start offsets of dig calls known to be the
+    // receiver of an outer dig (chain members, ceded to Style/DigChain).
+    pub(crate) sad_chain_receivers: HashSet<usize>,
     // Style/RedundantSelf: per-active def/block scope, the set of local
     // variable / parameter names known to disambiguate `self.x` from a bare
     // `x` — rubocop's `@local_variables_scopes` aliases ONE mutable Array
@@ -1973,6 +1979,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_nil_lambda_call(node);
         self.check_preferred_hash_methods(node);
         self.check_sample(node);
+        self.check_single_argument_dig(node);
         self.check_nested_parenthesized_calls(node);
         self.check_require_parentheses(node);
         // Naming/AsciiIdentifiers scans tIDENTIFIER tokens — method call
@@ -2269,6 +2276,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         else_layout_seen: HashSet::new(),
         top_level_sole_stmt: None,
         def_macro_args: HashSet::new(),
+        sad_chain_receivers: HashSet::new(),
         rs_scope_stack: Vec::new(),
         rs_narrow: Vec::new(),
         rs_block_stack: Vec::new(),
