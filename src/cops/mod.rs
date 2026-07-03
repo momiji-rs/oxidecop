@@ -163,7 +163,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SymbolProc", "Style/UnpackFirst", "Style/ZeroLengthPredicate",
     "Lint/RegexpAsCondition", "Style/MultilineIfModifier",
     "Layout/EmptyLinesAroundAccessModifier",
-    "Style/GlobalStdStream",
+    "Style/GlobalStdStream", "Style/MissingRespondToMissing",
 ];
 
 impl Engine {
@@ -480,6 +480,15 @@ pub(crate) struct Cops<'a> {
     // rubocop's `class_node.left_siblings` (siblings with an earlier start
     // offset than the node being checked, since prism visits in source order).
     pub(crate) exception_siblings_stack: Vec<Vec<(usize, Vec<u8>)>>,
+    // Style/MissingRespondToMissing: per enclosing class/module/sclass body,
+    // whether a `respond_to_missing?` (plain `def`) and/or a `self.
+    // respond_to_missing?` (`def self.`) exist ANYWHERE in that body's
+    // subtree — rubocop's `grand_parent.each_descendant(node.type)` scan,
+    // which does not stop at nested class/module boundaries. `(has_def,
+    // has_defs)`; an empty stack (no enclosing class/module/sclass) means
+    // rubocop's `node.parent.parent` scan target is unreachable, so the cop
+    // always fires (see `check_missing_respond_to_missing`'s doc comment).
+    pub(crate) respond_to_missing_stack: Vec<(bool, bool)>,
     // Every comment as (line, start_offset, end_offset) spans into src.
     pub(crate) comments: &'a [(usize, usize, usize)],
     // Enclosing class/module names (their constant-path sources) — the
@@ -1529,6 +1538,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
+        self.respond_to_missing_stack.push(Self::scan_respond_to_missing(&node.body()));
         // Layout/EmptyLinesAroundAccessModifier's `@class_or_module_def_first_line`/
         // `@class_or_module_def_last_line` — `parent_class.first_line` (the
         // superclass expression) when there is one, else the class node's own
@@ -1545,6 +1555,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_class_node(self, node);
         self.style_attr_custom_method_stack.pop();
         self.el_am_scope.pop();
+        self.respond_to_missing_stack.pop();
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
         self.leave_namespace();
@@ -1560,6 +1571,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
+        self.respond_to_missing_stack.push(Self::scan_respond_to_missing(&node.body()));
         let ml = node.location();
         self.el_am_class_first_line = Some(self.idx.loc(ml.start_offset()).0);
         self.el_am_class_last_line = Some(self.idx.loc(ml.end_offset().saturating_sub(1)).0);
@@ -1570,6 +1582,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_module_node(self, node);
         self.style_attr_custom_method_stack.pop();
         self.el_am_scope.pop();
+        self.respond_to_missing_stack.pop();
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
         self.leave_namespace();
@@ -1587,6 +1600,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        self.check_missing_respond_to_missing(node);
         self.check_trailing_method_end_statement(node);
         self.check_optional_boolean_parameter(node);
         self.check_empty_lines_around_method_body(node);
@@ -1729,9 +1743,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `class << self` is a scoping context — nested defs inside are allowed.
         self.scoping_depth += 1;
         self.el_am_scope.push(true);
+        self.respond_to_missing_stack.push(Self::scan_respond_to_missing(&node.body()));
         if let Some(b) = node.body() {
             self.visit(&b);
         }
+        self.respond_to_missing_stack.pop();
         self.el_am_scope.pop();
         self.scoping_depth -= 1;
     }
@@ -2091,6 +2107,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
         class_children_stack: Vec::new(),
         exception_siblings_stack: Vec::new(),
+        respond_to_missing_stack: Vec::new(),
         comments: &comment_data,
         mod_stack: Vec::new(),
         nodoc_all_stack: Vec::new(),

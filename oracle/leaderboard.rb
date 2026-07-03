@@ -171,6 +171,7 @@ COPS = {
   'Security/JSONLoad'                => 'security/json_load',
   'Style/Sample'                     => 'style/sample',
   'Style/Attr'                       => 'style/attr',
+  'Style/MissingRespondToMissing'    => 'style/missing_respond_to_missing',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
