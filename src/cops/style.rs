@@ -9769,3 +9769,33 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((close.start_offset(), close.end_offset(), end_repl));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/NegatedUnless — `unless !x` → `if x` and vice versa (mirror of NegatedIf).
+    pub(crate) fn check_negated_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        if !self.hot.negated_unless {
+            return;
+        }
+        const COP: &str = "Style/NegatedUnless";
+        if node.else_clause().is_some() {
+            return; // unless with else
+        }
+        let modifier = node.end_keyword_loc().is_none();
+        match self.hot.negated_unless_style {
+            1 if modifier => return,
+            2 if !modifier => return,
+            _ => {}
+        }
+        let Some((bang_start, recv_start)) = single_negative(node.predicate()) else { return };
+        let l = node.location();
+        let inverse = "if";
+        let current = "unless";
+        self.push(l.start_offset(), COP, true,
+            format!("Favor `{inverse}` over `{current}` for negative conditions."));
+        // fix: swap the keyword and drop the `!`
+        let kw = node.keyword_loc();
+        self.fixes.push((kw.start_offset(), kw.end_offset(), b"if".to_vec()));
+        self.fixes.push((bang_start, recv_start, Vec::new()));
+    }
+
+}

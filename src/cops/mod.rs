@@ -127,6 +127,9 @@ pub(crate) struct Hot {
     pub(crate) negated_if: bool,
     /// 0 = both, 1 = prefix, 2 = postfix
     pub(crate) negated_if_style: u8,
+    pub(crate) negated_unless: bool,
+    /// 0 = both, 1 = prefix, 2 = postfix
+    pub(crate) negated_unless_style: u8,
     pub(crate) sample: bool,
     pub(crate) single_argument_dig: bool,
 }
@@ -165,7 +168,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/NestedMethodDefinition", "Lint/RandOne", "Lint/UriEscapeUnescape",
     "Lint/UriRegexp", "Lint/UnifiedInteger", "Naming/MethodName", "Style/ArrayJoin", "Style/Dir",
     "Style/Documentation", "Style/EvenOdd", "Style/FrozenStringLiteralComment",
-    "Style/NegatedIf", "Style/NestedFileDirname", "Style/NilComparison",
+    "Style/NegatedIf", "Style/NegatedUnless", "Style/NestedFileDirname", "Style/NilComparison",
     "Style/NumericLiterals", "Style/NumericPredicate", "Style/RandomWithOffset",
     "Style/RedundantReturn", "Style/StringChars", "Style/StringLiterals", "Style/StringLiteralsInInterpolation",
     "Style/SymbolProc", "Style/UnpackFirst", "Style/ZeroLengthPredicate",
@@ -321,6 +324,12 @@ impl Engine {
                 "postfix" => 2,
                 _ => 0,
             },
+            negated_unless: is_on("Style/NegatedUnless"),
+            negated_unless_style: match cfg.enforced_style("Style/NegatedUnless") {
+                "prefix" => 1,
+                "postfix" => 2,
+                _ => 0,
+            },
             sample: is_on("Style/Sample"),
             single_argument_dig: is_on("Style/SingleArgumentDig"),
         };
@@ -389,6 +398,7 @@ impl Engine {
                     "Style/RedundantReturn" => hot.redundant_return = false,
                     "Lint/NestedMethodDefinition" => hot.nested_method_definition = false,
                     "Style/NegatedIf" => hot.negated_if = false,
+                    "Style/NegatedUnless" => hot.negated_unless = false,
                     "Style/Sample" => hot.sample = false,
                     "Style/SingleArgumentDig" => hot.single_argument_dig = false,
                     _ => {}
@@ -1157,6 +1167,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_assignment_in_condition(&node.predicate());
         self.check_redundant_conditional_unless(node);
         self.check_safe_navigation_with_empty(&node.predicate());
+        self.check_negated_unless(node);
         self.check_unless_else(node);
         self.check_empty_conditional_body_unless(node);
         self.check_empty_else_unless(node);
