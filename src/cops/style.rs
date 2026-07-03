@@ -5260,3 +5260,194 @@ impl<'a> super::Cops<'a> {
         style == kind || style == "both"
     }
 }
+
+/// Style/SelfAssignment: `x = x + 1` -> `x += 1`. Ports upstream's
+/// `on_lvasgn`/`on_ivasgn`/`on_cvasgn` -> `check`, which only ever looks at
+/// the PLAIN `=` write node (not the `+=`/`||=`/`&&=` shorthand write-node
+/// families, which are already correct and have their own prism node
+/// types) — hence hooking only `LocalVariableWriteNode`/
+/// `InstanceVariableWriteNode`/`ClassVariableWriteNode`, never their
+/// `OperatorWrite`/`OrWrite`/`AndWrite` siblings.
+///
+/// Two RHS shapes are recognized, matching upstream exactly:
+/// - `rhs.send_type? && rhs.arguments.one?` (a `CallNode`, safe-navigation
+///   excluded since prism's `csend`-equivalent is a distinct whitequark
+///   type upstream's `send_type?` never matches) whose `method_name` is one
+///   of `OPS` and whose receiver is a bare read of the SAME var/type
+///   (`target_node = s(var_type, var_name)`) — `x = x + 1`, `x = x.+(y)`.
+/// - `rhs.operator_keyword?` (`AndNode`/`OrNode` — covers `&&`/`and` and
+///   `||`/`or` alike, since whitequark unifies both spellings into a single
+///   `:and`/`:or` type) whose `lhs` is that same bare var read — `x = x ||
+///   y`, `x = x && y`.
+///
+/// Autocorrect (`apply_autocorrect`) inserts the operator text right before
+/// the assignment's own `=` (`node.loc.operator`) and replaces the WHOLE
+/// rhs expression with the source text of whichever sub-node upstream calls
+/// `new_rhs` (`rhs.first_argument` for the send shape, `rhs.rhs` for the
+/// boolean shape) — never a reconstructed string, so any incidental
+/// whitespace inside that sub-expression survives verbatim.
+const SELF_ASSIGNMENT_OPS: &[&[u8]] =
+    &[b"+", b"-", b"*", b"**", b"/", b"%", b"^", b"<<", b">>", b"|", b"&"];
+
+/// Which variable kind (`var_type` in upstream) the LHS is — determines
+/// what shape of bare variable-read node the RHS receiver/lhs must
+/// structurally equal (`target_node = s(var_type, var_name)`).
+enum SelfAssignmentVarKind<'a> {
+    Lvar(&'a [u8]),
+    Ivar(&'a [u8]),
+    Cvar(&'a [u8]),
+}
+
+impl SelfAssignmentVarKind<'_> {
+    fn matches(&self, node: &ruby_prism::Node) -> bool {
+        match self {
+            SelfAssignmentVarKind::Lvar(name) => {
+                node.as_local_variable_read_node().is_some_and(|v| v.name().as_slice() == *name)
+            }
+            SelfAssignmentVarKind::Ivar(name) => {
+                node.as_instance_variable_read_node().is_some_and(|v| v.name().as_slice() == *name)
+            }
+            SelfAssignmentVarKind::Cvar(name) => {
+                node.as_class_variable_read_node().is_some_and(|v| v.name().as_slice() == *name)
+            }
+        }
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_self_assignment_shorthand_lvar(&mut self, node: &ruby_prism::LocalVariableWriteNode) {
+        self.self_assignment_shorthand_check(
+            node.location().start_offset(),
+            node.operator_loc().start_offset(),
+            &node.value(),
+            &SelfAssignmentVarKind::Lvar(node.name().as_slice()),
+        );
+    }
+    pub(crate) fn check_self_assignment_shorthand_ivar(&mut self, node: &ruby_prism::InstanceVariableWriteNode) {
+        self.self_assignment_shorthand_check(
+            node.location().start_offset(),
+            node.operator_loc().start_offset(),
+            &node.value(),
+            &SelfAssignmentVarKind::Ivar(node.name().as_slice()),
+        );
+    }
+    pub(crate) fn check_self_assignment_shorthand_cvar(&mut self, node: &ruby_prism::ClassVariableWriteNode) {
+        self.self_assignment_shorthand_check(
+            node.location().start_offset(),
+            node.operator_loc().start_offset(),
+            &node.value(),
+            &SelfAssignmentVarKind::Cvar(node.name().as_slice()),
+        );
+    }
+
+    /// Shared `check` + `check_send_node`/`check_boolean_node` + autocorrect
+    /// dispatch — see the module-level doc comment above for the ported
+    /// shapes.
+    fn self_assignment_shorthand_check(
+        &mut self,
+        whole_start: usize,
+        op_start: usize,
+        rhs: &ruby_prism::Node,
+        kind: &SelfAssignmentVarKind,
+    ) {
+        const COP: &str = "Style/SelfAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        if let Some(call) = rhs.as_call_node() {
+            // `rhs.send_type?`: prism folds `&.` into the same `CallNode`,
+            // but whitequark's `send_type?` is `false` for its `csend`
+            // counterpart — exclude safe-navigation to match.
+            if call.is_safe_navigation() {
+                return;
+            }
+            let args: Vec<ruby_prism::Node> =
+                call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            if args.len() != 1 {
+                return;
+            }
+            let method = call.name().as_slice();
+            if !SELF_ASSIGNMENT_OPS.contains(&method) {
+                return;
+            }
+            let Some(receiver) = call.receiver() else { return };
+            if !kind.matches(&receiver) {
+                return;
+            }
+            let method_str = String::from_utf8_lossy(method).into_owned();
+            self.push(whole_start, COP, true, format!("Use self-assignment shorthand `{method_str}=`."));
+            let call_loc = call.location();
+            self.self_assignment_apply_fix(
+                op_start,
+                &method_str,
+                (call_loc.start_offset(), call_loc.end_offset()),
+                &args[0],
+            );
+        } else if let Some(and) = rhs.as_and_node() {
+            self.self_assignment_boolean_check(
+                whole_start,
+                op_start,
+                &and.left(),
+                &and.right(),
+                &and.operator_loc(),
+                &and.location(),
+                kind,
+            );
+        } else if let Some(or) = rhs.as_or_node() {
+            self.self_assignment_boolean_check(
+                whole_start,
+                op_start,
+                &or.left(),
+                &or.right(),
+                &or.operator_loc(),
+                &or.location(),
+                kind,
+            );
+        }
+    }
+
+    /// `check_boolean_node`: `rhs.lhs == target_node`; message/autocorrect
+    /// operator is the LITERAL operator source (`&&`/`and`/`||`/`or`), not a
+    /// normalized spelling.
+    #[allow(clippy::too_many_arguments)]
+    fn self_assignment_boolean_check(
+        &mut self,
+        whole_start: usize,
+        op_start: usize,
+        lhs: &ruby_prism::Node,
+        new_rhs: &ruby_prism::Node,
+        operator_loc: &ruby_prism::Location,
+        whole_rhs_loc: &ruby_prism::Location,
+        kind: &SelfAssignmentVarKind,
+    ) {
+        const COP: &str = "Style/SelfAssignment";
+        if !kind.matches(lhs) {
+            return;
+        }
+        let operator =
+            String::from_utf8_lossy(&self.src[operator_loc.start_offset()..operator_loc.end_offset()])
+                .into_owned();
+        self.push(whole_start, COP, true, format!("Use self-assignment shorthand `{operator}=`."));
+        self.self_assignment_apply_fix(
+            op_start,
+            &operator,
+            (whole_rhs_loc.start_offset(), whole_rhs_loc.end_offset()),
+            new_rhs,
+        );
+    }
+
+    /// `apply_autocorrect`: `corrector.insert_before(node.loc.operator,
+    /// operator)` then `corrector.replace(rhs, new_rhs.source)`.
+    fn self_assignment_apply_fix(
+        &mut self,
+        op_start: usize,
+        operator: &str,
+        replace_range: (usize, usize),
+        new_rhs: &ruby_prism::Node,
+    ) {
+        self.fixes.push((op_start, op_start, operator.as_bytes().to_vec()));
+        let nl = new_rhs.location();
+        let new_src = self.src[nl.start_offset()..nl.end_offset()].to_vec();
+        self.fixes.push((replace_range.0, replace_range.1, new_src));
+    }
+}

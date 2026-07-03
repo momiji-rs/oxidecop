@@ -163,6 +163,7 @@ COPS = {
   'Style/GlobalStdStream'            => 'style/global_std_stream',
   'Style/EmptyElse'                  => 'style/empty_else',
   'Layout/EmptyLineBetweenDefs'      => 'layout/empty_line_between_defs',
+  'Style/SelfAssignment'             => 'style/style_self_assignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
