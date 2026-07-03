@@ -165,6 +165,7 @@ COPS = {
   'Layout/EmptyLineBetweenDefs'      => 'layout/empty_line_between_defs',
   'Style/SelfAssignment'             => 'style/style_self_assignment',
   'Style/SingleLineMethods'          => 'style/single_line_methods',
+  'Style/PreferredHashMethods'       => 'style/preferred_hash_methods',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

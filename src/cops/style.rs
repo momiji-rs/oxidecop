@@ -5743,3 +5743,72 @@ fn slm_classify_single<'pr>(n: ruby_prism::Node<'pr>) -> SlmBody<'pr> {
     }
     SlmBody::Other(n)
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/PreferredHashMethods: checks for uses of Hash#has_key?/has_value?
+    /// (short style) or Hash#key?/value? (verbose style) and suggests the
+    /// preferred variant based on EnforcedStyle config (default: short).
+    pub(crate) fn check_preferred_hash_methods(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/PreferredHashMethods";
+        if !self.on(COP) {
+            return;
+        }
+
+        let method_name = node.name().as_slice();
+
+        // Check if the method has exactly one argument
+        let args_count = node.arguments().map(|a| a.arguments().len()).unwrap_or(0);
+        if args_count != 1 {
+            return;
+        }
+
+        let style = self.cfg.enforced_style(COP);
+
+        // Determine if this is an offending selector based on the style
+        let offending = if style == "verbose" {
+            matches!(method_name, b"key?" | b"value?")
+        } else {
+            // short is the default
+            matches!(method_name, b"has_key?" | b"has_value?")
+        };
+
+        if !offending {
+            return;
+        }
+
+        // Get the preferred method name
+        let preferred = if style == "verbose" {
+            // Convert key? -> has_key?, value? -> has_value?
+            if method_name == b"key?" {
+                "has_key?".to_string()
+            } else {
+                "has_value?".to_string()
+            }
+        } else {
+            // Convert has_key? -> key?, has_value? -> value?
+            if method_name == b"has_key?" {
+                "key?".to_string()
+            } else {
+                "value?".to_string()
+            }
+        };
+
+        let current_name = String::from_utf8_lossy(method_name).into_owned();
+        let message = format!(
+            "Use `Hash#{}` instead of `Hash#{}`.",
+            preferred, current_name
+        );
+
+        // Report the offense at the selector location
+        if let Some(msg_loc) = node.message_loc() {
+            self.push(msg_loc.start_offset(), COP, true, &message);
+
+            // Add the fix: replace the method selector
+            self.fixes.push((
+                msg_loc.start_offset(),
+                msg_loc.end_offset(),
+                preferred.as_bytes().to_vec(),
+            ));
+        }
+    }
+}
