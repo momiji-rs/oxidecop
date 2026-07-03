@@ -9084,3 +9084,181 @@ impl<'a> super::Cops<'a> {
     }
 
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/KeywordParametersOrder. rubocop's `on_kwoptarg` fires once per
+    /// `kwoptarg` (optional keyword parameter) that has ANY `kwarg`
+    /// (required keyword parameter) among its `right_siblings` — an offense
+    /// per misplaced optional. prism's `ParametersNode#keywords` already
+    /// lists exactly the keyword-parameter nodes (mixing
+    /// `OptionalKeywordParameterNode`/`RequiredKeywordParameterNode`) in
+    /// written order — no other parameter kind can be interleaved among
+    /// them by Ruby's grammar — so "right siblings that are `kwarg_type`"
+    /// reduces to "later entries of this Vec that are required".
+    ///
+    /// Only the FIRST optional parameter in the whole list ever performs the
+    /// reorder (upstream: `node.parent.find(&:kwoptarg_type?) == node`) —
+    /// later matching offenses are registered but not corrected, since a
+    /// single reorder already relocates every required parameter that
+    /// follows an optional one.
+    pub(crate) fn check_keyword_parameters_order_def(&mut self, node: &ruby_prism::DefNode) {
+        if !self.on("Style/KeywordParametersOrder") {
+            return;
+        }
+        let Some(params) = node.parameters() else { return };
+        let has_parens = node.lparen_loc().is_some();
+        self.kpo_check(&params, false, has_parens);
+    }
+
+    /// Same check for a block/lambda parameter list. Upstream's
+    /// `parentheses?(arguments)` is ALWAYS false for a block/lambda's args
+    /// node (its closing delimiter is `|` or, for a `->() {}` lambda, still
+    /// not literally `)` in the sense that method checks), so the
+    /// newline-after-reorder step is always attempted — but then
+    /// unconditionally suppressed by `unless arguments.parent.block_type?`.
+    /// Net effect: blocks/lambdas never get the trailing newline, whether or
+    /// not they use parens/pipes — modeled here simply as "never insert".
+    pub(crate) fn check_keyword_parameters_order_block(&mut self, params_holder: &ruby_prism::Node) {
+        if !self.on("Style/KeywordParametersOrder") {
+            return;
+        }
+        let Some(bp) = params_holder.as_block_parameters_node() else { return };
+        let Some(params) = bp.parameters() else { return };
+        self.kpo_check(&params, true, false);
+    }
+
+    fn kpo_check(&mut self, params: &ruby_prism::ParametersNode, is_block: bool, has_parens: bool) {
+        const COP: &str = "Style/KeywordParametersOrder";
+        const MSG: &str = "Place optional keyword parameters at the end of the parameters list.";
+
+        let keywords: Vec<ruby_prism::Node<'_>> = params.keywords().iter().collect();
+        if keywords.is_empty() {
+            return;
+        }
+        let first_opt_idx = keywords.iter().position(|n| n.as_optional_keyword_parameter_node().is_some());
+
+        for i in 0..keywords.len() {
+            if keywords[i].as_optional_keyword_parameter_node().is_none() {
+                continue;
+            }
+            let required_after: Vec<usize> = (i + 1..keywords.len())
+                .filter(|&j| keywords[j].as_required_keyword_parameter_node().is_some())
+                .collect();
+            if required_after.is_empty() {
+                continue;
+            }
+
+            self.push(keywords[i].location().start_offset(), COP, true, MSG);
+
+            // Only the earliest offending optional parameter corrects.
+            if first_opt_idx != Some(i) {
+                continue;
+            }
+
+            // A comment anywhere across the WHOLE parameter list (every
+            // kind, not just the keyword group) blocks the correction —
+            // upstream's `contains_comment?(arguments_range(defining_node))`.
+            let (span_start, span_end) = kpo_full_span(params);
+            if self.comments.iter().any(|&(_, s, _)| s >= span_start && s < span_end) {
+                continue;
+            }
+
+            // `corrector.insert_before(node, "#{kwarg_nodes.map(&:source).join(', ')}, ")`
+            let insert_off = keywords[i].location().start_offset();
+            let mut insert = Vec::new();
+            for (pos, &j) in required_after.iter().enumerate() {
+                if pos > 0 {
+                    insert.extend_from_slice(b", ");
+                }
+                insert.extend_from_slice(self.node_src(&keywords[j]));
+            }
+            insert.extend_from_slice(b", ");
+            self.fixes.push((insert_off, insert_off, insert));
+
+            // Remove each relocated required parameter from its original
+            // spot (with surrounding space/comma reconstruction) BEFORE
+            // queuing the trailing-newline insert below: `apply_fixes`
+            // breaks ties on identical start offsets by push order, and
+            // when the last optional parameter is immediately followed by
+            // one of these removals, the newline's insertion point and the
+            // removal's (comma-trimmed) start coincide exactly — the
+            // removal must be the one committed first so the newline lands
+            // in the gap the removal leaves behind, not immediately undone
+            // by `e <= last_start` rejecting the still-open removal.
+            for &j in &required_after {
+                let l = keywords[j].location();
+                let (rs, re) = kpo_remove_range(self.src, l.start_offset(), l.end_offset());
+                self.fixes.push((rs, re, Vec::new()));
+            }
+
+            // `append_newline_to_last_kwoptarg`: only for an unparenthesized
+            // `def` (never blocks/lambdas — see doc comment above) whose
+            // very last parameter isn't a `**rest`/`&block` (those already
+            // sit at the line's end, so no break is needed).
+            if !is_block && !has_parens {
+                let last_is_rest_or_block = params.keyword_rest().is_some() || params.block().is_some();
+                if !last_is_rest_or_block {
+                    if let Some(last_opt) =
+                        keywords.iter().rev().find(|n| n.as_optional_keyword_parameter_node().is_some())
+                    {
+                        let end = last_opt.location().end_offset();
+                        self.fixes.push((end, end, b"\n".to_vec()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The byte span from the first parameter (of any kind) to the last, in
+/// prism's fixed grammar order — upstream's `arguments_range(defining_node)`
+/// (`first_argument..last_argument`). Only called once at least one keyword
+/// parameter is known to exist, so the final `keywords` fallbacks always
+/// apply.
+fn kpo_full_span(params: &ruby_prism::ParametersNode) -> (usize, usize) {
+    let start = if let Some(n) = params.requireds().iter().next() {
+        n.location().start_offset()
+    } else if let Some(n) = params.optionals().iter().next() {
+        n.location().start_offset()
+    } else if let Some(n) = params.rest() {
+        n.location().start_offset()
+    } else if let Some(n) = params.posts().iter().next() {
+        n.location().start_offset()
+    } else {
+        params.keywords().iter().next().unwrap().location().start_offset()
+    };
+    let end = if let Some(n) = params.block() {
+        n.location().end_offset()
+    } else if let Some(n) = params.keyword_rest() {
+        n.location().end_offset()
+    } else {
+        params.keywords().iter().last().unwrap().location().end_offset()
+    };
+    (start, end)
+}
+
+/// `RangeHelp#range_with_surrounding_space` at its default (both sides,
+/// horizontal whitespace then a run of newlines, no further generic
+/// whitespace) followed by `range_with_surrounding_comma(range, :left)` —
+/// deletes a required keyword parameter cleanly out of its original
+/// position, consuming exactly one adjoining comma on the left.
+fn kpo_remove_range(src: &[u8], start: usize, end: usize) -> (usize, usize) {
+    let mut s = start;
+    let mut e = end;
+    while s > 0 && matches!(src[s - 1], b' ' | b'\t') {
+        s -= 1;
+    }
+    while s > 0 && src[s - 1] == b'\n' {
+        s -= 1;
+    }
+    while e < src.len() && matches!(src[e], b' ' | b'\t') {
+        e += 1;
+    }
+    while e < src.len() && src[e] == b'\n' {
+        e += 1;
+    }
+    while s > 0 && src[s - 1] == b',' {
+        s -= 1;
+    }
+    (s, e)
+}

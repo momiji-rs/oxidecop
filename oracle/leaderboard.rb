@@ -202,6 +202,7 @@ COPS = {
   'Metrics/ParameterLists'           => 'metrics/parameter_lists',
   'Layout/ClosingHeredocIndentation' => 'layout/closing_heredoc_indentation',
   'Lint/ImplicitStringConcatenation' => 'lint/implicit_string_concatenation',
+  'Style/KeywordParametersOrder'     => 'style/keyword_parameters_order',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
