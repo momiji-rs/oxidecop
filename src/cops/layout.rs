@@ -4297,3 +4297,221 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/EmptyLineBetweenDefs — ported from rubocop's `on_begin`, which
+    /// walks consecutive sibling pairs of a `:begin` statement sequence.
+    /// Prism's `StatementsNode` gives that same sibling list uniformly for
+    /// EVERY scope (program/class/module/def/block bodies, if/else branches,
+    /// kwbegin bodies) — including single-statement lists, where the
+    /// pairwise walk below is simply a no-op — so this runs generically from
+    /// `visit_statements_node`, same as `EmptyLinesAroundAttributeAccessor`.
+    ///
+    /// Both "def/class/module" and "macro call, with or without a literal
+    /// block" collapse cleanly under prism: unlike whitequark's separate
+    /// `:block`/`:numblock`/`:itblock` wrapper node (whose FIRST CHILD is the
+    /// underlying `:send`), prism represents a call-with-block as a single
+    /// `CallNode` whose `block()` field holds the `BlockNode` — so
+    /// `foo do end`/`foo { }`/numbered-param/`it`-param blocks are ALL just
+    /// "a CallNode with a block" here, no separate numblock/itblock handling
+    /// needed. `&:sym` block-pass args live in `.arguments()`, never in
+    /// `.block()`, so they never look like a block form here.
+    ///
+    /// The offense anchor and the `blank_lines_count_between`/`single_line?`
+    /// line math only ever need each node's OWN start/end line — upstream's
+    /// `def_location`/`def_start`/`def_end` branch on node type (keyword vs.
+    /// send vs. block-join) only because whitequark's block-node range starts
+    /// at the selector, not the receiver; prism's `CallNode#location` is
+    /// already receiver-inclusive (spanning through the block's own `end`),
+    /// so every candidate type's own `location()` already gives the same
+    /// start/end upstream reconstructs by hand.
+    pub(crate) fn check_empty_line_between_defs(&mut self, stmts: &ruby_prism::StatementsNode<'_>) {
+        const COP: &str = "Layout/EmptyLineBetweenDefs";
+        if !self.on(COP) {
+            return;
+        }
+        let body: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        for pair in body.windows(2) {
+            if self.eld_candidate(COP, &pair[0]) && self.eld_candidate(COP, &pair[1]) {
+                self.eld_check_defs(COP, &pair[0], &pair[1]);
+            }
+        }
+    }
+
+    /// `candidate?`: a def (`EmptyLineBetweenMethodDefs`), a class
+    /// (`EmptyLineBetweenClassDefs`), a module (`EmptyLineBetweenModuleDefs`),
+    /// or a configured `DefLikeMacros` call (with or without a block).
+    fn eld_candidate(&self, cop: &str, node: &ruby_prism::Node<'_>) -> bool {
+        if node.as_def_node().is_some() {
+            return self.cfg.get(cop, "EmptyLineBetweenMethodDefs") != Some("false");
+        }
+        if node.as_class_node().is_some() {
+            return self.cfg.get(cop, "EmptyLineBetweenClassDefs") != Some("false");
+        }
+        if node.as_module_node().is_some() {
+            return self.cfg.get(cop, "EmptyLineBetweenModuleDefs") != Some("false");
+        }
+        if let Some(call) = node.as_call_node() {
+            return self.eld_macro_candidate(cop, &call);
+        }
+        false
+    }
+
+    /// `macro_candidate?` + `SendNode#macro?`: an implicit-receiver call
+    /// whose name is listed in `DefLikeMacros` (empty by default — absent
+    /// from the generated schema since its default is the array `[]`),
+    /// sitting directly in a macro scope. Reuses
+    /// `EmptyLinesAroundAccessModifier`'s `el_am_scope` stack, which already
+    /// tracks upstream's exact `in_macro_scope?` predicate (root, or a
+    /// class/module/sclass/constructor-block body, transparent through
+    /// kwbegin/begin/any-block/if-branch wrappers).
+    fn eld_macro_candidate(&self, cop: &str, call: &ruby_prism::CallNode<'_>) -> bool {
+        if call.receiver().is_some() || !self.el_am_scope.last().copied().unwrap_or(true) {
+            return false;
+        }
+        let macros: Vec<String> =
+            self.cfg.get(cop, "DefLikeMacros").map(crate::config::parse_allowed_list).unwrap_or_default();
+        macros.iter().any(|m| m.as_bytes() == call.name().as_slice())
+    }
+
+    fn eld_check_defs(&mut self, cop: &'static str, prev: &ruby_prism::Node<'_>, node: &ruby_prism::Node<'_>) {
+        let count = self.eld_blank_lines_between(prev, node);
+        let (min, max) = self.eld_number_of_empty_lines(cop);
+        if count >= min && count <= max {
+            return;
+        }
+        if self.eld_multiple_blank_line_groups(prev, node) {
+            return;
+        }
+        if self.eld_single_line(prev)
+            && self.eld_single_line(node)
+            && self.cfg.get(cop, "AllowAdjacentOneLineDefs") != Some("false")
+        {
+            return;
+        }
+        let kind = Self::eld_node_kind(node);
+        let expected = Self::eld_expected_lines(min, max);
+        let msg = format!("Expected {expected} between {kind} definitions; found {count}.");
+        self.push(node.location().start_offset(), cop, true, msg);
+        self.eld_autocorrect(prev, node, count, min, max);
+    }
+
+    /// `blank_lines_count_between`: physical lines strictly between the two
+    /// nodes (exclusive of both) that are empty or whitespace-only.
+    fn eld_blank_lines_between(&self, prev: &ruby_prism::Node<'_>, node: &ruby_prism::Node<'_>) -> usize {
+        let Some((first, last)) = self.eld_between_lines(prev, node) else { return 0 };
+        (first..=last).filter(|&l| self.el_attr_line_blank(l)).count()
+    }
+
+    /// The physical line range strictly between `prev`'s own last line and
+    /// `node`'s own first line, or `None` when there's nothing in between
+    /// (adjacent lines, or squeezed onto the same line via a semicolon).
+    fn eld_between_lines(&self, prev: &ruby_prism::Node<'_>, node: &ruby_prism::Node<'_>) -> Option<(usize, usize)> {
+        let first_end_line = self.idx.loc(prev.location().end_offset().saturating_sub(1)).0;
+        let second_start_line = self.idx.loc(node.location().start_offset()).0;
+        if second_start_line < first_end_line + 2 {
+            return None;
+        }
+        Some((first_end_line + 1, second_start_line - 1))
+    }
+
+    /// `multiple_blank_lines_groups?`: true when the between-lines contain a
+    /// blank line occurring AFTER a non-blank one (e.g. a comment sandwiched
+    /// between two separate blank-line groups) — upstream always allows that
+    /// shape, regardless of `NumberOfEmptyLines`.
+    fn eld_multiple_blank_line_groups(&self, prev: &ruby_prism::Node<'_>, node: &ruby_prism::Node<'_>) -> bool {
+        let Some((first, last)) = self.eld_between_lines(prev, node) else { return false };
+        let mut blank_start = None;
+        let mut non_blank_end = None;
+        for (i, line) in (first..=last).enumerate() {
+            if self.el_attr_line_blank(line) {
+                blank_start = Some(i);
+            } else if non_blank_end.is_none() {
+                non_blank_end = Some(i);
+            }
+        }
+        matches!((blank_start, non_blank_end), (Some(b), Some(n)) if b > n)
+    }
+
+    /// `single_line?`: the node's own first and last source line coincide.
+    fn eld_single_line(&self, node: &ruby_prism::Node<'_>) -> bool {
+        let loc = node.location();
+        self.idx.loc(loc.start_offset()).0 == self.idx.loc(loc.end_offset().saturating_sub(1)).0
+    }
+
+    /// `node_type`: def -> method; a call with a block -> block; a bare call
+    /// -> send; class/module pass through as themselves.
+    fn eld_node_kind(node: &ruby_prism::Node<'_>) -> &'static str {
+        if node.as_def_node().is_some() {
+            return "method";
+        }
+        if node.as_class_node().is_some() {
+            return "class";
+        }
+        if node.as_module_node().is_some() {
+            return "module";
+        }
+        if let Some(call) = node.as_call_node() {
+            return if call.block().is_some() { "block" } else { "send" };
+        }
+        "send"
+    }
+
+    /// `minimum_empty_lines`/`maximum_empty_lines`: `NumberOfEmptyLines` is
+    /// either a scalar (min == max) or a `[min, max]` array; unset it falls
+    /// back to the schema default (`1`).
+    fn eld_number_of_empty_lines(&self, cop: &str) -> (usize, usize) {
+        let raw = self.cfg.get(cop, "NumberOfEmptyLines").unwrap_or("1").trim();
+        if raw.starts_with('[') {
+            let nums: Vec<i64> =
+                crate::config::parse_allowed_list(raw).iter().filter_map(|s| s.trim().parse().ok()).collect();
+            let min = nums.first().copied().unwrap_or(1).max(0) as usize;
+            let max = nums.last().copied().unwrap_or(min as i64).max(0) as usize;
+            (min, max)
+        } else {
+            let v = raw.parse::<i64>().unwrap_or(1).max(0) as usize;
+            (v, v)
+        }
+    }
+
+    /// `expected_lines`: `"min..max empty lines"` when they differ (a Ruby
+    /// `Range#to_s`), else `"N empty line(s)"`.
+    fn eld_expected_lines(min: usize, max: usize) -> String {
+        if min != max {
+            format!("{min}..{max} empty lines")
+        } else {
+            let word = if max == 1 { "line" } else { "lines" };
+            format!("{max} empty {word}")
+        }
+    }
+
+    /// `autocorrect`: find the first newline at/after `prev`'s own end —
+    /// unless `node` starts before that point (both squeezed onto one
+    /// physical line via a semicolon, so no such newline lies between them),
+    /// in which case anchor right before `node` instead. Too many blank
+    /// lines: remove the surplus bytes there. Too few: insert the shortfall
+    /// right after that newline.
+    fn eld_autocorrect(
+        &mut self,
+        prev: &ruby_prism::Node<'_>,
+        node: &ruby_prism::Node<'_>,
+        count: usize,
+        min: usize,
+        max: usize,
+    ) {
+        let end_pos = prev.location().end_offset();
+        let mut newline_pos =
+            self.src[end_pos..].iter().position(|&b| b == b'\n').map(|i| end_pos + i).unwrap_or(self.src.len());
+        let begin_pos = node.location().start_offset();
+        if newline_pos > begin_pos {
+            newline_pos = begin_pos.saturating_sub(1);
+        }
+        if count > max {
+            let difference = count - max;
+            self.fixes.push((newline_pos, newline_pos + difference, Vec::new()));
+        } else {
+            let difference = min - count;
+            self.fixes.push((newline_pos + 1, newline_pos + 1, "\n".repeat(difference).into_bytes()));
+        }
+    }
+}

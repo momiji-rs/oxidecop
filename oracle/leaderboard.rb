@@ -162,6 +162,7 @@ COPS = {
   'Layout/BeginEndAlignment'         => 'layout/begin_end_alignment',
   'Style/GlobalStdStream'            => 'style/global_std_stream',
   'Style/EmptyElse'                  => 'style/empty_else',
+  'Layout/EmptyLineBetweenDefs'      => 'layout/empty_line_between_defs',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
