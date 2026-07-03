@@ -193,6 +193,7 @@ COPS = {
   'Style/WhileUntilModifier'         => 'style/while_until_modifier',
   'Style/ExponentialNotation'        => 'style/exponential_notation',
   'Style/StructInheritance'          => 'style/struct_inheritance',
+  'Style/ExpandPathArguments'        => 'style/expand_path_arguments',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -8037,3 +8037,210 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+/// Style/ExpandPathArguments — `File.expand_path('..', __FILE__)` and the
+/// `Pathname(__FILE__).parent.expand_path` / `Pathname.new(...)` families,
+/// rewritten to their `__dir__`-based forms. Ported verbatim (message text,
+/// depth-counting, autocorrect ranges) from rubocop's
+/// `RuboCop::Cop::Style::ExpandPathArguments`.
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_expand_path_arguments(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/ExpandPathArguments";
+        if !self.on(COP) {
+            return;
+        }
+        if node.name().as_slice() != b"expand_path" {
+            return;
+        }
+        if let Some((current_path, default_dir)) = expand_path_file_args(node) {
+            self.expand_path_inspect_file(node, &current_path, &default_dir);
+        } else if let Some((parent_call, default_dir)) = expand_path_pathname_parent(node) {
+            if expand_path_is_file_literal(&default_dir, self.src) {
+                let l = node.location();
+                self.push(
+                    l.start_offset(),
+                    COP,
+                    true,
+                    "Use `Pathname(__dir__).expand_path` instead of \
+                     `Pathname(__FILE__).parent.expand_path`.",
+                );
+                self.expand_path_fix_pathname(&default_dir, &parent_call);
+            }
+        } else if let Some((parent_call, default_dir)) = expand_path_pathname_new_parent(node) {
+            if expand_path_is_file_literal(&default_dir, self.src) {
+                let l = node.location();
+                self.push(
+                    l.start_offset(),
+                    COP,
+                    true,
+                    "Use `Pathname.new(__dir__).expand_path` instead of \
+                     `Pathname.new(__FILE__).parent.expand_path`.",
+                );
+                self.expand_path_fix_pathname(&default_dir, &parent_call);
+            }
+        }
+    }
+
+    /// Mirrors `inspect_offense_for_expand_path` + `autocorrect_expand_path`:
+    /// only fires when `default_dir` is literally `__FILE__` and `current_path`
+    /// is a plain (non-interpolated) string.
+    fn expand_path_inspect_file(
+        &mut self,
+        node: &ruby_prism::CallNode,
+        current_path: &ruby_prism::Node,
+        default_dir: &ruby_prism::Node,
+    ) {
+        const COP: &str = "Style/ExpandPathArguments";
+        if !expand_path_is_file_literal(default_dir, self.src) {
+            return;
+        }
+        let Some(str_node) = current_path.as_string_node() else { return };
+        let Some(sel) = node.message_loc() else { return };
+
+        let current_path_str = String::from_utf8_lossy(str_node.content_loc().as_slice()).into_owned();
+        let parent = expand_path_parent_path(&current_path_str);
+        let depth = expand_path_depth(&current_path_str);
+
+        let new_path = if parent.is_empty() { String::new() } else { format!("'{parent}', ") };
+        let new_default_dir = if depth == 0 { "__FILE__" } else { "__dir__" };
+
+        let message = format!(
+            "Use `expand_path({new_path}{new_default_dir})` instead of \
+             `expand_path('{current_path_str}', __FILE__)`."
+        );
+        self.push(sel.start_offset(), COP, true, message);
+
+        let arg_start = current_path.location().start_offset();
+        let arg_end = default_dir.location().end_offset();
+        match depth {
+            0 => self.fixes.push((arg_start, arg_end, b"__FILE__".to_vec())),
+            1 => self.fixes.push((arg_start, arg_end, b"__dir__".to_vec())),
+            _ => {
+                let new_path_lit = format!("'{parent}'");
+                let cp_l = current_path.location();
+                let dd_l = default_dir.location();
+                self.fixes.push((cp_l.start_offset(), cp_l.end_offset(), new_path_lit.into_bytes()));
+                self.fixes.push((dd_l.start_offset(), dd_l.end_offset(), b"__dir__".to_vec()));
+            }
+        }
+    }
+
+    /// Mirrors the Pathname branch of `autocorrect` + `remove_parent_method`:
+    /// replace `__FILE__` with `__dir__` and drop the `.parent` call.
+    fn expand_path_fix_pathname(&mut self, default_dir: &ruby_prism::Node, parent_call: &ruby_prism::CallNode) {
+        let dd_l = default_dir.location();
+        self.fixes.push((dd_l.start_offset(), dd_l.end_offset(), b"__dir__".to_vec()));
+        if let (Some(dot), Some(sel)) = (parent_call.call_operator_loc(), parent_call.message_loc()) {
+            self.fixes.push((dot.start_offset(), dot.end_offset(), Vec::new()));
+            self.fixes.push((sel.start_offset(), sel.end_offset(), Vec::new()));
+        }
+    }
+}
+
+/// `File`/`Pathname` receiver, bare (`File`) or top-level (`::File`) — mirrors
+/// the `{nil? cbase} :Name` node-pattern slot.
+fn expand_path_bare_const(n: &ruby_prism::Node, name: &[u8]) -> bool {
+    if let Some(cr) = n.as_constant_read_node() {
+        cr.name().as_slice() == name
+    } else if let Some(cp) = n.as_constant_path_node() {
+        cp.parent().is_none() && cp.name().is_some_and(|nm| nm.as_slice() == name)
+    } else {
+        false
+    }
+}
+
+/// rubocop's `unrecommended_argument?`: the node's source is literally `__FILE__`.
+fn expand_path_is_file_literal(n: &ruby_prism::Node, src: &[u8]) -> bool {
+    let l = n.location();
+    &src[l.start_offset()..l.end_offset()] == b"__FILE__"
+}
+
+fn expand_path_arg_count(node: &ruby_prism::CallNode) -> usize {
+    node.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0)
+}
+
+/// `(send (const {nil? cbase} :File) :expand_path $_ $_)`
+fn expand_path_file_args<'pr>(
+    node: &ruby_prism::CallNode<'pr>,
+) -> Option<(ruby_prism::Node<'pr>, ruby_prism::Node<'pr>)> {
+    let recv = node.receiver()?;
+    if !expand_path_bare_const(&recv, b"File") {
+        return None;
+    }
+    let args: Vec<ruby_prism::Node> =
+        node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    if args.len() != 2 {
+        return None;
+    }
+    let mut it = args.into_iter();
+    let a0 = it.next().unwrap();
+    let a1 = it.next().unwrap();
+    Some((a0, a1))
+}
+
+/// `(send (send (send nil? :Pathname $_) :parent) :expand_path)` — `node` is
+/// the outer `:expand_path` call itself; returns the `.parent` call (for
+/// removal) and the captured argument to `Pathname(...)`.
+fn expand_path_pathname_parent<'pr>(
+    node: &ruby_prism::CallNode<'pr>,
+) -> Option<(ruby_prism::CallNode<'pr>, ruby_prism::Node<'pr>)> {
+    if expand_path_arg_count(node) != 0 {
+        return None;
+    }
+    let parent_call = node.receiver()?.as_call_node()?;
+    if parent_call.name().as_slice() != b"parent" || expand_path_arg_count(&parent_call) != 0 {
+        return None;
+    }
+    let pathname_call = parent_call.receiver()?.as_call_node()?;
+    if pathname_call.name().as_slice() != b"Pathname" || pathname_call.receiver().is_some() {
+        return None;
+    }
+    let args: Vec<ruby_prism::Node> =
+        pathname_call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    if args.len() != 1 {
+        return None;
+    }
+    Some((parent_call, args.into_iter().next().unwrap()))
+}
+
+/// `(send (send (send (const {nil? cbase} :Pathname) :new $_) :parent) :expand_path)`
+fn expand_path_pathname_new_parent<'pr>(
+    node: &ruby_prism::CallNode<'pr>,
+) -> Option<(ruby_prism::CallNode<'pr>, ruby_prism::Node<'pr>)> {
+    if expand_path_arg_count(node) != 0 {
+        return None;
+    }
+    let parent_call = node.receiver()?.as_call_node()?;
+    if parent_call.name().as_slice() != b"parent" || expand_path_arg_count(&parent_call) != 0 {
+        return None;
+    }
+    let new_call = parent_call.receiver()?.as_call_node()?;
+    if new_call.name().as_slice() != b"new" {
+        return None;
+    }
+    let recv = new_call.receiver()?;
+    if !expand_path_bare_const(&recv, b"Pathname") {
+        return None;
+    }
+    let args: Vec<ruby_prism::Node> =
+        new_call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    if args.len() != 1 {
+        return None;
+    }
+    Some((parent_call, args.into_iter().next().unwrap()))
+}
+
+/// rubocop's `depth`: split on `/`, count components that aren't `.`.
+fn expand_path_depth(current_path: &str) -> usize {
+    current_path.split('/').filter(|p| *p != ".").count()
+}
+
+/// rubocop's `parent_path`: drop `.` components, then drop the FIRST `..`.
+fn expand_path_parent_path(current_path: &str) -> String {
+    let mut paths: Vec<&str> = current_path.split('/').collect();
+    paths.retain(|p| *p != ".");
+    if let Some(idx) = paths.iter().position(|p| *p == "..") {
+        paths.remove(idx);
+    }
+    paths.join("/")
+}
