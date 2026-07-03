@@ -6983,3 +6983,122 @@ fn is_operator_method_name(name: &[u8]) -> bool {
             | b"`"
     )
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/RedundantException — checks for `raise`/`fail` with explicit
+    /// `RuntimeError` that can be simplified. Handles two patterns:
+    /// 1. `raise RuntimeError, 'message'` → `raise 'message'`
+    /// 2. `raise RuntimeError.new('message')` → `raise 'message'`
+    ///
+    /// Ported from rubocop's two node matchers: exploded (comma-separated) and
+    /// compact (new call) forms.
+    pub(crate) fn check_redundant_exception(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/RedundantException";
+        if !self.on(COP) {
+            return;
+        }
+
+        let method_name = node.name().as_slice();
+        if !matches!(method_name, b"raise" | b"fail") {
+            return;
+        }
+
+        // Try the compact form first (RuntimeError.new(message))
+        if let Some(args_node) = node.arguments() {
+            let args: Vec<ruby_prism::Node> = args_node.arguments().iter().collect();
+            if args.len() == 1 {
+                if let Some(new_call) = args[0].as_call_node() {
+                    if new_call.name().as_slice() == b"new" {
+                        if let Some(receiver) = new_call.receiver() {
+                            if self.re_is_runtime_error_const(&receiver) {
+                                if let Some(new_args_node) = new_call.arguments() {
+                                    let new_args: Vec<ruby_prism::Node> = new_args_node.arguments().iter().collect();
+                                    if new_args.len() == 1 {
+                                        let message = &new_args[0];
+                                        self.push(
+                                            node.location().start_offset(),
+                                            COP,
+                                            true,
+                                            "Redundant `RuntimeError.new` call can be replaced with just the message.",
+                                        );
+                                        let msg_src = self.node_src(message);
+                                        let is_string = self.re_is_string(message);
+                                        let replacement = if is_string {
+                                            msg_src.to_vec()
+                                        } else {
+                                            let mut buf = msg_src.to_vec();
+                                            buf.extend_from_slice(b".to_s");
+                                            buf
+                                        };
+                                        self.fixes.push((new_call.location().start_offset(), new_call.location().end_offset(), replacement));
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try the exploded form (raise RuntimeError, message)
+        if let Some(args_node) = node.arguments() {
+            let args: Vec<ruby_prism::Node> = args_node.arguments().iter().collect();
+            if args.len() == 2 {
+                if self.re_is_runtime_error_const(&args[0]) {
+                    let message = &args[1];
+                    self.push(
+                        node.location().start_offset(),
+                        COP,
+                        true,
+                        "Redundant `RuntimeError` argument can be removed.",
+                    );
+
+                    let msg_src = self.node_src(message);
+                    let is_string = self.re_is_string(message);
+
+                    // Build replacement
+                    let is_parenthesized = node.opening_loc().is_some();
+                    let arg = if is_string {
+                        msg_src.to_vec()
+                    } else {
+                        let mut buf = msg_src.to_vec();
+                        buf.extend_from_slice(b".to_s");
+                        buf
+                    };
+
+                    let mut replacement = Vec::new();
+                    replacement.extend_from_slice(b"raise");
+                    if is_parenthesized {
+                        replacement.push(b'(');
+                        replacement.extend_from_slice(&arg);
+                        replacement.push(b')');
+                    } else {
+                        replacement.push(b' ');
+                        replacement.extend_from_slice(&arg);
+                    }
+
+                    self.fixes.push((node.location().start_offset(), node.location().end_offset(), replacement));
+                }
+            }
+        }
+    }
+
+    /// Check if a node is the RuntimeError constant (with or without :: prefix)
+    fn re_is_runtime_error_const(&self, node: &ruby_prism::Node) -> bool {
+        let const_node = match node.as_constant_read_node() {
+            Some(c) => c,
+            None => return false,
+        };
+
+        const_node.name().as_slice() == b"RuntimeError"
+    }
+
+    /// Check if a message node is a string type (including interpolated strings)
+    fn re_is_string(&self, node: &ruby_prism::Node) -> bool {
+        node.as_string_node().is_some()
+            || node.as_interpolated_string_node().is_some()
+            || node.as_x_string_node().is_some()
+            || node.as_interpolated_x_string_node().is_some()
+    }
+}
