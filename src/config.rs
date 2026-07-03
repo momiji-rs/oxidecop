@@ -284,6 +284,14 @@ impl Config {
         }
         out
     }
+    /// Raw AllCops lookup (user-set values only).
+    pub fn get_all_cops(&self, key: &str) -> Option<&str> {
+        self.sections.get("AllCops").and_then(|s| s.get(key)).map(String::as_str)
+    }
+    /// Inject an AllCops value (the TargetRuby detection chain writes here).
+    pub fn set_all_cops(&mut self, key: &str, val: String) {
+        self.sections.entry("AllCops".to_string()).or_default().insert(key.to_string(), val);
+    }
     /// AllCops/TargetRubyVersion — rubocop's DEFAULT_VERSION (2.7) when unset.
     /// Version-gated cop behavior (parser names, minimum_target_ruby_version)
     /// dispatches on this.

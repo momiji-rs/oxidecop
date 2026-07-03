@@ -99,6 +99,72 @@ fn is_ruby_file(path: &Path) -> bool {
     )
 }
 
+/// rubocop's TargetRuby non-config sources: .ruby-version, .tool-versions,
+/// then the first *.gemspec's required_ruby_version — each yielding a
+/// major.minor version string.
+fn detect_target_ruby(dir: &Path) -> Option<String> {
+    fn floor2(v: &str) -> Option<String> {
+        let mut it = v.trim().trim_start_matches("ruby-").split('.');
+        let maj: u32 = it.next()?.trim().parse().ok()?;
+        let min: u32 = it.next().unwrap_or("0").trim().parse().ok()?;
+        Some(format!("{maj}.{min}"))
+    }
+    if let Ok(t) = std::fs::read_to_string(dir.join(".ruby-version")) {
+        if let Some(v) = floor2(&t) {
+            return Some(v);
+        }
+    }
+    if let Ok(t) = std::fs::read_to_string(dir.join(".tool-versions")) {
+        for line in t.lines() {
+            if let Some(rest) = line.trim().strip_prefix("ruby ") {
+                if let Some(v) = floor2(rest) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    let entries = std::fs::read_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { dir }).ok()?;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("gemspec") {
+            continue;
+        }
+        let Ok(t) = std::fs::read_to_string(&p) else { continue };
+        for line in t.lines() {
+            if !line.contains("required_ruby_version") {
+                continue;
+            }
+            // pick the smallest x.y among quoted requirement strings,
+            // mirroring rubocop's Gem::Requirement minimal-version walk
+            let mut best: Option<(u32, u32)> = None;
+            let mut rest = line;
+            while let Some(q) = rest.find(|c| c == '"' || c == '\'') {
+                let quote = rest.as_bytes()[q] as char;
+                let tail = &rest[q + 1..];
+                let Some(endq) = tail.find(quote) else { break };
+                let lit = &tail[..endq];
+                let ver = lit.trim_start_matches(['>', '<', '=', '~', ' ']);
+                if let Some(v) = floor2(ver) {
+                    let mut parts = v.split('.');
+                    if let (Some(a), Some(b)) = (
+                        parts.next().and_then(|x| x.parse().ok()),
+                        parts.next().and_then(|x| x.parse().ok()),
+                    ) {
+                        if best.is_none() || (a, b) < best.unwrap() {
+                            best = Some((a, b));
+                        }
+                    }
+                }
+                rest = &tail[endq + 1..];
+            }
+            if let Some((a, b)) = best {
+                return Some(format!("{a}.{b}"));
+            }
+        }
+    }
+    None
+}
+
 /// Load a config honoring `inherit_from` (base files first, child overrides;
 /// Exclude lists merge), recursively with a depth cap.
 fn load_config_chain(path: &Path, depth: usize) -> config::Config {
@@ -237,6 +303,15 @@ fn main() {
 
     let cfg_file = cfg_path.clone().unwrap_or_else(|| ".rubocop.yml".to_string());
     let mut cfg = load_config_chain(Path::new(&cfg_file), 0);
+    // rubocop's TargetRuby source chain when the config doesn't pin it:
+    // .ruby-version -> .tool-versions -> *.gemspec required_ruby_version
+    // (BundlerLockFile omitted), else the 2.7 default in Config::target_ruby.
+    if cfg.get_all_cops("TargetRubyVersion").is_none() {
+        let dir = Path::new(&cfg_file).parent().map(Path::to_path_buf).unwrap_or_default();
+        if let Some(v) = detect_target_ruby(&dir) {
+            cfg.set_all_cops("TargetRubyVersion", v);
+        }
+    }
     cfg.only = only;
     cfg.except = except;
     let cfg_text_for_cache = cfg.identity();
