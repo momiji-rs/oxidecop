@@ -3836,3 +3836,148 @@ impl<'a> super::Cops<'a> {
             })
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Layout/CaseIndentation — checks how each `when`/`in` branch of a
+    /// `case`/`case ... in` expression is indented relative to the `case`
+    /// keyword (`EnforcedStyle: case`, the default) or the `end` keyword
+    /// (`EnforcedStyle: end`), optionally requiring one extra
+    /// `configured_indentation_width` step in (`IndentOneStep`). Ports
+    /// rubocop's `CaseIndentation` cop.
+    ///
+    /// The `ConfigurableEnforcedStyle` bookkeeping upstream
+    /// (`correct_style_detected`/`opposite_style_detected`/
+    /// `unrecognized_style_detected`, called from `check_when`/
+    /// `detect_incorrect_style`) only feeds `--auto-gen-config`'s detected-
+    /// style tracking — it never affects the offense range, message, or
+    /// autocorrection — so it's skipped entirely.
+    ///
+    /// All `column`s below are rubocop's raw parser columns (byte offset
+    /// from the start of the line): this cop, unlike `Alignment#check_alignment`,
+    /// never calls the Unicode-aware `display_column`.
+    pub(crate) fn check_case_indentation(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Layout/CaseIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let case_kw_start = node.case_keyword_loc().start_offset();
+        let end_kw_start = node.end_keyword_loc().start_offset();
+        let case_line = self.idx.loc(case_kw_start).0;
+        let end_line = self.idx.loc(end_kw_start).0;
+        if case_line == end_line {
+            return; // `return if case_node.single_line?`
+        }
+        let style_is_end = self.cfg.enforced_style(COP) == "end";
+        if style_is_end && self.end_and_last_conditional_same_line(end_line, node.else_clause(), node.conditions().iter().last())
+        {
+            return;
+        }
+        let case_col = self.idx.loc(case_kw_start).1 - 1;
+        let end_col = self.idx.loc(end_kw_start).1 - 1;
+        let base_col = if style_is_end { end_col } else { case_col };
+        let indent_one_step = self.cfg.get(COP, "IndentOneStep") == Some("true");
+        let width = if indent_one_step { self.case_indentation_width(COP) } else { 0 };
+        let expected = base_col + width;
+        let style_str: &'static str = if style_is_end { "end" } else { "case" };
+        for branch in node.conditions().iter() {
+            let Some(when_node) = branch.as_when_node() else { continue };
+            self.check_case_branch(when_node.keyword_loc().start_offset(), "when", expected, indent_one_step, style_str, COP);
+        }
+    }
+
+    /// Same as `check_case_indentation`, for `case ... in` (prism's
+    /// `CaseMatchNode`/`InNode` — rubocop's `on_case_match` +
+    /// `in_pattern_branches`).
+    pub(crate) fn check_case_match_indentation(&mut self, node: &ruby_prism::CaseMatchNode) {
+        const COP: &str = "Layout/CaseIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let case_kw_start = node.case_keyword_loc().start_offset();
+        let end_kw_start = node.end_keyword_loc().start_offset();
+        let case_line = self.idx.loc(case_kw_start).0;
+        let end_line = self.idx.loc(end_kw_start).0;
+        if case_line == end_line {
+            return;
+        }
+        let style_is_end = self.cfg.enforced_style(COP) == "end";
+        if style_is_end && self.end_and_last_conditional_same_line(end_line, node.else_clause(), node.conditions().iter().last())
+        {
+            return;
+        }
+        let case_col = self.idx.loc(case_kw_start).1 - 1;
+        let end_col = self.idx.loc(end_kw_start).1 - 1;
+        let base_col = if style_is_end { end_col } else { case_col };
+        let indent_one_step = self.cfg.get(COP, "IndentOneStep") == Some("true");
+        let width = if indent_one_step { self.case_indentation_width(COP) } else { 0 };
+        let expected = base_col + width;
+        let style_str: &'static str = if style_is_end { "end" } else { "case" };
+        for branch in node.conditions().iter() {
+            let Some(in_node) = branch.as_in_node() else { continue };
+            self.check_case_branch(in_node.in_loc().start_offset(), "in", expected, indent_one_step, style_str, COP);
+        }
+    }
+
+    /// `end_and_last_conditional_same_line?`: with `EnforcedStyle: end`, the
+    /// whole check is skipped when the `end` keyword shares a line with the
+    /// case's last conditional content — the `else` keyword if there's an
+    /// `else` clause, otherwise the last `when`/`in` branch's own start
+    /// (rubocop's `node.child_nodes.last`, which — absent an `else` — is
+    /// always that last branch).
+    fn end_and_last_conditional_same_line(
+        &self,
+        end_line: usize,
+        else_clause: Option<ruby_prism::ElseNode>,
+        last_branch: Option<ruby_prism::Node>,
+    ) -> bool {
+        let last_conditional_line = match else_clause {
+            Some(e) => Some(self.idx.loc(e.else_keyword_loc().start_offset()).0),
+            None => last_branch.map(|b| self.idx.loc(b.location().start_offset()).0),
+        };
+        last_conditional_line == Some(end_line)
+    }
+
+    /// `check_when` + `incorrect_style`'s `AutoCorrector` block (minus the
+    /// pure `ConfigurableEnforcedStyle` bookkeeping — see above): compares
+    /// the `when`/`in` keyword's column against the already-resolved
+    /// `expected` column (`base_column(case_node, style) + indentation_width`)
+    /// and, on mismatch, registers the offense. The corrector reindents the
+    /// keyword's leading whitespace to `expected` columns, but only when
+    /// that leading text is ALL whitespace (`whitespace.source.strip.empty?`)
+    /// — a `when` sharing its line with `case` (e.g.
+    /// `case test when something`) is reported but left uncorrected, since
+    /// the "whitespace" range there is actually `case test `.
+    fn check_case_branch(
+        &mut self,
+        keyword_start: usize,
+        branch_type: &str,
+        expected: usize,
+        indent_one_step: bool,
+        style: &str,
+        cop: &'static str,
+    ) {
+        let (line, col1) = self.idx.loc(keyword_start);
+        let when_col = col1 - 1;
+        if when_col == expected {
+            return;
+        }
+        let depth = if indent_one_step { "one step more than" } else { "as deep as" };
+        self.push(keyword_start, cop, true, format!("Indent `{branch_type}` {depth} `{style}`."));
+        let line_start = self.idx.starts[line - 1];
+        if self.src[line_start..keyword_start].iter().all(u8::is_ascii_whitespace) {
+            self.fixes.push((line_start, keyword_start, vec![b' '; expected]));
+        }
+    }
+
+    /// `Alignment#configured_indentation_width`: cop-local `IndentationWidth`
+    /// — a raw `cop_config` read with no schema default, hence `cfg.param`
+    /// (user-set only) rather than `cfg.get` — else `Layout/IndentationWidth`'s
+    /// `Width`, else 2.
+    fn case_indentation_width(&self, cop: &'static str) -> usize {
+        self.cfg
+            .param(cop, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+}

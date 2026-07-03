@@ -149,6 +149,7 @@ COPS = {
   'Lint/UselessMethodDefinition'     => 'lint/useless_method_definition',
   'Lint/SelfAssignment'              => 'lint/self_assignment',
   'Layout/AccessModifierIndentation' => 'layout/access_modifier_indentation',
+  'Layout/CaseIndentation'           => 'layout/case_indentation',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
