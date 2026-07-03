@@ -141,6 +141,7 @@ COPS = {
   'Lint/UselessSetterCall'           => 'lint/useless_setter_call',
   'Lint/EmptyConditionalBody'        => 'lint/empty_conditional_body',
   'Style/ComparableClamp'            => 'style/comparable_clamp',
+  'Style/RedundantFreeze'            => 'style/redundant_freeze',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

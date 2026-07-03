@@ -4190,3 +4190,200 @@ const CLAMP_OPERATOR_METHODS: &[&[u8]] = &[
 fn clamp_is_operator_method(name: &[u8]) -> bool {
     CLAMP_OPERATOR_METHODS.contains(&name)
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/RedundantFreeze — checks for uses of `Object#freeze` on immutable objects.
+    pub(crate) fn check_redundant_freeze(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/RedundantFreeze";
+        if !self.on(COP) || node.name().as_slice() != b"freeze" {
+            return;
+        }
+
+        let Some(receiver) = node.receiver() else { return };
+
+        // Check if the receiver is an immutable object
+        if !self.is_immutable_literal_or_operation(&receiver) {
+            return;
+        }
+
+        // Report offense and add fix
+        self.push(
+            node.location().start_offset(),
+            COP,
+            true,
+            "Do not freeze immutable objects, as freezing them has no effect.",
+        );
+
+        // Fix: remove `.freeze` (remove the dot and selector)
+        if let (Some(dot), Some(msg)) = (node.call_operator_loc(), node.message_loc()) {
+            self.fixes.push((dot.start_offset(), msg.end_offset(), vec![]));
+        }
+    }
+
+    /// Check if the node is an immutable literal, frozen string, or operation that produces immutable
+    fn is_immutable_literal_or_operation(&self, node: &ruby_prism::Node) -> bool {
+        // Check the node after unwrapping begin nodes
+        self.check_immutable_recursive(node)
+    }
+
+    /// Recursively check if a node is immutable, stripping parentheses/begin nodes
+    fn check_immutable_recursive(&self, node: &ruby_prism::Node) -> bool {
+        // Unwrap parentheses nodes
+        if let Some(paren) = node.as_parentheses_node() {
+            if let Some(body) = paren.body() {
+                // ParenthesesNode body is typically a StatementsNode, so unwrap it
+                if let Some(stmts) = body.as_statements_node() {
+                    if let Some(first) = stmts.body().iter().next() {
+                        return self.check_immutable_recursive(&first);
+                    }
+                } else {
+                    // If body is not a StatementsNode, recurse on it directly
+                    return self.check_immutable_recursive(&body);
+                }
+            }
+        }
+
+        // Unwrap begin nodes (from rescue/ensure blocks)
+        if let Some(begin) = node.as_begin_node() {
+            if let Some(stmts) = begin.statements() {
+                if let Some(first) = stmts.body().iter().next() {
+                    return self.check_immutable_recursive(&first);
+                }
+            }
+        }
+
+        // Check basic immutable literals
+        if node.as_integer_node().is_some()
+            || node.as_float_node().is_some()
+            || node.as_symbol_node().is_some()
+            || node.as_interpolated_symbol_node().is_some()
+            || node.as_true_node().is_some()
+            || node.as_false_node().is_some()
+            || node.as_nil_node().is_some()
+            || node.as_rational_node().is_some()
+            || node.as_imaginary_node().is_some()
+        {
+            return true;
+        }
+
+        // Check for frozen string literal
+        if node.as_string_node().is_some() && self.frozen_string_literal_enabled() {
+            return true;
+        }
+
+        // Regexp and Range literals are frozen in Ruby 3.0+
+        if self.cfg.target_ruby() >= 3.0 {
+            if node.as_regular_expression_node().is_some() {
+                return true;
+            }
+            if node.as_range_node().is_some() {
+                return true;
+            }
+        }
+
+        // Check operations that produce immutable objects
+        self.operation_produces_immutable(node)
+    }
+
+    /// Check if frozen strings are enabled (FrozenStringLiteral mixin)
+    fn frozen_string_literal_enabled(&self) -> bool {
+        match self.fsl_enabled {
+            Some(true) => true,
+            Some(false) => false,
+            None => {
+                // Check StringLiteralsFrozenByDefault setting
+                match self.cfg.param("AllCops", "StringLiteralsFrozenByDefault") {
+                    Some(v) => v == "true",
+                    None => false,
+                }
+            }
+        }
+    }
+
+    /// Check if the receiver expression produces an immutable object
+    fn operation_produces_immutable(&self, node: &ruby_prism::Node) -> bool {
+        // (send {float int} {:+ :- :* :** :/ :% :<<} _)
+        if self.is_numeric_arithmetic(node) {
+            return true;
+        }
+
+        // (send !{(str _) array} {:+ :- :* :** :/ :%} {float int})
+        if self.is_reverse_numeric_arithmetic(node) {
+            return true;
+        }
+
+        // (send _ {:== :=== :!= :<= :>= :< :>} _)
+        if self.is_comparison(node) {
+            return true;
+        }
+
+        // (send _ {:count :length :size} ...)
+        if self.is_collection_size_method(node) {
+            return true;
+        }
+
+        false
+    }
+
+    /// Check for (send {float int} {:+ :- :* :** :/ :% :<<} _)
+    fn is_numeric_arithmetic(&self, node: &ruby_prism::Node) -> bool {
+        let Some(call) = node.as_call_node() else { return false };
+        let Some(receiver) = call.receiver() else { return false };
+
+        // Receiver must be float or int
+        let receiver_is_numeric = receiver.as_float_node().is_some() || receiver.as_integer_node().is_some();
+        if !receiver_is_numeric {
+            return false;
+        }
+
+        // Method must be an arithmetic operator
+        matches!(
+            call.name().as_slice(),
+            b"+" | b"-" | b"*" | b"**" | b"/" | b"%" | b"<<"
+        )
+    }
+
+    /// Check for (send !{(str _) array} {:+ :- :* :** :/ :%} {float int})
+    fn is_reverse_numeric_arithmetic(&self, node: &ruby_prism::Node) -> bool {
+        let Some(call) = node.as_call_node() else { return false };
+        let Some(receiver) = call.receiver() else { return false };
+
+        // Receiver must NOT be a string or array
+        if receiver.as_string_node().is_some() || receiver.as_array_node().is_some() {
+            return false;
+        }
+
+        // Method must be an arithmetic operator (excluding <<)
+        if !matches!(call.name().as_slice(), b"+" | b"-" | b"*" | b"**" | b"/" | b"%") {
+            return false;
+        }
+
+        // There must be exactly one argument and it must be float or int
+        let Some(args) = call.arguments() else { return false };
+        let args_vec: Vec<_> = args.arguments().iter().collect();
+        if args_vec.len() != 1 {
+            return false;
+        }
+
+        args_vec[0].as_float_node().is_some() || args_vec[0].as_integer_node().is_some()
+    }
+
+    /// Check for (send _ {:== :=== :!= :<= :>= :< :>} _)
+    fn is_comparison(&self, node: &ruby_prism::Node) -> bool {
+        let Some(call) = node.as_call_node() else { return false };
+
+        // Must have a receiver
+        call.receiver().is_some()
+            && matches!(
+                call.name().as_slice(),
+                b"==" | b"===" | b"!=" | b"<=" | b">=" | b"<" | b">"
+            )
+    }
+
+    /// Check for (send _ {:count :length :size} ...)
+    fn is_collection_size_method(&self, node: &ruby_prism::Node) -> bool {
+        let Some(call) = node.as_call_node() else { return false };
+
+        matches!(call.name().as_slice(), b"count" | b"length" | b"size")
+    }
+}
