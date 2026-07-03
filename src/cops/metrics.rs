@@ -1262,12 +1262,13 @@ impl<'a> super::Cops<'a> {
                 param_count,
                 max_params
             );
-            // Report on the opening paren, which is one character before the parameters
-            let offset = if params.location().start_offset() > 0 {
-                params.location().start_offset() - 1
-            } else {
-                params.location().start_offset()
-            };
+            // Upstream anchors at node.arguments.source_range, whose span
+            // INCLUDES the parens — use the def's lparen when present (the
+            // params may start on a later line), else the first param.
+            let offset = node
+                .lparen_loc()
+                .map(|l| l.start_offset())
+                .unwrap_or_else(|| params.location().start_offset());
             self.push(offset, COP, false, msg);
         }
 

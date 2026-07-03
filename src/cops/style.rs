@@ -8231,13 +8231,23 @@ fn expand_path_pathname_new_parent<'pr>(
 }
 
 /// rubocop's `depth`: split on `/`, count components that aren't `.`.
+/// Ruby's String#split drops TRAILING empty segments ("../../".split('/')
+/// == ["..", ".."]); Rust keeps them — mirror Ruby here.
+fn expand_path_split(current_path: &str) -> Vec<&str> {
+    let mut parts: Vec<&str> = current_path.split('/').collect();
+    while parts.last() == Some(&"") {
+        parts.pop();
+    }
+    parts
+}
+
 fn expand_path_depth(current_path: &str) -> usize {
-    current_path.split('/').filter(|p| *p != ".").count()
+    expand_path_split(current_path).into_iter().filter(|p| *p != ".").count()
 }
 
 /// rubocop's `parent_path`: drop `.` components, then drop the FIRST `..`.
 fn expand_path_parent_path(current_path: &str) -> String {
-    let mut paths: Vec<&str> = current_path.split('/').collect();
+    let mut paths = expand_path_split(current_path);
     paths.retain(|p| *p != ".");
     if let Some(idx) = paths.iter().position(|p| *p == "..") {
         paths.remove(idx);
@@ -9032,17 +9042,14 @@ impl<'a> super::Cops<'a> {
 
         let good = format!("fetch({}, {})", String::from_utf8_lossy(key_src), default_src);
 
-        // For empty block
-        let bad_msg = if is_nil {
-            format!("Use `fetch({}, nil)` instead of `fetch({}) {{}}`.",
-                String::from_utf8_lossy(key_src),
-                String::from_utf8_lossy(key_src))
-        } else {
-            format!("Use `{}` instead of `fetch({}) {{ {} }}`.",
-                good,
-                String::from_utf8_lossy(key_src),
-                String::from_utf8_lossy(body_src))
-        };
+        // An explicit `{ nil }` body renders like any other body — only a
+        // genuinely EMPTY block (handled above) prints `{}`.
+        let bad_msg = format!(
+            "Use `{}` instead of `fetch({}) {{ {} }}`.",
+            good,
+            String::from_utf8_lossy(key_src),
+            String::from_utf8_lossy(body_src)
+        );
 
         // Report the offense with the range from 'fetch' keyword to end of block
         if let Some(msg_loc) = call.message_loc() {
