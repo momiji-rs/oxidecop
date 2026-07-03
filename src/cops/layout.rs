@@ -3362,3 +3362,214 @@ impl<'a> Cops<'a> {
         })
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Layout/CommentIndentation — ports rubocop's `check`/`correct_indentation`
+    /// verbatim. For every OWN-LINE comment (only whitespace precedes the `#`
+    /// on its physical line — excludes trailing `code # comment` comments
+    /// AND `=begin`/`=end` document comments, whose own first line starts
+    /// with `=`, not `#`), the correct indentation is derived from the FIRST
+    /// non-blank line strictly after the comment: normally that line's own
+    /// indentation, plus one indentation width when the line dedents (`end`,
+    /// a closing bracket, or — under `Layout/AccessModifierIndentation:
+    /// outdent` — an access modifier). Lines starting `else`/`elsif`/`when`/
+    /// `in`/`rescue`/`ensure` get a second look: if the comment matches
+    /// keyword+width instead of the keyword's own column, it's accepted too
+    /// (but the ORIGINAL, pre-adjustment column_delta is what autocorrect
+    /// uses). `AllowForAlignment` (default false) additionally accepts a
+    /// comment whose column matches the nearest preceding TRAILING
+    /// (non-own-line) comment. Autocorrect chains backward through
+    /// adjacent-line comments (any kind) sharing the SAME original column as
+    /// the one being fixed, reusing the same delta for the whole run — this
+    /// is what lets a block of misaligned continuation comments move
+    /// together in one shot instead of one at a time.
+    pub(crate) fn check_comment_indentation(&mut self) {
+        const COP: &str = "Layout/CommentIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        if self.comments.is_empty() {
+            return;
+        }
+        let allow_for_alignment = self.cfg.get(COP, "AllowForAlignment") == Some("true");
+        let width = self.ci_indentation_width();
+
+        let cols: Vec<i64> = self.comments.iter().map(|&(_, s, _)| self.ci_column0(s)).collect();
+        let own_line: Vec<bool> =
+            self.comments.iter().map(|&(l, s, _)| self.ci_own_line(l, s)).collect();
+
+        // Pass 1 (read-only): decide which comments offend, and their
+        // message + the ORIGINAL column_delta (rubocop keeps @column_delta
+        // from before the two_alternatives adjustment, for autocorrect).
+        let mut offending: Vec<(usize, i64, String)> = Vec::new();
+        for ix in 0..self.comments.len() {
+            if !own_line[ix] {
+                continue;
+            }
+            let (line, _, _) = self.comments[ix];
+            let next = self.ci_line_after(line);
+            let mut correct = self.ci_correct_indentation(next, width);
+            let column = cols[ix];
+            let delta = correct - column;
+            if delta == 0 {
+                continue;
+            }
+            if let Some(nl) = next {
+                if ci_two_alternatives(nl) {
+                    correct += width;
+                    if column == correct {
+                        continue;
+                    }
+                }
+            }
+            if allow_for_alignment {
+                let mut j = ix;
+                let mut aligned = false;
+                while j > 0 {
+                    j -= 1;
+                    if !own_line[j] {
+                        aligned = cols[j] == column;
+                        break;
+                    }
+                }
+                if aligned {
+                    continue;
+                }
+            }
+            let msg = format!("Incorrect indentation detected (column {column} instead of {correct}).");
+            offending.push((ix, delta, msg));
+        }
+
+        // Pass 2 (mutating): register offenses + autocorrect.
+        // `AlignmentCorrector` no-ops entirely under `Layout/IndentationStyle:
+        // tabs` (detection still fires — only the fix is suppressed).
+        let using_tabs = self.cfg.enforced_style("Layout/IndentationStyle") == "tabs";
+        for (ix, delta, msg) in offending {
+            let start = self.comments[ix].1;
+            self.push(start, COP, true, msg);
+            if using_tabs {
+                continue;
+            }
+            self.ci_autocorrect_one(ix, delta);
+            let mut below = ix;
+            while below > 0 {
+                let above = below - 1;
+                let (above_line, above_start, _) = self.comments[above];
+                let (below_line, _, _) = self.comments[below];
+                if above_line != below_line - 1 || self.ci_column0(above_start) != cols[below] {
+                    break;
+                }
+                self.ci_autocorrect_one(above, delta);
+                below = above;
+            }
+        }
+    }
+
+    /// `Alignment#configured_indentation_width`: the cop's own
+    /// `IndentationWidth` (no schema default — meaningful only when a user
+    /// sets it directly on this cop), else `Layout/IndentationWidth`'s
+    /// `Width` (schema default 2).
+    fn ci_indentation_width(&self) -> i64 {
+        self.cfg
+            .get("Layout/CommentIndentation", "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()).unwrap_or(2)
+            })
+    }
+
+    /// `comment.loc.column`: 0-based CHARACTER column (not `Alignment`'s
+    /// display-width column — this cop compares raw `loc.column` values).
+    fn ci_column0(&self, off: usize) -> i64 {
+        let (line, mut col) = self.idx.loc(off);
+        let prefix = &self.src[self.idx.starts[line - 1]..off];
+        if !prefix.is_ascii() {
+            col = String::from_utf8_lossy(prefix).chars().count() + 1;
+        }
+        (col - 1) as i64
+    }
+
+    /// `own_line_comment?`: the physical line the comment starts on matches
+    /// `/\A\s*#/`. True for a whole-line `#...` comment; false for a
+    /// trailing `code # comment`, and false for a `=begin`/`=end` document
+    /// comment even though nothing but whitespace precedes its start offset
+    /// (its first physical line is `=begin`, which doesn't start with `#`).
+    fn ci_own_line(&self, line: usize, start: usize) -> bool {
+        if self.src.get(start) != Some(&b'#') {
+            return false;
+        }
+        let line_start = self.idx.starts[line - 1];
+        self.src[line_start..start].iter().all(|b| b.is_ascii_whitespace())
+    }
+
+    /// `processed_source.lines[line - 1]`, excluding the trailing newline.
+    fn ci_line_bytes(&self, line: usize) -> &'a [u8] {
+        &self.src[self.idx.starts[line - 1]..self.line_end(line)]
+    }
+
+    /// `line_after_comment`: the first non-blank physical line strictly
+    /// after `comment_line`, or `None` at EOF.
+    fn ci_line_after(&self, comment_line: usize) -> Option<&'a [u8]> {
+        let total = self.idx.starts.len();
+        ((comment_line + 1)..=total)
+            .map(|l| self.ci_line_bytes(l))
+            .find(|bytes| !bytes.iter().all(|b| b.is_ascii_whitespace()))
+    }
+
+    /// `correct_indentation`: 0 with no next line; else the next line's own
+    /// indentation, plus one width when it dedents (`less_indented?`).
+    fn ci_correct_indentation(&self, next_line: Option<&[u8]>, width: i64) -> i64 {
+        let Some(line) = next_line else { return 0 };
+        let indent = line.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(0) as i64;
+        indent + if self.ci_less_indented(line) { width } else { 0 }
+    }
+
+    /// `less_indented?`: the next line starts (after its own indentation)
+    /// with `end`, a closing bracket, or — under
+    /// `Layout/AccessModifierIndentation: outdent` — an access modifier.
+    fn ci_less_indented(&self, line: &[u8]) -> bool {
+        let indent = line.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(line.len());
+        let rest = &line[indent..];
+        if ci_word_at(rest, b"end") || matches!(rest.first(), Some(b')' | b'}' | b']')) {
+            return true;
+        }
+        self.cfg.enforced_style("Layout/AccessModifierIndentation") == "outdent"
+            && [b"private".as_slice(), b"protected", b"public"].iter().any(|w| ci_word_at(rest, w))
+    }
+
+    /// `AlignmentCorrector.correct` specialized to a single-line comment
+    /// token: insert `delta` spaces before it (widen), or delete the
+    /// `-delta` bytes immediately before it — but ONLY when they're all
+    /// spaces/tabs, the same guard rubocop uses to avoid corrupting
+    /// non-whitespace content when the assumption doesn't hold.
+    fn ci_autocorrect_one(&mut self, ix: usize, delta: i64) {
+        let start = self.comments[ix].1;
+        if delta > 0 {
+            self.fixes.push((start, start, vec![b' '; delta as usize]));
+        } else if delta < 0 {
+            let n = (-delta) as usize;
+            if n <= start && self.src[start - n..start].iter().all(|&b| b == b' ' || b == b'\t') {
+                self.fixes.push((start - n, start, Vec::new()));
+            }
+        }
+    }
+}
+
+/// `two_alternatives?`: the next line starts (after indentation) with a
+/// mid-statement keyword that has a "deeper OR keyword-aligned" comment
+/// convention.
+fn ci_two_alternatives(line: &[u8]) -> bool {
+    let indent = line.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(line.len());
+    let rest = &line[indent..];
+    [b"else".as_slice(), b"elsif", b"when", b"in", b"rescue", b"ensure"]
+        .iter()
+        .any(|w| ci_word_at(rest, w))
+}
+
+/// `rest` starts with `word`, immediately followed by a non-word byte (or
+/// end of line) — a `\b`-terminated literal match.
+fn ci_word_at(rest: &[u8], word: &[u8]) -> bool {
+    rest.len() >= word.len()
+        && &rest[..word.len()] == word
+        && rest.get(word.len()).is_none_or(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
+}
