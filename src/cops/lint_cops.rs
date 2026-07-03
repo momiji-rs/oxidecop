@@ -5261,19 +5261,22 @@ impl<'a> super::Cops<'a> {
             // Check for rest arguments (`*args`); `...` sits in the same slot
             // as a ForwardingParameterNode but is NOT a whitequark restarg —
             // upstream still flags `def m(...)` + bare super.
+            // `use_rest_or_optional_args?` lists exactly optarg/restarg/
+            // kwoptarg: required keywords, **kwargs, &block, and `...`
+            // (prism's keyword_rest ForwardingParameterNode) do NOT exempt.
             if params.rest().is_some_and(|r| r.as_forwarding_parameter_node().is_none()) {
                 return;
             }
-            // Check for optional arguments
             if !params.optionals().is_empty() {
                 return;
             }
-            // Check for keyword rest arguments
-            if params.keyword_rest().is_some() {
+            if params.keywords().iter().any(|k| k.as_optional_keyword_parameter_node().is_some()) {
                 return;
             }
-            // Check for keyword arguments (any keywords mean there are defaults or **kwargs)
-            if !params.keywords().is_empty() {
+            if params
+                .keyword_rest()
+                .is_some_and(|kr| kr.as_forwarding_parameter_node().is_none() && kr.as_keyword_rest_parameter_node().is_none())
+            {
                 return;
             }
         }
