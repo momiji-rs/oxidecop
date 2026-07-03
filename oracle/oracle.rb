@@ -680,7 +680,7 @@ examples.each_with_index do |ex, n|
     cfg_hash = resolve_cfg_variables!(parse_cfg(ex[:override]), ex[:lets] || {}) || {}
     if (sections = ex[:sections])
       extra_sections = sections.reject { |k, _| k == COP }
-                               .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(resolve_section_text(h, ex[:lets] || {}))) || {}] }
+                               .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(resolve_section_text(h, ex[:lets] || {})), ex[:lets] || {}) || {}] }
     end
   elsif (sections = ex[:sections])
     base = sections[COP]
@@ -695,7 +695,7 @@ examples.each_with_index do |ex, n|
       next
     end
     extra_sections = sections.reject { |k, _| k == COP }
-                             .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(resolve_section_text(h, ex[:lets] || {}))) || {}] }
+                             .map { |k, (h, _)| [k, resolve_cfg_variables!(parse_cfg(resolve_section_text(h, ex[:lets] || {})), ex[:lets] || {}) || {}] }
   end
 
   if (oc = ex[:other_cops]) && oc != 'default'
