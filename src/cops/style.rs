@@ -3628,3 +3628,148 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Style/RedundantPercentQ — `%q(...)`/`%Q(...)` where a plain `'...'`/
+    /// `"..."` literal would do just as well.
+    ///
+    /// rubocop routes this through `on_str`/`on_dstr`: a plain (non-
+    /// interpolated) literal is a `str` node and is checked as-is; one with
+    /// real interpolation is a `dstr` node checked as a whole (its inner
+    /// parts have no delimiters of their own, so rubocop's
+    /// `string_literal?` guard — `loc?(:begin) && loc?(:end)` — skips them).
+    /// `%q` itself never interpolates, so it is always the plain-`str` case.
+    /// Both routes funnel into the same text-level check over the node's raw
+    /// source, which is what `check_redundant_percent_q` below implements.
+    pub(crate) fn check_redundant_percent_q_str(&mut self, node: &ruby_prism::StringNode) {
+        if !self.on("Style/RedundantPercentQ") {
+            return;
+        }
+        let Some(open) = node.opening_loc() else { return };
+        let Some(close) = node.closing_loc() else { return };
+        let l = node.location();
+        self.check_redundant_percent_q(l.start_offset(), l.end_offset(), open, close, true);
+    }
+
+    /// Same check, routed for a `dstr` node (a `%Q(...)` with real `#{}`
+    /// interpolation). Inner parts lack their own opening/closing delimiters
+    /// and bail out via the same guard, matching rubocop's `string_literal?`.
+    pub(crate) fn check_redundant_percent_q_dstr(&mut self, node: &ruby_prism::InterpolatedStringNode) {
+        if !self.on("Style/RedundantPercentQ") {
+            return;
+        }
+        let Some(open) = node.opening_loc() else { return };
+        let Some(close) = node.closing_loc() else { return };
+        let l = node.location();
+        self.check_redundant_percent_q(l.start_offset(), l.end_offset(), open, close, false);
+    }
+
+    /// The shared body of rubocop's `check` — a pure text-level analysis over
+    /// `node.source` (`start..end`), plus the `loc.begin`/`loc.end`
+    /// (`open`/`close`) delimiter ranges the autocorrect rewrites.
+    /// `is_str_type` mirrors rubocop's `node.str_type?` (true only when the
+    /// checked node is the plain, non-interpolated literal itself).
+    fn check_redundant_percent_q(
+        &mut self,
+        start: usize,
+        end: usize,
+        open: ruby_prism::Location,
+        close: ruby_prism::Location,
+        is_str_type: bool,
+    ) {
+        const COP: &str = "Style/RedundantPercentQ";
+        let src = &self.src[start..end];
+        if !(src.starts_with(b"%q") || src.starts_with(b"%Q")) {
+            return;
+        }
+        // `interpolated_quotes?` — a literal `'` AND `"` anywhere in the
+        // source means quoting either way needs escapes, so both variants
+        // are left alone regardless of anything else.
+        if src.contains(&b'\'') && src.contains(&b'"') {
+            return;
+        }
+        let is_capital = src[1] == b'Q';
+        let allowed = if is_capital { acceptable_capital_q(src, is_str_type) } else { acceptable_q(src) };
+        if allowed {
+            return;
+        }
+        let (q_type, extra): (&str, &str) = if is_capital {
+            ("%Q", ", or for dynamic strings that contain double quotes")
+        } else {
+            ("%q", "")
+        };
+        self.push(
+            start,
+            COP,
+            true,
+            format!(
+                "Use `{q_type}` only for strings that contain both single quotes and double quotes{extra}."
+            ),
+        );
+        // Delimiter choice — rubocop's `/\A%Q[^"]+\z|'/.match?(node.source)`:
+        // a `%Q` with no `"` anywhere after it, or any literal `'` anywhere,
+        // picks `"`; otherwise `'`.
+        let percent_q_no_dquote = src.starts_with(b"%Q") && src.len() > 2 && !src[2..].contains(&b'"');
+        let delimiter: u8 = if percent_q_no_dquote || src.contains(&b'\'') { b'"' } else { b'\'' };
+        self.fixes.push((open.start_offset(), open.end_offset(), vec![delimiter]));
+        self.fixes.push((close.start_offset(), close.end_offset(), vec![delimiter]));
+    }
+}
+
+/// rubocop's `STRING_INTERPOLATION_REGEXP` (`/#\{.+\}/`) — a purely textual
+/// heuristic over the literal's raw source (`%q` never actually
+/// interpolates, but the check still runs over its source text as if it
+/// might). `.` doesn't cross a newline, so the search for the closing `}`
+/// stops at line boundaries, same as the Ruby regex without `/m`.
+fn looks_interpolated(src: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < src.len() {
+        if src[i] == b'#' && src[i + 1] == b'{' {
+            let mut j = i + 2;
+            while j < src.len() && src[j] != b'\n' {
+                if src[j] == b'}' && j > i + 2 {
+                    return true;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// rubocop's `acceptable_q?` — a `%q` is left alone when it has
+/// interpolation-like syntax alongside a single quote (requoting with `"`
+/// would activate real interpolation), or when it already contains a "real"
+/// escape (`\X` for `X != \\`, e.g. `\'`) that a bare requote would corrupt.
+fn acceptable_q(src: &[u8]) -> bool {
+    if looks_interpolated(src) && src.contains(&b'\'') {
+        return true;
+    }
+    // `src.scan(/\\./).any? { |m| m =~ /\\[^\\]/ }` — non-overlapping
+    // backslash+char pairs scanned left to right; a pair whose second byte
+    // isn't itself a backslash is a "real" (non-backslash) escape. `.`
+    // doesn't match `\n`, so a backslash immediately before a newline (or at
+    // the very end of the source) never starts a match.
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'\\' {
+            match src.get(i + 1) {
+                Some(b'\n') | None => i += 1,
+                Some(b'\\') => i += 2,
+                Some(_) => return true,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// rubocop's `acceptable_capital_q?` — a `%Q` is left alone when it contains
+/// a literal `"` and either looks interpolated, or (for a genuinely static,
+/// `str`-typed node) its content couldn't be re-quoted as single-quoted
+/// without a `double_quotes_required?` escape anyway.
+fn acceptable_capital_q(src: &[u8], is_str_type: bool) -> bool {
+    src.contains(&b'"') && (looks_interpolated(src) || (is_str_type && double_quotes_required(src)))
+}
