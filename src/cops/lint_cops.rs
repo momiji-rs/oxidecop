@@ -3256,3 +3256,176 @@ fn arl_find_fixes(root: &ruby_prism::Node, targets: &HashSet<usize>) -> Vec<(usi
     w.visit(root);
     w.fixes
 }
+
+impl<'a> Cops<'a> {
+    /// Lint/AmbiguousBlockAssociation — `some_method a { |x| .. }`: a bare
+    /// (unparenthesized) call whose LAST argument is itself a call taking a
+    /// literal block. Reads like the block belongs to `some_method`, but it
+    /// actually belongs to `a`. Ported verbatim from upstream's `on_send`
+    /// (aliased `on_csend`) plus the `AllowedMethods`/`AllowedPattern` mixins.
+    ///
+    /// Prism attaches a literal block as a FIELD of the call it belongs to,
+    /// not as a separate wrapping node the way whitequark's `(block (send
+    /// ...) ...)` does. So upstream's `send_node.last_argument` (a `BlockNode`
+    /// whose `#send_node` is the wrapped call) collapses here into ONE prism
+    /// `CallNode`: the last element of `node`'s own arguments, IF its
+    /// `.block()` is a `BlockNode` — a `&:sym`/`&blk` pass-through surfaces as
+    /// a `BlockArgumentNode` there instead and correctly never matches
+    /// `as_block_node()` (upstream's `any_block_type?` excludes it too).
+    ///
+    /// Because that inner call's own prism location already spans from its
+    /// start THROUGH its block's closing delimiter (unlike the whitequark
+    /// send node, whose `#source_range` stops before the block), anywhere
+    /// upstream reads `last_argument.send_node.source`/`#method_name` for
+    /// text OTHER than the full param dump, we must exclude the trailing
+    /// block ourselves (`call_source_excluding_block`); anywhere it reads
+    /// `last_argument.source`/`#source_range` wholesale (the offense param,
+    /// and the autocorrect's `insert_after` point) the raw prism location is
+    /// exactly right, block included, with no adjustment needed.
+    pub(crate) fn check_ambiguous_block_association(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/AmbiguousBlockAssociation";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let Some(last) = args.arguments().last() else { return };
+        // `ambiguous_block_association?`: last arg is itself a block-having
+        // call (never a `&blk`/`&:sym` pass-through) whose OWN call has no
+        // explicit arguments of its own.
+        let Some(inner) = last.as_call_node() else { return };
+        if inner.block().and_then(|b| b.as_block_node()).is_none() {
+            return;
+        }
+        if inner.arguments().is_some() {
+            return;
+        }
+        // `node.parenthesized?` — `loc.end.is?(')')`.
+        if node.closing_loc().is_some_and(|c| c.as_slice() == b")") {
+            return;
+        }
+        // `node.last_argument.lambda_or_proc?`
+        if is_lambda_or_proc_call(&inner) {
+            return;
+        }
+        // `allowed_method_pattern?`
+        let outer_name = node.name().as_slice();
+        if node.equal_loc().is_some()
+            || is_operator_method_name(outer_name)
+            || outer_name == b"[]"
+            || self.allowed_method_name(COP, inner.name().as_slice())
+        {
+            return;
+        }
+        let method_src = call_source_excluding_block(&inner, self.src);
+        if self.allowed_pattern_text(COP, method_src) {
+            return;
+        }
+        let param = String::from_utf8_lossy(self.node_src(&last)).into_owned();
+        let method = String::from_utf8_lossy(method_src).into_owned();
+        let message = format!(
+            "Parenthesize the param `{param}` to make sure that the block will be associated with the `{method}` method call."
+        );
+        self.push(node.location().start_offset(), COP, true, message);
+
+        // `wrap_in_parentheses`: replace the whitespace between the selector
+        // and the first argument with `(`, then close after the last one.
+        if let (Some(sel), Some(first)) = (node.message_loc(), args.arguments().first()) {
+            let (ws_start, ws_end) = (sel.end_offset(), first.location().start_offset());
+            self.fixes.push((ws_start, ws_end, b"(".to_vec()));
+            let end = last.location().end_offset();
+            self.fixes.push((end, end, b")".to_vec()));
+        }
+    }
+
+    /// Is `cop`'s configured `AllowedMethods` set (default `[]`) an exact
+    /// match for `name`?
+    fn allowed_method_name(&self, cop: &str, name: &[u8]) -> bool {
+        self.eng.allowed_methods.get(cop).is_some_and(|names| names.iter().any(|n| n.as_bytes() == name))
+    }
+
+    /// Does any of `cop`'s configured `AllowedPatterns` (default `[]`) match
+    /// `text`?
+    fn allowed_pattern_text(&self, cop: &str, text: &[u8]) -> bool {
+        self.eng.allowed_patterns.get(cop).is_some_and(|pats| {
+            let s = String::from_utf8_lossy(text);
+            pats.iter().any(|re| re.is_match(&s))
+        })
+    }
+}
+
+/// The text of `call`, EXCLUDING its own trailing block (and the whitespace
+/// separating them) — upstream's whitequark `send_node#source_range`, which
+/// never includes the block it's wrapped by, unlike prism's own `CallNode`
+/// location.
+fn call_source_excluding_block<'s>(call: &ruby_prism::CallNode, src: &'s [u8]) -> &'s [u8] {
+    let l = call.location();
+    let start = l.start_offset();
+    let mut end = match call.block() {
+        Some(b) => b.location().start_offset(),
+        None => l.end_offset(),
+    };
+    while end > start && matches!(src[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        end -= 1;
+    }
+    &src[start..end]
+}
+
+/// Upstream's `MethodIdentifierPredicates::OPERATOR_METHODS`.
+fn is_operator_method_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"|" | b"^"
+            | b"&"
+            | b"<=>"
+            | b"=="
+            | b"==="
+            | b"=~"
+            | b">"
+            | b">="
+            | b"<"
+            | b"<="
+            | b"<<"
+            | b">>"
+            | b"+"
+            | b"-"
+            | b"*"
+            | b"/"
+            | b"%"
+            | b"**"
+            | b"~"
+            | b"+@"
+            | b"-@"
+            | b"!@"
+            | b"~@"
+            | b"[]"
+            | b"[]="
+            | b"!"
+            | b"!="
+            | b"!~"
+            | b"`"
+    )
+}
+
+/// Upstream's `Node#lambda_or_proc?` (`{lambda? proc?}`) applied to a call
+/// that's already known to carry a literal block: `lambda { }`/`->() { }`
+/// (bare `lambda`, no receiver) or `proc { }`/`Proc.new { }` (bare `proc`, or
+/// `new` on the bare or fully-qualified `Proc` constant).
+fn is_lambda_or_proc_call(call: &ruby_prism::CallNode) -> bool {
+    let name = call.name().as_slice();
+    if call.receiver().is_none() && matches!(name, b"lambda" | b"proc") {
+        return true;
+    }
+    name == b"new" && call.receiver().is_some_and(|r| is_global_const_named(&r, b"Proc"))
+}
+
+/// Upstream's `Node#global_const?`: a bare constant, or one anchored at the
+/// top level (`::Proc`), named `name`.
+fn is_global_const_named(node: &ruby_prism::Node, name: &[u8]) -> bool {
+    if let Some(c) = node.as_constant_read_node() {
+        return c.name().as_slice() == name;
+    }
+    if let Some(c) = node.as_constant_path_node() {
+        return c.parent().is_none() && c.name().is_some_and(|n| n.as_slice() == name);
+    }
+    false
+}
