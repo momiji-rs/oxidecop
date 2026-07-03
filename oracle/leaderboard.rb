@@ -151,6 +151,7 @@ COPS = {
   'Layout/AccessModifierIndentation' => 'layout/access_modifier_indentation',
   'Layout/CaseIndentation'           => 'layout/case_indentation',
   'Style/RedundantSelf'              => 'style/redundant_self',
+  'Lint/UselessTimes'                => 'lint/useless_times',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -5645,3 +5645,361 @@ fn sa_masgn_pair_matches(target: &ruby_prism::Node, rhs_elem: &ruby_prism::Node)
     }
     false
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/UselessTimes — `0.times { }` / negative `.times` never yield;
+    /// `1.times { }` yields exactly once, so the call adds nothing but noise.
+    /// Ported from `lib/rubocop/cop/lint/useless_times.rb` (rubocop 1.88.0).
+    ///
+    /// `times_call?` (`(send (int $_) :times (block-pass (sym $_))?)`) is
+    /// reproduced directly: plain (non safe-nav) `send`, integer-literal
+    /// receiver, no positional args, and — if a block-pass is present — it
+    /// must be a literal `&:sym` (anything else, e.g. `&some_proc`, means the
+    /// whole pattern fails to match and there is NO offense at all, not just
+    /// no autocorrect).
+    pub(crate) fn check_useless_times<'pr>(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        const COP: &str = "Lint/UselessTimes";
+        if !self.on(COP) {
+            return;
+        }
+        if node.name().as_slice() != b"times" || node.is_safe_navigation() {
+            return;
+        }
+        let Some(receiver) = node.receiver() else { return };
+        let Some(int_node) = receiver.as_integer_node() else { return };
+        // An extra positional arg (`1.times(2)`, `1.times(2, &:foo)`) breaks
+        // the node-pattern match entirely — no offense, not even LOC.
+        if node.arguments().is_some() {
+            return;
+        }
+
+        // Owned, not borrowed: `SymbolNode::unescaped()` ties its return to
+        // `&self`, and the local `sym`/`expr` bindings don't outlive this
+        // block — a `Vec` sidesteps that without changing behavior (this is
+        // a short-lived label, not a hot path).
+        let mut proc_name: Option<Vec<u8>> = None;
+        let mut literal_block: Option<ruby_prism::BlockNode<'pr>> = None;
+        if let Some(b) = node.block() {
+            if let Some(bn) = b.as_block_node() {
+                literal_block = Some(bn);
+            } else if let Some(bp) = b.as_block_argument_node() {
+                // `(block-pass (sym $_))` — a non-literal block-pass
+                // (`&some_proc`, bare `&`) doesn't match at all.
+                let Some(expr) = bp.expression() else { return };
+                let Some(sym) = expr.as_symbol_node() else { return };
+                proc_name = Some(sym.unescaped().to_vec());
+            } else {
+                return;
+            }
+        }
+
+        // `return if count > 1` — huge (bignum) receivers overflow i32; they
+        // are never `<= 1` in practice, so treat conversion failure the same
+        // as "count > 1" (no offense). This is a deliberate, harmless
+        // deviation for a receiver no real program writes.
+        let count: i32 = match int_node.value().try_into() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if count > 1 {
+            return;
+        }
+
+        let node_loc = node.location();
+        let start = node_loc.start_offset();
+
+        // `next if !own_line?(node) || node.parent&.send_type?` — both guards
+        // live inside the corrector block upstream: tripping either one still
+        // registers the offense, just with no fix attached (not "Correctable").
+        let guards_ok = self.ut_own_line(start) && !self.ut_call_child.contains(&start);
+        let fix: Option<(usize, usize, Vec<u8>)> = if !guards_ok {
+            None
+        } else {
+            let empty_block_body = literal_block.as_ref().is_some_and(|b| b.body().is_none());
+            if count < 1 || empty_block_body {
+                Some(self.ut_remove_whole_lines(node_loc))
+            } else if let Some(name) = &proc_name {
+                Some((start, node_loc.end_offset(), name.clone()))
+            } else if let Some(bn) = &literal_block {
+                self.ut_autocorrect_block(&node_loc, bn).map(|body| (start, node_loc.end_offset(), body))
+            } else {
+                None
+            }
+        };
+
+        self.push(start, COP, fix.is_some(), format!("Useless call to `{count}.times` detected."));
+        if let Some(f) = fix {
+            self.fixes.push(f);
+        }
+    }
+
+    /// `own_line?`: nothing but whitespace precedes `offset` on its line.
+    fn ut_own_line(&self, offset: usize) -> bool {
+        let (line, _) = self.idx.loc(offset);
+        let line_start = self.idx.starts[line - 1];
+        self.src[line_start..offset].iter().all(u8::is_ascii_whitespace)
+    }
+
+    /// `remove_node`: `range_by_whole_lines(node.source_range,
+    /// include_final_newline: true)` — extend to the start of the node's
+    /// first line and through the newline ending its last line (or EOF, if
+    /// that line has none).
+    fn ut_remove_whole_lines(&self, node_loc: ruby_prism::Location<'_>) -> (usize, usize, Vec<u8>) {
+        let start_off = node_loc.start_offset();
+        let end_off = node_loc.end_offset();
+        let start_line = self.idx.loc(start_off).0;
+        let end_line = self.idx.loc(end_off.saturating_sub(1).max(start_off)).0;
+        let range_start = self.idx.starts[start_line - 1];
+        let range_end =
+            if end_line < self.idx.starts.len() { self.idx.starts[end_line] } else { self.src.len() };
+        (range_start, range_end, Vec::new())
+    }
+
+    /// `autocorrect_block`: splice the block's body out in place of the whole
+    /// `N.times do ... end` node, substituting the (sole, simple) block
+    /// argument's occurrences with `0` and re-indenting continuation lines so
+    /// they land where the receiver used to start. Returns `None` for any of
+    /// upstream's `reducible_to_body?` disqualifiers (never autocorrect).
+    fn ut_autocorrect_block(
+        &self,
+        node_loc: &ruby_prism::Location<'_>,
+        block: &ruby_prism::BlockNode<'_>,
+    ) -> Option<Vec<u8>> {
+        use ruby_prism::Visit;
+        let body = block.body()?;
+
+        let block_arg = match ut_param_shape(block) {
+            UtParamShape::NotReducible => return None,
+            UtParamShape::Zero => None,
+            UtParamShape::Simple(name) => Some(name),
+        };
+
+        let mut scan = UtBodyScan {
+            target: block_arg,
+            reassigned: false,
+            shield_depth: 0,
+            orphan: false,
+            in_pattern: false,
+        };
+        scan.visit(&body);
+        if scan.orphan || scan.reassigned {
+            return None;
+        }
+
+        let body_loc = body.location();
+        let body_text = &self.src[body_loc.start_offset()..body_loc.end_offset()];
+        let text = match block_arg {
+            Some(name) => ut_word_replace(body_text, name, b"0"),
+            None => body_text.to_vec(),
+        };
+
+        let node_col = self.ut_column(node_loc.start_offset());
+        let body_col = self.ut_column(body_loc.start_offset());
+        Some(ut_fix_indentation(&text, node_col, body_col))
+    }
+
+    fn ut_column(&self, offset: usize) -> usize {
+        let (line, _) = self.idx.loc(offset);
+        offset - self.idx.starts[line - 1]
+    }
+}
+
+/// The shape of a block's formal parameters, for `reducible_to_body?`.
+enum UtParamShape<'a> {
+    /// No declared params (including `it`/numbered-parameter blocks, which
+    /// prism represents without a `BlockParametersNode` — matching upstream's
+    /// incidental behavior of never substituting `it`/`_1` either).
+    Zero,
+    /// Exactly one plain required identifier (`|i|`) — substitutable.
+    Simple(&'a [u8]),
+    /// Anything else (>1 param of any kind; or a lone destructured/splat/
+    /// optional/keyword/block param) — never autocorrect.
+    NotReducible,
+}
+
+fn ut_param_shape<'a>(block: &ruby_prism::BlockNode<'a>) -> UtParamShape<'a> {
+    let Some(params) = block.parameters() else { return UtParamShape::Zero };
+    let Some(bp) = params.as_block_parameters_node() else { return UtParamShape::Zero };
+    let Some(p) = bp.parameters() else { return UtParamShape::Zero };
+    let requireds = p.requireds();
+    let total = requireds.iter().count()
+        + p.optionals().iter().count()
+        + usize::from(p.rest().is_some())
+        + p.posts().iter().count()
+        + p.keywords().iter().count()
+        + usize::from(p.keyword_rest().is_some())
+        + usize::from(p.block().is_some());
+    if total == 0 {
+        return UtParamShape::Zero;
+    }
+    if total == 1 {
+        if let Some(req) = requireds.iter().next().and_then(|n| n.as_required_parameter_node()) {
+            return UtParamShape::Simple(req.name().as_slice());
+        }
+    }
+    UtParamShape::NotReducible
+}
+
+/// `\b#{name}\b` gsub, byte-for-byte (this is what upstream does — a naive
+/// textual substitution over the body's raw source, not an AST rewrite, so
+/// it would also (incorrectly) touch an identical identifier inside a string
+/// literal; that quirk is intentionally preserved).
+fn ut_word_replace(text: &[u8], name: &[u8], replacement: &[u8]) -> Vec<u8> {
+    fn is_word_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i..].starts_with(name)
+            && !name.is_empty()
+            && (i == 0 || !is_word_byte(text[i - 1]))
+            && (i + name.len() == text.len() || !is_word_byte(text[i + name.len()]))
+        {
+            out.extend_from_slice(replacement);
+            i += name.len();
+        } else {
+            out.push(text[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `fix_indentation`: for every line but the first, delete the byte-column
+/// range `[node_col, body_col)` (NOT "the first `body_col - node_col`
+/// bytes" — the range is anchored at `node_col`, which only coincides with
+/// the line start when the offending call itself starts at column 0).
+/// Blank lines are left alone; a line too short to reach `node_col` is left
+/// alone too (upstream would raise; this is a harmless, safer deviation).
+fn ut_fix_indentation(text: &[u8], node_col: usize, body_col: usize) -> Vec<u8> {
+    if body_col <= node_col {
+        return text.to_vec();
+    }
+    let mut out = Vec::with_capacity(text.len());
+    for (i, line) in text.split(|&b| b == b'\n').enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
+        if i == 0 || line.is_empty() || line.len() <= node_col {
+            out.extend_from_slice(line);
+        } else {
+            let cut_end = body_col.min(line.len());
+            out.extend_from_slice(&line[..node_col]);
+            out.extend_from_slice(&line[cut_end..]);
+        }
+    }
+    out
+}
+
+/// One recursive pass over a `1.times { |arg| BODY }`'s body computing BOTH
+/// `reducible_to_body?` disqualifiers that require walking the tree:
+///   - `orphans_loop_control_keyword?`: a `next`/`break`/`redo` not shielded
+///     by an intervening block/while/until/for (relative to the outer
+///     `times` block, which is about to be removed).
+///   - `block_reassigns_arg?`: any `lvasgn`-shaped write to `arg` anywhere in
+///     the subtree (whitequark represents op-assign targets, multiple-
+///     assignment targets, for-loop index vars and rescue vars all as plain
+///     `lvasgn` — matched here via prism's `LocalVariable*WriteNode` and
+///     `LocalVariableTargetNode`). A `case/in` or one-line `=>`/`in` pattern
+///     capture reuses `LocalVariableTargetNode` too, but whitequark parses
+///     those as `match_var` (never `lvasgn`) — `in_pattern` excludes them.
+struct UtBodyScan<'a> {
+    target: Option<&'a [u8]>,
+    reassigned: bool,
+    shield_depth: u32,
+    orphan: bool,
+    in_pattern: bool,
+}
+impl<'pr> ruby_prism::Visit<'pr> for UtBodyScan<'pr> {
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        self.shield_depth += 1;
+        ruby_prism::visit_block_node(self, node);
+        self.shield_depth -= 1;
+    }
+    fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        self.shield_depth += 1;
+        ruby_prism::visit_while_node(self, node);
+        self.shield_depth -= 1;
+    }
+    fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        self.shield_depth += 1;
+        ruby_prism::visit_until_node(self, node);
+        self.shield_depth -= 1;
+    }
+    fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
+        self.shield_depth += 1;
+        ruby_prism::visit_for_node(self, node);
+        self.shield_depth -= 1;
+    }
+    fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
+        if self.shield_depth == 0 {
+            self.orphan = true;
+        }
+        ruby_prism::visit_next_node(self, node);
+    }
+    fn visit_break_node(&mut self, node: &ruby_prism::BreakNode<'pr>) {
+        if self.shield_depth == 0 {
+            self.orphan = true;
+        }
+        ruby_prism::visit_break_node(self, node);
+    }
+    fn visit_redo_node(&mut self, node: &ruby_prism::RedoNode<'pr>) {
+        if self.shield_depth == 0 {
+            self.orphan = true;
+        }
+        ruby_prism::visit_redo_node(self, node);
+    }
+    fn visit_in_node(&mut self, node: &ruby_prism::InNode<'pr>) {
+        let prev = self.in_pattern;
+        self.in_pattern = true;
+        self.visit(&node.pattern());
+        self.in_pattern = prev;
+        if let Some(s) = node.statements() {
+            self.visit_statements_node(&s);
+        }
+    }
+    fn visit_match_required_node(&mut self, node: &ruby_prism::MatchRequiredNode<'pr>) {
+        self.visit(&node.value());
+        let prev = self.in_pattern;
+        self.in_pattern = true;
+        self.visit(&node.pattern());
+        self.in_pattern = prev;
+    }
+    fn visit_match_predicate_node(&mut self, node: &ruby_prism::MatchPredicateNode<'pr>) {
+        self.visit(&node.value());
+        let prev = self.in_pattern;
+        self.in_pattern = true;
+        self.visit(&node.pattern());
+        self.in_pattern = prev;
+    }
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        if self.target == Some(node.name().as_slice()) {
+            self.reassigned = true;
+        }
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        if self.target == Some(node.name().as_slice()) {
+            self.reassigned = true;
+        }
+        ruby_prism::visit_local_variable_and_write_node(self, node);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        if self.target == Some(node.name().as_slice()) {
+            self.reassigned = true;
+        }
+        ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        if self.target == Some(node.name().as_slice()) {
+            self.reassigned = true;
+        }
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
+    }
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        if !self.in_pattern && self.target == Some(node.name().as_slice()) {
+            self.reassigned = true;
+        }
+    }
+}

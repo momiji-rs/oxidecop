@@ -146,7 +146,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody", "Lint/AmbiguousRegexpLiteral", "Layout/BlockEndNewline",
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
-    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf", "Lint/UselessTimes",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -572,6 +572,14 @@ pub(crate) struct Cops<'a> {
     // `each_ancestor(:block).first` (type-filtered!) +
     // `empty_and_without_delimiters?`.
     pub(crate) rs_block_stack: Vec<(bool, bool)>,
+    // Lint/UselessTimes: start offsets of nodes that are the RECEIVER of, or a
+    // direct positional ARGUMENT to, an enclosing (non-safe-navigation) call —
+    // rubocop's `node.parent&.send_type?` guard (whitequark's `:block`/`:send`
+    // node for a call wraps its receiver/args as direct children; a hash pair
+    // or array element does NOT count, matching whitequark's `:pair`/`:array`
+    // parent types). Populated eagerly in `visit_call_node` before descending,
+    // so it's already complete by the time a nested `send` is visited.
+    pub(crate) ut_call_child: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1681,6 +1689,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_freeze(node);
         self.check_nil_lambda_call(node);
         self.check_self_assignment_send(node);
+        self.check_useless_times(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
         let n = node.as_node();
@@ -1746,9 +1755,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             .unwrap_or((node_off, node_off));
         self.call_stack.push(name_span);
         let track_args = self.eng.debugger_on;
+        // Lint/UselessTimes: a safe-navigation call's receiver/args don't
+        // count as "parent is :send" (whitequark's `:csend` != `:send`).
+        let ut_track = !node.is_safe_navigation() && self.on("Lint/UselessTimes");
         if let Some(r) = node.receiver() {
             if track_args {
                 self.assumed_arg_offsets.insert(r.location().start_offset());
+            }
+            if ut_track {
+                self.ut_call_child.insert(r.location().start_offset());
             }
             self.visit(&r);
         }
@@ -1780,6 +1795,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             for arg in a.arguments().iter() {
                 if track_args {
                     self.assumed_arg_offsets.insert(arg.location().start_offset());
+                }
+                if ut_track {
+                    self.ut_call_child.insert(arg.location().start_offset());
                 }
                 self.visit(&arg);
             }
@@ -1939,6 +1957,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         rs_scope_stack: Vec::new(),
         rs_narrow: Vec::new(),
         rs_block_stack: Vec::new(),
+        ut_call_child: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);
