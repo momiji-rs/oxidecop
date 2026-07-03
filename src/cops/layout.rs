@@ -3691,3 +3691,148 @@ fn dot_position_heredoc_line(cops: &Cops, node: &ruby_prism::Node) -> Option<usi
     };
     closing.map(|c| cops.idx.loc(c.start_offset()).0)
 }
+
+impl<'a> super::Cops<'a> {
+    /// Layout/AccessModifierIndentation — a bare `private`/`protected`/
+    /// `public`/`module_function` call (no receiver, no args, no block —
+    /// upstream's `bare_access_modifier?`) sitting directly in a
+    /// class/module/singleton-class/block body must be indented like the
+    /// method defs around it (`EnforcedStyle: indent`, default) or like the
+    /// container's own opening keyword (`outdent`).
+    ///
+    /// Ported from `check_body`/`check_modifier`: only runs when the body has
+    /// 2+ direct statements — upstream's `node.body&.begin_type?` guard. A
+    /// single-statement body (even a lone bare modifier) is never checked;
+    /// prism always wraps 1+ statements in a `StatementsNode` (unlike
+    /// whitequark, which leaves a lone statement unwrapped), so the length
+    /// check stands in for whitequark's begin/non-begin distinction. Also
+    /// skipped: a body whose implicit `rescue`/`ensure` makes prism return a
+    /// `BeginNode` instead of a bare `StatementsNode` (`body.as_statements_node()`
+    /// fails) — matches upstream, whose translated body there isn't
+    /// `begin_type?` either. A modifier on the SAME line as the container's
+    /// own start is exempt (`class A; private; def foo; end; end`).
+    ///
+    /// The offense/correction math (`column_offset_between` +
+    /// `AlignmentCorrector::correct`, both specialized to a single-line node
+    /// since a bare modifier call is always one token on one line): `offset =
+    /// modifier's own 0-based column − the container's closing keyword's
+    /// 0-based column`; `delta = expected_offset − offset`, where
+    /// `expected_offset` is 0 under `outdent` or the configured indentation
+    /// width under `indent`. `delta == 0` needs no offense; otherwise insert
+    /// `delta` spaces immediately before the modifier (delta > 0) or delete
+    /// the `-delta` bytes immediately before it (delta < 0) — mirroring
+    /// `AlignmentCorrector`'s two branches for a node that's the very first
+    /// thing on its line.
+    fn access_modifier_indentation_body(
+        &mut self,
+        container_start: usize,
+        end_start: usize,
+        body: Option<ruby_prism::Node>,
+    ) {
+        const COP: &str = "Layout/AccessModifierIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = body else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        if stmts.body().len() < 2 {
+            return;
+        }
+        let container_line = self.idx.loc(container_start).0;
+        let end_col0 = self.idx.loc(end_start).1 - 1;
+        let outdent = self.cfg.enforced_style(COP) == "outdent";
+        let width = self.ami_indentation_width();
+        let expected: isize = if outdent { 0 } else { width as isize };
+
+        for child in stmts.body().iter() {
+            let Some(call) = child.as_call_node() else { continue };
+            if call.receiver().is_some() || call.block().is_some() {
+                continue;
+            }
+            if call.arguments().is_some_and(|a| !a.arguments().is_empty()) {
+                continue;
+            }
+            let name = call.name();
+            let name = name.as_slice();
+            if !matches!(name, b"public" | b"protected" | b"private" | b"module_function") {
+                continue;
+            }
+            let start = call.location().start_offset();
+            let (line, col) = self.idx.loc(start);
+            if line == container_line {
+                continue;
+            }
+            let offset = col as isize - 1 - end_col0 as isize;
+            let delta = expected - offset;
+            if delta == 0 {
+                continue;
+            }
+            let style_word = if outdent { "Outdent" } else { "Indent" };
+            let name_str = String::from_utf8_lossy(name);
+            self.push(start, COP, true, format!("{style_word} access modifiers like `{name_str}`."));
+            if delta > 0 {
+                self.fixes.push((start, start, vec![b' '; delta as usize]));
+            } else {
+                let n = (-delta) as usize;
+                if n <= start {
+                    self.fixes.push((start - n, start, Vec::new()));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn check_access_modifier_indentation_class(&mut self, node: &ruby_prism::ClassNode) {
+        self.access_modifier_indentation_body(
+            node.location().start_offset(),
+            node.end_keyword_loc().start_offset(),
+            node.body(),
+        );
+    }
+
+    pub(crate) fn check_access_modifier_indentation_module(&mut self, node: &ruby_prism::ModuleNode) {
+        self.access_modifier_indentation_body(
+            node.location().start_offset(),
+            node.end_keyword_loc().start_offset(),
+            node.body(),
+        );
+    }
+
+    pub(crate) fn check_access_modifier_indentation_sclass(&mut self, node: &ruby_prism::SingletonClassNode) {
+        self.access_modifier_indentation_body(
+            node.location().start_offset(),
+            node.end_keyword_loc().start_offset(),
+            node.body(),
+        );
+    }
+
+    /// For `on_block`, upstream's container-start line is the FULL
+    /// underlying call's start (including any receiver chain — verified live
+    /// against real RuboCop's prism translation: `Test = Class.new do` and a
+    /// multi-line-receiver probe both showed the translated `:block` node's
+    /// `.loc` starting at the call's own beginning, not just at `do`). Here
+    /// we only have the raw prism `BlockNode`, whose own `.location()` starts
+    /// at the block's opening (`do`/`{`) — every fixture example has a
+    /// single-line call header before `do`, where the two coincide, so this
+    /// is unobservable in-repo; a receiver chain wrapping onto its own line
+    /// before a trailing `do` is unrepresented and could disagree with
+    /// upstream on the same-line exemption.
+    pub(crate) fn check_access_modifier_indentation_block(&mut self, node: &ruby_prism::BlockNode) {
+        self.access_modifier_indentation_body(
+            node.location().start_offset(),
+            node.closing_loc().start_offset(),
+            node.body(),
+        );
+    }
+
+    /// `Alignment#configured_indentation_width`: cop-local `IndentationWidth`
+    /// (no schema default for this cop — meaningful only when a user sets it
+    /// directly), else `Layout/IndentationWidth`'s `Width` (schema default 2).
+    fn ami_indentation_width(&self) -> usize {
+        self.cfg
+            .get("Layout/AccessModifierIndentation", "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()).unwrap_or(2)
+            })
+    }
+}

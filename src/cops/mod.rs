@@ -146,7 +146,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody", "Lint/AmbiguousRegexpLiteral", "Layout/BlockEndNewline",
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
-    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -1168,6 +1168,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     // IS this block's own StatementsNode" right before descending into it.
     fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
         self.check_block_end_newline(node);
+        self.check_access_modifier_indentation_block(node);
         if let Some(params) = node.parameters() {
             self.visit(&params);
         }
@@ -1342,6 +1343,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_inherit_exception_class(node);
         self.check_ineffective_access_modifier(node.body());
         self.check_empty_lines_around_class_body(node);
+        self.check_access_modifier_indentation_class(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
@@ -1358,6 +1360,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_camel_case_name(&node.constant_path());
         self.check_empty_lines_around_module_body(node);
         self.check_ineffective_access_modifier(node.body());
+        self.check_access_modifier_indentation_module(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
@@ -1492,6 +1495,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
         self.check_empty_lines_around_sclass_body(node);
+        self.check_access_modifier_indentation_sclass(node);
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(), node.body().is_some(), false, true);
         self.check_trailing_body_on_class(node.class_keyword_loc().start_offset(), l.end_offset(), node.body());
