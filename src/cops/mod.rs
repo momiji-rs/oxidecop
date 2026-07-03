@@ -63,6 +63,14 @@ impl LineIndex {
 /// An autocorrect edit: (start_byte, end_byte, replacement).
 pub type Fix = (usize, usize, Vec<u8>);
 
+/// Lint/NonLocalExitFromIterator: a single frame of `nle_stack` — see the
+/// field doc on `Cops::nle_stack` for what each variant means.
+pub(crate) enum NleFrame {
+    Def,
+    Lambda,
+    Block { has_args: bool, is_define_method: bool, chained: bool },
+}
+
 /// Per-RUN state derived from the Config once — parsed patterns, resolved
 /// enablement, compiled exemption maps. lint() is called per file; nothing
 /// here should be rebuilt per file.
@@ -185,6 +193,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
     "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException", "Style/TrailingUnderscoreVariable",
+    "Lint/NonLocalExitFromIterator",
 ];
 
 impl Engine {
@@ -642,6 +651,29 @@ pub(crate) struct Cops<'a> {
     // `each_ancestor(:block).first` (type-filtered!) +
     // `empty_and_without_delimiters?`.
     pub(crate) rs_block_stack: Vec<(bool, bool)>,
+    // Lint/NonLocalExitFromIterator: one entry per active def/block/lambda
+    // ancestor, innermost last — mirrors upstream's
+    // `each_ancestor(:any_block, :any_def)` climb from a `return` node.
+    // `Def` and `Lambda` are the two frame kinds that make `scoped_node?`
+    // true and stop the climb outright (a `def`/`defs`, or a block whose
+    // `send_node` is literally named `lambda` — prism represents a stabby
+    // `->(){}` as its own `LambdaNode`, which RuboCop's own Prism translator
+    // rewrites into that same "block whose send is `lambda`" shape, so both
+    // collapse to the same frame here). `Block` carries what upstream reads
+    // off the block's owning `send_node`: whether it has an explicit
+    // receiver (`chained_send?`), whether it's a bare `define_method`/
+    // `define_singleton_method` call (breaks the climb without offending),
+    // and whether the block itself declares any parameters
+    // (`argument_list.empty?`).
+    pub(crate) nle_stack: Vec<NleFrame>,
+    // One-shot: `(is_lambda_call, has_receiver, is_define_method)` for the
+    // block a `visit_call_node` is about to descend into — set right before
+    // that descent, consumed by the immediately following `visit_block_node`
+    // call. `None` when a block is reached some other way (e.g. owned by a
+    // `super`/`zsuper` call): upstream's `chained_send?`/`define_method?`
+    // patterns only ever match a `send`/`csend` node, so those default to
+    // "no receiver, not define_method" — never scoped, never chained.
+    pub(crate) nle_pending: Option<(bool, bool, bool)>,
     // Lint/UselessTimes: start offsets of nodes that are the RECEIVER of, or a
     // direct positional ARGUMENT to, an enclosing (non-safe-navigation) call —
     // rubocop's `node.parent&.send_type?` guard (whitequark's `:block`/`:send`
@@ -895,6 +927,29 @@ impl<'a> Cops<'a> {
         }
     }
 
+    /// Lint/NonLocalExitFromIterator: whether a block's `parameters()` yields
+    /// a non-empty `argument_list` — upstream's `BlockNode#argument_list`.
+    /// A numbered-param (`_1`) or `it`-param block ALWAYS counts (prism only
+    /// produces those node kinds when the block body actually uses `_1..._9`
+    /// / bare `it`); an explicit `|...|` block counts only if it actually
+    /// declares a required/optional/rest/keyword/keyword-rest/post/block
+    /// param (matches `each_descendant(:argument)` — an empty `|| `
+    /// delimiter pair has none).
+    fn nle_block_has_args(params: &Option<ruby_prism::Node>) -> bool {
+        let Some(p) = params else { return false };
+        if p.as_numbered_parameters_node().is_some() || p.as_it_parameters_node().is_some() {
+            return true;
+        }
+        let Some(bp) = p.as_block_parameters_node() else { return false };
+        let Some(inner) = bp.parameters() else { return false };
+        inner.requireds().iter().count() > 0
+            || inner.optionals().iter().count() > 0
+            || inner.rest().is_some()
+            || inner.posts().iter().count() > 0
+            || inner.keywords().iter().count() > 0
+            || inner.keyword_rest().is_some()
+            || inner.block().is_some()
+    }
     /// Names of `class` nodes that are direct children of `body`.
     fn direct_child_classes(body: &Option<ruby_prism::Node>) -> Vec<Vec<u8>> {
         body.as_ref()
@@ -1463,6 +1518,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
         self.check_min_max_return(node);
         self.check_top_level_return_with_argument(node);
+        self.check_non_local_exit_from_iterator(node);
         ruby_prism::visit_return_node(self, node);
     }
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
@@ -1531,6 +1587,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.check_keyword_parameters_order_block(&p);
         }
         self.rs_block_stack.push((is_plain, no_delims));
+        // Lint/NonLocalExitFromIterator: consume the pending call-context
+        // `visit_call_node` set right before descending into us (`None`
+        // when we weren't reached that way, e.g. a `super`/`zsuper` block —
+        // see the `nle_pending` field doc).
+        let has_args = Self::nle_block_has_args(&node.parameters());
+        let nle_frame = match self.nle_pending.take() {
+            Some((true, _, _)) => NleFrame::Lambda,
+            Some((false, chained, is_define_method)) => NleFrame::Block { has_args, is_define_method, chained },
+            None => NleFrame::Block { has_args, is_define_method: false, chained: false },
+        };
+        self.nle_stack.push(nle_frame);
         let rs_names = node
             .parameters()
             .and_then(|p| p.as_block_parameters_node())
@@ -1580,6 +1647,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.se_ancestor_end_lines.pop();
         self.rs_scope_stack.pop();
         self.rs_block_stack.pop();
+        self.nle_stack.pop();
         if is_ctor_block {
             self.el_am_scope.pop();
         }
@@ -1944,7 +2012,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             .map(|l| self.idx.loc(l.start_offset()).0)
             .unwrap_or_else(|| self.idx.loc(node.location().end_offset()).0);
         self.se_ancestor_end_lines.push(def_end_line);
+        // Lint/NonLocalExitFromIterator: a `def`/`defs` always stops
+        // upstream's ancestor climb (`scoped_node?`'s `any_def_type?`).
+        self.nle_stack.push(NleFrame::Def);
         ruby_prism::visit_def_node(self, node);
+        self.nle_stack.pop();
         self.se_ancestor_end_lines.pop();
         self.el_am_scope.pop();
         self.rs_scope_stack.pop();
@@ -1973,7 +2045,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.usage_block_depth += 1;
+        // Lint/NonLocalExitFromIterator: a stabby `->(){}` always stops
+        // upstream's ancestor climb (`scoped_node?`'s `node.lambda?` —
+        // RuboCop's Prism translator rewrites `LambdaNode` into the same
+        // "block whose send is `lambda`" shape it uses for `lambda do...end`).
+        self.nle_stack.push(NleFrame::Lambda);
         ruby_prism::visit_lambda_node(self, node);
+        self.nle_stack.pop();
         self.usage_block_depth -= 1;
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
@@ -2372,6 +2450,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_metrics_complexity_define_method(node, &bn);
                 self.check_empty_lines_around_exception_handling_keywords_block(node, &bn);
             }
+            // Lint/NonLocalExitFromIterator: stash this call's shape
+            // (`send_node.method?(:lambda)`, `define_method?`,
+            // `chained_send?`) for the `visit_block_node` call
+            // `self.visit(&b)` triggers below — see the `nle_pending` field
+            // doc. Left `None` for `&:sym` block-pass args, which never
+            // trigger `visit_block_node`.
+            if b.as_block_node().is_some() {
+                let is_lambda_call = node.name().as_slice() == b"lambda";
+                let is_define_method =
+                    matches!(node.name().as_slice(), b"define_method" | b"define_singleton_method")
+                        && node.arguments().is_some_and(|a| a.arguments().iter().count() == 1);
+                self.nle_pending = Some((is_lambda_call, node.receiver().is_some(), is_define_method));
+            }
             // Consumed by the `visit_block_node` call this triggers below
             // (`&:sym` block-pass args aren't block nodes, so this is false
             // whenever `b` isn't one — no visit_block_node ever fires for it).
@@ -2527,6 +2618,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         rs_scope_stack: Vec::new(),
         rs_narrow: Vec::new(),
         rs_block_stack: Vec::new(),
+        nle_stack: Vec::new(),
+        nle_pending: None,
         ut_call_child: HashSet::new(),
         el_am_scope: Vec::new(),
         el_am_class_first_line: None,

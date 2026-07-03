@@ -221,6 +221,7 @@ COPS = {
   'Style/CommentAnnotation'          => 'style/comment_annotation',
   'Lint/SuppressedException'         => 'lint/suppressed_exception',
   'Style/TrailingUnderscoreVariable' => 'style/trailing_underscore_variable',
+  'Lint/NonLocalExitFromIterator'    => 'lint/non_local_exit_from_iterator',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

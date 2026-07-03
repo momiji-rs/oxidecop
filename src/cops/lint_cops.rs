@@ -8367,3 +8367,50 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Lint/NonLocalExitFromIterator (detection only, no autocorrect).
+    ///
+    /// Ports `on_return` by walking `self.nle_stack` — the innermost active
+    /// def/block/lambda ancestors, pushed/popped by `visit_def_node` /
+    /// `visit_lambda_node` / `visit_block_node` in `mod.rs` (prism has no
+    /// parent pointers, so this stack stands in for upstream's
+    /// `each_ancestor(:any_block, :any_def)`). Walking it innermost-first
+    /// mirrors that climb exactly:
+    ///
+    /// * `Def`/`Lambda` -> `scoped_node?` was true upstream: stop, no offense.
+    /// * `Block { is_define_method: true, .. }` -> upstream's
+    ///   `define_method?(node.send_node)` breaks the climb outright, even
+    ///   when the block itself has no params.
+    /// * `Block { has_args: false, .. }` -> upstream's
+    ///   `next if node.argument_list.empty?`: skip this frame, keep climbing.
+    /// * `Block { chained: true, .. }` -> upstream's `chained_send?`: offense
+    ///   at the `return` keyword, then stop.
+    /// * `Block { chained: false, .. }` -> no match, keep climbing (upstream's
+    ///   implicit `next` when the `if chained_send?` guard is false).
+    pub(crate) fn check_non_local_exit_from_iterator(&mut self, node: &ruby_prism::ReturnNode) {
+        const COP: &str = "Lint/NonLocalExitFromIterator";
+        const MSG: &str = "Non-local exit from iterator, without return value. \
+            `next`, `break`, `Array#find`, `Array#any?`, etc. is preferred.";
+        if !self.on(COP) {
+            return;
+        }
+        // `return_value?`: `return` with an explicit value is always allowed.
+        if node.arguments().is_some() {
+            return;
+        }
+        for frame in self.nle_stack.iter().rev() {
+            match frame {
+                super::NleFrame::Def | super::NleFrame::Lambda => break,
+                super::NleFrame::Block { is_define_method: true, .. } => break,
+                super::NleFrame::Block { has_args: false, .. } => continue,
+                super::NleFrame::Block { chained: true, .. } => {
+                    self.push(node.keyword_loc().start_offset(), COP, false, MSG);
+                    break;
+                }
+                super::NleFrame::Block { .. } => continue,
+            }
+        }
+    }
+}
+
