@@ -6812,6 +6812,22 @@ impl<'a> super::Cops<'a> {
             return;
         }
 
+        // `lhs.const_type? && !lhs.module_name?`: a const receiver whose
+        // final segment isn't CamelCase (all-caps like URI::HTTPS — a
+        // value-ish constant) is skipped by upstream regardless of config.
+        let const_last_name: Option<&[u8]> = if let Some(c) = lhs.as_constant_read_node() {
+            Some(c.name().as_slice())
+        } else {
+            lhs.as_constant_path_node().and_then(|p| p.name().map(|n| n.as_slice()))
+        };
+        if let Some(name) = const_last_name {
+            let module_name = name.first().is_some_and(u8::is_ascii_uppercase)
+                && name.iter().any(u8::is_ascii_lowercase);
+            if !module_name {
+                return;
+            }
+        }
+
         // Check AllowOnConstant config
         let allow_on_constant = self.cfg.get(COP, "AllowOnConstant") == Some("true");
         if (lhs.as_constant_read_node().is_some() || lhs.as_constant_path_node().is_some()) && allow_on_constant {
