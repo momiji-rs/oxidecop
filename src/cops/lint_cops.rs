@@ -6275,3 +6275,99 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+impl<'a> super::Cops<'a> {
+    /// Security/Open — `Kernel#open` and `URI.open` enable not only file
+    /// access but also process invocation by prefixing a pipe symbol.
+    /// Flags calls with non-safe first arguments (non-literal strings,
+    /// or literals starting with `|`).
+    pub(crate) fn check_open(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Security/Open";
+        if !self.on(COP) {
+            return;
+        }
+        if node.name().as_slice() != b"open" {
+            return;
+        }
+
+        // Check receiver: must be nil (Kernel#open) or URI constant
+        let receiver = node.receiver();
+        let receiver_name = receiver.as_ref().and_then(const_name_root);
+        let is_kernel = receiver.is_none();
+        let is_uri = receiver_name.as_deref() == Some("URI");
+
+        if !is_uri && !is_kernel {
+            return;
+        }
+
+        // Get the first argument
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.is_empty() {
+            return;
+        }
+
+        let first_arg = &args[0];
+
+        // Check if the argument is safe
+        if self.is_safe_open_arg(first_arg) {
+            return;
+        }
+
+        // Report offense at the method selector
+        if let Some(sel) = node.message_loc() {
+            let receiver_str = if is_uri {
+                let recv_src = String::from_utf8_lossy(self.node_src(receiver.as_ref().unwrap())).into_owned();
+                format!("{recv_src}.")
+            } else {
+                "Kernel#".to_string()
+            };
+            let msg = format!("The use of `{receiver_str}open` is a serious security risk.");
+            self.push(sel.start_offset(), COP, false, msg);
+        }
+    }
+
+    /// Check if a first argument to `open` is safe:
+    /// - Simple string: safe if not empty and doesn't start with `|`
+    /// - Interpolated string: safe if the first part is safe
+    /// - Concatenated string: safe if the first part (before the +) is safe
+    /// - Anything else: unsafe
+    fn is_safe_open_arg(&self, node: &ruby_prism::Node) -> bool {
+        match node {
+            // Simple string literal
+            n if n.as_string_node().is_some() => {
+                let s = n.as_string_node().unwrap();
+                let content = s.content_loc().as_slice();
+                !content.is_empty() && !content.starts_with(b"|")
+            }
+            // Interpolated string: check the first part
+            n if n.as_interpolated_string_node().is_some() => {
+                let dstr = n.as_interpolated_string_node().unwrap();
+                let parts = dstr.parts();
+                if parts.is_empty() {
+                    return false;
+                }
+                // Check the first part
+                match parts.iter().next().unwrap() {
+                    part_n if part_n.as_string_node().is_some() => {
+                        let s = part_n.as_string_node().unwrap();
+                        let content = s.content_loc().as_slice();
+                        !content.starts_with(b"|")
+                    }
+                    _ => false, // starts with interpolation
+                }
+            }
+            // Concatenated string (string + something)
+            n if n.as_call_node().is_some() => {
+                let call = n.as_call_node().unwrap();
+                if call.name().as_slice() == b"+" {
+                    if let Some(receiver) = call.receiver() {
+                        return self.is_safe_open_arg(&receiver);
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+}
+

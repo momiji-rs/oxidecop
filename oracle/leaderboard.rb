@@ -167,6 +167,7 @@ COPS = {
   'Style/SingleLineMethods'          => 'style/single_line_methods',
   'Style/PreferredHashMethods'       => 'style/preferred_hash_methods',
   'Style/NumericLiteralPrefix'       => 'style/numeric_literal_prefix',
+  'Security/Open'                    => 'security/open',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
