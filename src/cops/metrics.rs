@@ -17,14 +17,34 @@
 //! walk) — `AbcCounter` below scores AFTER recursing into children to match
 //! that order.
 //!
-//! Known gaps (none exercised by the spec fixture): `AbcSize`'s "compound
-//! assignment" bean-counting for `masgn`/`op_asgn`/`or_asgn`/`and_asgn` LHS
-//! shapes (rubocop's `compound_assignment`) is not replicated — those nodes
-//! still contribute their `or`/`and`-family COUNTED_NODES condition point,
-//! but never an assignment point. `RepeatedAttributeDiscount`'s invalidation
-//! on reassignment (`update_repeated_attribute`) is not replicated either —
-//! our attribute trie only grows, it never forgets an attribute after
-//! `self.foo = x`.
+//! Known gaps (none exercised by the spec fixture): `RepeatedAttributeDiscount`'s
+//! invalidation on reassignment (`update_repeated_attribute`) is not
+//! replicated — our attribute trie only grows, it never forgets an attribute
+//! after `self.foo = x`. This only matters under `CountRepeatedAttributes:
+//! false`. Also not replicated: `AbcSizeCalculator`'s attribute-repetition
+//! discount for the *target* of a compound assignment (`obj.attr ||= x`
+//! under `CountRepeatedAttributes: false` doesn't discount the implicit
+//! `obj.attr` read) — a narrower version of the same gap.
+//!
+//! Fixed traps worth flagging for the next person poking at this file:
+//!  - rubocop's `:rescue` node is ONE node per `begin`/`rescue` construct no
+//!    matter how many `rescue` clauses it has (each clause is a `:resbody`
+//!    child, which ISN'T in `COUNTED_NODES`) — prism instead chains one
+//!    `RescueNode` per clause via `.subsequent()`, so scoring every node the
+//!    default traversal reaches double/triple-counts multi-clause rescues.
+//!    We score once per chain and walk the rest unscored.
+//!  - `expr rescue fallback` (modifier rescue) is prism's own
+//!    `RescueModifierNode` — a different node type than `RescueNode`, easy
+//!    to silently miss entirely.
+//!  - a block using numbered parameters (`_1`) or `it` is rubocop's
+//!    `:numblock`/`:itblock` node type, NOT `:block` — since `COUNTED_NODES`
+//!    only lists `:block`, such blocks (even ones on a known-iterating
+//!    method) never earn a complexity/condition point. Prism keeps the same
+//!    `BlockNode` type for all three; the distinction only shows up in
+//!    `block.parameters()` being a `NumberedParametersNode`/`ItParametersNode`.
+//!  - `->{ }` is prism's own `LambdaNode`, with no underlying call node —
+//!    rubocop's parser desugars it to `(block (send nil :lambda) ...)`, so
+//!    `AbcSize` picks up a `branch` point from the hidden `send`.
 use super::Cops;
 use ruby_prism::Visit;
 use std::collections::{HashMap, HashSet};
@@ -64,6 +84,55 @@ fn is_comparison_method(name: &[u8]) -> bool {
     matches!(name, b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<")
 }
 
+/// `AbcSizeCalculator#compound_assignment`'s `will_be_miscounted` check,
+/// generalized to a *value* position: `respond_to?(:setter_method?) &&
+/// !setter_method?` is true for any node shaped like a plain (non-setter)
+/// dispatch — a bare/attribute call, `yield`, or `super` — PROVIDED it
+/// doesn't carry its own block (a call/`super` WITH a block is rubocop's
+/// `:block` node, which doesn't respond to `setter_method?` at all; `->{}`
+/// is the same `:block` shape under the hood, so it never qualifies either).
+/// rubocop's `compound_assignment` runs this same check against BOTH the
+/// (possibly synthetic, in prism) assignment target AND the RHS value —
+/// this only covers the value side; the target side is baked directly into
+/// each `visit_*_write_node` override below (attribute/index targets are
+/// always send-shaped, so they always qualify; local/ivar/etc. targets
+/// never do).
+fn is_readonly_dispatch(node: &ruby_prism::Node) -> bool {
+    // A literal block (`{ }`/`do...end`) wraps the call into rubocop's
+    // `:block` node type instead of `:send`/`:zsuper`/`:super` —
+    // disqualifying (see `is_countable_block`'s doc comment for the same
+    // trap in reverse). A block-PASS (`&:sym`/`&block_var`) stays a plain
+    // `:send` with the pass as just another argument — still qualifies.
+    fn has_literal_block(block: Option<ruby_prism::Node>) -> bool {
+        block.is_some_and(|b| b.as_block_node().is_some())
+    }
+    if let Some(c) = node.as_call_node() {
+        !has_literal_block(c.block())
+    } else if node.as_yield_node().is_some() {
+        true
+    } else if let Some(s) = node.as_super_node() {
+        !has_literal_block(s.block())
+    } else if let Some(s) = node.as_forwarding_super_node() {
+        s.block().is_none()
+    } else {
+        node.as_defined_node().is_some()
+    }
+}
+
+/// A call's `.block()` counts toward complexity/condition only when it's a
+/// rubocop `:block` node — `:numblock` (numbered params, `_1`) and
+/// `:itblock` (`it`) are distinct COUNTED_NODES-excluded types in rubocop's
+/// AST even though prism keeps them all as one `BlockNode` shape.
+fn is_countable_block(block: &ruby_prism::Node) -> bool {
+    if let Some(b) = block.as_block_node() {
+        !b.parameters().is_some_and(|p| {
+            p.as_numbered_parameters_node().is_some() || p.as_it_parameters_node().is_some()
+        })
+    } else {
+        block.as_block_argument_node().is_some()
+    }
+}
+
 /// rubocop's `capturing_variable?`: a name that isn't `_`-prefixed.
 fn is_capturing_name(name: &[u8]) -> bool {
     !name.is_empty() && !name.starts_with(b"_")
@@ -79,20 +148,95 @@ fn format_g(value: f64, prec: usize) -> String {
         return "0".to_string();
     }
     let prec = prec.max(1);
-    let sci = format!("{:.*e}", prec - 1, value);
-    let epos = sci.find('e').expect("scientific notation always has an exponent");
-    let exp: i32 = sci[epos + 1..].parse().expect("valid exponent digits");
-    if exp < -4 || exp >= prec as i32 {
-        let mantissa = sci[..epos].trim_end_matches('0').trim_end_matches('.');
-        format!("{mantissa}e{}{:02}", if exp >= 0 { "+" } else { "-" }, exp.abs())
-    } else {
-        let decimals = (prec as i32 - 1 - exp).max(0) as usize;
-        let fixed = format!("{value:.decimals$}");
-        if fixed.contains('.') {
-            fixed.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            fixed
+    let neg = value.is_sign_negative();
+
+    // Ruby's `sprintf("%g", ...)` rounds from the SHORTEST round-trip
+    // decimal digit string for the float (the same digits `Float#to_s`
+    // would print), not from the float's full binary-exact decimal
+    // expansion. The two disagree exactly at representable ties — e.g. the
+    // nearest `f64` to `173.35` is truly `173.34999999999999431...`, which
+    // "%.4g"-rounds to `173.3` if you round the exact value but to `173.4`
+    // if you round the shortest digit string `"173.35"` (a genuine halfway
+    // case, rounded up) — and Ruby does the latter. Rust's `{}` Display
+    // impl for `f64` already computes that same shortest digit string, so
+    // we round THAT instead of a `{:e}`-formatted exact expansion.
+    let shortest = format!("{}", value.abs());
+    let (int_part, frac_part) = shortest.split_once('.').unwrap_or((shortest.as_str(), ""));
+    let mut digits: Vec<u8> = int_part.bytes().chain(frac_part.bytes()).map(|b| b - b'0').collect();
+    let mut exp: i32 = int_part.len() as i32 - 1;
+    while digits.len() > 1 && digits[0] == 0 {
+        digits.remove(0);
+        exp -= 1;
+    }
+
+    // Round the digit string to `prec` significant digits — but ONLY if it
+    // actually has more than `prec` digits to begin with. This matters for
+    // trailing zeros: rubocop's `format("%.4g", ...)` strips trailing
+    // fractional zeros for a value that already fit in fewer digits
+    // (`8.0` → `"8"`), but KEEPS a trailing zero produced by rounding down
+    // to exactly `prec` digits (`8.05` at `%.2g` → `"8.0"`, not `"8"`) —
+    // i.e. it never pads short digit strings, and never strips digits it
+    // was asked to show. An exact tie (the digit immediately after position
+    // `prec` is `5` with nothing nonzero beyond) rounds HALF TO EVEN,
+    // matching the dtoa-style rounding underneath Ruby's `sprintf` —
+    // everything else rounds the ordinary way (up from 5, down otherwise).
+    if digits.len() > prec {
+        let exact_half = digits[prec] == 5 && digits[prec + 1..].iter().all(|&d| d == 0);
+        let round_up = if exact_half { digits[prec - 1] % 2 == 1 } else { digits[prec] >= 5 };
+        digits.truncate(prec);
+        if round_up {
+            let mut i = prec;
+            loop {
+                if i == 0 {
+                    digits.insert(0, 1);
+                    exp += 1;
+                    digits.truncate(prec);
+                    break;
+                }
+                i -= 1;
+                if digits[i] == 9 {
+                    digits[i] = 0;
+                } else {
+                    digits[i] += 1;
+                    break;
+                }
+            }
         }
+    }
+
+    let sign = if neg { "-" } else { "" };
+    if exp < -4 || exp >= prec as i32 {
+        let mantissa_digits: String = digits.iter().map(|d| (d + b'0') as char).collect();
+        let (first, rest) = mantissa_digits.split_at(1);
+        let mantissa = if rest.is_empty() { first.to_string() } else { format!("{first}.{rest}") };
+        format!("{sign}{mantissa}e{}{:02}", if exp >= 0 { "+" } else { "-" }, exp.abs())
+    } else if exp < 0 {
+        let mut out = String::from("0.");
+        for _ in 0..(-exp - 1) {
+            out.push('0');
+        }
+        for d in &digits {
+            out.push((d + b'0') as char);
+        }
+        format!("{sign}{}", out.trim_end_matches('0').trim_end_matches('.'))
+    } else {
+        let int_len = (exp + 1) as usize;
+        let mut out = String::new();
+        for (i, d) in digits.iter().enumerate() {
+            if i == int_len {
+                out.push('.');
+            }
+            out.push((d + b'0') as char);
+        }
+        for _ in digits.len()..int_len {
+            out.push('0');
+        }
+        let out = if out.contains('.') {
+            out.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            out
+        };
+        format!("{sign}{out}")
     }
 }
 
@@ -150,6 +294,24 @@ impl<'pr> ComplexityCounter<'pr> {
             false
         }
     }
+
+    /// Walks a `rescue`/`.subsequent()` chain WITHOUT re-scoring each link
+    /// (that's `visit_rescue_node`'s job, done once for the whole chain) —
+    /// mirrors prism's own `visit_rescue_node` default traversal.
+    fn visit_rescue_chain(&mut self, node: &ruby_prism::RescueNode<'pr>) {
+        for exc in node.exceptions().iter() {
+            self.visit(&exc);
+        }
+        if let Some(r) = node.reference() {
+            self.visit(&r);
+        }
+        if let Some(s) = node.statements() {
+            self.visit_statements_node(&s);
+        }
+        if let Some(sub) = node.subsequent() {
+            self.visit_rescue_chain(&sub);
+        }
+    }
 }
 
 impl<'pr> Visit<'pr> for ComplexityCounter<'pr> {
@@ -170,11 +332,19 @@ impl<'pr> Visit<'pr> for ComplexityCounter<'pr> {
         ruby_prism::visit_unless_node(self, node);
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
-        self.score += 1;
+        // `begin ... end while cond` (a post-condition/do-while loop) is
+        // rubocop's distinct `while_post` node type — NOT `while` — and
+        // isn't itself in COUNTED_NODES either way.
+        if !node.is_begin_modifier() {
+            self.score += 1;
+        }
         ruby_prism::visit_while_node(self, node);
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
-        self.score += 1;
+        // See `visit_while_node` — `begin ... end until cond` is `until_post`.
+        if !node.is_begin_modifier() {
+            self.score += 1;
+        }
         ruby_prism::visit_until_node(self, node);
     }
     fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
@@ -182,8 +352,15 @@ impl<'pr> Visit<'pr> for ComplexityCounter<'pr> {
         ruby_prism::visit_for_node(self, node);
     }
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
+        // One `+1` for the whole chain (rubocop's single `:rescue` node),
+        // not one per `.subsequent()` link (rubocop's per-clause `:resbody`,
+        // which ISN'T itself in COUNTED_NODES) — see module doc comment.
         self.score += 1;
-        ruby_prism::visit_rescue_node(self, node);
+        self.visit_rescue_chain(node);
+    }
+    fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
+        self.score += 1;
+        ruby_prism::visit_rescue_modifier_node(self, node);
     }
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
         self.score += 1;
@@ -221,8 +398,7 @@ impl<'pr> Visit<'pr> for ComplexityCounter<'pr> {
             self.score += 1;
         }
         if let Some(b) = node.block() {
-            let is_block = b.as_block_node().is_some() || b.as_block_argument_node().is_some();
-            if is_block && is_known_iterating_method(node.name().as_slice()) {
+            if is_countable_block(&b) && is_known_iterating_method(node.name().as_slice()) {
                 self.score += 1;
             }
         }
@@ -287,12 +463,18 @@ impl<'pr> Visit<'pr> for ComplexityCounter<'pr> {
         ruby_prism::visit_instance_variable_or_write_node(self, node);
     }
     fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        self.repeated_csend.remove(node.name().as_slice());
         self.score += 1;
         ruby_prism::visit_local_variable_and_write_node(self, node);
     }
     fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        self.repeated_csend.remove(node.name().as_slice());
         self.score += 1;
         ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        self.repeated_csend.remove(node.name().as_slice());
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
     }
 }
 
@@ -326,6 +508,14 @@ struct AbcCounter<'pr> {
     repeated_csend: HashSet<&'pr [u8]>,
     discount_attrs: bool,
     attr_roots: HashMap<AttrRoot<'pr>, AttrTrie<'pr>>,
+    /// Set while walking an `in`/`=>`/`in` (`InNode`/`MatchRequiredNode`/
+    /// `MatchPredicateNode`) pattern: rubocop's parser binds pattern
+    /// captures (`in [a, b]`, `in {name:}`) via its own `match_var` node
+    /// type, never `lvasgn` — so unlike a real local-variable target
+    /// (masgn/for-loop), a capture earns no `assignment` point. Prism
+    /// reuses the very same `LocalVariableTargetNode` for both, so this
+    /// flag is how `visit_local_variable_target_node` tells them apart.
+    in_pattern: bool,
 }
 
 impl<'pr> AbcCounter<'pr> {
@@ -334,6 +524,7 @@ impl<'pr> AbcCounter<'pr> {
             assignment: 0,
             branch: 0,
             condition: 0,
+            in_pattern: false,
             repeated_csend: HashSet::new(),
             discount_attrs,
             attr_roots: HashMap::new(),
@@ -341,7 +532,15 @@ impl<'pr> AbcCounter<'pr> {
     }
 
     fn discount_csend(&mut self, node: &ruby_prism::CallNode<'pr>) -> bool {
-        let Some(lv) = node.receiver().and_then(|r| r.as_local_variable_read_node()) else {
+        self.discount_csend_receiver(node.receiver())
+    }
+
+    /// Shared by every csend-shaped node (`CallNode` and the `&.`-flavored
+    /// compound-write nodes: `CallAndWriteNode`/`CallOrWriteNode`/
+    /// `CallOperatorWriteNode`) — only a bare-local-variable receiver is
+    /// trackable; every other receiver shape always counts.
+    fn discount_csend_receiver(&mut self, receiver: Option<ruby_prism::Node<'pr>>) -> bool {
+        let Some(lv) = receiver.and_then(|r| r.as_local_variable_read_node()) else {
             return false;
         };
         let name = lv.name().as_slice();
@@ -350,6 +549,23 @@ impl<'pr> AbcCounter<'pr> {
         } else {
             self.repeated_csend.insert(name);
             false
+        }
+    }
+
+    /// Walks a `rescue`/`.subsequent()` chain WITHOUT re-scoring each link
+    /// — see `visit_rescue_node` and the module doc comment.
+    fn visit_rescue_chain(&mut self, node: &ruby_prism::RescueNode<'pr>) {
+        for exc in node.exceptions().iter() {
+            self.visit(&exc);
+        }
+        if let Some(r) = node.reference() {
+            self.visit(&r);
+        }
+        if let Some(s) = node.statements() {
+            self.visit_statements_node(&s);
+        }
+        if let Some(sub) = node.subsequent() {
+            self.visit_rescue_chain(&sub);
         }
     }
 
@@ -415,11 +631,17 @@ impl<'pr> Visit<'pr> for AbcCounter<'pr> {
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
         ruby_prism::visit_while_node(self, node);
-        self.condition += 1;
+        // `begin ... end while cond` is rubocop's `while_post`, not `while`
+        // — not in CONDITION_NODES either way.
+        if !node.is_begin_modifier() {
+            self.condition += 1;
+        }
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
         ruby_prism::visit_until_node(self, node);
-        self.condition += 1;
+        if !node.is_begin_modifier() {
+            self.condition += 1;
+        }
     }
     fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
         ruby_prism::visit_for_node(self, node);
@@ -427,16 +649,51 @@ impl<'pr> Visit<'pr> for AbcCounter<'pr> {
         self.assignment += 1; // `node.for_type?` short-circuits `assignment?`
     }
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
-        ruby_prism::visit_rescue_node(self, node);
+        // One point per chain, not per `.subsequent()` link — see
+        // `visit_rescue_chain` and the module doc comment.
+        self.visit_rescue_chain(node);
         self.condition += 1;
+    }
+    fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
+        ruby_prism::visit_rescue_modifier_node(self, node);
+        self.condition += 1;
+    }
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        ruby_prism::visit_lambda_node(self, node);
+        // `->{ }` desugars to `(block (send nil :lambda) ...)` in rubocop's
+        // parser — no such node exists in prism, so the implicit `send`'s
+        // `branch` point has no home except here.
+        self.branch += 1;
     }
     fn visit_when_node(&mut self, node: &ruby_prism::WhenNode<'pr>) {
         ruby_prism::visit_when_node(self, node);
         self.condition += 1;
     }
     fn visit_in_node(&mut self, node: &ruby_prism::InNode<'pr>) {
-        ruby_prism::visit_in_node(self, node);
+        let prev = self.in_pattern;
+        self.in_pattern = true;
+        self.visit(&node.pattern());
+        self.in_pattern = prev;
+        if let Some(s) = node.statements() {
+            self.visit_statements_node(&s);
+        }
         self.condition += 1;
+    }
+    // `data => {name:}` / `data in {name:}` — one-line pattern matching,
+    // same `match_var`-not-`lvasgn` capture semantics as `in_node`'s pattern.
+    fn visit_match_required_node(&mut self, node: &ruby_prism::MatchRequiredNode<'pr>) {
+        self.visit(&node.value());
+        let prev = self.in_pattern;
+        self.in_pattern = true;
+        self.visit(&node.pattern());
+        self.in_pattern = prev;
+    }
+    fn visit_match_predicate_node(&mut self, node: &ruby_prism::MatchPredicateNode<'pr>) {
+        self.visit(&node.value());
+        let prev = self.in_pattern;
+        self.in_pattern = true;
+        self.visit(&node.pattern());
+        self.in_pattern = prev;
     }
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
         ruby_prism::visit_and_node(self, node);
@@ -446,69 +703,228 @@ impl<'pr> Visit<'pr> for AbcCounter<'pr> {
         ruby_prism::visit_or_node(self, node);
         self.condition += 1;
     }
+    // Compound assignment (`or_asgn`/`and_asgn`/`op_asgn` in rubocop-ast):
+    // upstream's `assignment?` special-cases these via `compound_assignment`,
+    // which re-derives the assignment point that visiting the LHS as its OWN
+    // node (an equals-assignment shape, in rubocop's parser) would otherwise
+    // have earned. Prism instead fuses LHS+operator+RHS into one node per
+    // shape with no such nested target to visit independently, so each of
+    // these pays the assignment (and, for the call/index-setter shapes,
+    // branch) point explicitly here — see module doc comment.
     fn visit_call_and_write_node(&mut self, node: &ruby_prism::CallAndWriteNode<'pr>) {
         ruby_prism::visit_call_and_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
+        self.branch += 1;
+        if node.is_safe_navigation() && !self.discount_csend_receiver(node.receiver()) {
+            self.condition += 1;
+        }
         self.condition += 1;
     }
     fn visit_call_or_write_node(&mut self, node: &ruby_prism::CallOrWriteNode<'pr>) {
         ruby_prism::visit_call_or_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
+        self.branch += 1;
+        if node.is_safe_navigation() && !self.discount_csend_receiver(node.receiver()) {
+            self.condition += 1;
+        }
         self.condition += 1;
+    }
+    fn visit_call_operator_write_node(&mut self, node: &ruby_prism::CallOperatorWriteNode<'pr>) {
+        ruby_prism::visit_call_operator_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
+        self.branch += 1;
+        if node.is_safe_navigation() && !self.discount_csend_receiver(node.receiver()) {
+            self.condition += 1;
+        }
     }
     fn visit_class_variable_and_write_node(&mut self, node: &ruby_prism::ClassVariableAndWriteNode<'pr>) {
         ruby_prism::visit_class_variable_and_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
     }
     fn visit_class_variable_or_write_node(&mut self, node: &ruby_prism::ClassVariableOrWriteNode<'pr>) {
         ruby_prism::visit_class_variable_or_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
+    }
+    fn visit_class_variable_operator_write_node(&mut self, node: &ruby_prism::ClassVariableOperatorWriteNode<'pr>) {
+        ruby_prism::visit_class_variable_operator_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
     }
     fn visit_constant_and_write_node(&mut self, node: &ruby_prism::ConstantAndWriteNode<'pr>) {
         ruby_prism::visit_constant_and_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
     }
     fn visit_constant_or_write_node(&mut self, node: &ruby_prism::ConstantOrWriteNode<'pr>) {
         ruby_prism::visit_constant_or_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
+    }
+    fn visit_constant_operator_write_node(&mut self, node: &ruby_prism::ConstantOperatorWriteNode<'pr>) {
+        ruby_prism::visit_constant_operator_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
     }
     fn visit_constant_path_and_write_node(&mut self, node: &ruby_prism::ConstantPathAndWriteNode<'pr>) {
         ruby_prism::visit_constant_path_and_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
     }
     fn visit_constant_path_or_write_node(&mut self, node: &ruby_prism::ConstantPathOrWriteNode<'pr>) {
         ruby_prism::visit_constant_path_or_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
+    }
+    fn visit_constant_path_operator_write_node(&mut self, node: &ruby_prism::ConstantPathOperatorWriteNode<'pr>) {
+        ruby_prism::visit_constant_path_operator_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
     }
     fn visit_global_variable_and_write_node(&mut self, node: &ruby_prism::GlobalVariableAndWriteNode<'pr>) {
         ruby_prism::visit_global_variable_and_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
     }
     fn visit_global_variable_or_write_node(&mut self, node: &ruby_prism::GlobalVariableOrWriteNode<'pr>) {
         ruby_prism::visit_global_variable_or_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
     }
+    fn visit_global_variable_operator_write_node(&mut self, node: &ruby_prism::GlobalVariableOperatorWriteNode<'pr>) {
+        ruby_prism::visit_global_variable_operator_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
+    }
+    // Index targets (`arr[i] ||= x`) are, like attribute targets, a
+    // send-shaped fragment when isolated (`arr[i]`'s getter form) — prism
+    // fuses the implicit `[]` call away entirely, so its `branch` point (and
+    // the unconditional assignment compensation) has no other home.
     fn visit_index_and_write_node(&mut self, node: &ruby_prism::IndexAndWriteNode<'pr>) {
         ruby_prism::visit_index_and_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
+        self.branch += 1;
         self.condition += 1;
     }
     fn visit_index_or_write_node(&mut self, node: &ruby_prism::IndexOrWriteNode<'pr>) {
         ruby_prism::visit_index_or_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
+        self.branch += 1;
         self.condition += 1;
+    }
+    fn visit_index_operator_write_node(&mut self, node: &ruby_prism::IndexOperatorWriteNode<'pr>) {
+        ruby_prism::visit_index_operator_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
+        self.branch += 1;
     }
     fn visit_instance_variable_and_write_node(&mut self, node: &ruby_prism::InstanceVariableAndWriteNode<'pr>) {
         ruby_prism::visit_instance_variable_and_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
     }
     fn visit_instance_variable_or_write_node(&mut self, node: &ruby_prism::InstanceVariableOrWriteNode<'pr>) {
         ruby_prism::visit_instance_variable_or_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
+    }
+    fn visit_instance_variable_operator_write_node(
+        &mut self,
+        node: &ruby_prism::InstanceVariableOperatorWriteNode<'pr>,
+    ) {
+        ruby_prism::visit_instance_variable_operator_write_node(self, node);
+        self.assignment += 1;
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
     }
     fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
         ruby_prism::visit_local_variable_and_write_node(self, node);
+        self.repeated_csend.remove(node.name().as_slice());
+        if is_capturing_name(node.name().as_slice()) {
+            self.assignment += 1;
+        }
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
     }
     fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
         ruby_prism::visit_local_variable_or_write_node(self, node);
+        self.repeated_csend.remove(node.name().as_slice());
+        if is_capturing_name(node.name().as_slice()) {
+            self.assignment += 1;
+        }
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
         self.condition += 1;
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
+        self.repeated_csend.remove(node.name().as_slice());
+        if is_capturing_name(node.name().as_slice()) {
+            self.assignment += 1;
+        }
+        if is_readonly_dispatch(&node.value()) {
+            self.assignment += 1;
+        }
     }
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
         ruby_prism::visit_local_variable_write_node(self, node);
@@ -519,6 +935,11 @@ impl<'pr> Visit<'pr> for AbcCounter<'pr> {
     }
     fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
         ruby_prism::visit_local_variable_target_node(self, node);
+        // A pattern-matching capture (`match_var` in rubocop's parser, not
+        // `lvasgn`) earns nothing — see `in_pattern`'s doc comment.
+        if self.in_pattern {
+            return;
+        }
         self.repeated_csend.remove(node.name().as_slice());
         if is_capturing_name(node.name().as_slice()) {
             self.assignment += 1;
@@ -555,6 +976,37 @@ impl<'pr> Visit<'pr> for AbcCounter<'pr> {
     fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
         ruby_prism::visit_constant_path_write_node(self, node);
         self.assignment += 1;
+    }
+    // Masgn (`a, b = 1, 2`) targets: unlike `or_asgn`/`and_asgn`/`op_asgn`,
+    // prism keeps a genuinely separate, visitable target node per LHS
+    // element here (matching rubocop's parser) rather than fusing everything
+    // into one node — so these need no RHS-bonus (masgn's own
+    // `compound_assignment` only ever inspects `node.assignments`, i.e. the
+    // targets) but otherwise follow the same rules as their write-node
+    // counterparts above.
+    fn visit_constant_target_node(&mut self, node: &ruby_prism::ConstantTargetNode<'pr>) {
+        ruby_prism::visit_constant_target_node(self, node);
+        self.assignment += 1;
+    }
+    fn visit_constant_path_target_node(&mut self, node: &ruby_prism::ConstantPathTargetNode<'pr>) {
+        ruby_prism::visit_constant_path_target_node(self, node);
+        self.assignment += 1;
+    }
+    fn visit_call_target_node(&mut self, node: &ruby_prism::CallTargetNode<'pr>) {
+        ruby_prism::visit_call_target_node(self, node);
+        self.assignment += 1;
+        self.branch += 1;
+        if node.is_safe_navigation() && !self.discount_csend_receiver(Some(node.receiver())) {
+            self.condition += 1;
+        }
+    }
+    fn visit_index_target_node(&mut self, node: &ruby_prism::IndexTargetNode<'pr>) {
+        ruby_prism::visit_index_target_node(self, node);
+        self.assignment += 1;
+        self.branch += 1;
+        if node.is_safe_navigation() && !self.discount_csend_receiver(Some(node.receiver())) {
+            self.condition += 1;
+        }
     }
     fn visit_required_parameter_node(&mut self, node: &ruby_prism::RequiredParameterNode<'pr>) {
         ruby_prism::visit_required_parameter_node(self, node);
@@ -608,6 +1060,27 @@ impl<'pr> Visit<'pr> for AbcCounter<'pr> {
         ruby_prism::visit_yield_node(self, node);
         self.branch += 1;
     }
+    // `/regexp/ =~ expr` with named captures (`(?<name>...)`) auto-vivifies
+    // locals for each name — rubocop's parser fuses the whole thing into one
+    // `match_with_lvasgn` node that ISN'T itself send/csend/yield (no
+    // `branch`), isn't a COUNTED_NODES/CONDITION_NODES member (no
+    // `condition`), and doesn't expose the captures as separately-visitable
+    // `lvasgn` targets either (no `assignment`) — it's entirely uncounted
+    // except for whatever's nested inside the matched expression itself.
+    // Prism's `MatchWriteNode` keeps a real (visitable, scorable) `CallNode`
+    // for the `=~` and real `LocalVariableTargetNode`s for the captures, so
+    // we walk around both rather than through `visit_call_node`/the targets.
+    fn visit_match_write_node(&mut self, node: &ruby_prism::MatchWriteNode<'pr>) {
+        let call = node.call();
+        if let Some(r) = call.receiver() {
+            self.visit(&r);
+        }
+        if let Some(args) = call.arguments() {
+            for a in args.arguments().iter() {
+                self.visit(&a);
+            }
+        }
+    }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
         ruby_prism::visit_call_node(self, node);
         // Setter-shaped calls (`obj.attr = x`, `x[0] = 1`) — `equal_loc` is
@@ -629,8 +1102,7 @@ impl<'pr> Visit<'pr> for AbcCounter<'pr> {
         // A block/block-pass on a KNOWN ITERATING method is its own
         // `condition` point — never discounted by the attribute tracking.
         if let Some(b) = node.block() {
-            let is_block = b.as_block_node().is_some() || b.as_block_argument_node().is_some();
-            if is_block && is_known_iterating_method(node.name().as_slice()) {
+            if is_countable_block(&b) && is_known_iterating_method(node.name().as_slice()) {
                 self.condition += 1;
             }
         }
