@@ -6510,3 +6510,124 @@ impl<'a> Cops<'a> {
         self.fixes.push((char_off, char_off + 1, vec![new_char]));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/NestedParenthesizedCalls — a parenthesis-less method call
+    /// nested directly (one level deep, as receiver or argument — NOT
+    /// recursively) inside the argument list of a PARENTHESIZED call must
+    /// itself get parens. Verbatim port of `on_send`/`allowed_omission?`/
+    /// `allowed?`: `node.each_child_node(:call)` in whitequark walks only
+    /// the send node's immediate AST children (receiver + each argument),
+    /// which is why `method(block_taker { another_method 1 })` is clean —
+    /// `another_method 1` sits two levels down, inside the block body, and
+    /// is never visited from `method`'s own on_send. Every parenthesized
+    /// call anywhere in the tree gets its own independent check (this hook
+    /// runs for every `CallNode`, not just outermost ones), so
+    /// `foo(bar(baz qux))` still flags `baz qux` — via `bar(...)`'s own
+    /// on_send, since `bar(...)` is itself parenthesized.
+    pub(crate) fn check_nested_parenthesized_calls(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/NestedParenthesizedCalls";
+        if !self.on(COP) {
+            return;
+        }
+        if !npc_parenthesized(node.opening_loc()) {
+            return;
+        }
+        let outer_arg_count = node.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0);
+
+        let mut candidates: Vec<ruby_prism::Node> = Vec::new();
+        if let Some(r) = node.receiver() {
+            candidates.push(r);
+        }
+        if let Some(a) = node.arguments() {
+            candidates.extend(a.arguments().iter());
+        }
+
+        for cand in candidates {
+            let Some(nested) = cand.as_call_node() else { continue };
+            if self.npc_allowed_omission(&nested, outer_arg_count) {
+                continue;
+            }
+            let loc = nested.location();
+            let source = String::from_utf8_lossy(&self.src[loc.start_offset()..loc.end_offset()]).into_owned();
+            self.push(loc.start_offset(), COP, true, format!("Add parentheses to nested method call `{source}`."));
+            self.npc_autocorrect(&nested);
+        }
+    }
+
+    /// `allowed_omission?`: skip a nested call that has no arguments, is
+    /// already parenthesized, is a setter (`obj.attr = val`), is an
+    /// operator method (`a + b`, `a[i]`, ...), or is individually allowed
+    /// via `allowed?` (see below).
+    fn npc_allowed_omission(&self, nested: &ruby_prism::CallNode, outer_arg_count: usize) -> bool {
+        let nested_args = nested.arguments();
+        let nested_arg_count = nested_args.as_ref().map(|a| a.arguments().iter().count()).unwrap_or(0);
+        if nested_arg_count == 0 {
+            return true;
+        }
+        if npc_parenthesized(nested.opening_loc()) {
+            return true;
+        }
+        if nested.is_attribute_write() {
+            return true;
+        }
+        if RS_OPERATOR_METHODS.contains(&nested.name().as_slice()) {
+            return true;
+        }
+        // `allowed?`: the OUTER (parenthesized) call has exactly one
+        // argument, the nested call's own method name is in
+        // `AllowedMethods`, and the nested call itself has exactly one
+        // argument.
+        outer_arg_count == 1
+            && nested_arg_count == 1
+            && self.allowed("Style/NestedParenthesizedCalls", nested.name().as_slice())
+    }
+
+    /// `autocorrect`: replace the (possibly backslash-continued,
+    /// whitespace-padded) gap between the nested call's selector and its
+    /// first argument with `(`, then insert `)` right after the last
+    /// argument. Mirrors `range_with_surrounding_space(first_arg.begin,
+    /// side: :left, whitespace: true, continuations: true)` — see
+    /// `npc_leading_space_start` for the exact left-extension algorithm.
+    fn npc_autocorrect(&mut self, nested: &ruby_prism::CallNode) {
+        let Some(args) = nested.arguments() else { return };
+        let items: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        let (Some(first), Some(last)) = (items.first(), items.last()) else { return };
+        let first_start = first.location().start_offset();
+        let last_end = last.location().end_offset();
+        let leading_start = npc_leading_space_start(self.src, first_start);
+        self.fixes.push((leading_start, first_start, b"(".to_vec()));
+        self.fixes.push((last_end, last_end, b")".to_vec()));
+    }
+}
+
+/// `ParameterizedNode#parenthesized?` (`loc_is?(:end, ')')`, equivalent
+/// here to checking the opening delimiter of the argument list is `(` —
+/// excludes `[...]` (aref) and bare unparenthesized calls alike).
+fn npc_parenthesized(opening: Option<ruby_prism::Location>) -> bool {
+    opening.is_some_and(|o| o.as_slice() == b"(")
+}
+
+/// `RangeHelp#range_with_surrounding_space(range: first_arg.begin, side:
+/// :left, whitespace: true, continuations: true)` — rubocop's `final_pos`
+/// walks left through FOUR separate, sequential phases, each fully
+/// consumed before the next starts: horizontal whitespace, then
+/// backslash-newline continuations, then bare newlines, then (since
+/// `whitespace: true`) any remaining `\s` at all (which can eat back
+/// through more spaces/newlines the earlier phases already stopped at
+/// their own boundaries).
+fn npc_leading_space_start(src: &[u8], mut pos: usize) -> usize {
+    while pos > 0 && matches!(src[pos - 1], b' ' | b'\t') {
+        pos -= 1;
+    }
+    while pos >= 2 && &src[pos - 2..pos] == b"\\\n" {
+        pos -= 2;
+    }
+    while pos > 0 && src[pos - 1] == b'\n' {
+        pos -= 1;
+    }
+    while pos > 0 && matches!(src[pos - 1], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+        pos -= 1;
+    }
+    pos
+}
