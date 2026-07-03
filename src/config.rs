@@ -22,6 +22,9 @@ pub struct Schema {
     /// The style-guide anchor/URL (default.yml `StyleGuide:`) — appended to
     /// messages under `AllCops: DisplayStyleGuide`.
     pub style_guide: Option<&'static str>,
+    /// Reference URLs (default.yml `References:`/legacy `Reference:`) —
+    /// appended after the style-guide URL under DisplayStyleGuide.
+    pub references: &'static [&'static str],
 }
 pub use crate::schema_gen::SCHEMA;
 pub fn schema(cop: &str) -> Option<&'static Schema> {

@@ -313,17 +313,27 @@ impl Engine {
             cop_excludes, display_style_guide, style_guide_base,
         }
     }
-    /// The " (https://...)" message suffix for a cop, when configured.
+    /// The " (https://...)" message suffix for a cop, when configured —
+    /// upstream MessageAnnotator's `(style_guide_url, *reference_urls)`,
+    /// shown under AllCops: DisplayStyleGuide when any URL exists.
     pub(crate) fn style_guide_suffix(&self, cop: &str) -> Option<String> {
         if !self.display_style_guide {
             return None;
         }
-        let sg = crate::config::schema(cop)?.style_guide?;
-        Some(if sg.starts_with('#') {
-            format!(" ({}{sg})", self.style_guide_base)
-        } else {
-            format!(" ({sg})")
-        })
+        let schema = crate::config::schema(cop)?;
+        let mut urls: Vec<String> = Vec::new();
+        if let Some(sg) = schema.style_guide {
+            urls.push(if sg.starts_with('#') {
+                format!("{}{sg}", self.style_guide_base)
+            } else {
+                sg.to_string()
+            });
+        }
+        urls.extend(schema.references.iter().map(|r| r.to_string()));
+        if urls.is_empty() {
+            return None;
+        }
+        Some(format!(" ({})", urls.join(", ")))
     }
     /// The hot flags for one file: the base view with per-cop Excludes for
     /// matching cops switched off. Returns the excluded non-hot cop names too.

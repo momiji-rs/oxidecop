@@ -56,9 +56,11 @@ rows = cops.map do |cop, conf|
   excludes = (conf['Exclude'] || []).map { |m| rust_str(m) }
   sg = conf['StyleGuide'] ? rust_str(conf['StyleGuide']) : 'e'
   sg = sg == 'e' ? 'None' : "Some(#{sg})"
+  refs = Array(conf['References'] || conf['Reference']).reject { |r| r.to_s.empty? }
+                                                       .map { |r| rust_str(r) }
   "    Schema { cop: #{rust_str(cop)}, params: &[#{params.join(', ')}], " \
     "styles: &[#{styles.join(', ')}], allowed_methods: &[#{allowed.join(', ')}], " \
-    "excludes: &[#{excludes.join(', ')}], style_guide: #{sg} },"
+    "excludes: &[#{excludes.join(', ')}], style_guide: #{sg}, references: &[#{refs.join(', ')}] },"
 end
 
 File.write(OUT, <<~RUST)
