@@ -182,6 +182,7 @@ COPS = {
   'Lint/RequireParentheses'          => 'lint/require_parentheses',
   'Style/CaseEquality'               => 'style/case_equality',
   'Style/RedundantException'         => 'style/redundant_exception',
+  'Naming/AsciiIdentifiers'          => 'naming/ascii_identifiers',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

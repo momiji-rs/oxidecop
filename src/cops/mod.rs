@@ -137,7 +137,7 @@ pub fn intern_cop(name: &str) -> Option<&'static str> {
 
 /// Every cop name the engine implements — enablement resolves once per run.
 const IMPLEMENTED: &[&str] = &[
-    "Lint/DuplicateRequire", "Naming/BinaryOperatorParameterName",
+    "Lint/DuplicateRequire", "Naming/AsciiIdentifiers", "Naming/BinaryOperatorParameterName",
     "Naming/ClassAndModuleCamelCase", "Naming/ConstantName", "Style/MultilineIfThen",
     "Style/Not", "Style/StderrPuts", "Style/WhileUntilDo", "Style/ColonMethodCall", "Style/Attr",
     "Lint/EmptyClass", "Lint/DeprecatedClassMethods", "Layout/EmptyLineAfterMagicComment",
@@ -874,6 +874,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
+        self.check_ascii_symbol(node);
         self.check_boolean_symbol(node);
         self.check_symbol_literal(node);
     }
@@ -933,6 +934,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
         let v = node.value();
+        self.check_ascii_constant_write(node);
         self.check_constant_name(node.name().as_slice(), node.name_loc().start_offset(), Some(&v));
         self.check_self_assignment_const(node.location().start_offset(), node.name().as_slice(), &v);
         assignment_write!(self, node);
@@ -950,6 +952,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_constant_name(node.name().as_slice(), node.location().start_offset(), None);
     }
     fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+        self.check_ascii_constant_path_write(node);
         let t = node.target();
         if let Some(name) = t.name() {
             let v = node.value();
@@ -1122,6 +1125,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.check_ascii_local_variable_write(node);
         self.check_self_assignment_shorthand_lvar(node);
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
@@ -1543,6 +1547,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.class_children_stack.pop();
     }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        self.check_ascii_class(node);
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(),
             node.body().is_some(), node.superclass().is_some(), false);
@@ -1580,6 +1585,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.leave_namespace();
     }
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        self.check_ascii_module(node);
         self.check_trailing_body_on_module(node);
         self.check_class_methods(&node.constant_path(), node.body());
         self.check_documentation("module", node.location().start_offset(), &node.constant_path(), node.body());
@@ -1619,6 +1625,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        self.check_ascii_def(node);
         self.check_missing_respond_to_missing(node);
         self.check_trailing_method_end_statement(node);
         self.check_optional_boolean_parameter(node);

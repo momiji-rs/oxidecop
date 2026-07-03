@@ -724,3 +724,113 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+/// Naming/AsciiIdentifiers — checks for non-ASCII characters in identifier
+/// and constant names.
+fn check_ascii_identifier_name(name: &[u8], offset: usize, is_constant: bool, check_constants: bool) -> Option<(usize, bool)> {
+    // Skip if not checking constants and this is a constant
+    if is_constant && !check_constants {
+        return None;
+    }
+
+    let name_str = String::from_utf8_lossy(name);
+
+    // Find first non-ASCII character sequence
+    for (idx, ch) in name_str.chars().enumerate() {
+        if !ch.is_ascii() {
+            // Calculate byte offset of this character within the name
+            let bytes_before = name_str.chars().take(idx).map(|c| c.len_utf8()).sum::<usize>();
+            return Some((offset + bytes_before, is_constant));
+        }
+    }
+    None
+}
+
+impl<'a> Cops<'a> {
+    /// Naming/AsciiIdentifiers — visitor hook that checks all nodes with names
+    pub(crate) fn check_ascii_identifiers_in_name(&mut self, name: &[u8], offset: usize, is_constant: bool) {
+        const COP: &str = "Naming/AsciiIdentifiers";
+        if !self.on(COP) {
+            return;
+        }
+
+        let check_constants = self.cfg.get(COP, "AsciiConstants") != Some("false");
+
+        if let Some((offense_offset, is_const)) = check_ascii_identifier_name(name, offset, is_constant, check_constants) {
+            let msg = if is_const {
+                "Use only ascii symbols in constants."
+            } else {
+                "Use only ascii symbols in identifiers."
+            };
+            self.push(offense_offset, COP, false, msg.to_string());
+        }
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    // Visitor methods for various identifier-bearing nodes
+
+    pub(crate) fn check_ascii_local_variable_write(&mut self, node: &ruby_prism::LocalVariableWriteNode) {
+        self.check_ascii_identifiers_in_name(node.name().as_slice(), node.name_loc().start_offset(), false);
+    }
+
+    pub(crate) fn check_ascii_constant_write(&mut self, node: &ruby_prism::ConstantWriteNode) {
+        self.check_ascii_identifiers_in_name(node.name().as_slice(), node.name_loc().start_offset(), true);
+    }
+
+    pub(crate) fn check_ascii_constant_path_write(&mut self, node: &ruby_prism::ConstantPathWriteNode) {
+        // For constant path writes, check the target constant
+        let target = node.target();
+        // Check just the name part (not the parent) - extract from source
+        let name_loc = target.name_loc();
+        let name_bytes = &self.src[name_loc.start_offset()..name_loc.end_offset()];
+        self.check_ascii_identifiers_in_name(name_bytes, name_loc.start_offset(), true);
+    }
+
+    pub(crate) fn check_ascii_def(&mut self, node: &ruby_prism::DefNode) {
+        // Method names are identifiers, not constants
+        let name = node.name().as_slice();
+        let offset = node.name_loc().start_offset();
+        self.check_ascii_identifiers_in_name(name, offset, false);
+    }
+
+    pub(crate) fn check_ascii_class(&mut self, node: &ruby_prism::ClassNode) {
+        // Check the constant name of the class
+        let cp = node.constant_path();
+        if let Some(const_path) = cp.as_constant_path_node() {
+            // For constant paths like Foo::Bar, check just the last component
+            let name_loc = const_path.name_loc();
+            let name_bytes = &self.src[name_loc.start_offset()..name_loc.end_offset()];
+            self.check_ascii_identifiers_in_name(name_bytes, name_loc.start_offset(), true);
+        } else if let Some(const_read) = cp.as_constant_read_node() {
+            // For simple constants like Foo
+            let name = const_read.name().as_slice();
+            let offset = const_read.location().start_offset();
+            self.check_ascii_identifiers_in_name(name, offset, true);
+        }
+    }
+
+    pub(crate) fn check_ascii_module(&mut self, node: &ruby_prism::ModuleNode) {
+        // Check the constant name of the module
+        let cp = node.constant_path();
+        if let Some(const_path) = cp.as_constant_path_node() {
+            // For constant paths like Foo::Bar, check just the last component
+            let name_loc = const_path.name_loc();
+            let name_bytes = &self.src[name_loc.start_offset()..name_loc.end_offset()];
+            self.check_ascii_identifiers_in_name(name_bytes, name_loc.start_offset(), true);
+        } else if let Some(const_read) = cp.as_constant_read_node() {
+            // For simple constants like Foo
+            let name = const_read.name().as_slice();
+            let offset = const_read.location().start_offset();
+            self.check_ascii_identifiers_in_name(name, offset, true);
+        }
+    }
+
+    pub(crate) fn check_ascii_symbol(&mut self, node: &ruby_prism::SymbolNode) {
+        // Check symbol names (they're identifiers)
+        if let Some(value_loc) = node.value_loc() {
+            let symbol_bytes = &self.src[value_loc.start_offset()..value_loc.end_offset()];
+            self.check_ascii_identifiers_in_name(symbol_bytes, value_loc.start_offset(), false);
+        }
+    }
+}
