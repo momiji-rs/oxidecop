@@ -6275,3 +6275,104 @@ impl<'pr> ruby_prism::Visit<'pr> for RespondToMissingCollector {
         ruby_prism::visit_def_node(self, node);
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/HashLikeCase — a `case-when` mapping literal (string/symbol)
+    /// conditions 1:1 onto literal bodies, with no `else`, reads better as a
+    /// hash lookup. Ports rubocop's node-pattern (`hash_like_case?`) plus its
+    /// `MinBranchesCount` mixin (`min_branches_count?`):
+    ///
+    ///   (case _ (when ${str_type? sym_type?} $[!nil? recursive_basic_literal?])+ nil?)
+    ///
+    /// Node-pattern ARITY is significant here, not just node TYPE: a `when`
+    /// with more than one comma-separated value (2+ `conditions()`, e.g.
+    /// `when 'a', 'b'`) or with zero statements has the wrong shape to match
+    /// `(when $cond $body)` at all, which fails the repetition (`+`) for the
+    /// WHOLE case node — no partial offense — verified live against rubocop
+    /// 1.88 (`when 'a', 'b'` blocks the offense entirely, even alongside
+    /// otherwise-conforming branches).
+    ///
+    /// The trailing `nil?` matches rubocop's raw case-node sexp, where an
+    /// ABSENT `else` and a syntactically EMPTY `else` (keyword with no
+    /// statements) are indistinguishable — both render as a bare `nil`
+    /// child, since whitequark doesn't wrap `else` in its own node — verified
+    /// live: `case x; when 'a'; 'A'; when 'b'; 'B'; else; end` still offends
+    /// (`ps.ast` for that source is `s(:case, ..., s(:when, ...), nil)`).
+    /// Only a NON-empty `else` body blocks the match.
+    pub(crate) fn check_hash_like_case(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Style/HashLikeCase";
+        if !self.on(COP) {
+            return;
+        }
+
+        let min_branches = self
+            .cfg
+            .get(COP, "MinBranchesCount")
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(3) as usize;
+
+        let branches = node.conditions();
+        if branches.len() < min_branches {
+            return;
+        }
+
+        if node.else_clause().is_some_and(|e| e.statements().is_some()) {
+            return;
+        }
+
+        let mut cond_repr: Option<ruby_prism::Node> = None;
+        let mut body_repr: Option<ruby_prism::Node> = None;
+
+        for branch in branches.iter() {
+            // `case`/`when` conditions are always `WhenNode`s (`case`/`in`
+            // uses a separate `CaseMatchNode`/`InNode` pair entirely), but
+            // stay defensive rather than assume.
+            let Some(when_node) = branch.as_when_node() else { return };
+
+            let mut whens = when_node.conditions().iter();
+            let Some(condition) = whens.next() else { return };
+            if whens.next().is_some() {
+                return;
+            }
+            if condition.as_string_node().is_none() && condition.as_symbol_node().is_none() {
+                return;
+            }
+
+            let Some(body) = hash_like_case_body(&when_node) else { return };
+            if !super::lint_cops::is_recursive_basic_literal(&body) {
+                return;
+            }
+
+            match &cond_repr {
+                None => cond_repr = Some(condition),
+                Some(first) if std::mem::discriminant(first) == std::mem::discriminant(&condition) => {}
+                Some(_) => return,
+            }
+            match &body_repr {
+                None => body_repr = Some(body),
+                Some(first) if std::mem::discriminant(first) == std::mem::discriminant(&body) => {}
+                Some(_) => return,
+            }
+        }
+
+        self.push(node.location().start_offset(), COP, false, "Consider replacing `case-when` with a hash lookup.");
+    }
+}
+
+/// The `when` clause's body position the way rubocop's sexp represents it: a
+/// SINGLE statement stands for itself; 2+ statements collapse to their
+/// enclosing (`:begin`-typed, in whitequark) statements list — matched here
+/// by returning the `StatementsNode` itself, since `is_recursive_basic_literal`
+/// already recurses through `StatementsNode` the same way it would a `:begin`
+/// node; zero statements is the sexp's bare `nil`, which never matches
+/// (`None`).
+fn hash_like_case_body<'pr>(when_node: &ruby_prism::WhenNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    let stmts = when_node.statements()?;
+    let body = stmts.body();
+    match body.len() {
+        0 => None,
+        1 => body.iter().next(),
+        _ => Some(stmts.as_node()),
+    }
+}

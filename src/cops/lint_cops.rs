@@ -517,7 +517,7 @@ fn is_duplicate_hash_key_candidate(node: &ruby_prism::Node) -> bool {
 /// composite literals (array/hash/pair/range/regexp/string/symbol/xstring),
 /// bottoming out at non-composite basic literals (int/float/sym/true/false/
 /// nil/str/rational/complex).
-fn is_recursive_basic_literal(node: &ruby_prism::Node) -> bool {
+pub(crate) fn is_recursive_basic_literal(node: &ruby_prism::Node) -> bool {
     if let Some(call) = node.as_call_node() {
         const OPS: &[&[u8]] = &[b"==", b"===", b"!=", b"<=", b">=", b">", b"<", b"*", b"!", b"<=>"];
         let Some(recv) = call.receiver() else { return false };

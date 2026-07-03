@@ -172,6 +172,7 @@ COPS = {
   'Style/Sample'                     => 'style/sample',
   'Style/Attr'                       => 'style/attr',
   'Style/MissingRespondToMissing'    => 'style/missing_respond_to_missing',
+  'Style/HashLikeCase'               => 'style/hash_like_case',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
