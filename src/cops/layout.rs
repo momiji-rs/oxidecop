@@ -4212,3 +4212,88 @@ impl<'a> super::Cops<'a> {
         i != body.len() - 1
     }
 }
+impl<'a> super::Cops<'a> {
+
+    /// Layout/BeginEndAlignment — checks whether the `end` keyword of a
+    /// `begin` block is properly aligned with the `begin` keyword or with the
+    /// start of the line (depending on `EnforcedStyleAlignWith` config).
+    ///
+    /// Two modes are supported:
+    /// - `begin` (align end with begin keyword column)
+    /// - `start_of_line` (default, align end with line start indentation)
+    pub(crate) fn check_begin_end_alignment(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Layout/BeginEndAlignment";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Only check explicit `begin...end` blocks (with begin keyword).
+        let Some(begin_loc) = node.begin_keyword_loc() else {
+            return;
+        };
+        let Some(end_loc) = node.end_keyword_loc() else {
+            return;
+        };
+
+        // This cop's style knob is EnforcedStyleAlignWith, not EnforcedStyle.
+        let style = self.cfg.get(COP, "EnforcedStyleAlignWith").unwrap_or("start_of_line");
+        let end_pos = end_loc.start_offset();
+        let (end_line, end_col) = self.idx.loc(end_pos);
+
+        // Determine alignment target based on style (all columns are 1-indexed for logic).
+        let (align_col, align_line, align_source): (usize, usize, String) = match style {
+            "begin" => {
+                // Align with the `begin` keyword column.
+                let (begin_line, begin_col) = self.idx.loc(begin_loc.start_offset());
+                (begin_col, begin_line, "begin".to_string())
+            }
+            _ => {
+                // Default: `start_of_line` — align with the start of the line where begin is.
+                let (begin_line, _) = self.idx.loc(begin_loc.start_offset());
+                let line_start_offset = self.idx.starts[begin_line - 1];
+                let line_end = self.line_end(begin_line);
+                let line_src = &self.src[line_start_offset..line_end];
+
+                // Find first non-whitespace column (0-indexed), convert to 1-indexed for comparison.
+                let col = line_src
+                    .iter()
+                    .position(|&b| b != b' ' && b != b'\t')
+                    .unwrap_or(0) + 1;
+                let line_text = String::from_utf8_lossy(line_src).trim().to_string();
+                (col, begin_line, line_text)
+            }
+        };
+
+        // Check alignment: if columns match (both 1-indexed), it's correct.
+        if end_col == align_col {
+            return;
+        }
+
+        // Misaligned: report offense. Message uses 0-indexed columns.
+        let msg = format!(
+            "`end` at {}, {} is not aligned with `{}` at {}, {}.",
+            end_line,
+            end_col - 1,  // Convert to 0-indexed for message
+            align_source,
+            align_line,
+            align_col - 1  // Convert to 0-indexed for message
+        );
+        self.push(end_pos, COP, true, &msg);
+
+        // AlignmentCorrector: shift the `end` keyword to the target column —
+        // pad with spaces, or eat leading whitespace when over-indented.
+        let delta = align_col as isize - end_col as isize;
+        if delta > 0 {
+            self.fixes.push((end_pos, end_pos, vec![b' '; delta as usize]));
+        } else {
+            let n = (-delta) as usize;
+            let line_start = self.idx.starts[end_line - 1];
+            if end_pos >= n
+                && end_pos - n >= line_start
+                && self.src[end_pos - n..end_pos].iter().all(|&b| b == b' ' || b == b'\t')
+            {
+                self.fixes.push((end_pos - n, end_pos, Vec::new()));
+            }
+        }
+    }
+}

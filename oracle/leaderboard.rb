@@ -159,6 +159,7 @@ COPS = {
   'Lint/StructNewOverride'           => 'lint/struct_new_override',
   'Lint/Loop'                        => 'lint/loop',
   'Style/BlockComments'              => 'style/block_comments',
+  'Layout/BeginEndAlignment'         => 'layout/begin_end_alignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
