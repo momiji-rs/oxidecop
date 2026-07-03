@@ -5889,3 +5889,218 @@ impl<'a> Cops<'a> {
         None
     }
 }
+impl<'a> super::Cops<'a> {
+
+    /// Style/Sample — shuffle.first/shuffle.last/shuffle[]/shuffle.at/shuffle.slice → sample.
+    pub(crate) fn check_sample(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/Sample";
+        if !self.hot.sample {
+            return;
+        }
+        static PAT: OnceLock<Pat> = OnceLock::new();
+        // Match patterns like: shuffle.first, shuffle[0], shuffle.at(0), etc.
+        // The pattern is: (call (call <receiver> :shuffle <args>) <method> <method_args>)
+        let pat = matcher(&PAT,
+            "{(call (call _ :shuffle) :first)\
+              (call (call _ :shuffle) :first (...))\
+              (call (call _ :shuffle) :last)\
+              (call (call _ :shuffle) :last (...))\
+              (call (call _ :shuffle) :[] (...))\
+              (call (call _ :shuffle) :[] (...) (...))\
+              (call (call _ :shuffle) :at (...))\
+              (call (call _ :shuffle) :slice)\
+              (call (call _ :shuffle) :slice (...))\
+              (call (call _ :shuffle) :slice (...) (...))\
+              (call (call _ :shuffle (...)) :first)\
+              (call (call _ :shuffle (...)) :first (...))\
+              (call (call _ :shuffle (...)) :last)\
+              (call (call _ :shuffle (...)) :last (...))\
+              (call (call _ :shuffle (...)) :[] (...))\
+              (call (call _ :shuffle (...)) :[] (...) (...))\
+              (call (call _ :shuffle (...)) :at (...))\
+              (call (call _ :shuffle (...)) :slice)\
+              (call (call _ :shuffle (...)) :slice (...))\
+              (call (call _ :shuffle (...)) :slice (...) (...))}");
+        if nodepattern::matches(pat, &node.as_node(), self.src).is_none() {
+            return;
+        }
+
+        let method_name = node.name();
+
+        // Get receiver (the shuffle call node)
+        let Some(receiver) = node.receiver() else { return };
+        let Some(shuffle_call) = receiver.as_call_node() else { return };
+
+        // Get shuffle's arguments
+        let shuffle_arg_src = shuffle_call.arguments()
+            .and_then(|a| a.arguments().iter().next())
+            .map(|n| String::from_utf8_lossy(self.node_src(&n)).into_owned());
+
+        // Get this call's arguments (the method being called on shuffle)
+        let method_args_opt = node.arguments().map(|a| a.arguments());
+
+        // Determine if offensive
+        if !self.is_sample_offensive_opt(method_name.as_slice(), method_args_opt.as_ref()) {
+            return;
+        }
+
+        // Build correction
+        let correct = self.sample_correction_opt(shuffle_arg_src.as_deref(), method_name.as_slice(), method_args_opt.as_ref());
+
+        // Get source range: from shuffle's selector to end of this call
+        let shuffle_loc = match shuffle_call.message_loc() {
+            Some(sel_loc) => (sel_loc.start_offset(), node.location().end_offset()),
+            None => return,
+        };
+        let incorrect = String::from_utf8_lossy(&self.src[shuffle_loc.0..shuffle_loc.1]).into_owned();
+        let message = format!("Use `{correct}` instead of `{incorrect}`.");
+
+        self.push(shuffle_loc.0, COP, true, message);
+        self.fixes.push((shuffle_loc.0, shuffle_loc.1, correct.into_bytes()));
+    }
+
+    fn is_sample_offensive_opt(&self, method: &[u8], args: Option<&ruby_prism::NodeList>) -> bool {
+        let args = match args {
+            Some(a) => a,
+            None => return matches!(method, b"first" | b"last"),
+        };
+
+        match method {
+            b"first" | b"last" => true,
+            b"[]" | b"at" | b"slice" => {
+                self.sample_size_opt(Some(args)).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    // Returns Some(size_string) if the size can be determined, None if unknown
+    fn sample_size_opt(&self, args: Option<&ruby_prism::NodeList>) -> Option<String> {
+        let args = args?;
+
+        let int_of = |n: &ruby_prism::Node| -> Option<i64> {
+            let l = n.location();
+            std::str::from_utf8(&self.src[l.start_offset()..l.end_offset()])
+                .ok()?
+                .replace('_', "")
+                .parse()
+                .ok()
+        };
+
+        if args.is_empty() {
+            return None;
+        }
+
+        if args.len() == 1 {
+            let arg = &args.iter().next()?;
+
+            // Check if it's a range
+            if let Some(range_node) = arg.as_range_node() {
+                let (Some(b), Some(e)) = (range_node.left(), range_node.right()) else { return None };
+                let (Some(b), Some(e)) = (int_of(&b), int_of(&e)) else { return None };
+                if b != 0 {
+                    return None; // Not starting at 0
+                }
+                let is_exclusive = range_node.operator_loc().as_slice() == b"...";
+                let size = if is_exclusive { e } else { e + 1 };
+                return Some(size.to_string());
+            }
+
+            // Check if it's an integer literal
+            if let Some(v) = int_of(arg) {
+                if v == 0 || v == -1 {
+                    return Some("unknown".to_string()); // Offensive
+                }
+                return None; // Not offensive
+            }
+
+            return None; // Unknown
+        }
+
+        if args.len() == 2 {
+            // For [offset, length], only offensive if offset == 0
+            let first = &args.iter().next()?;
+            if let Some(v) = int_of(first) {
+                if v == 0 {
+                    // Return the second argument as the size
+                    let second = &args.iter().nth(1)?;
+                    let size_src = String::from_utf8_lossy(self.node_src(second)).into_owned();
+                    return Some(size_src);
+                }
+            }
+            return None;
+        }
+
+        None
+    }
+
+    fn sample_correction_opt(&self, shuffle_arg: Option<&str>, method: &[u8], args: Option<&ruby_prism::NodeList>) -> String {
+        let sample_arg = self.get_sample_arg_opt(method, args);
+
+        let mut parts = Vec::new();
+        if let Some(arg) = sample_arg {
+            parts.push(arg);
+        }
+        if let Some(sarg) = shuffle_arg {
+            parts.push(sarg.to_string());
+        }
+
+        if parts.is_empty() {
+            "sample".to_string()
+        } else {
+            format!("sample({})", parts.join(", "))
+        }
+    }
+
+    fn get_sample_arg_opt(&self, method: &[u8], args: Option<&ruby_prism::NodeList>) -> Option<String> {
+        let args = args?;
+
+        let int_of = |n: &ruby_prism::Node| -> Option<i64> {
+            let l = n.location();
+            std::str::from_utf8(&self.src[l.start_offset()..l.end_offset()])
+                .ok()?
+                .replace('_', "")
+                .parse()
+                .ok()
+        };
+
+        match method {
+            b"first" | b"last" => {
+                if !args.is_empty() {
+                    let arg = &args.iter().next()?;
+                    Some(String::from_utf8_lossy(self.node_src(arg)).into_owned())
+                } else {
+                    None
+                }
+            }
+            b"[]" | b"slice" => {
+                if args.len() == 1 {
+                    let arg = &args.iter().next()?;
+                    if let Some(range_node) = arg.as_range_node() {
+                        let (Some(b), Some(e)) = (range_node.left(), range_node.right()) else { return None };
+                        let (Some(b), Some(e)) = (int_of(&b), int_of(&e)) else { return None };
+                        if b != 0 {
+                            return None;
+                        }
+                        let is_exclusive = range_node.operator_loc().as_slice() == b"...";
+                        let size = if is_exclusive { e } else { e + 1 };
+                        return Some(size.to_string());
+                    }
+                    None
+                } else if args.len() == 2 {
+                    let first = &args.iter().next()?;
+                    if let Some(v) = int_of(first) {
+                        if v == 0 {
+                            let second = &args.iter().nth(1)?;
+                            return Some(String::from_utf8_lossy(self.node_src(second)).into_owned());
+                        }
+                    }
+                    None
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
