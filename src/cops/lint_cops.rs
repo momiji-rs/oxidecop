@@ -5371,3 +5371,277 @@ impl<'a> super::Cops<'a> {
         args
     }
 }
+
+/// Lint/SelfAssignment — `x = x` (and every shape rubocop recognizes: `||=`/
+/// `&&=`, multiple assignment, attribute writers, `[]=`). Ported from
+/// `RuboCop::Cop::Lint::SelfAssignment`; the cop never autocorrects, so every
+/// offense here is `self.push(..., false, ...)`.
+///
+/// Node-shape notes (prism vs whitequark):
+///   - whitequark folds a plain var write, `||=`, and `&&=` into `lvasgn`/
+///     `or-asgn`/`and-asgn` with a UNIFORM lhs/rhs shape per var kind; prism
+///     instead gives each combination (kind × operator) its own struct
+///     (`LocalVariableWriteNode`/`OrWriteNode`/`AndWriteNode`, ditto for
+///     ivar/cvar/gvar/const) — hence one thin per-kind wrapper below, all
+///     sharing `self_assignment_var_check`.
+///   - `obj.attr {=,||=,&&=}` and `hash[k] {=,||=,&&=}` are, in whitequark,
+///     ALL "send" nodes (`[]=`/`attr=` for plain writes; `or-asgn`/`and-asgn`
+///     wrapping a `[]`/`attr` READ node for the shorthand forms) — one
+///     `reader_self_assignment?` handles both attribute and index shapes.
+///     Prism instead has SEPARATE node types per shape: `CallNode` (plain
+///     `obj.attr =` / `hash[k] =` / the explicit-call form `obj.[]=(...)`),
+///     and — with NO relation to `CallNode` at all — `CallAndWriteNode`/
+///     `CallOrWriteNode` (attribute `||=`/`&&=`) and `IndexAndWriteNode`/
+///     `IndexOrWriteNode` (index `||=`/`&&=`). Each needs its own `visit_*`
+///     override (see `mod.rs`) feeding the same `sa_reader_match` core.
+impl<'a> super::Cops<'a> {
+    /// `AllowRBSInlineAnnotation` (default false), resolved via `cfg.get` so
+    /// the schema default applies when unset.
+    fn self_assignment_allow_rbs(&self) -> bool {
+        self.cfg.get("Lint/SelfAssignment", "AllowRBSInlineAnnotation") == Some("true")
+    }
+
+    /// Upstream's `rbs_inline_annotation?` asks whether a trailing `#: ...`
+    /// RBS comment is associated (via `ast_with_comments`) with a specific
+    /// sub-node (the rhs for `on_lvasgn`, the first mlhs target for
+    /// `on_masgn`, the lhs reader for `on_or_asgn`/`on_and_asgn`, the
+    /// receiver for `on_send`). Every spec fixture keeps the whole offending
+    /// statement — and its trailing annotation, if any — on one physical
+    /// line, so "does a `#:`-comment sit on THIS line" is behaviorally
+    /// equivalent here and sidesteps reimplementing comment/node association.
+    fn self_assignment_rbs_annotated(&self, offset: usize) -> bool {
+        let line = self.idx.loc(offset).0;
+        self.comments.iter().any(|&(l, s, e)| l == line && self.src[s..e].starts_with(b"#:"))
+    }
+
+    /// Structural-equality shortcut for the node comparisons this cop makes
+    /// (`node.receiver == value_node.receiver`, `lhs.arguments == rhs.arguments`,
+    /// `rhs.children.first == lhs.children.first`, ...): every comparison
+    /// this cop needs is between two sub-expressions that, when equal, are
+    /// spelled identically (same variable name, same literal) — so byte-for-
+    /// byte source comparison stands in for whitequark's structural node
+    /// `==` without needing a general AST-equality routine.
+    fn sa_opt_recv_eq(&self, a: Option<&ruby_prism::Node>, b: Option<&ruby_prism::Node>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(x), Some(y)) => self.node_src(x) == self.node_src(y),
+            _ => false,
+        }
+    }
+    fn sa_args_eq(&self, a: &[ruby_prism::Node], b: &[ruby_prism::Node]) -> bool {
+        a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| self.node_src(x) == self.node_src(y))
+    }
+
+    /// Shared core for the four simple-var kinds (local/instance/class/global):
+    /// gate on enablement + RBS annotation, then let the caller's `matches`
+    /// closure decide (by rhs node type + name) whether this is a self-write.
+    fn self_assignment_var_check(
+        &mut self,
+        whole_start: usize,
+        rhs: &ruby_prism::Node,
+        matches: impl FnOnce(&ruby_prism::Node) -> bool,
+    ) {
+        const COP: &str = "Lint/SelfAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.self_assignment_allow_rbs() && self.self_assignment_rbs_annotated(whole_start) {
+            return;
+        }
+        if matches(rhs) {
+            self.push(whole_start, COP, false, "Self-assignment detected.");
+        }
+    }
+
+    /// `on_lvasgn`/`on_ivasgn`/`on_cvasgn`/`on_gvasgn` (`ASSIGNMENT_TYPE_TO_RHS_TYPE`):
+    /// `foo = foo`, `foo ||= foo`, `foo &&= foo`.
+    pub(crate) fn check_self_assignment_lvar(&mut self, whole_start: usize, name: &[u8], rhs: &ruby_prism::Node) {
+        self.self_assignment_var_check(whole_start, rhs, |r| {
+            r.as_local_variable_read_node().is_some_and(|v| v.name().as_slice() == name)
+        });
+    }
+    pub(crate) fn check_self_assignment_ivar(&mut self, whole_start: usize, name: &[u8], rhs: &ruby_prism::Node) {
+        self.self_assignment_var_check(whole_start, rhs, |r| {
+            r.as_instance_variable_read_node().is_some_and(|v| v.name().as_slice() == name)
+        });
+    }
+    pub(crate) fn check_self_assignment_cvar(&mut self, whole_start: usize, name: &[u8], rhs: &ruby_prism::Node) {
+        self.self_assignment_var_check(whole_start, rhs, |r| {
+            r.as_class_variable_read_node().is_some_and(|v| v.name().as_slice() == name)
+        });
+    }
+    pub(crate) fn check_self_assignment_gvar(&mut self, whole_start: usize, name: &[u8], rhs: &ruby_prism::Node) {
+        self.self_assignment_var_check(whole_start, rhs, |r| {
+            r.as_global_variable_read_node().is_some_and(|v| v.name().as_slice() == name)
+        });
+    }
+    /// `on_casgn`: only the bare-constant shape (`Foo = Foo`) is checked —
+    /// upstream compares `node.namespace == node.rhs.namespace` too, which is
+    /// why `Foo = ::Foo`/`Foo ||= ::Foo` (rhs scoped to top-level, namespace
+    /// `cbase` vs lhs's `nil`) never match; requiring the rhs to be a bare
+    /// `ConstantReadNode` (rather than a `ConstantPathNode`) reproduces that
+    /// for every namespace shape without modeling namespaces explicitly.
+    pub(crate) fn check_self_assignment_const(&mut self, whole_start: usize, name: &[u8], rhs: &ruby_prism::Node) {
+        self.self_assignment_var_check(whole_start, rhs, |r| {
+            r.as_constant_read_node().is_some_and(|v| v.name().as_slice() == name)
+        });
+    }
+
+    /// `on_masgn` / `multiple_self_assignment?`: `foo, bar = foo, bar` (and
+    /// the explicit-array form `foo, bar = [foo, bar]`). Only local/instance/
+    /// class/global-var targets ever match (`ASSIGNMENT_TYPE_TO_RHS_TYPE`
+    /// excludes `casgn`/`send`/`splat`), so a target of any other shape
+    /// anywhere in the list makes the whole `masgn` unflagged — ported via
+    /// `sa_masgn_pair_matches` returning `false` for those shapes.
+    pub(crate) fn check_self_assignment_masgn(&mut self, node: &ruby_prism::MultiWriteNode) {
+        const COP: &str = "Lint/SelfAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        let whole_start = node.location().start_offset();
+        if self.self_assignment_allow_rbs() && self.self_assignment_rbs_annotated(whole_start) {
+            return;
+        }
+        // rhs must be an explicit array — `foo, bar = *something` (splat) and
+        // `foo, bar = something` (a bare method-call rhs) are never arrays.
+        let Some(arr) = node.value().as_array_node() else { return };
+        let elems: Vec<ruby_prism::Node> = arr.elements().iter().collect();
+
+        let lefts: Vec<ruby_prism::Node> = node.lefts().iter().collect();
+        let rights: Vec<ruby_prism::Node> = node.rights().iter().collect();
+        let mut targets: Vec<ruby_prism::Node> = Vec::with_capacity(lefts.len() + rights.len() + 1);
+        targets.extend(lefts);
+        if let Some(rest) = node.rest() {
+            targets.push(rest);
+        }
+        targets.extend(rights);
+
+        if targets.is_empty() || targets.len() != elems.len() {
+            return;
+        }
+        let all_match = targets.iter().zip(elems.iter()).all(|(t, r)| sa_masgn_pair_matches(t, r));
+        if all_match {
+            self.push(whole_start, COP, false, "Self-assignment detected.");
+        }
+    }
+
+    /// `reader_self_assignment?`: does `rhs` read the exact same
+    /// `receiver.method_name(*key_args)` expression being written? Shared by
+    /// every "call/index write vs call/index READ" shape: plain `obj.attr =
+    /// obj.attr` / `hash[k] = hash[k]` (`on_send`'s `handle_attribute_assignment`/
+    /// `handle_key_assignment`, `method_name`/`key_args` taken from the LHS
+    /// write) and their `||=`/`&&=` counterparts (`CallOrWriteNode` &c., with
+    /// `key_args` empty for the attribute shape). A method-call key
+    /// (`hash[foo] ||= hash[foo]`) is deliberately never a match, since it
+    /// may return a different value each call.
+    fn sa_reader_match(
+        &self,
+        receiver: Option<&ruby_prism::Node>,
+        method_name: &[u8],
+        key_args: &[ruby_prism::Node],
+        rhs: &ruby_prism::Node,
+    ) -> bool {
+        let Some(rc) = rhs.as_call_node() else { return false };
+        if rc.name().as_slice() != method_name {
+            return false;
+        }
+        if !self.sa_opt_recv_eq(receiver, rc.receiver().as_ref()) {
+            return false;
+        }
+        if key_args.iter().any(|a| a.as_call_node().is_some()) {
+            return false;
+        }
+        let rc_args: Vec<ruby_prism::Node> =
+            rc.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        self.sa_args_eq(key_args, &rc_args)
+    }
+
+    /// `CallAndWriteNode`/`CallOrWriteNode` (attribute `foo.bar {||=,&&=} foo.bar`)
+    /// and `IndexAndWriteNode`/`IndexOrWriteNode` (`hash[k] {||=,&&=} hash[k]`) —
+    /// `or_and_asgn_self_assignment?`'s `:send`/`:csend` branch.
+    pub(crate) fn check_self_assignment_reader_write(
+        &mut self,
+        whole_start: usize,
+        receiver: Option<ruby_prism::Node>,
+        method_name: &[u8],
+        key_args: &[ruby_prism::Node],
+        rhs: &ruby_prism::Node,
+    ) {
+        const COP: &str = "Lint/SelfAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.self_assignment_allow_rbs() && self.self_assignment_rbs_annotated(whole_start) {
+            return;
+        }
+        if self.sa_reader_match(receiver.as_ref(), method_name, key_args, rhs) {
+            self.push(whole_start, COP, false, "Self-assignment detected.");
+        }
+    }
+
+    /// `on_send`/`on_csend`: plain `obj.attr = obj.attr` (`handle_attribute_assignment`)
+    /// and `hash[k] = hash[k]` / the explicit-call `obj.[]=(k, obj[k])` /
+    /// `obj&.[]=(k, obj[k])` forms (`handle_key_assignment`, dispatched off
+    /// `method?(:[]=)` — which also matches the explicit-call spelling, since
+    /// it has the exact same method name).
+    pub(crate) fn check_self_assignment_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/SelfAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        let is_key = name == b"[]=";
+        if !is_key && !is_assignment_method_name(name) {
+            return;
+        }
+        if self.self_assignment_allow_rbs() && self.self_assignment_rbs_annotated(node.location().start_offset()) {
+            return;
+        }
+        let arg_list: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let offends = if is_key {
+            // `node.last_argument` / `node.arguments[0...-1]`: the trailing
+            // arg is the value being written, everything before it is the
+            // index's own key arguments.
+            match arg_list.split_last() {
+                Some((value_node, key_args)) => {
+                    self.sa_reader_match(node.receiver().as_ref(), b"[]", key_args, value_node)
+                }
+                None => false,
+            }
+        } else if arg_list.len() == 1 {
+            // `first_argument.method_name.to_s == node.method_name.to_s.delete_suffix('=')`
+            match name.strip_suffix(b"=") {
+                Some(base) => self.sa_reader_match(node.receiver().as_ref(), base, &[], &arg_list[0]),
+                None => false,
+            }
+        } else {
+            false
+        };
+        if offends {
+            self.push(node.location().start_offset(), COP, false, "Self-assignment detected.");
+        }
+    }
+}
+
+/// `rhs_matches_lhs?` restricted to the shapes `ASSIGNMENT_TYPE_TO_RHS_TYPE`
+/// covers (local/instance/class/global-var targets only — a `casgn`, `send`
+/// (attribute/index), or `splat` target never matches, matching upstream's
+/// `Hash#[]` miss on those types).
+fn sa_masgn_pair_matches(target: &ruby_prism::Node, rhs_elem: &ruby_prism::Node) -> bool {
+    if let Some(t) = target.as_local_variable_target_node() {
+        return rhs_elem.as_local_variable_read_node().is_some_and(|r| r.name().as_slice() == t.name().as_slice());
+    }
+    if let Some(t) = target.as_instance_variable_target_node() {
+        return rhs_elem
+            .as_instance_variable_read_node()
+            .is_some_and(|r| r.name().as_slice() == t.name().as_slice());
+    }
+    if let Some(t) = target.as_class_variable_target_node() {
+        return rhs_elem.as_class_variable_read_node().is_some_and(|r| r.name().as_slice() == t.name().as_slice());
+    }
+    if let Some(t) = target.as_global_variable_target_node() {
+        return rhs_elem.as_global_variable_read_node().is_some_and(|r| r.name().as_slice() == t.name().as_slice());
+    }
+    false
+}
