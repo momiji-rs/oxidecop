@@ -6784,3 +6784,202 @@ impl<'a> super::Cops<'a> {
     }
 
 }
+impl<'a> super::Cops<'a> {
+
+    /// Style/CaseEquality — Avoid the use of the case equality operator `===`.
+    /// Checks for === calls and suggests alternatives based on the receiver type.
+    /// - For ranges: (1..10) === var → (1..10).include?(var)
+    /// - For constants: Array === var → var.is_a?(Array)
+    /// - For self.class: self.class === var → var.is_a?(self.class)
+    /// Respects AllowOnConstant and AllowOnSelfClass configuration options.
+    pub(crate) fn check_case_equality(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/CaseEquality";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Only handle === operator
+        if node.name().as_slice() != b"===" {
+            return;
+        }
+
+        let Some(lhs) = node.receiver() else { return };
+        let Some(args) = node.arguments() else { return };
+        let Some(rhs_node) = args.arguments().iter().next() else { return };
+
+        // Skip if receiver is a regexp
+        if lhs.as_regular_expression_node().is_some() || lhs.as_interpolated_regular_expression_node().is_some() {
+            return;
+        }
+
+        // Check AllowOnConstant config
+        let allow_on_constant = self.cfg.get(COP, "AllowOnConstant") == Some("true");
+        if (lhs.as_constant_read_node().is_some() || lhs.as_constant_path_node().is_some()) && allow_on_constant {
+            return;
+        }
+
+        // Check AllowOnSelfClass config
+        let allow_on_self_class = self.cfg.get(COP, "AllowOnSelfClass") == Some("true");
+        if is_self_class(&lhs) && allow_on_self_class {
+            return;
+        }
+
+        // Report offense at the === operator
+        let Some(msg_loc) = node.message_loc() else { return };
+        self.push(msg_loc.start_offset(), COP, true, "Avoid the use of the case equality operator `===`.");
+
+        // Try to generate an autocorrect
+        if let Some(replacement) = case_equality_replacement(&lhs, &rhs_node, self.src) {
+            let loc = node.location();
+            self.fixes.push((loc.start_offset(), loc.end_offset(), replacement));
+        }
+    }
+}
+
+/// Check if a node is `self.class`
+fn is_self_class(node: &ruby_prism::Node) -> bool {
+    if let Some(call) = node.as_call_node() {
+        // Check if it's a send call to :class on self (receiver is Self)
+        if call.name().as_slice() == b"class" {
+            if let Some(receiver) = call.receiver() {
+                if let Some(_) = receiver.as_self_node() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Generate replacement for a case equality call.
+/// Returns the full replacement bytes, or None if no replacement can be generated.
+fn case_equality_replacement(lhs: &ruby_prism::Node, rhs: &ruby_prism::Node, src: &[u8]) -> Option<Vec<u8>> {
+    // Get source code for lhs and rhs
+    let lhs_start = lhs.location().start_offset();
+    let lhs_end = lhs.location().end_offset();
+    let lhs_src = &src[lhs_start..lhs_end];
+
+    let rhs_start = rhs.location().start_offset();
+    let rhs_end = rhs.location().end_offset();
+    let rhs_src = &src[rhs_start..rhs_end];
+
+    if let Some(begin) = lhs.as_begin_node() {
+        // Check if it's a Range inside begin
+        if let Some(first_child) = begin.statements().and_then(|s| s.body().iter().next()) {
+            if first_child.as_range_node().is_some() {
+                // (1..10) === var → (1..10).include?(var)
+                let mut replacement = lhs_src.to_vec();
+                replacement.extend_from_slice(b".include?(");
+                replacement.extend_from_slice(rhs_src);
+                replacement.push(b')');
+                return Some(replacement);
+            }
+        }
+    } else if lhs.as_range_node().is_some() {
+        // Range without begin: 1..10 === var → (1..10).include?(var)
+        let mut replacement = b"(".to_vec();
+        replacement.extend_from_slice(lhs_src);
+        replacement.extend_from_slice(b").include?(");
+        replacement.extend_from_slice(rhs_src);
+        replacement.push(b')');
+        return Some(replacement);
+    } else if lhs.as_constant_read_node().is_some() || lhs.as_constant_path_node().is_some() {
+        // Constant: Array === var → var.is_a?(Array)
+        let rhs_needs_parens = needs_parentheses(rhs);
+        let mut replacement = if rhs_needs_parens { b"(".to_vec() } else { Vec::new() };
+        replacement.extend_from_slice(rhs_src);
+        if rhs_needs_parens {
+            replacement.push(b')');
+        }
+        replacement.extend_from_slice(b".is_a?(");
+        replacement.extend_from_slice(lhs_src);
+        replacement.push(b')');
+        return Some(replacement);
+    } else if is_self_class(lhs) {
+        // self.class: self.class === var → var.is_a?(self.class)
+        let rhs_needs_parens = needs_parentheses(rhs);
+        let mut replacement = if rhs_needs_parens { b"(".to_vec() } else { Vec::new() };
+        replacement.extend_from_slice(rhs_src);
+        if rhs_needs_parens {
+            replacement.push(b')');
+        }
+        replacement.extend_from_slice(b".is_a?(");
+        replacement.extend_from_slice(lhs_src);
+        replacement.push(b')');
+        return Some(replacement);
+    }
+
+    None
+}
+
+/// Check if RHS needs parentheses when converting Array === a + b to (a + b).is_a?(Array)
+fn needs_parentheses(node: &ruby_prism::Node) -> bool {
+    // and/or nodes need parentheses
+    if node.as_and_node().is_some() || node.as_or_node().is_some() {
+        return true;
+    }
+    // if/unless nodes need parentheses
+    if node.as_if_node().is_some() || node.as_unless_node().is_some() {
+        return true;
+    }
+    // range nodes need parentheses
+    if node.as_range_node().is_some() {
+        return true;
+    }
+    // Assignment nodes need parentheses
+    if node.as_local_variable_write_node().is_some()
+        || node.as_instance_variable_write_node().is_some()
+        || node.as_class_variable_write_node().is_some()
+        || node.as_global_variable_write_node().is_some()
+        || node.as_constant_write_node().is_some()
+        || node.as_constant_path_write_node().is_some()
+    {
+        return true;
+    }
+    // Call nodes: operator methods and unary operations need parentheses
+    if let Some(call) = node.as_call_node() {
+        let name = call.name().as_slice();
+        // Check for operator methods (including binary operators)
+        if is_operator_method_name(name) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if a method name is an operator method
+fn is_operator_method_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"|" | b"^"
+            | b"&"
+            | b"<=>"
+            | b"=="
+            | b"==="
+            | b"=~"
+            | b">"
+            | b">="
+            | b"<"
+            | b"<="
+            | b"<<"
+            | b">>"
+            | b"+"
+            | b"-"
+            | b"*"
+            | b"/"
+            | b"%"
+            | b"**"
+            | b"~"
+            | b"+@"
+            | b"-@"
+            | b"!@"
+            | b"~@"
+            | b"[]"
+            | b"[]="
+            | b"!"
+            | b"!="
+            | b"!~"
+            | b"`"
+    )
+}
