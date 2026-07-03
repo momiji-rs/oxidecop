@@ -5451,3 +5451,295 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((replace_range.0, replace_range.1, new_src));
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/SingleLineMethods — a single-line `def`/`defs` WITH a body
+    /// (`def foo; body end`). Endless methods (`def foo = body`, Ruby 3.0+)
+    /// are always accepted outright (`node.endless?`); a body-less one-liner
+    /// (`def foo; end`) is accepted too unless `AllowIfMethodIsEmpty: false`
+    /// (default `true`).
+    ///
+    /// Ported from rubocop's `on_def`/`on_defs` (aliased) + `Alignment` +
+    /// `LineBreakCorrector`. The autocorrect BRANCHES into either an endless
+    /// method or a multiline one; every edge below was live-probed against
+    /// the actual rubocop 1.88.0 gem (`rubocop -a --only
+    /// Style/SingleLineMethods` on scratch files, and
+    /// `RuboCop::ProcessedSource#ast` dumps) because `correct_to_endless?`'s
+    /// guards read subtly differently once ported off whitequark's node
+    /// types onto prism's:
+    ///
+    /// - `target_ruby_version < 3.0`, or `Style/EndlessMethod` disabled/
+    ///   disallowing (`disallow_endless_method_style?`: rubocop's
+    ///   `cop_enabled?` is `!!config['Enabled']`, so upstream's own
+    ///   `Enabled: pending` default.yml entry is TRUTHY and counts as "on" —
+    ///   matches `self.cfg.enabled`'s "no explicit `false`" default; ONLY an
+    ///   explicit `Enabled: false` or `EnforcedStyle: disallow` blocks it) →
+    ///   always multiline, never endless.
+    /// - a `nil` body (empty one-liner method, only reachable when
+    ///   `AllowIfMethodIsEmpty: false`) → always multiline.
+    /// - the def's own name ends in `=` and isn't a comparison operator
+    ///   (`==`/`===`/`!=`/`<=`/`>=`) — a setter (`foo=`) can't be written as
+    ///   an endless method → always multiline.
+    /// - the body is `return`/`break`/`next` → always multiline.
+    /// - the body is `if`/`unless`/`while`/`until` (rubocop's
+    ///   `basic_conditional?` — both the full-block AND modifier forms of
+    ///   `unless` alias to `if` in rubocop's own whitequark-parity AST;
+    ///   both prism node types are covered here) → always multiline.
+    ///   `case`/`case`-with-`in` are NOT in this set — confirmed live: they
+    ///   DO convert to endless.
+    /// - the body is `:begin`-typed: EITHER 2+ top-level statements
+    ///   (rubocop's implicit multi-statement wrap — prism: a
+    ///   `StatementsNode` with 2+ children) OR a bare `(expr)` single
+    ///   statement (prism: `ParenthesesNode` — whitequark quirk: parens
+    ///   synthesize a `:begin` node even around one expression) → always
+    ///   multiline.
+    /// - the body is an explicit `begin...end` keyword block (prism:
+    ///   `BeginNode` WITH a `begin_keyword_loc`, reached by unwrapping a
+    ///   single-statement `StatementsNode`) — rubocop's `:kwbegin` — →
+    ///   always multiline.
+    /// - a `rescue`/`ensure` clause attached DIRECTLY to the `def` with no
+    ///   `begin` keyword at all (prism: a `BeginNode` with NO
+    ///   `begin_keyword_loc`, returned straight from `def.body` with no
+    ///   `StatementsNode` wrapper at all) is `:rescue`/`:ensure`-typed in
+    ///   rubocop's AST, NOT `:begin`/`:kwbegin` — so it is NOT blocked.
+    ///   Confirmed live: `def foo; x; rescue; y; end` really is "corrected"
+    ///   by actual rubocop 1.88.0 to the broken `def foo() = x; rescue; y`.
+    ///   Ported verbatim (bug and all) — not exercised by the fixture.
+    /// - anything else (a plain call, literal, `case`, a call-with-block,
+    ///   ...) → endless.
+    pub(crate) fn check_single_line_methods(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/SingleLineMethods";
+        if !self.on(COP) {
+            return;
+        }
+        let loc = node.location();
+        let start_line = self.idx.loc(loc.start_offset()).0;
+        let end_line = self.idx.loc(loc.end_offset().saturating_sub(1)).0;
+        if start_line != end_line {
+            return; // node.single_line?
+        }
+        if node.equal_loc().is_some() {
+            return; // node.endless?
+        }
+        let body = node.body();
+        let allow_empty = self.cfg.get(COP, "AllowIfMethodIsEmpty") == Some("true");
+        if allow_empty && body.is_none() {
+            return;
+        }
+        self.push(loc.start_offset(), COP, true, "Avoid single-line method definitions.");
+        let kind = match body {
+            Some(b) => classify_slm_body(b),
+            None => SlmBody::None,
+        };
+        if self.slm_correct_to_endless_ok(node, &kind) {
+            self.slm_correct_to_endless(node, &kind);
+        } else {
+            self.slm_correct_to_multiline(node, &kind);
+        }
+    }
+
+    /// `correct_to_endless?` — see the big doc comment above for the full,
+    /// live-probed guard-by-guard mapping.
+    fn slm_correct_to_endless_ok(&self, node: &ruby_prism::DefNode, kind: &SlmBody) -> bool {
+        if self.cfg.target_ruby() < 3.0 {
+            return false;
+        }
+        // `disallow_endless_method_style?`
+        if !self.cfg.enabled("Style/EndlessMethod") {
+            return false;
+        }
+        if self.cfg.enforced_style("Style/EndlessMethod") == "disallow" {
+            return false;
+        }
+        match kind {
+            SlmBody::None | SlmBody::Paren(_) | SlmBody::Multi(_) | SlmBody::KwBegin(_) => false,
+            SlmBody::Other(n) => {
+                if n.as_if_node().is_some()
+                    || n.as_unless_node().is_some()
+                    || n.as_while_node().is_some()
+                    || n.as_until_node().is_some()
+                    || n.as_return_node().is_some()
+                    || n.as_break_node().is_some()
+                    || n.as_next_node().is_some()
+                {
+                    return false;
+                }
+                // `body_node.parent.assignment_method?`: the DEF's own name
+                // (its "parent", from the body's point of view) ends in `=`
+                // and isn't a comparison operator.
+                let name = node.name().as_slice();
+                !(name.ends_with(b"=") && !matches!(name, b"==" | b"===" | b"!=" | b"<=" | b">="))
+            }
+        }
+    }
+
+    /// `correct_to_endless` — `def #{receiver}#{name}#{arguments} = #{body}`,
+    /// replacing the node's entire source range. `arguments` is the params
+    /// list's OWN literal source (parens included when the user wrote them,
+    /// EXCLUDED when they didn't — matching a genuine rubocop quirk where a
+    /// parenless single param glues onto the method name with no space,
+    /// e.g. `def some_methodarg = body`), or the literal `"()"` when there
+    /// are no params at all.
+    fn slm_correct_to_endless(&mut self, node: &ruby_prism::DefNode, kind: &SlmBody) {
+        let SlmBody::Other(body) = kind else { return };
+        let mut out: Vec<u8> = b"def ".to_vec();
+        if let Some(recv) = node.receiver() {
+            out.extend_from_slice(self.node_src(&recv));
+            out.push(b'.');
+        }
+        out.extend_from_slice(node.name().as_slice());
+        match node.parameters() {
+            Some(params) => {
+                let mut s = params.location().start_offset();
+                let mut e = params.location().end_offset();
+                if let Some(lp) = node.lparen_loc() {
+                    s = lp.start_offset();
+                }
+                if let Some(rp) = node.rparen_loc() {
+                    e = rp.end_offset();
+                }
+                out.extend_from_slice(&self.src[s..e]);
+            }
+            None => out.extend_from_slice(b"()"),
+        }
+        out.extend_from_slice(b" = ");
+        out.extend_from_slice(&self.slm_method_body_source(body));
+        let loc = node.location();
+        self.fixes.push((loc.start_offset(), loc.end_offset(), out));
+    }
+
+    /// `method_body_source` + `require_parentheses?` — a bare (no-block,
+    /// non-safe-nav) call whose method name isn't a comparison/arithmetic
+    /// operator and takes at least one argument gets its args parenthesized
+    /// and comma-joined from their own sources (`head :ok` -> `head(:ok)`,
+    /// `head :ok, :bar` -> `head(:ok, :bar)`); everything else (including a
+    /// call already using parens — reconstructed identically) keeps its
+    /// literal source verbatim.
+    fn slm_method_body_source(&self, body: &ruby_prism::Node) -> Vec<u8> {
+        if let Some(call) = body.as_call_node() {
+            if call.block().is_none() && !call.is_safe_navigation() {
+                let name = call.name().as_slice();
+                let arithmetic = matches!(name, b"+" | b"-" | b"*" | b"/" | b"%" | b"**");
+                let comparison =
+                    matches!(name, b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<");
+                let args = call.arguments();
+                let has_args = args.as_ref().is_some_and(|a| !a.arguments().is_empty());
+                if !arithmetic && has_args && !comparison {
+                    let mut out = Vec::new();
+                    if let Some(recv) = call.receiver() {
+                        out.extend_from_slice(self.node_src(&recv));
+                        out.push(b'.');
+                    }
+                    out.extend_from_slice(name);
+                    out.push(b'(');
+                    let mut first = true;
+                    for a in args.unwrap().arguments().iter() {
+                        if !first {
+                            out.extend_from_slice(b", ");
+                        }
+                        first = false;
+                        out.extend_from_slice(self.node_src(&a));
+                    }
+                    out.push(b')');
+                    return out;
+                }
+            }
+        }
+        self.node_src(body).to_vec()
+    }
+
+    /// `correct_to_multiline` — break the body (and, for 2+ statements,
+    /// EACH top-level statement) onto its own freshly-indented line, then
+    /// the `end` keyword onto its own line at the `def`'s own indentation,
+    /// then move an end-of-line comment above the `def`. Ported from
+    /// `LineBreakCorrector.break_line_before`/`move_comment` — the same
+    /// primitives `check_trailing_body_on_method_definition` applies for a
+    /// different cop.
+    fn slm_correct_to_multiline(&mut self, node: &ruby_prism::DefNode, kind: &SlmBody) {
+        let keyword_start = node.def_keyword_loc().start_offset();
+        let keyword_col = self.idx.loc(keyword_start).1 - 1; // 0-based
+        let width: usize = self
+            .cfg
+            .param("Style/SingleLineMethods", "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2);
+        let indent1 = " ".repeat(keyword_col + width);
+        match kind {
+            SlmBody::None => {} // no body at all -> nothing to break before `end`
+            SlmBody::Paren(n) | SlmBody::KwBegin(n) | SlmBody::Other(n) => {
+                let start = n.location().start_offset();
+                self.fixes.push((start, start, format!("\n{indent1}").into_bytes()));
+            }
+            SlmBody::Multi(items) => {
+                for it in items.iter() {
+                    let start = it.location().start_offset();
+                    self.fixes.push((start, start, format!("\n{indent1}").into_bytes()));
+                }
+            }
+        }
+        // `break_line_before(corrector, node, node.loc.end, indent_steps: 0)`
+        if let Some(end_loc) = node.end_keyword_loc() {
+            let end_start = end_loc.start_offset();
+            let indent0 = " ".repeat(keyword_col);
+            self.fixes.push((end_start, end_start, format!("\n{indent0}").into_bytes()));
+        }
+        // `move_comment`: an EOL comment on the def's own opening line moves
+        // above the def, at the def's own indentation.
+        let start_line = self.idx.loc(keyword_start).0;
+        if let Some(&(_, cs, ce)) = self.comments.iter().find(|(line, _, _)| *line == start_line) {
+            let mut ins = self.src[cs..ce].to_vec();
+            ins.push(b'\n');
+            ins.extend(std::iter::repeat(b' ').take(keyword_col));
+            self.fixes.push((keyword_start, keyword_start, ins));
+            self.fixes.push((cs, ce, Vec::new()));
+        }
+    }
+}
+
+/// A `def`/`defs` node's BODY the way rubocop-ast's Prism translation
+/// surfaces it (see `check_single_line_methods`'s doc comment for the full
+/// mapping + live-probed edge cases): unwrap a `StatementsNode` with
+/// exactly one statement to that statement; 2+ statements become an
+/// implicit, delimiter-less `:begin` group; everything else (including a
+/// `BeginNode` reached WITHOUT going through a `StatementsNode` at all —
+/// the def's own direct rescue/ensure) passes through as itself.
+enum SlmBody<'pr> {
+    None,
+    /// A bare `(expr)` single statement — `:begin`-typed, WITH delimiters
+    /// (`parenthesized_call?`): broken onto its own line as ONE unit,
+    /// parens included.
+    Paren(ruby_prism::Node<'pr>),
+    /// 2+ top-level statements — `:begin`-typed, no delimiters: each
+    /// statement gets its own line.
+    Multi(ruby_prism::NodeList<'pr>),
+    /// An explicit `begin...end` keyword block — `:kwbegin`.
+    KwBegin(ruby_prism::Node<'pr>),
+    /// Anything else (a single non-parenthesized statement, or a `BeginNode`
+    /// reached directly — the def's own rescue/ensure).
+    Other(ruby_prism::Node<'pr>),
+}
+
+fn classify_slm_body<'pr>(body: ruby_prism::Node<'pr>) -> SlmBody<'pr> {
+    if let Some(stmts) = body.as_statements_node() {
+        let items = stmts.body();
+        return match items.len() {
+            0 => SlmBody::None,
+            1 => slm_classify_single(items.iter().next().unwrap()),
+            _ => SlmBody::Multi(items),
+        };
+    }
+    slm_classify_single(body)
+}
+
+fn slm_classify_single<'pr>(n: ruby_prism::Node<'pr>) -> SlmBody<'pr> {
+    if n.as_parentheses_node().is_some() {
+        return SlmBody::Paren(n);
+    }
+    if let Some(b) = n.as_begin_node() {
+        if b.begin_keyword_loc().is_some() {
+            return SlmBody::KwBegin(n);
+        }
+    }
+    SlmBody::Other(n)
+}
