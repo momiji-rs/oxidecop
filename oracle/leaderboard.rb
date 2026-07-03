@@ -126,6 +126,7 @@ COPS = {
   'Style/RedundantSortBy'            => 'style/redundant_sort_by',
   'Layout/SpaceInLambdaLiteral'      => 'layout/space_in_lambda_literal',
   'Layout/SpaceAroundEqualsInParameterDefault' => 'layout/space_around_equals_in_parameter_default',
+  'Layout/EndOfLine'                 => 'layout/end_of_line',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

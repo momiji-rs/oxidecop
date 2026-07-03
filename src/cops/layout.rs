@@ -2824,3 +2824,77 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((param_end, value_start, replacement));
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/EndOfLine — checks for Windows-style (CR+LF) vs Unix-style (LF)
+    /// line endings. Three styles supported: native (platform-dependent),
+    /// lf (Unix), crlf (Windows). Hooks from text-level check, scans all lines
+    /// before __END__ and reports only the first offense.
+    pub(crate) fn check_end_of_line(&mut self) {
+        const COP: &str = "Layout/EndOfLine";
+        if !self.on(COP) {
+            return;
+        }
+        if self.src.is_empty() {
+            return;
+        }
+
+        let configured_style = self.cfg.enforced_style(COP); // native / lf / crlf
+        // native = platform line ending; this build never targets Windows.
+        let effective_style = if configured_style == "native" { "lf" } else { configured_style };
+
+        // Upstream gates on `last_line = processed_source.tokens.last.line`:
+        // trailing blank lines and __END__ data carry no tokens and are never
+        // checked. Comments ARE tokens, so "last line with any non-whitespace
+        // content before __END__" is the same boundary.
+        let mut last_line = 0usize;
+        for (i, &start) in self.idx.starts.iter().enumerate() {
+            let line_no = i + 1;
+            if self.data_line.is_some_and(|d| line_no >= d) {
+                break;
+            }
+            let end = self.idx.starts.get(i + 1).copied().unwrap_or(self.src.len());
+            if self.src[start..end].iter().any(|b| !b.is_ascii_whitespace()) {
+                last_line = line_no;
+            }
+        }
+
+        for i in 0..last_line {
+            // The line INCLUDING its terminator, like String#each_line.
+            let start = self.idx.starts[i];
+            let end = self.idx.starts.get(i + 1).copied().unwrap_or(self.src.len());
+            let line = &self.src[start..end];
+
+            let offense = match effective_style {
+                // `line.end_with?("\r", "\r\n")`
+                "lf" => {
+                    if line.ends_with(b"\r\n") || line.ends_with(b"\r") {
+                        Some("Carriage return character detected.")
+                    } else {
+                        None
+                    }
+                }
+                _ => {
+                    // crlf: MSG_MISSING unless the line ends \r\n; but if the
+                    // LAST checked line has no LF at all, a missing CR there
+                    // is unimportant (`unimportant_missing_cr?`).
+                    if line.ends_with(b"\r\n") {
+                        None
+                    } else if i + 1 == last_line && !line.ends_with(b"\n") {
+                        None
+                    } else {
+                        Some("Carriage return character missing.")
+                    }
+                }
+            };
+
+            if let Some(msg) = offense {
+                // Not autocorrectable upstream (Base without AutoCorrector).
+                self.push(start, COP, false, msg);
+                // Usually all or none of a file's lines share their ending;
+                // upstream reports only the first offense.
+                break;
+            }
+        }
+    }
+}
