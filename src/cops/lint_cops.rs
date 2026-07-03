@@ -7655,3 +7655,268 @@ impl<'a> Cops<'a> {
     }
 }
 
+
+// Lint/UnderscorePrefixedVariableName ---------------------------------------
+//
+// Upstream rides `VariableForce` (`after_leaving_scope`): for every local
+// variable whose name starts with `_`, if it has at least one EXPLICIT
+// reference (a real `lvar` read — NOT the implicit "everything's in scope"
+// reference a zero-arity `super` or bare `binding` call produces) and isn't
+// an allowed block keyword argument, offend at the variable's declaration.
+//
+// This repo has no shared variable-tracking force, so this ports a
+// standalone, scoped local-variable walk (precedent: Style/RedundantSelf's
+// `rs_scope` machinery in style.rs, though that only tracks NAMES, not
+// per-variable usage). One frame per active def/class/module/sclass/
+// block/lambda/top-level scope — exactly the node kinds Ruby itself treats
+// as a fresh local-variable namespace. `LocalVariableReadNode`,
+// `LocalVariableWriteNode`, and `LocalVariableTargetNode` all carry a
+// `depth` field that prism resolves at PARSE time using Ruby's own scoping
+// rules, so looking up which frame a name belongs to is just
+// `frames[frames.len() - 1 - depth]` — prism can never emit a depth that
+// would need to cross a hard (def/class/module/sclass) scope boundary,
+// since that isn't legal Ruby (confirmed by probing `Prism.parse` directly:
+// a `def` nested inside another method always resets `depth` to 0 for its
+// own locals), so one flat stack is sufficient; no separate bookkeeping is
+// needed to keep block-chains from leaking across a `def`.
+//
+// `super`/`binding` implicit references (upstream's `process_zero_arity_
+// super`/`process_send`) need no special-casing at all: neither ever
+// produces a `LocalVariableReadNode`, and only explicit reads count toward
+// `references.none?(&:explicit?)` — so simply never creating a reference
+// for them already matches upstream's semantics for free. A `super(*_)` or
+// `binding(*_)` DOES pick up `_` as an ordinary argument, which prism gives
+// us as a ordinary `LocalVariableReadNode` inside the call's `ArgumentsNode`
+// — caught by the plain read-node handling with no extra plumbing.
+impl<'a> super::Cops<'a> {
+    /// `after_leaving_scope`: runs the whole-file scope walk once (from
+    /// `visit_program_node` in mod.rs) and reports every `_`-prefixed local
+    /// that has an explicit reference, skipping ones exempted by
+    /// `AllowKeywordBlockArguments`. Not `extend AutoCorrector` upstream —
+    /// detection only, no autocorrect.
+    pub(crate) fn check_underscore_prefixed_variable_name(&mut self, node: &ruby_prism::ProgramNode) {
+        const COP: &str = "Lint/UnderscorePrefixedVariableName";
+        if !self.on(COP) {
+            return;
+        }
+        let allow_kw_block = self.cfg.get(COP, "AllowKeywordBlockArguments") == Some("true");
+        let mut c = UpvCollector { frames: vec![HashMap::new()], is_block: vec![false], vars: Vec::new() };
+        use ruby_prism::Visit;
+        c.visit(&node.as_node());
+        for v in &c.vars {
+            if !v.used || !v.name.starts_with(b"_") {
+                continue;
+            }
+            if v.allow_kw_block && allow_kw_block {
+                continue;
+            }
+            self.push(v.decl_offset, COP, false, "Do not use prefix `_` for a variable that is used.");
+        }
+    }
+}
+
+/// One declared local: its name, the offset of its FIRST declaration in its
+/// scope (upstream anchors the offense there even after reassignment), and
+/// whether it was ever read explicitly.
+struct UpvVar {
+    name: Vec<u8>,
+    decl_offset: usize,
+    used: bool,
+    /// `variable.block_argument? && variable.keyword_argument?` — a keyword
+    /// parameter (required or optional) declared directly in a block's OR
+    /// lambda's own parameter list (never a `def`'s).
+    allow_kw_block: bool,
+}
+
+/// Lint/UnderscorePrefixedVariableName: the scope walk. `frames`/`is_block`
+/// are parallel stacks (one entry per currently-open def/class/module/
+/// sclass/block/lambda/top-level scope); `vars` is the flat storage all
+/// frames index into by name.
+struct UpvCollector {
+    frames: Vec<HashMap<Vec<u8>, usize>>,
+    is_block: Vec<bool>,
+    vars: Vec<UpvVar>,
+}
+
+impl UpvCollector {
+    fn frame_for_depth(&self, depth: u32) -> usize {
+        self.frames.len().saturating_sub(1).saturating_sub(depth as usize)
+    }
+    /// `variable_table.declare_variable(name, node) unless variable_exist?
+    /// (name)` — a subsequent write/param with the same name in the SAME
+    /// target frame is a no-op (the offense always anchors on the original
+    /// declaration, not a reassignment).
+    fn declare(&mut self, name: &[u8], depth: u32, anchor: usize, allow_kw_block: bool) {
+        let idx = self.frame_for_depth(depth);
+        self.declare_in(idx, name, anchor, allow_kw_block);
+    }
+    /// Parameters/shadow-locals always declare into the CURRENT (innermost)
+    /// frame — there's no `depth` field for them, they can only ever
+    /// introduce a name in their own parameter list's scope.
+    fn declare_here(&mut self, name: &[u8], anchor: usize, allow_kw_block: bool) {
+        let here = self.frames.len() - 1;
+        self.declare_in(here, name, anchor, allow_kw_block);
+    }
+    fn declare_in(&mut self, idx: usize, name: &[u8], anchor: usize, allow_kw_block: bool) {
+        if self.frames[idx].contains_key(name) {
+            return;
+        }
+        let var_idx = self.vars.len();
+        self.vars.push(UpvVar { name: name.to_vec(), decl_offset: anchor, used: false, allow_kw_block });
+        self.frames[idx].insert(name.to_vec(), var_idx);
+    }
+    /// `variable.reference!(node)` for a plain `lvar` read — the only kind
+    /// of reference this cop ever sees, since `super`/`binding`'s implicit
+    /// references are never materialized here (see the module comment).
+    fn reference(&mut self, name: &[u8], depth: u32) {
+        let idx = self.frame_for_depth(depth);
+        if let Some(&var_idx) = self.frames[idx].get(name) {
+            self.vars[var_idx].used = true;
+        }
+    }
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for UpvCollector {
+    // `def`/`class`/`module`/`sclass` are hard scope boundaries: the parts
+    // evaluated in the ENCLOSING scope (a `defs` receiver, a class's
+    // superclass/constant path, `class << expr`'s `expr`) are visited
+    // BEFORE the new frame is pushed; only the params/body run inside it.
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        if let Some(recv) = node.receiver() {
+            self.visit(&recv);
+        }
+        self.frames.push(HashMap::new());
+        self.is_block.push(false);
+        if let Some(params) = node.parameters() {
+            self.visit_parameters_node(&params);
+        }
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.frames.pop();
+        self.is_block.pop();
+    }
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        self.visit(&node.constant_path());
+        if let Some(sup) = node.superclass() {
+            self.visit(&sup);
+        }
+        self.frames.push(HashMap::new());
+        self.is_block.push(false);
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.frames.pop();
+        self.is_block.pop();
+    }
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        self.visit(&node.constant_path());
+        self.frames.push(HashMap::new());
+        self.is_block.push(false);
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.frames.pop();
+        self.is_block.pop();
+    }
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        self.visit(&node.expression());
+        self.frames.push(HashMap::new());
+        self.is_block.push(false);
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.frames.pop();
+        self.is_block.pop();
+    }
+    // Blocks and lambdas are SOFT scopes: they may close over an enclosing
+    // frame (via `depth`), so they get their own frame but are marked
+    // `is_block` for the `AllowKeywordBlockArguments` gate. Default
+    // traversal (params, then body) is otherwise exactly what we want.
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        self.frames.push(HashMap::new());
+        self.is_block.push(true);
+        ruby_prism::visit_block_node(self, node);
+        self.frames.pop();
+        self.is_block.pop();
+    }
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.frames.push(HashMap::new());
+        self.is_block.push(true);
+        ruby_prism::visit_lambda_node(self, node);
+        self.frames.pop();
+        self.is_block.pop();
+    }
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.declare(node.name().as_slice(), node.depth(), node.name_loc().start_offset(), false);
+        self.visit(&node.value());
+    }
+    // `masgn` targets (`foo, bar = baz`), `case/in` pattern bindings, and
+    // `foo => bar` rightward assignment all reuse this one node type —
+    // upstream's PATTERN_MATCH_VARIABLE_TYPE (`:match_var`) and masgn's
+    // plain `lvasgn` targets are BOTH just declarations here; either way the
+    // anchor is `node.loc.name` (this node's own span, no separate name_loc).
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        self.declare(node.name().as_slice(), node.depth(), node.location().start_offset(), false);
+    }
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.reference(node.name().as_slice(), node.depth());
+    }
+    fn visit_required_parameter_node(&mut self, node: &ruby_prism::RequiredParameterNode<'pr>) {
+        self.declare_here(node.name().as_slice(), node.location().start_offset(), false);
+    }
+    fn visit_optional_parameter_node(&mut self, node: &ruby_prism::OptionalParameterNode<'pr>) {
+        self.declare_here(node.name().as_slice(), node.name_loc().start_offset(), false);
+        self.visit(&node.value());
+    }
+    fn visit_rest_parameter_node(&mut self, node: &ruby_prism::RestParameterNode<'pr>) {
+        // anonymous `*` (no name) declares nothing — `process_variable_
+        // declaration`'s `return unless variable_name` upstream.
+        if let (Some(name), Some(loc)) = (node.name(), node.name_loc()) {
+            self.declare_here(name.as_slice(), loc.start_offset(), false);
+        }
+    }
+    fn visit_required_keyword_parameter_node(&mut self, node: &ruby_prism::RequiredKeywordParameterNode<'pr>) {
+        let is_block = *self.is_block.last().unwrap_or(&false);
+        self.declare_here(node.name().as_slice(), node.name_loc().start_offset(), is_block);
+    }
+    fn visit_optional_keyword_parameter_node(&mut self, node: &ruby_prism::OptionalKeywordParameterNode<'pr>) {
+        let is_block = *self.is_block.last().unwrap_or(&false);
+        self.declare_here(node.name().as_slice(), node.name_loc().start_offset(), is_block);
+        self.visit(&node.value());
+    }
+    fn visit_keyword_rest_parameter_node(&mut self, node: &ruby_prism::KeywordRestParameterNode<'pr>) {
+        if let (Some(name), Some(loc)) = (node.name(), node.name_loc()) {
+            self.declare_here(name.as_slice(), loc.start_offset(), false);
+        }
+    }
+    // `&block` — a method/block's block-PASS parameter, not a block node.
+    fn visit_block_parameter_node(&mut self, node: &ruby_prism::BlockParameterNode<'pr>) {
+        if let (Some(name), Some(loc)) = (node.name(), node.name_loc()) {
+            self.declare_here(name.as_slice(), loc.start_offset(), false);
+        }
+    }
+    // `shadowarg` — a block-local variable (`obj.each { |arg; this| }`).
+    fn visit_block_local_variable_node(&mut self, node: &ruby_prism::BlockLocalVariableNode<'pr>) {
+        self.declare_here(node.name().as_slice(), node.location().start_offset(), false);
+    }
+    // Regexp named captures (`/(?<_foo>\w+)/ =~ str`) — upstream's
+    // `match_with_lvasgn`. Location = the REGEXP node's own range (`node.
+    // children.first.source_range`), shared by every name this match
+    // declares — NOT each target's own span. Handled directly (not via the
+    // generic `visit_local_variable_target_node` dispatch) so an ordinary
+    // masgn/pattern target's anchor logic doesn't get reused here.
+    fn visit_match_write_node(&mut self, node: &ruby_prism::MatchWriteNode<'pr>) {
+        let call = node.call();
+        let anchor = call.receiver().map(|r| r.location().start_offset());
+        ruby_prism::visit_call_node(self, &call);
+        if let Some(anchor) = anchor {
+            for t in node.targets().iter() {
+                if let Some(tgt) = t.as_local_variable_target_node() {
+                    self.declare(tgt.name().as_slice(), tgt.depth(), anchor, false);
+                }
+            }
+        }
+    }
+}
+

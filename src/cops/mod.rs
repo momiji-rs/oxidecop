@@ -183,7 +183,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/WhileUntilModifier",
     "Lint/ImplicitStringConcatenation",
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
-    "Style/NonNilCheck", "Style/MixinUsage",
+    "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName",
 ];
 
 impl Engine {
@@ -1747,6 +1747,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         } else {
             None
         };
+        self.check_underscore_prefixed_variable_name(node);
         ruby_prism::visit_program_node(self, node);
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
