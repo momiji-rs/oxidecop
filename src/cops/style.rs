@@ -3527,3 +3527,104 @@ fn remove_surrounding_parens(src: &[u8]) -> Vec<u8> {
         src.to_vec()
     }
 }
+impl<'a> super::Cops<'a> {
+    /// Style/RedundantSortBy — Identifies places where `sort_by { ... }`
+    /// can be replaced by `sort`. Detects three patterns:
+    /// 1. Regular block: `sort_by { |x| x }`
+    /// 2. Numbered block: `sort_by { _1 }`
+    /// 3. It-block: `sort_by { it }`
+    pub(crate) fn check_redundant_sort_by(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/RedundantSortBy";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Check if this is a `.sort_by` call
+        if node.name().as_slice() != b"sort_by" {
+            return;
+        }
+
+        // Must have a block
+        let Some(block_node) = node.block().and_then(|b| b.as_block_node()) else {
+            return;
+        };
+
+        // Check the block parameters and body
+        let Some(message) = self.redundant_sort_by_pattern(&block_node) else {
+            return;
+        };
+
+        // The offense range spans from the selector start to the block's end
+        let selector_start = node.message_loc().map(|l| l.start_offset()).unwrap_or_else(|| node.location().start_offset());
+        let block_end = block_node.location().end_offset();
+
+        self.push(selector_start, COP, true, message);
+        self.fixes.push((selector_start, block_end, b"sort".to_vec()));
+    }
+
+    /// Check if a block is a redundant sort_by pattern.
+    /// Returns the message string if redundant, None otherwise.
+    fn redundant_sort_by_pattern(&self, block: &ruby_prism::BlockNode) -> Option<String> {
+        let params = block.parameters();
+        let body = block.body()?;
+
+        // Get the block body statements
+        let stmts = body.as_statements_node()?;
+        let mut body_iter = stmts.body().iter();
+        let first_stmt = body_iter.next()?;
+
+        // Body must be a single statement
+        if body_iter.next().is_some() {
+            return None;
+        }
+
+        // Check for regular block pattern: { |x| x }
+        if let Some(bp) = params.as_ref().and_then(|p| p.as_block_parameters_node()) {
+            // Must have exactly one required parameter
+            let params_node = bp.parameters()?;
+            let requireds: Vec<_> = params_node.requireds().iter().collect();
+            if requireds.len() != 1
+                || params_node.optionals().iter().count() > 0
+                || params_node.rest().is_some()
+                || params_node.posts().iter().count() > 0
+                || params_node.keywords().iter().count() > 0
+                || params_node.keyword_rest().is_some()
+                || params_node.block().is_some()
+            {
+                return None;
+            }
+
+            let param_name = requireds[0].as_required_parameter_node()?.name();
+            let param_name_str = String::from_utf8_lossy(param_name.as_slice());
+
+            // Check if body is just a reference to that parameter
+            let lvar = first_stmt.as_local_variable_read_node()?;
+            if lvar.name().as_slice() == param_name.as_slice() {
+                return Some(format!("Use `sort` instead of `sort_by {{ |{}| {} }}`.", param_name_str, param_name_str));
+            }
+            return None;
+        }
+
+        // Check for numbered block pattern: { _1 }
+        if let Some(_np) = params.as_ref().and_then(|p| p.as_numbered_parameters_node()) {
+            // Check if body is just `_1`
+            let lvar = first_stmt.as_local_variable_read_node()?;
+            if lvar.name().as_slice() == b"_1" {
+                return Some("Use `sort` instead of `sort_by { _1 }`.".to_string());
+            }
+            return None;
+        }
+
+        // Check for it-block pattern: { it }
+        if let Some(_ip) = params.as_ref().and_then(|p| p.as_it_parameters_node()) {
+            // For it-blocks, the body is an ItLocalVariableReadNode (not LocalVariableReadNode)
+            if first_stmt.as_it_local_variable_read_node().is_some() {
+                return Some("Use `sort` instead of `sort_by { it }`.".to_string());
+            }
+            return None;
+        }
+
+        None
+    }
+}
+
