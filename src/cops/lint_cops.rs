@@ -3885,3 +3885,98 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/RedundantStringCoercion — checks for string conversion in string
+    /// interpolation, `print`, `puts`, and `warn` arguments, which is redundant.
+    pub(crate) fn check_redundant_string_coercion_in_call(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/RedundantStringCoercion";
+        if !self.on(COP) {
+            return;
+        }
+
+        let method_name = node.name().as_slice();
+        // Check if this is one of the target methods: print, puts, warn
+        if !matches!(method_name, b"print" | b"puts" | b"warn") {
+            return;
+        }
+
+        // Must be a bare call (no receiver)
+        if node.receiver().is_some() {
+            return;
+        }
+
+        // Check arguments for .to_s calls
+        if let Some(args) = node.arguments() {
+            for arg in args.arguments().iter() {
+                if let Some(call) = arg.as_call_node() {
+                    if Self::is_redundant_to_s_call(&call) {
+                        self.register_redundant_string_coercion_offense(
+                            &call,
+                            &format!("`{}`", String::from_utf8_lossy(method_name)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn check_redundant_string_coercion_in_interpolation(
+        &mut self,
+        node: &ruby_prism::EmbeddedStatementsNode,
+    ) {
+        const COP: &str = "Lint/RedundantStringCoercion";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Get the last statement in the interpolation
+        if let Some(stmts) = node.statements() {
+            if let Some(final_node) = stmts.body().last() {
+                if let Some(call) = final_node.as_call_node() {
+                    if Self::is_redundant_to_s_call(&call) {
+                        self.register_redundant_string_coercion_offense(&call, "interpolation");
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_redundant_to_s_call(call: &ruby_prism::CallNode) -> bool {
+        // Check if this is a .to_s call with no arguments
+        call.name().as_slice() == b"to_s" && call.arguments().is_none()
+    }
+
+    fn register_redundant_string_coercion_offense(
+        &mut self,
+        call: &ruby_prism::CallNode,
+        context: &str,
+    ) {
+        // Determine the message and replacement
+        let (message, replacement) = if let Some(receiver) = call.receiver() {
+            let recv_src = self.node_src(&receiver);
+            (
+                format!("Redundant use of `Object#to_s` in {}.", context),
+                recv_src.to_vec(),
+            )
+        } else {
+            (
+                format!("Use `self` instead of `Object#to_s` in {}.", context),
+                b"self".to_vec(),
+            )
+        };
+
+        // Get the selector location (the "to_s" part)
+        let sel_offset = call
+            .message_loc()
+            .map(|l| l.start_offset())
+            .unwrap_or_else(|| call.location().start_offset());
+
+        // Push the offense
+        self.push(sel_offset, "Lint/RedundantStringCoercion", true, message);
+
+        // Push the fix: replace the entire call with the replacement
+        let l = call.location();
+        self.fixes.push((l.start_offset(), l.end_offset(), replacement));
+    }
+}

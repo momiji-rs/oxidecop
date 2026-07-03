@@ -133,6 +133,7 @@ COPS = {
   'Style/RedundantPercentQ'          => 'style/redundant_percent_q',
   'Layout/SpaceBeforeFirstArg'       => 'layout/space_before_first_arg',
   'Lint/UnreachableCode'             => 'lint/unreachable_code',
+  'Lint/RedundantStringCoercion'     => 'lint/redundant_string_coercion',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
