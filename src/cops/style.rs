@@ -8244,3 +8244,280 @@ fn expand_path_parent_path(current_path: &str) -> String {
     }
     paths.join("/")
 }
+impl<'a> super::Cops<'a> {
+
+    /// Style/RedundantSelfAssignment — detects assignments like `foo = foo.concat(ary)`
+    /// where the method call returns self and modifies the receiver in place.
+    pub(crate) fn check_redundant_self_assignment_lvar(
+        &mut self,
+        node: &ruby_prism::LocalVariableWriteNode,
+    ) {
+        const COP: &str = "Style/RedundantSelfAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        let rhs = &node.value();
+        if !self.check_redundant_self_assignment_impl(rhs, &RsaReceiver::Lvar(node.name().as_slice())) {
+            return;
+        }
+
+        let call = match rhs.as_call_node() {
+            Some(c) => c,
+            _ => return,
+        };
+        let method_str = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+        let msg = format!(
+            "Redundant self assignment detected. Method `{}` modifies its receiver in place.",
+            method_str
+        );
+        self.push(node.operator_loc().start_offset(), COP, true, msg);
+
+        // Fix: replace the entire assignment with just the RHS
+        self.fixes.push((node.location().start_offset(), node.location().end_offset(), self.node_src(rhs).to_vec()));
+    }
+
+    /// Check for redundant self assignment on instance variables
+    pub(crate) fn check_redundant_self_assignment_ivar(
+        &mut self,
+        node: &ruby_prism::InstanceVariableWriteNode,
+    ) {
+        const COP: &str = "Style/RedundantSelfAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        let rhs = &node.value();
+        if !self.check_redundant_self_assignment_impl(rhs, &RsaReceiver::Ivar(node.name().as_slice())) {
+            return;
+        }
+
+        let call = match rhs.as_call_node() {
+            Some(c) => c,
+            _ => return,
+        };
+        let method_str = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+        let msg = format!(
+            "Redundant self assignment detected. Method `{}` modifies its receiver in place.",
+            method_str
+        );
+        self.push(node.operator_loc().start_offset(), COP, true, msg);
+
+        // Fix: replace the entire assignment with just the RHS
+        self.fixes.push((node.location().start_offset(), node.location().end_offset(), self.node_src(rhs).to_vec()));
+    }
+
+    /// Check for redundant self assignment on class variables
+    pub(crate) fn check_redundant_self_assignment_cvar(
+        &mut self,
+        node: &ruby_prism::ClassVariableWriteNode,
+    ) {
+        const COP: &str = "Style/RedundantSelfAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        let rhs = &node.value();
+        if !self.check_redundant_self_assignment_impl(rhs, &RsaReceiver::Cvar(node.name().as_slice())) {
+            return;
+        }
+
+        let call = match rhs.as_call_node() {
+            Some(c) => c,
+            _ => return,
+        };
+        let method_str = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+        let msg = format!(
+            "Redundant self assignment detected. Method `{}` modifies its receiver in place.",
+            method_str
+        );
+        self.push(node.operator_loc().start_offset(), COP, true, msg);
+
+        // Fix: replace the entire assignment with just the RHS
+        self.fixes.push((node.location().start_offset(), node.location().end_offset(), self.node_src(rhs).to_vec()));
+    }
+
+    /// Check for redundant self assignment on global variables
+    pub(crate) fn check_redundant_self_assignment_gvar(
+        &mut self,
+        node: &ruby_prism::GlobalVariableWriteNode,
+    ) {
+        const COP: &str = "Style/RedundantSelfAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        let rhs = &node.value();
+        if !self.check_redundant_self_assignment_impl(rhs, &RsaReceiver::Gvar(node.name().as_slice())) {
+            return;
+        }
+
+        let call = match rhs.as_call_node() {
+            Some(c) => c,
+            _ => return,
+        };
+        let method_str = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+        let msg = format!(
+            "Redundant self assignment detected. Method `{}` modifies its receiver in place.",
+            method_str
+        );
+        self.push(node.operator_loc().start_offset(), COP, true, msg);
+
+        // Fix: replace the entire assignment with just the RHS
+        self.fixes.push((node.location().start_offset(), node.location().end_offset(), self.node_src(rhs).to_vec()));
+    }
+
+    /// Check for redundant assignment via attribute setter (e.g., `other.foo = other.foo.concat(ary)`)
+    pub(crate) fn check_redundant_self_assignment_call(
+        &mut self,
+        node: &ruby_prism::CallNode,
+    ) {
+        const COP: &str = "Style/RedundantSelfAssignment";
+        if !self.on(COP) {
+            return;
+        }
+
+        // Must be a method call ending with `=` (assignment method)
+        let method_bytes = node.name().as_slice();
+        if !method_bytes.ends_with(b"=") {
+            return;
+        }
+
+        // Extract the attribute name (without the trailing `=`)
+        let attr_name = &method_bytes[..method_bytes.len() - 1];
+
+        let Some(receiver) = node.receiver() else { return };
+
+        // Get the first argument (the RHS of the assignment)
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.len() != 1 {
+            return;
+        }
+        let rhs = &args[0];
+
+        // Check if the RHS is a call to a method that returns self
+        let Some(rhs_call) = rhs.as_call_node() else { return };
+
+        // The RHS receiver should be a call to the same attribute on the same object
+        // E.g., for `other.foo = other.foo.concat(ary)`:
+        // - receiver is `other` (CallNode for the simple identifier access)
+        // - rhs_call.receiver() should also produce the same `other.foo` structure
+        let Some(rhs_receiver) = rhs_call.receiver() else { return };
+
+        // For the receivers to match, we need to check if accessing the same attribute
+        // on the same base object. For simple cases like `other.foo`, the receiver
+        // should be `other` and the method name in the RHS should match the attribute
+        // Let me check if the RHS is `receiver.attr_name.*(...)`
+        let Some(rhs_receiver_call) = rhs_receiver.as_call_node() else {
+            return;
+        };
+
+        // The RHS receiver should be a call to the same method name on the same base receiver
+        if rhs_receiver_call.name().as_slice() != attr_name {
+            return;
+        }
+
+        // Check if the base receivers match
+        let lhs_receiver_src = self.node_src(&receiver).to_vec();
+        let rhs_base_receiver = rhs_receiver_call.receiver();
+        let rhs_base_src = rhs_base_receiver.map(|r| self.node_src(&r).to_vec());
+
+        if Some(lhs_receiver_src) != rhs_base_src {
+            return;
+        }
+
+        // Check if the RHS method (the one being called on the attribute) returns self
+        let rhs_method = rhs_call.name().as_slice();
+        if !RSA_METHODS_RETURNING_SELF.contains(&rhs_method) {
+            return;
+        }
+
+        let method_str = String::from_utf8_lossy(rhs_method).into_owned();
+        let msg = format!(
+            "Redundant self assignment detected. Method `{}` modifies its receiver in place.",
+            method_str
+        );
+
+        // Find the `=` sign location for the error report
+        // The method name for assignment includes the `=`, so we can find it by searching for it
+        // in the source between the receiver end and the arguments start
+        let node_start = node.location().start_offset();
+        let node_end = node.location().end_offset();
+        let src = &self.src[node_start..node_end];
+
+        // Find the `=` in the source
+        if let Some(eq_pos) = src.iter().position(|&b| b == b'=') {
+            self.push(node_start + eq_pos, COP, true, msg);
+        } else {
+            // Fallback: use the start of the node
+            self.push(node_start, COP, true, msg);
+        }
+
+        // Fix: remove the assignment part and keep just the method call
+        // For `other.foo = other.foo.concat(ary)`, replace with `other.foo.concat(ary)`
+        self.fixes.push((node.location().start_offset(), node.location().end_offset(), self.node_src(rhs).to_vec()));
+    }
+
+    /// Helper to check if RHS is calling a self-returning method on the same receiver
+    fn check_redundant_self_assignment_impl(
+        &self,
+        rhs: &ruby_prism::Node,
+        expected_receiver: &RsaReceiver,
+    ) -> bool {
+        let Some(call) = rhs.as_call_node() else { return false };
+
+        // Check if method returns self
+        let method = call.name();
+        if !RSA_METHODS_RETURNING_SELF.contains(&method.as_slice()) {
+            return false;
+        }
+
+        // Check if the receiver matches
+        let Some(receiver) = call.receiver() else { return false };
+        expected_receiver.matches(&receiver)
+    }
+
+}
+
+/// Methods that return self (or equivalent) after modifying the receiver in place
+/// From RuboCop::Cop::Style::RedundantSelfAssignment::METHODS_RETURNING_SELF
+const RSA_METHODS_RETURNING_SELF: &[&[u8]] = &[
+    b"append", b"clear", b"collect!", b"compare_by_identity", b"concat", b"delete_if",
+    b"fill", b"initialize_copy", b"insert", b"keep_if", b"map!", b"merge!", b"prepend",
+    b"push", b"rehash", b"replace", b"reverse!", b"rotate!", b"shuffle!", b"sort!",
+    b"sort_by!", b"transform_keys!", b"transform_values!", b"unshift", b"update",
+];
+
+/// Helper enum for matching different types of receivers in redundant self assignment detection
+#[derive(Debug)]
+enum RsaReceiver<'a> {
+    Lvar(&'a [u8]),
+    Ivar(&'a [u8]),
+    Cvar(&'a [u8]),
+    Gvar(&'a [u8]),
+}
+
+impl<'a> RsaReceiver<'a> {
+    /// Check if the given node matches this receiver
+    fn matches(&self, node: &ruby_prism::Node) -> bool {
+        match self {
+            RsaReceiver::Lvar(name) => {
+                node.as_local_variable_read_node()
+                    .map(|n| n.name().as_slice() == *name)
+                    .unwrap_or(false)
+            }
+            RsaReceiver::Ivar(name) => {
+                node.as_instance_variable_read_node()
+                    .map(|n| n.name().as_slice() == *name)
+                    .unwrap_or(false)
+            }
+            RsaReceiver::Cvar(name) => {
+                node.as_class_variable_read_node()
+                    .map(|n| n.name().as_slice() == *name)
+                    .unwrap_or(false)
+            }
+            RsaReceiver::Gvar(name) => {
+                node.as_global_variable_read_node()
+                    .map(|n| n.name().as_slice() == *name)
+                    .unwrap_or(false)
+            }
+        }
+    }
+}

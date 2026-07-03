@@ -194,6 +194,7 @@ COPS = {
   'Style/ExponentialNotation'        => 'style/exponential_notation',
   'Style/StructInheritance'          => 'style/struct_inheritance',
   'Style/ExpandPathArguments'        => 'style/expand_path_arguments',
+  'Style/RedundantSelfAssignment'    => 'style/redundant_self_assignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
