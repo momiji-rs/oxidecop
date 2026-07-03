@@ -168,6 +168,8 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/EmptyLinesAroundAccessModifier",
     "Style/GlobalStdStream", "Style/MissingRespondToMissing",
     "Style/NestedModifier",
+    "Layout/MultilineArrayBraceLayout", "Layout/MultilineHashBraceLayout",
+    "Layout/MultilineMethodDefinitionBraceLayout",
 ];
 
 impl Engine {
@@ -660,6 +662,15 @@ pub(crate) struct Cops<'a> {
     // whitequark namespace child is a non-nil `cbase`, not `nil?`), so only
     // ConstantReadNode offsets are ever inserted here.
     pub(crate) gss_gvasgn_skip: HashSet<usize>,
+    // Layout/MultilineArrayBraceLayout / MultilineHashBraceLayout: start
+    // offsets of array/hash LITERALS that are either the RECEIVER of an
+    // enclosing call (any flavor, incl. safe-navigation — rubocop's
+    // `chained?`) or a direct positional ARGUMENT of an enclosing
+    // NON-safe-navigation call (`argument?`) — populated eagerly in
+    // `visit_call_node` before descending. Method-definition brace layout
+    // never needs this: its "node" is the parameters list, whose parent is
+    // always the `def`/`defs`, never a call.
+    pub(crate) mlbl_call_child: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -910,6 +921,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
         self.check_duplicate_hash_key(node);
+        self.check_multiline_hash_brace_layout(node);
         if self.ll_active {
             let l = node.location();
             self.ll_enter_collection(
@@ -1482,6 +1494,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_parentheses_node(self, node);
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+        self.check_multiline_array_brace_layout(node);
         self.check_nested_percent_literal(node);
         self.check_percent_symbol_array(node);
         self.check_percent_string_array(node);
@@ -1652,6 +1665,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
         self.check_ascii_def(node);
+        self.check_multiline_method_definition_brace_layout(node);
         self.check_missing_respond_to_missing(node);
         self.check_trailing_method_end_statement(node);
         self.check_optional_boolean_parameter(node);
@@ -1980,12 +1994,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Lint/UselessTimes: a safe-navigation call's receiver/args don't
         // count as "parent is :send" (whitequark's `:csend` != `:send`).
         let ut_track = !node.is_safe_navigation() && self.on("Lint/UselessTimes");
+        // Layout/Multiline{Array,Hash}BraceLayout: `chained?` (receiver of
+        // ANY call, safe-nav included) / `argument?` (positional argument of
+        // a non-safe-nav call only) — see `mlbl_call_child`.
+        let mlbl_track = self.on("Layout/MultilineArrayBraceLayout")
+            || self.on("Layout/MultilineHashBraceLayout");
         if let Some(r) = node.receiver() {
             if track_args {
                 self.assumed_arg_offsets.insert(r.location().start_offset());
             }
             if ut_track {
                 self.ut_call_child.insert(r.location().start_offset());
+            }
+            if mlbl_track {
+                self.mlbl_call_child.insert(r.location().start_offset());
             }
             self.visit(&r);
         }
@@ -2020,6 +2042,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
                 if ut_track {
                     self.ut_call_child.insert(arg.location().start_offset());
+                }
+                if mlbl_track && !node.is_safe_navigation() {
+                    self.mlbl_call_child.insert(arg.location().start_offset());
                 }
                 self.visit(&arg);
             }
@@ -2194,6 +2219,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         el_am_block_owns_next_stmts: false,
         el_am_ctor_block: false,
         gss_gvasgn_skip: HashSet::new(),
+        mlbl_call_child: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);

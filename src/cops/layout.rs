@@ -4521,3 +4521,361 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+// ===========================================================================
+// Layout/MultilineArrayBraceLayout, Layout/MultilineHashBraceLayout,
+// Layout/MultilineMethodDefinitionBraceLayout
+//
+// Ported from rubocop's shared `RuboCop::Cop::MultilineLiteralBraceLayout`
+// mixin (lib/rubocop/cop/mixin/multiline_literal_brace_layout.rb) plus its
+// `MultilineLiteralBraceCorrector`
+// (lib/rubocop/cop/correctors/multiline_literal_brace_corrector.rb). All
+// three cops share identical layout/correction logic; only the "children"
+// (array elements / hash pairs / method parameters), the opening/closing
+// token locations, and the four message strings differ per cop.
+// ===========================================================================
+
+/// The four style-specific message strings a cop's `SAME_LINE_MESSAGE` /
+/// `NEW_LINE_MESSAGE` / `ALWAYS_NEW_LINE_MESSAGE` / `ALWAYS_SAME_LINE_MESSAGE`
+/// constants hold.
+struct MlblMessages {
+    same_line: &'static str,
+    new_line: &'static str,
+    always_new_line: &'static str,
+    always_same_line: &'static str,
+}
+
+impl<'a> Cops<'a> {
+    /// `Layout::MultilineArrayBraceLayout#on_array` — `check_brace_layout(node)`.
+    pub(crate) fn check_multiline_array_brace_layout(&mut self, node: &ruby_prism::ArrayNode) {
+        const COP: &str = "Layout/MultilineArrayBraceLayout";
+        if !self.on(COP) {
+            return;
+        }
+        // `implicit_literal?`: `!node.loc.begin` — a comma-separated implicit
+        // array (`foo = a,\nb`) has no brackets at all.
+        let Some(open) = node.opening_loc() else { return };
+        let Some(close) = node.closing_loc() else { return };
+        let children: Vec<ruby_prism::Node> = node.elements().iter().collect();
+        const MSGS: MlblMessages = MlblMessages {
+            same_line: "The closing array brace must be on the same line as the last array \
+                element when the opening brace is on the same line as the first array element.",
+            new_line: "The closing array brace must be on the line after the last array \
+                element when the opening brace is on a separate line from the first array \
+                element.",
+            always_new_line: "The closing array brace must be on the line after the last array \
+                element.",
+            always_same_line: "The closing array brace must be on the same line as the last \
+                array element.",
+        };
+        self.check_multiline_literal_brace(
+            COP,
+            &MSGS,
+            (open.start_offset(), open.end_offset()),
+            (close.start_offset(), close.end_offset()),
+            &children,
+        );
+    }
+
+    /// `Layout::MultilineHashBraceLayout#on_hash` — `check_brace_layout(node)`.
+    /// A braceless keyword-argument hash (`foo(a: 1, b: 2)`) is a distinct
+    /// prism node kind (`KeywordHashNode`), never visited here, so the
+    /// "implicit" case rubocop guards against never reaches this hook at all.
+    pub(crate) fn check_multiline_hash_brace_layout(&mut self, node: &ruby_prism::HashNode) {
+        const COP: &str = "Layout/MultilineHashBraceLayout";
+        if !self.on(COP) {
+            return;
+        }
+        let open = node.opening_loc();
+        let close = node.closing_loc();
+        let children: Vec<ruby_prism::Node> = node.elements().iter().collect();
+        const MSGS: MlblMessages = MlblMessages {
+            same_line: "Closing hash brace must be on the same line as the last hash element \
+                when opening brace is on the same line as the first hash element.",
+            new_line: "Closing hash brace must be on the line after the last hash element when \
+                opening brace is on a separate line from the first hash element.",
+            always_new_line: "Closing hash brace must be on the line after the last hash \
+                element.",
+            always_same_line: "Closing hash brace must be on the same line as the last hash \
+                element.",
+        };
+        self.check_multiline_literal_brace(
+            COP,
+            &MSGS,
+            (open.start_offset(), open.end_offset()),
+            (close.start_offset(), close.end_offset()),
+            &children,
+        );
+    }
+
+    /// `Layout::MultilineMethodDefinitionBraceLayout#on_def`/`#on_defs` —
+    /// `check_brace_layout(node.arguments)`. Prism folds `def`/`defs` into
+    /// one `DefNode`; its `lparen_loc`/`rparen_loc` stand in for whitequark's
+    /// implicit-vs-explicit `arguments` node `loc.begin`/`loc.end`, and the
+    /// ordered parameter list (requireds, optionals, rest, posts, keywords,
+    /// keyword_rest, block — Ruby's fixed parameter order) stands in for its
+    /// `children`.
+    pub(crate) fn check_multiline_method_definition_brace_layout(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Layout/MultilineMethodDefinitionBraceLayout";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(lparen) = node.lparen_loc() else { return };
+        let Some(rparen) = node.rparen_loc() else { return };
+        let Some(params) = node.parameters() else { return };
+        let children = mlbl_ordered_params(&params);
+        const MSGS: MlblMessages = MlblMessages {
+            same_line: "Closing method definition brace must be on the same line as the last \
+                parameter when opening brace is on the same line as the first parameter.",
+            new_line: "Closing method definition brace must be on the line after the last \
+                parameter when opening brace is on a separate line from the first parameter.",
+            always_new_line: "Closing method definition brace must be on the line after the \
+                last parameter.",
+            always_same_line: "Closing method definition brace must be on the same line as the \
+                last parameter.",
+        };
+        self.check_multiline_literal_brace(
+            COP,
+            &MSGS,
+            (lparen.start_offset(), lparen.end_offset()),
+            (rparen.start_offset(), rparen.end_offset()),
+            &children,
+        );
+    }
+
+    /// Ported `MultilineLiteralBraceLayout#check_brace_layout` (minus the
+    /// early `ignored_literal?`/heredoc guards, folded in below) plus
+    /// `#check`/`#check_symmetrical`/`#check_new_line`/`#check_same_line`,
+    /// plus `MultilineLiteralBraceCorrector#call` and everything it calls.
+    fn check_multiline_literal_brace(
+        &mut self,
+        cop: &'static str,
+        msgs: &MlblMessages,
+        open: (usize, usize),
+        close: (usize, usize),
+        children: &[ruby_prism::Node],
+    ) {
+        // `empty_literal?`
+        if children.is_empty() {
+            return;
+        }
+        // `single_line?` — the whole literal (brace-to-brace) fits one line.
+        let whole_start_line = self.idx.loc(open.0).0;
+        let whole_end_line = self.idx.loc(close.1.saturating_sub(1).max(open.0)).0;
+        if whole_start_line == whole_end_line {
+            return;
+        }
+
+        let last = children.last().expect("checked non-empty above");
+        // `last_line_heredoc?(node.children.last)`: a heredoc's own
+        // `location()` covers only its opener line (the body/terminator are
+        // separate `content_loc`/`closing_loc`), so any composite node's
+        // location that recursively contains one is unreliable for "last
+        // line" purposes — moving the brace could land it mid-heredoc.
+        // rubocop's recursive line comparison amounts in practice to "does
+        // the last child contain a heredoc anywhere" (a heredoc terminator
+        // is always at-or-after its own opener's line, and Ruby's grammar
+        // forces anything textually after a heredoc argument onto a later
+        // line), so skip the whole check whenever one is found.
+        if mlbl_subtree_has_heredoc(last) {
+            return;
+        }
+
+        let first = &children[0];
+        let opening_same = self.idx.loc(open.0).0 == self.idx.loc(first.location().start_offset()).0;
+        let last_start = last.location().start_offset();
+        let last_end = last.location().end_offset();
+        let last_line = self.idx.loc(last_end.saturating_sub(1).max(last_start)).0;
+        let closing_same = self.idx.loc(close.0).0 == last_line;
+
+        let style = self.cfg.enforced_style(cop);
+        let message: &str = match style {
+            "new_line" => {
+                if !closing_same {
+                    return;
+                }
+                msgs.always_new_line
+            }
+            "same_line" => {
+                if closing_same {
+                    return;
+                }
+                msgs.always_same_line
+            }
+            _ => match (opening_same, closing_same) {
+                (true, true) | (false, false) => return,
+                (true, false) => msgs.same_line,
+                (false, true) => msgs.new_line,
+            },
+        };
+
+        self.push(close.0, cop, true, message.to_string());
+
+        // ---- MultilineLiteralBraceCorrector ----
+        if closing_same {
+            // `correct_same_line_brace`: push the closing token onto its own
+            // line, disturbing nothing else.
+            self.fixes.push((close.0, close.0, b"\n".to_vec()));
+            return;
+        }
+
+        // `new_line_needed_before_closing_brace?`: a trailing comment on the
+        // last child's own line blocks the move only when the literal is
+        // ITSELF a call's receiver or (non-safe-nav) positional argument —
+        // rubocop declines to untangle the comment from a resumed chain.
+        let last_commented = self.mlbl_comment_at_line(last_line);
+        if last_commented && self.mlbl_is_chained_or_argument(open.0) {
+            // Offense stands; no correction (matches upstream leaving it
+            // uncorrected here).
+            return;
+        }
+
+        // `last_element_range_with_trailing_comma(node).end`
+        let insert_at = self.mlbl_last_element_end_with_comma(last_end);
+
+        // `range_with_surrounding_space(node.loc.end, side: :left)`
+        let left_start = self.mlbl_left_space_start(close.0);
+        self.fixes.push((left_start, close.0, Vec::new()));
+
+        if last_commented {
+            // `select_content_to_be_inserted_after_last_element`: drag
+            // everything from the closing token through the end of ITS own
+            // line (e.g. a trailing comma from an enclosing literal) along
+            // with the brace, past the comment.
+            let line_end = self.mlbl_end_of_line(close.0);
+            let text = self.src[close.0..line_end].to_vec();
+            self.fixes.push((close.0, line_end, Vec::new()));
+            self.fixes.push((insert_at, insert_at, text));
+        } else {
+            let text = self.src[close.0..close.1].to_vec();
+            self.fixes.push((insert_at, insert_at, text));
+        }
+    }
+
+    fn mlbl_comment_at_line(&self, line: usize) -> bool {
+        self.comments.iter().any(|(l, _, _)| *l == line)
+    }
+
+    /// `node.chained?` (`parent&.call_type? && parent.receiver == node`) OR
+    /// `node.argument?` (`parent&.send_type? && parent.arguments.include?
+    /// (node)`) for the array/hash LITERAL itself — `mlbl_call_child` was
+    /// populated with exactly those start offsets while visiting calls.
+    /// Method-definition brace layout never calls this (its "node" — the
+    /// parameter list — is never a call's receiver/argument).
+    fn mlbl_is_chained_or_argument(&self, literal_start: usize) -> bool {
+        self.mlbl_call_child.contains(&literal_start)
+    }
+
+    /// `range_with_surrounding_space(children(node).last.source_range,
+    /// side: :right).end.resize(1)` compared against `,`: the position right
+    /// after the last child's trailing horizontal whitespace + newlines,
+    /// taken as a trailing comma only if that's what's actually there.
+    fn mlbl_last_element_end_with_comma(&self, last_end: usize) -> usize {
+        let mut pos = last_end;
+        while pos < self.src.len() && matches!(self.src[pos], b' ' | b'\t') {
+            pos += 1;
+        }
+        while pos < self.src.len() && self.src[pos] == b'\n' {
+            pos += 1;
+        }
+        if pos < self.src.len() && self.src[pos] == b',' {
+            pos + 1
+        } else {
+            last_end
+        }
+    }
+
+    /// `range_with_surrounding_space(range, side: :left)` at its default
+    /// (`newlines: true, whitespace: false`): walk left over horizontal
+    /// whitespace, then over newlines.
+    fn mlbl_left_space_start(&self, end: usize) -> usize {
+        let mut pos = end;
+        while pos > 0 && matches!(self.src[pos - 1], b' ' | b'\t') {
+            pos -= 1;
+        }
+        while pos > 0 && self.src[pos - 1] == b'\n' {
+            pos -= 1;
+        }
+        pos
+    }
+
+    /// The end of the (unterminated) line starting at `start` — used as
+    /// `range_by_whole_lines(node.source_range).end.end_pos` (default
+    /// `include_final_newline: false`), specialized to a range whose own
+    /// last line IS the line `start` sits on.
+    fn mlbl_end_of_line(&self, start: usize) -> usize {
+        let mut pos = start;
+        while pos < self.src.len() && self.src[pos] != b'\n' {
+            pos += 1;
+        }
+        pos
+    }
+}
+
+/// A `def`'s parameters in Ruby's fixed grammar order (requireds, optionals,
+/// rest, posts, keywords, keyword_rest, block) as generic nodes — the
+/// method-definition cop's `children(node)`.
+fn mlbl_ordered_params<'pr>(p: &ruby_prism::ParametersNode<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    let mut v = Vec::new();
+    for n in p.requireds().iter() {
+        v.push(n);
+    }
+    for n in p.optionals().iter() {
+        v.push(n);
+    }
+    if let Some(n) = p.rest() {
+        v.push(n);
+    }
+    for n in p.posts().iter() {
+        v.push(n);
+    }
+    for n in p.keywords().iter() {
+        v.push(n);
+    }
+    if let Some(n) = p.keyword_rest() {
+        v.push(n);
+    }
+    if let Some(n) = p.block() {
+        v.push(n.as_node());
+    }
+    v
+}
+
+/// `last_line_heredoc?`'s recursive descent, collapsed to "does this
+/// subtree contain a heredoc-opened string/xstring anywhere" (see the
+/// doc comment on its call site for why that's equivalent in practice).
+/// Reuses prism's own default traversal (`ruby_prism::Visit`) for every
+/// node kind except the four string flavors that can open a heredoc.
+struct MlblHeredocFinder {
+    found: bool,
+}
+impl<'pr> ruby_prism::Visit<'pr> for MlblHeredocFinder {
+    fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
+        if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) {
+            self.found = true;
+        }
+    }
+    fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
+        if node.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")) {
+            self.found = true;
+        }
+        ruby_prism::visit_interpolated_string_node(self, node);
+    }
+    fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
+        if node.opening_loc().as_slice().starts_with(b"<<") {
+            self.found = true;
+        }
+    }
+    fn visit_interpolated_x_string_node(&mut self, node: &ruby_prism::InterpolatedXStringNode<'pr>) {
+        if node.opening_loc().as_slice().starts_with(b"<<") {
+            self.found = true;
+        }
+        ruby_prism::visit_interpolated_x_string_node(self, node);
+    }
+}
+fn mlbl_subtree_has_heredoc(node: &ruby_prism::Node) -> bool {
+    use ruby_prism::Visit;
+    let mut f = MlblHeredocFinder { found: false };
+    f.visit(node);
+    f.found
+}
