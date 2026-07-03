@@ -175,6 +175,7 @@ COPS = {
   'Style/HashLikeCase'               => 'style/hash_like_case',
   'Style/PercentQLiterals'           => 'style/percent_q_literals',
   'Lint/PercentStringArray'          => 'lint/percent_string_array',
+  'Lint/MixedRegexpCaptureTypes'     => 'lint/mixed_regexp_capture_types',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

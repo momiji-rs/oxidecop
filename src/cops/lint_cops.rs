@@ -6551,3 +6551,248 @@ fn psa_contains_quotes_or_commas(literal: &[u8]) -> bool {
     false
 }
 
+impl<'a> super::Cops<'a> {
+    /// Lint/MixedRegexpCaptureTypes — a `Regexp` literal that mixes named
+    /// `(?<name>...)` captures with plain numbered `(...)` captures (the
+    /// numbered ones are silently ignored by Ruby's `Regexp` engine once a
+    /// named one is present, which is almost never what the author wants).
+    ///
+    /// Upstream (`RuboCop::Ext::RegexpNode#each_capture`) hands the regexp's
+    /// *un-interpolated* source off to the `regexp_parser` gem and walks the
+    /// resulting expression tree counting named vs. numbered capture groups.
+    /// `RegularExpressionNode` (the plain `/.../ ` / `%r{...}` literal, as
+    /// opposed to `InterpolatedRegularExpressionNode`) never contains
+    /// interpolation, so it always satisfies rubocop's
+    /// `return if node.interpolation?` guard — we only need to hook the
+    /// non-interpolated node type at all.
+    ///
+    /// Rather than pull in a full regex-parsing dependency, `scan_regexp_captures`
+    /// below is a small purpose-built scanner over the pattern's raw source
+    /// bytes that tracks just enough state (character-class depth, escapes,
+    /// `(?...)` group-type dispatch, extended-mode `#` comments) to tell
+    /// whether the pattern contains a named capture and/or a numbered one —
+    /// mirroring `Regexp::Expression`'s capturing-group semantics for that
+    /// one purpose, without being a general regex parser.
+    pub(crate) fn check_mixed_regexp_capture_types(&mut self, node: &ruby_prism::RegularExpressionNode) {
+        const COP: &str = "Lint/MixedRegexpCaptureTypes";
+        if !self.on(COP) {
+            return;
+        }
+        let content_loc = node.content_loc();
+        let src = &self.src[content_loc.start_offset()..content_loc.end_offset()];
+        let (has_named, has_numbered) = scan_regexp_captures(src, node.is_extended());
+        if !has_named || !has_numbered {
+            return;
+        }
+        const MSG: &str = "Do not mix named captures and numbered captures in a Regexp literal.";
+        self.push(node.location().start_offset(), COP, false, MSG);
+    }
+}
+
+/// Scans a regexp pattern's raw source bytes (already excluding the
+/// delimiters and trailing option letters) and reports whether it contains
+/// at least one named capturing group (`(?<name>...)` / `(?'name'...)`,
+/// excluding lookbehind `(?<=`/`(?<!`) and/or at least one plain numbered
+/// capturing group (a `(` not followed by `?`).
+///
+/// This purposefully does not build a full parse tree — it only needs to
+/// classify each top-level `(` it meets, which can be done by looking at
+/// the handful of bytes immediately following it. Contents unrelated to
+/// group/class delimiters (backslash escapes, character classes, `(?#...)`
+/// comments, `x`-mode `#...` comments, non-capturing/lookaround/atomic
+/// groups, inline-option groups, and numbered subexpression calls) are
+/// skipped over without recursing, since none of them can themselves
+/// introduce a capture.
+///
+/// Every group *with a body* (plain capture, named capture, non-capturing,
+/// lookaround, atomic, absent, and colon-bodied inline-option groups) is
+/// tallied in `depth`, decremented by the literal `)` that later closes it;
+/// `(?#...)` comments and bodyless directives/subexpression-calls (`(?i)`,
+/// `(?1)`) are fully self-contained and never touch `depth`. If `depth` is
+/// ever driven negative (a stray close-paren, as literally happens with
+/// `(?#comment (with parens))...` — the comment eats only up to the first
+/// `)`, leaving the next `)` unmatched) or ends up non-zero, real rubocop's
+/// `regexp_parser` backend fails to parse the pattern at all and — since
+/// `each_capture` then yields nothing for either type — no offense is ever
+/// raised; we mirror that by returning `(false, false)` in that case
+/// (mirroring: https://github.com/rubocop/rubocop/issues/8083).
+fn scan_regexp_captures(src: &[u8], extended: bool) -> (bool, bool) {
+    let mut has_named = false;
+    let mut has_numbered = false;
+    let n = src.len();
+    let mut i = 0usize;
+    // Depth of nested `[...]` character classes (Onigmo allows nesting via
+    // `&&` set intersection); parens/brackets inside a class are literal.
+    let mut class_depth: u32 = 0;
+    // Count of currently-open groups-with-a-body, used purely to detect
+    // whether the pattern is well-formed (balanced parens); see doc above.
+    let mut depth: i64 = 0;
+
+    while i < n {
+        let b = src[i];
+
+        // A backslash escapes the next byte everywhere, including inside a
+        // character class — it can never itself open/close a group or class.
+        if b == b'\\' {
+            i += 2;
+            continue;
+        }
+
+        if class_depth > 0 {
+            // POSIX bracket subexpressions (`[:alpha:]`, `[.ch.]`, `[=e=]`)
+            // are literal spans inside a class; skip to their own closer so
+            // their embedded `]` can't be mistaken for the class's closer.
+            if b == b'[' && i + 1 < n && matches!(src[i + 1], b':' | b'.' | b'=') {
+                let closer = [src[i + 1], b']'];
+                match find_bytes(&src[i + 2..], &closer) {
+                    Some(rel) => i += 2 + rel + 2,
+                    None => i += 2,
+                }
+                continue;
+            }
+            if b == b'[' {
+                class_depth += 1;
+                i += 1;
+                continue;
+            }
+            if b == b']' {
+                class_depth -= 1;
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Outside any character class.
+        if b == b'[' {
+            class_depth = 1;
+            i += 1;
+            // Negation and a then-immediately-following `]` don't close the
+            // class: `]` is only a literal-first-character allowance.
+            if i < n && src[i] == b'^' {
+                i += 1;
+            }
+            if i < n && src[i] == b']' {
+                i += 1;
+            }
+            continue;
+        }
+
+        if extended && b == b'#' {
+            // Free-spacing mode: `#` starts a comment that runs to EOL.
+            while i < n && src[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        if b == b')' {
+            // Closes the innermost open group-with-a-body. A `)` with
+            // nothing open is a syntax error real rubocop can't parse past.
+            if depth == 0 {
+                return (false, false);
+            }
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+
+        if b != b'(' {
+            i += 1;
+            continue;
+        }
+
+        // `b == b'('`.
+        if i + 1 >= n || src[i + 1] != b'?' {
+            // A plain, non-`?`-prefixed `(` is always a numbered capture.
+            has_numbered = true;
+            depth += 1;
+            i += 1;
+            continue;
+        }
+
+        // `(?...` — a special group; classify by what follows `?`.
+        let j = i + 2;
+        if j >= n {
+            i = j;
+            continue;
+        }
+        match src[j] {
+            b'#' => {
+                // `(?#comment)` — raw text up to the next `)`; no escaping.
+                // Self-contained: does not touch `depth`.
+                i = match find_bytes(&src[j + 1..], b")") {
+                    Some(rel) => j + 1 + rel + 1,
+                    None => n,
+                };
+            }
+            b'<' if j + 1 < n && matches!(src[j + 1], b'=' | b'!') => {
+                // Lookbehind `(?<=...)` / `(?<!...)` — not a capture, but
+                // still has a body that a later `)` must close.
+                depth += 1;
+                i = j + 2;
+            }
+            b'<' => {
+                // Named capture `(?<name>...)`.
+                has_named = true;
+                depth += 1;
+                i = match find_bytes(&src[j + 1..], b">") {
+                    Some(rel) => j + 1 + rel + 1,
+                    None => n,
+                };
+            }
+            b'\'' => {
+                // Named capture using quote delimiters: `(?'name'...)`.
+                has_named = true;
+                depth += 1;
+                i = match find_bytes(&src[j + 1..], b"'") {
+                    Some(rel) => j + 1 + rel + 1,
+                    None => n,
+                };
+            }
+            b':' | b'=' | b'!' | b'>' | b'~' => {
+                // Non-capturing group / lookahead / negative lookahead /
+                // atomic group / absent-expression group — all have bodies.
+                depth += 1;
+                i = j + 1;
+            }
+            _ => {
+                // An inline-option group (`(?imx-ix:...)`), a bodyless
+                // option directive (`(?imx)`), or a numbered/relative
+                // subexpression call (`(?1)`, `(?+1)`, `(?R)`) — none of
+                // these are captures. None of them contain a nested `(`
+                // before their own `:` (body-opener) or `)`
+                // (bodyless-closer, already fully self-contained), so a
+                // flat scan for whichever comes first is exact.
+                let mut k = j;
+                while k < n && src[k] != b':' && src[k] != b')' {
+                    k += 1;
+                }
+                if k < n && src[k] == b':' {
+                    depth += 1;
+                    i = k + 1;
+                } else if k < n {
+                    i = k + 1;
+                } else {
+                    i = n;
+                }
+            }
+        }
+    }
+
+    if depth != 0 || class_depth != 0 {
+        // Unbalanced groups or an unterminated character class: real
+        // rubocop's regexp_parser backend fails to parse this pattern, so
+        // `each_capture` (of either kind) comes up empty and no offense is
+        // ever raised — regardless of what we tallied above.
+        return (false, false);
+    }
+
+    (has_named, has_numbered)
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
