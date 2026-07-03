@@ -160,7 +160,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/NumericLiterals", "Style/NumericPredicate", "Style/RandomWithOffset",
     "Style/RedundantReturn", "Style/StringChars", "Style/StringLiterals",
     "Style/SymbolProc", "Style/UnpackFirst", "Style/ZeroLengthPredicate",
-    "Lint/RegexpAsCondition", "Style/MultilineIfModifier", "Lint/SelfAssignment",
+    "Lint/RegexpAsCondition", "Style/MultilineIfModifier",
 ];
 
 impl Engine {
