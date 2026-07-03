@@ -150,6 +150,7 @@ COPS = {
   'Lint/SelfAssignment'              => 'lint/self_assignment',
   'Layout/AccessModifierIndentation' => 'layout/access_modifier_indentation',
   'Layout/CaseIndentation'           => 'layout/case_indentation',
+  'Style/RedundantSelf'              => 'style/redundant_self',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

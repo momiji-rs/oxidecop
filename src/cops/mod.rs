@@ -146,7 +146,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody", "Lint/AmbiguousRegexpLiteral", "Layout/BlockEndNewline",
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
-    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords", "Style/RedundantPercentQ", "Layout/SpaceBeforeFirstArg", "Lint/UnreachableCode", "Lint/RedundantStringCoercion", "Style/EachForSimpleLoop", "Lint/RedundantWithIndex", "Layout/CommentIndentation", "Layout/DotPosition", "Lint/UselessSetterCall", "Lint/EmptyConditionalBody", "Style/ComparableClamp", "Style/RedundantFreeze", "Lint/LiteralInInterpolation", "Lint/EmptyBlock", "Lint/DuplicateMagicComment", "Style/NilLambda", "Lint/UselessMethodDefinition", "Lint/SelfAssignment", "Layout/AccessModifierIndentation", "Layout/CaseIndentation", "Style/RedundantSelf",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -550,6 +550,28 @@ pub(crate) struct Cops<'a> {
     // direct argument of a NON-access-modifier call (`do_something def m`) —
     // upstream's method_definition_with_modifier? skip.
     pub(crate) def_macro_args: HashSet<usize>,
+    // Style/RedundantSelf: per-active def/block scope, the set of local
+    // variable / parameter names known to disambiguate `self.x` from a bare
+    // `x` — rubocop's `@local_variables_scopes` aliases ONE mutable Array
+    // across every descendant of a def/block (`add_scope`), so a name pushed
+    // anywhere is visible scope-wide from that point on; a nested `block`
+    // literally reuses (shares) the enclosing scope's Rc (closures see outer
+    // locals — even ones only a nested block itself defines, matching
+    // upstream's heuristic), while a nested `def` always gets a fresh one
+    // (methods don't close over outer locals).
+    pub(crate) rs_scope_stack: Vec<std::rc::Rc<std::cell::RefCell<Vec<Vec<u8>>>>>,
+    // Style/RedundantSelf: TOP-LEVEL (no enclosing def/block) exemptions —
+    // upstream's identity-keyed hash gives each un-scoped node its own
+    // private entry; a (span, name) pair stands in for "is the candidate
+    // node an each_ancestor of the node that entry belongs to" via byte-range
+    // containment, which holds for any well-formed AST nesting.
+    pub(crate) rs_narrow: Vec<(usize, usize, Vec<u8>)>,
+    // Style/RedundantSelf: enclosing block ancestors, outermost first — (is
+    // this a PLAIN block, i.e. not `_1`/`it` numbered-param sugar; does it
+    // have NO `|...|` delimiters at all) — `it_method_in_block?`'s
+    // `each_ancestor(:block).first` (type-filtered!) +
+    // `empty_and_without_delimiters?`.
+    pub(crate) rs_block_stack: Vec<(bool, bool)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -857,6 +879,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_constant_path_and_write_node(self, node);
     }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_nested_ternary_operator(node);
         self.check_else_layout_if(node);
         self.check_assignment_in_condition(&node.predicate());
@@ -899,6 +922,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_else_layout_unless(node);
         // whitequark's parser has no distinct `unless` node type — `unless
         // cond` compiles to `(if cond nil body)`, so upstream's `on_if` (which
@@ -991,6 +1015,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
+        self.rs_lvar_write(node.name().as_slice(), &node.value());
         ruby_prism::visit_local_variable_write_node(self, node);
     }
     fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
@@ -1000,11 +1025,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
+        self.rs_lvar_write(node.name().as_slice(), &node.value());
         ruby_prism::visit_local_variable_or_write_node(self, node);
     }
     fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
+        self.rs_lvar_write(node.name().as_slice(), &node.value());
         ruby_prism::visit_local_variable_and_write_node(self, node);
     }
     fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
@@ -1034,6 +1061,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let op_end = node.operator_loc().end_offset();
         self.assignment_indentation_hook(lhs_start, op_end, node.value());
         self.check_self_assignment_masgn(node);
+        // Style/RedundantSelf: only plain local-var masgn targets carry a
+        // usable name upstream (`child.to_a.first` on a non-lvasgn target —
+        // e.g. an attr-writer or splat — yields a NODE, not a symbol, so it
+        // can never match a `method_name` and is effectively a no-op there).
+        for t in node.lefts().iter().chain(node.rights().iter()) {
+            if let Some(lv) = t.as_local_variable_target_node() {
+                let name = lv.name().as_slice().to_vec();
+                self.rs_lvar_write(&name, &node.value());
+            }
+        }
         ruby_prism::visit_multi_write_node(self, node);
     }
     fn visit_call_and_write_node(&mut self, node: &ruby_prism::CallAndWriteNode<'pr>) {
@@ -1099,6 +1136,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_when_then(node);
         self.check_multiline_when_then(node);
         ruby_prism::visit_when_node(self, node);
+    }
+    fn visit_in_node(&mut self, node: &ruby_prism::InNode<'pr>) {
+        self.check_redundant_self_in_pattern(node);
+        ruby_prism::visit_in_node(self, node);
     }
     fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
         let klass = node.name().as_slice();
@@ -1171,6 +1212,31 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
         self.check_block_end_newline(node);
         self.check_access_modifier_indentation_block(node);
+        // Style/RedundantSelf: a block CONTINUES (shares) the enclosing
+        // scope's name set when one is active — a real Ruby closure sees
+        // outer locals, and upstream's `add_scope(node,
+        // @local_variables_scopes[node])` reuses the SAME Array object, not a
+        // copy. At top level (no enclosing def/block) it starts fresh.
+        let is_plain = !matches!(&node.parameters(),
+            Some(p) if p.as_numbered_parameters_node().is_some() || p.as_it_parameters_node().is_some());
+        let no_delims = node.parameters().is_none();
+        self.rs_block_stack.push((is_plain, no_delims));
+        let rs_names = node
+            .parameters()
+            .and_then(|p| p.as_block_parameters_node())
+            .and_then(|bp| bp.parameters())
+            .map(|pp| style::rs_params_of(&pp))
+            .unwrap_or_default();
+        match self.rs_scope_stack.last() {
+            Some(top) => {
+                if !rs_names.is_empty() {
+                    top.borrow_mut().extend(rs_names);
+                }
+                let shared = top.clone();
+                self.rs_scope_stack.push(shared);
+            }
+            None => self.rs_scope_stack.push(std::rc::Rc::new(std::cell::RefCell::new(rs_names))),
+        }
         if let Some(params) = node.parameters() {
             self.visit(&params);
         }
@@ -1180,8 +1246,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
             self.visit(&body);
         }
+        self.rs_scope_stack.pop();
+        self.rs_block_stack.pop();
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_assignment_in_condition(&node.predicate());
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
         if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
@@ -1194,6 +1263,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth -= 1;
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_assignment_in_condition(&node.predicate());
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
         if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
@@ -1421,7 +1491,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.def_depth += 1;
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
+        // Style/RedundantSelf: a `def` ALWAYS starts a brand-new scope (even
+        // nested inside a block/def) — methods don't see enclosing locals.
+        let rs_names = node.parameters().map(|p| style::rs_params_of(&p)).unwrap_or_default();
+        self.rs_scope_stack.push(std::rc::Rc::new(std::cell::RefCell::new(rs_names)));
         ruby_prism::visit_def_node(self, node);
+        self.rs_scope_stack.pop();
         self.class_children_stack.pop();
         self.def_depth -= 1;
         self.ll_exit_collection();
@@ -1536,6 +1611,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        self.check_redundant_self(node);
         self.check_binary_operator_with_identical_operands(node);
         self.check_float_comparison(node);
         if self.ll_active {
@@ -1860,6 +1936,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         else_layout_seen: HashSet::new(),
         top_level_sole_stmt: None,
         def_macro_args: HashSet::new(),
+        rs_scope_stack: Vec::new(),
+        rs_narrow: Vec::new(),
+        rs_block_stack: Vec::new(),
     };
 
     let t = tick(&T_PREP, t);

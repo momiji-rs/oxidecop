@@ -4554,3 +4554,336 @@ fn nil_lambda_whole_lines(src: &[u8], start: usize, end: usize) -> (usize, usize
     }
     (s, e)
 }
+use ruby_prism::Visit;
+
+// Style/RedundantSelf ------------------------------------------------------
+//
+// Ported from rubocop's on_send/on_def/on_block/on_lvasgn/on_masgn/on_or_asgn
+// /on_and_asgn/on_op_asgn/on_if/on_while/on_until/on_in_pattern family. The
+// upstream cop keys a `Hash.new { |h, k| h[k] = [] }.compare_by_identity`
+// (`@local_variables_scopes`) by AST node identity: `add_scope` assigns the
+// SAME Array object to every descendant of a def/block, so a name pushed via
+// any descendant's entry is visible to the whole scope from that point on;
+// un-scoped (top-level) nodes each get their own private Array. We port this
+// as:
+//   - `rs_scope_stack`: one shared `Rc<RefCell<Vec<name>>>` per active
+//     def/block scope (see `visit_def_node`/`visit_block_node` in mod.rs) —
+//     pushing a name mutates the object every descendant already points at.
+//   - `rs_narrow`: (byte-span, name) pairs recorded once, up front, for
+//     un-scoped top-level exemptions — span containment stands in for
+//     "is the candidate call an each_ancestor of the node the identity-keyed
+//     entry belonged to", which holds for any well-formed AST nesting.
+//   - `rs_block_stack`: (is a plain — not numbered/`it` — block; has NO
+//     `|...|` delimiters at all) per enclosing block, for `it_method_in_block?`.
+//
+// Two prism-vs-whitequark shape differences make several upstream guards
+// (`allow_self`, the `node.parent&.mlhs_type?` check) unreachable dead code
+// here, for free:
+//   - `self.foo ||= x` / `&&=` / `+=` and masgn attr targets (`a, self.b = c,
+//     d`) are fused into their own write/target node kinds (CallOrWriteNode,
+//     CallAndWriteNode, CallOperatorWriteNode, CallTargetNode) — there is no
+//     separate reachable `CallNode` standing in for "self.foo" the way
+//     whitequark's translated AST exposes one as `on_or_asgn`'s `.lhs`, so
+//     `visit_call_node` (our `on_send`) never even sees a candidate there.
+//   - a plain single write (`self.foo = bar`) IS a genuine `CallNode` (name
+//     `foo=`), but carries prism's own `equal_loc` — exactly upstream's
+//     `setter_method?` (`loc?(:operator)`) signal — so it's excluded via
+//     `rs_regular_method_call` the same way, no extra plumbing needed.
+impl<'a> Cops<'a> {
+    /// `on_send`: `node.self_receiver? && regular_method_call?(node)` plus
+    /// the scope/kernel-method/`it`-in-block exemptions.
+    pub(crate) fn check_redundant_self(&mut self, node: &ruby_prism::CallNode) {
+        if !self.on("Style/RedundantSelf") {
+            return;
+        }
+        let Some(recv) = node.receiver() else { return };
+        if recv.as_self_node().is_none() {
+            return;
+        }
+        if !self.rs_regular_method_call(node) {
+            return;
+        }
+        if self.rs_it_method_in_block(node) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if RS_KERNEL_METHODS.contains(&name) {
+            return;
+        }
+        if self.rs_scope_allows(node.location().start_offset(), name) {
+            return;
+        }
+        let recv_loc = recv.location();
+        self.push(recv_loc.start_offset(), "Style/RedundantSelf", true, "Redundant `self` detected.");
+        // Two separate removals, exactly like upstream's
+        // `corrector.remove(node.receiver)` + `corrector.remove(node.loc.dot)`
+        // — NOT one merged span, so stray whitespace between `self` and `.`
+        // (`self . foo`) is left untouched just like the real cop.
+        self.fixes.push((recv_loc.start_offset(), recv_loc.end_offset(), Vec::new()));
+        if let Some(dot) = node.call_operator_loc() {
+            self.fixes.push((dot.start_offset(), dot.end_offset(), Vec::new()));
+        }
+    }
+
+    /// `regular_method_call?`: not an operator, a keyword-named method, a
+    /// camelCase (constant-look-alike) call, a setter, or `self.()`.
+    fn rs_regular_method_call(&self, node: &ruby_prism::CallNode) -> bool {
+        let name = node.name().as_slice();
+        if RS_OPERATOR_METHODS.contains(&name) {
+            return false;
+        }
+        if RS_KEYWORDS.contains(&name) {
+            return false;
+        }
+        if name.first().is_some_and(u8::is_ascii_uppercase) {
+            return false;
+        }
+        // `setter_method?` (`loc?(:operator)`) — prism's `equal_loc` is set
+        // exactly for the `x.y = z` assignment-sugar shape.
+        if node.equal_loc().is_some() {
+            return false;
+        }
+        // `implicit_call?`: `self.()`, not `self.call`.
+        if name == b"call" && node.message_loc().is_none() {
+            return false;
+        }
+        true
+    }
+
+    /// `it_method_in_block?`: bare `self.it` inside the nearest enclosing
+    /// PLAIN block (skipping `_1`/`it`-numbered ones, matching upstream's
+    /// `each_ancestor(:block)` type filter) that has no `|...|` at all.
+    fn rs_it_method_in_block(&self, node: &ruby_prism::CallNode) -> bool {
+        if node.name().as_slice() != b"it" {
+            return false;
+        }
+        let Some(&(_, no_delims)) = self.rs_block_stack.iter().rev().find(|(is_plain, _)| *is_plain) else {
+            return false;
+        };
+        if !no_delims {
+            return false;
+        }
+        let args_empty = node.arguments().is_none_or(|a| a.arguments().iter().count() == 0);
+        args_empty && node.block().is_none()
+    }
+
+    /// Does the current scope (if any) or a recorded top-level narrow
+    /// exemption make `self.<name>` at `off` redundant?
+    fn rs_scope_allows(&self, off: usize, name: &[u8]) -> bool {
+        if let Some(top) = self.rs_scope_stack.last() {
+            if top.borrow().iter().any(|n| n.as_slice() == name) {
+                return true;
+            }
+        }
+        self.rs_narrow.iter().any(|(s, e, n)| off >= *s && off < *e && n.as_slice() == name)
+    }
+
+    /// `add_lhs_to_local_variables_scopes`: if `rhs` is itself a call with
+    /// arguments, the name disambiguates each ARGUMENT subtree; otherwise it
+    /// disambiguates `rhs` itself (and, transitively, everything nested
+    /// inside it).
+    pub(crate) fn rs_lvar_write(&mut self, lhs: &[u8], rhs: &ruby_prism::Node) {
+        if let Some(call) = rhs.as_call_node() {
+            if let Some(args) = call.arguments() {
+                let arglist: Vec<_> = args.arguments().iter().collect();
+                if !arglist.is_empty() {
+                    for a in &arglist {
+                        let l = a.location();
+                        self.rs_push_name(l.start_offset(), l.end_offset(), lhs);
+                    }
+                    return;
+                }
+            }
+        }
+        let l = rhs.location();
+        self.rs_push_name(l.start_offset(), l.end_offset(), lhs);
+    }
+
+    /// Record `name` as disambiguating `self.name` — scope-wide if a
+    /// def/block scope is active (shared Array semantics), otherwise narrowly
+    /// scoped to `[start, end)` (this node's own un-scoped identity entry).
+    pub(crate) fn rs_push_name(&mut self, start: usize, end: usize, name: &[u8]) {
+        if let Some(top) = self.rs_scope_stack.last() {
+            top.borrow_mut().push(name.to_vec());
+        } else {
+            self.rs_narrow.push((start, end, name.to_vec()));
+        }
+    }
+
+    /// `on_if`/`on_while`/`on_until` (prism gives `unless` its own node, so
+    /// `visit_unless_node` calls this too): `node.each_descendant(:lvasgn,
+    /// :masgn)`, exempting `node.condition` for each name found ANYWHERE in
+    /// the whole conditional (predicate, body, elsif/else) — order-agnostic,
+    /// mirroring upstream's full pre-scan before any children are visited.
+    pub(crate) fn rs_scan_conditional(&mut self, whole: &ruby_prism::Node, predicate: &ruby_prism::Node) {
+        if !self.on("Style/RedundantSelf") {
+            return;
+        }
+        let mut c = RsAssignCollector { assign_names: Vec::new() };
+        c.visit(whole);
+        if c.assign_names.is_empty() {
+            return;
+        }
+        let l = predicate.location();
+        let (s, e) = (l.start_offset(), l.end_offset());
+        for name in c.assign_names {
+            self.rs_push_name(s, e, &name);
+        }
+    }
+
+    /// `on_in_pattern`/`add_match_var_scopes`: every match-var bound by this
+    /// `in` clause's PATTERN disambiguates `self.x` anywhere in the whole
+    /// clause (pattern, guard, and body — `node`'s own span, matching
+    /// upstream's `@local_variables_scopes[in_pattern_node]`). Scanning only
+    /// `node.pattern()` (not `node.statements()`, the executed body) matters:
+    /// prism reuses `LocalVariableTargetNode` for BOTH pattern bindings and
+    /// ordinary masgn targets, and only the former count as upstream's
+    /// `:match_var` node type.
+    pub(crate) fn check_redundant_self_in_pattern(&mut self, node: &ruby_prism::InNode) {
+        if !self.on("Style/RedundantSelf") {
+            return;
+        }
+        let mut c = RsMatchVarCollector { names: Vec::new() };
+        c.visit(&node.pattern());
+        if c.names.is_empty() {
+            return;
+        }
+        let l = node.location();
+        let (s, e) = (l.start_offset(), l.end_offset());
+        for name in c.names {
+            self.rs_push_name(s, e, &name);
+        }
+    }
+}
+
+/// Style/RedundantSelf: names introduced by a parameter list (def OR block —
+/// `BlockParametersNode` wraps the identical `ParametersNode` shape).
+/// Recurses into destructured `(a, b)` parameters (`MultiTargetNode`, reused
+/// by prism for both masgn targets and destructured params) the way
+/// upstream's `on_argument` recurses via `on_args` for an `mlhs_type?` node.
+pub(crate) fn rs_params_of(params: &ruby_prism::ParametersNode) -> Vec<Vec<u8>> {
+    let mut names = Vec::new();
+    for n in params.requireds().iter() {
+        rs_collect_param_name(&mut names, &n);
+    }
+    for n in params.optionals().iter() {
+        rs_collect_param_name(&mut names, &n);
+    }
+    if let Some(r) = params.rest() {
+        rs_collect_param_name(&mut names, &r);
+    }
+    for n in params.posts().iter() {
+        rs_collect_param_name(&mut names, &n);
+    }
+    for n in params.keywords().iter() {
+        rs_collect_param_name(&mut names, &n);
+    }
+    if let Some(kr) = params.keyword_rest() {
+        rs_collect_param_name(&mut names, &kr);
+    }
+    if let Some(b) = params.block() {
+        if let Some(nm) = b.name() {
+            names.push(nm.as_slice().to_vec());
+        }
+    }
+    names
+}
+
+fn rs_collect_param_name(names: &mut Vec<Vec<u8>>, n: &ruby_prism::Node) {
+    if let Some(p) = n.as_required_parameter_node() {
+        names.push(p.name().as_slice().to_vec());
+    } else if let Some(p) = n.as_optional_parameter_node() {
+        names.push(p.name().as_slice().to_vec());
+    } else if let Some(p) = n.as_rest_parameter_node() {
+        if let Some(nm) = p.name() {
+            names.push(nm.as_slice().to_vec());
+        }
+    } else if let Some(p) = n.as_keyword_rest_parameter_node() {
+        if let Some(nm) = p.name() {
+            names.push(nm.as_slice().to_vec());
+        }
+    } else if let Some(p) = n.as_required_keyword_parameter_node() {
+        names.push(p.name().as_slice().to_vec());
+    } else if let Some(p) = n.as_optional_keyword_parameter_node() {
+        names.push(p.name().as_slice().to_vec());
+    } else if let Some(p) = n.as_multi_target_node() {
+        for c in p.lefts().iter() {
+            rs_collect_param_name(names, &c);
+        }
+        if let Some(r) = p.rest() {
+            rs_collect_param_name(names, &r);
+        }
+        for c in p.rights().iter() {
+            rs_collect_param_name(names, &c);
+        }
+    } else if let Some(p) = n.as_splat_node() {
+        if let Some(e) = p.expression() {
+            rs_collect_param_name(names, &e);
+        }
+    }
+    // `NoKeywordsParameterNode` (`**nil`) and anything else carries no name.
+}
+
+/// Style/RedundantSelf: collects `LocalVariableWriteNode`/`MultiWriteNode`
+/// names anywhere in an if/unless/while/until subtree — upstream's
+/// `node.each_descendant(:lvasgn, :masgn)`.
+struct RsAssignCollector {
+    assign_names: Vec<Vec<u8>>,
+}
+impl<'pr> ruby_prism::Visit<'pr> for RsAssignCollector {
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.assign_names.push(node.name().as_slice().to_vec());
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        for t in node.lefts().iter().chain(node.rights().iter()) {
+            if let Some(lv) = t.as_local_variable_target_node() {
+                self.assign_names.push(lv.name().as_slice().to_vec());
+            }
+        }
+        ruby_prism::visit_multi_write_node(self, node);
+    }
+}
+
+/// Style/RedundantSelf: collects `LocalVariableTargetNode` ("match_var" in
+/// whitequark) names within a `case/in` pattern.
+struct RsMatchVarCollector {
+    names: Vec<Vec<u8>>,
+}
+impl<'pr> ruby_prism::Visit<'pr> for RsMatchVarCollector {
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        self.names.push(node.name().as_slice().to_vec());
+    }
+}
+
+/// `RedundantSelf::KEYWORDS` — verbatim.
+const RS_KEYWORDS: &[&[u8]] = &[
+    b"alias", b"and", b"begin", b"break", b"case", b"class", b"def", b"defined?", b"do",
+    b"else", b"elsif", b"end", b"ensure", b"false", b"for", b"if", b"in", b"module",
+    b"next", b"nil", b"not", b"or", b"redo", b"rescue", b"retry", b"return", b"self",
+    b"super", b"then", b"true", b"undef", b"unless", b"until", b"when", b"while",
+    b"yield", b"__FILE__", b"__LINE__", b"__ENCODING__",
+];
+
+/// `RuboCop::AST::Node::MethodIdentifierPredicates::OPERATOR_METHODS`.
+const RS_OPERATOR_METHODS: &[&[u8]] = &[
+    b"|", b"^", b"&", b"<=>", b"==", b"===", b"=~", b">", b">=", b"<", b"<=", b"<<", b">>",
+    b"+", b"-", b"*", b"/", b"%", b"**", b"~", b"+@", b"-@", b"!@", b"~@", b"[]", b"[]=",
+    b"!", b"!=", b"!~", b"`",
+];
+
+/// `RedundantSelf::KERNEL_METHODS = Kernel.methods(false)` under ruby 3.4.1
+/// (the interpreter rubocop 1.88.0 runs on) — includes some camelCase names
+/// (`Array`, `Complex`, ...) that `rs_regular_method_call`'s camel-case guard
+/// would already have excluded first; kept for fidelity with the source list.
+const RS_KERNEL_METHODS: &[&[u8]] = &[
+    b"Array", b"Complex", b"Float", b"Hash", b"Integer", b"Rational", b"String",
+    b"__callee__", b"__dir__", b"__method__", b"`", b"abort", b"at_exit", b"autoload",
+    b"autoload?", b"binding", b"block_given?", b"caller", b"caller_locations", b"catch",
+    b"eval", b"exec", b"exit", b"exit!", b"fail", b"fork", b"format", b"gets",
+    b"global_variables", b"iterator?", b"lambda", b"load", b"local_variables", b"loop",
+    b"open", b"p", b"print", b"printf", b"proc", b"putc", b"puts", b"raise", b"rand",
+    b"readline", b"readlines", b"require", b"require_relative", b"select",
+    b"set_trace_func", b"sleep", b"spawn", b"sprintf", b"srand", b"syscall", b"system",
+    b"test", b"throw", b"trace_var", b"trap", b"untrace_var", b"warn",
+];
