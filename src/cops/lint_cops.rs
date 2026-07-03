@@ -5258,8 +5258,10 @@ impl<'a> super::Cops<'a> {
         // Skip if method has rest arguments (*args) or optional arguments (x = default)
         // or keyword arguments with defaults
         if let Some(params) = node.parameters() {
-            // Check for rest arguments
-            if params.rest().is_some() {
+            // Check for rest arguments (`*args`); `...` sits in the same slot
+            // as a ForwardingParameterNode but is NOT a whitequark restarg —
+            // upstream still flags `def m(...)` + bare super.
+            if params.rest().is_some_and(|r| r.as_forwarding_parameter_node().is_none()) {
                 return;
             }
             // Check for optional arguments
@@ -5295,15 +5297,21 @@ impl<'a> super::Cops<'a> {
         };
 
         // Try multiple ways to find a super node
-        // First, check if body is directly a super
+        // First, check if body is directly a super. A super with an attached
+        // literal block adds behavior — whitequark wraps it in a :block node
+        // upstream's matcher never accepts.
         if let Some(super_node) = body.as_super_node() {
+            if super_node.block().is_some() {
+                return false;
+            }
             return self.check_super_matches_params(&super_node, def_node);
         }
 
         // Check if body is a bare/forwarding super
-        if body.as_forwarding_super_node().is_some() {
-            // Forwarding super (bare super) always delegates
-            return true;
+        if let Some(fsuper) = body.as_forwarding_super_node() {
+            // Forwarding super (bare super) always delegates — unless it
+            // carries a block.
+            return fsuper.block().is_none();
         }
 
         // Otherwise, check if it's wrapped in a StatementsNode
@@ -5316,13 +5324,15 @@ impl<'a> super::Cops<'a> {
             }
 
             if let Some(super_node) = stmts_list[0].as_super_node() {
+                if super_node.block().is_some() {
+                    return false;
+                }
                 return self.check_super_matches_params(&super_node, def_node);
             }
 
             // Also check for forwarding super in statements
-            if stmts_list[0].as_forwarding_super_node().is_some() {
-                // Forwarding super always delegates
-                return true;
+            if let Some(fsuper) = stmts_list[0].as_forwarding_super_node() {
+                return fsuper.block().is_none();
             }
         }
 
