@@ -124,6 +124,7 @@ COPS = {
   'Metrics/AbcSize'                  => 'metrics/abc_size',
   'Layout/EmptyLinesAroundAttributeAccessor' => 'layout/empty_lines_around_attribute_accessor',
   'Style/RedundantSortBy'            => 'style/redundant_sort_by',
+  'Layout/SpaceInLambdaLiteral'      => 'layout/space_in_lambda_literal',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
