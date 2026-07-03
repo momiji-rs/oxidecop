@@ -191,6 +191,7 @@ COPS = {
   'Layout/MultilineMethodDefinitionBraceLayout' => 'layout/multiline_method_definition_brace_layout',
   'Layout/DefEndAlignment'           => 'layout/def_end_alignment',
   'Style/WhileUntilModifier'         => 'style/while_until_modifier',
+  'Style/ExponentialNotation'        => 'style/exponential_notation',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -7802,3 +7802,127 @@ fn wum_ends_with_word(before: &[u8], w: &[u8]) -> bool {
     let start = before.len() - w.len();
     start == 0 || !matches!(before[start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
 }
+
+/// Style/ExponentialNotation helpers, ported verbatim from rubocop's
+/// `ExponentialNotation` cop. All three operate on the *mantissa* (and, for
+/// `engineering`, the exponent) obtained by splitting the float literal's
+/// raw source text on the literal byte `'e'` — matching the Ruby cop's
+/// `node.source.split('e')`.
+///
+/// `scientific?` — mantissa must be `-?[1-9]` optionally followed by a `.`
+/// and one-or-more digits (a trailing zero after the dot is fine — the
+/// regex only requires *a* digit there, not a non-zero one).
+fn exponential_notation_scientific(mantissa: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^-?[1-9](\.\d*[0-9])?$").unwrap()).is_match(mantissa)
+}
+
+/// `integral?` — mantissa must be a bare integer starting with `1`-`9` and,
+/// if more digits follow, ending in a non-zero digit (no trailing zeroes).
+fn exponential_notation_integral(mantissa: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"^-?[1-9](\d*[1-9])?$").unwrap()).is_match(mantissa)
+}
+
+/// `engineering?` — exponent must be an integer divisible by 3, and the
+/// mantissa must not have a 4+ digit integer part, must not start with `0`
+/// immediately followed by another digit, and must not start with `0<any
+/// char>0` (rubocop's `/^-?0.0/` — the middle `.` is an unescaped regex
+/// wildcard, not a literal dot, so it also rejects e.g. `0x0`, though that
+/// never arises for float-literal mantissas).
+fn exponential_notation_engineering(mantissa: &str, exponent: &str) -> bool {
+    static RE_EXP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RE_4DIGIT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RE_0DIGIT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RE_00: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+    let re_exp = RE_EXP.get_or_init(|| regex::Regex::new(r"^-?\d+$").unwrap());
+    if !re_exp.is_match(exponent) {
+        return false;
+    }
+    // Ruby's Integer#% follows floor-division semantics, but for a
+    // known-good `-?\d+` string dividing by 3 the "is it exactly zero"
+    // answer is sign-independent, so Rust's truncating `%` agrees here.
+    let Ok(exp_val) = exponent.parse::<i64>() else { return false };
+    if exp_val % 3 != 0 {
+        return false;
+    }
+    let re_4digit = RE_4DIGIT.get_or_init(|| regex::Regex::new(r"^-?\d{4}").unwrap());
+    if re_4digit.is_match(mantissa) {
+        return false;
+    }
+    let re_0digit = RE_0DIGIT.get_or_init(|| regex::Regex::new(r"^-?0\d").unwrap());
+    if re_0digit.is_match(mantissa) {
+        return false;
+    }
+    let re_00 = RE_00.get_or_init(|| regex::Regex::new(r"^-?0.0").unwrap());
+    if re_00.is_match(mantissa) {
+        return false;
+    }
+    true
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/ExponentialNotation — enforces a consistent style for
+    /// exponential-notation float literals (`10e6`, `3.14e0`, ...) per
+    /// `EnforcedStyle`: `scientific` (default), `engineering`, `integral`.
+    ///
+    /// Ported from rubocop's `ExponentialNotation` cop
+    /// (`ConfigurableEnforcedStyle`). Every check works on `node.source` —
+    /// the raw literal text, byte-identical to what's in the file — so no
+    /// numeric parsing of the actual float value happens anywhere; it's
+    /// pure source-text pattern matching, split on the literal byte `'e'`.
+    ///
+    /// Important corollary (verbatim from `offense?`'s
+    /// `return false unless node.source['e']`, a case-sensitive substring
+    /// check): a literal written with an uppercase `E` (e.g. `1.2E3`) has
+    /// no lowercase `'e'` anywhere in its source, so this short-circuits to
+    /// "not an offense" — in ANY style, including `scientific` — and such
+    /// literals are silently never checked by this cop at all.
+    ///
+    /// Never correctable (the Ruby cop has no `AutoCorrector`/`autocorrect`
+    /// method).
+    pub(crate) fn check_exponential_notation(&mut self, node: &ruby_prism::FloatNode<'_>) {
+        const COP: &str = "Style/ExponentialNotation";
+        if !self.on(COP) {
+            return;
+        }
+        let loc = node.location();
+        let start = loc.start_offset();
+        let end = loc.end_offset();
+        let src = &self.src[start..end];
+        if !src.contains(&b'e') {
+            return;
+        }
+        let Ok(src_str) = std::str::from_utf8(src) else { return };
+
+        // `ConfigurableEnforcedStyle` — default `scientific`.
+        let style = self.cfg.get(COP, "EnforcedStyle").unwrap_or("scientific");
+
+        let (offense, message): (bool, &'static str) = match style {
+            "scientific" => {
+                let mantissa = src_str.split('e').next().unwrap_or(src_str);
+                (!exponential_notation_scientific(mantissa), "Use a mantissa >= 1 and < 10.")
+            }
+            "engineering" => {
+                let mut parts = src_str.split('e');
+                let mantissa = parts.next().unwrap_or(src_str);
+                let exponent = parts.next().unwrap_or("");
+                (
+                    !exponential_notation_engineering(mantissa, exponent),
+                    "Use an exponent divisible by 3 and a mantissa >= 0.1 and < 1000.",
+                )
+            }
+            "integral" => {
+                let mantissa = src_str.split('e').next().unwrap_or(src_str);
+                (!exponential_notation_integral(mantissa), "Use an integer as mantissa, without trailing zero.")
+            }
+            _ => (false, ""),
+        };
+
+        if !offense {
+            return;
+        }
+        self.push(start, COP, false, message);
+    }
+}
