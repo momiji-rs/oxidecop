@@ -9822,7 +9822,8 @@ impl<'a> super::Cops<'a> {
             Some(body)
         };
         if let Some(last) = last {
-            self.non_nil_ignored.insert(last.location().start_offset());
+            self.non_nil_ignored
+                .insert((last.location().start_offset(), last.location().end_offset()));
         }
     }
 
@@ -9845,7 +9846,10 @@ impl<'a> super::Cops<'a> {
         }
         // `ignored_node?`: this exact node was marked by an enclosing
         // predicate `def` as its trailing/only body statement.
-        if self.non_nil_ignored.contains(&node.location().start_offset()) {
+        if self
+            .non_nil_ignored
+            .contains(&(node.location().start_offset(), node.location().end_offset()))
+        {
             return;
         }
         let semantic = self.non_nil_semantic_changes(COP);
@@ -9929,7 +9933,10 @@ impl<'a> super::Cops<'a> {
         if call.name().as_slice() != b"nil?" || call.arguments().is_some() {
             return;
         }
-        if self.non_nil_ignored.contains(&call.location().start_offset()) {
+        if self
+            .non_nil_ignored
+            .contains(&(call.location().start_offset(), call.location().end_offset()))
+        {
             return;
         }
         // A receiver-less `nil?` (`unless nil?` — implicit `self.nil?`)

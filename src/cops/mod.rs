@@ -761,12 +761,13 @@ pub(crate) struct Cops<'a> {
     // Style/PerlBackrefs: depth of enclosing class/module nodes — used to
     // determine if Regexp constant needs :: prefix.
     pub(crate) class_module_depth: usize,
-    // Style/NonNilCheck: start offsets of nodes marked via `ignore_node` —
+    // Style/NonNilCheck: (start, end) offset spans of nodes marked via
+    // `ignore_node` —
     // the trailing (or sole) statement of a predicate method's (`foo?`)
     // body, which prism always wraps in a `StatementsNode` regardless of
     // statement count. A later `on_send`-equivalent visit on the EXACT same
     // node is skipped, mirroring rubocop's node-identity `ignored_node?`.
-    pub(crate) non_nil_ignored: HashSet<usize>,
+    pub(crate) non_nil_ignored: HashSet<(usize, usize)>,
     // Layout/MultilineMethodCallBraceLayout: a CallNode's own start offset ->
     // (dot start offset, enclosing call's own end offset) when that call is
     // itself the DOT-CHAINED RECEIVER of an outer call (`X.method_name`) AND
