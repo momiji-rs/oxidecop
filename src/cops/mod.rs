@@ -184,7 +184,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/ImplicitStringConcatenation",
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
     "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
-    "Layout/MultilineMethodCallBraceLayout",
+    "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation",
 ];
 
 impl Engine {
@@ -2550,6 +2550,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     cops.check_leading_comment_space();
     cops.check_comment_indentation();
     cops.check_block_comments();
+    cops.check_comment_annotation();
     // Lint/AmbiguousRegexpLiteral: rides prism's own lex-level
     // PM_WARN_AMBIGUOUS_SLASH warnings (result.warnings()), not a specific
     // node type — there's no single visit_* hook to attach this to.

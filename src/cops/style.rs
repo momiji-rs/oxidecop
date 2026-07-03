@@ -10238,3 +10238,142 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((l.start_offset(), l.end_offset(), prefer_bytes));
     }
 }
+
+/// Ruby's `String#capitalize`: upcase the first char, downcase the rest.
+/// Used only for `CommentAnnotation`'s `just_keyword_of_sentence?` check
+/// (`keyword == keyword.capitalize`).
+fn ruby_capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+        None => String::new(),
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/CommentAnnotation — flags annotation keywords (`TODO`, `FIXME`,
+    /// ...) that aren't `KEYWORD: note` (or `KEYWORD note` under
+    /// `RequireColon: false`). Ported from rubocop's `CommentAnnotation` cop
+    /// + its `AnnotationComment` mixin, operating directly on the comment
+    /// token list (`self.comments`) rather than any AST node — there's no
+    /// single visit_* hook for this, so it runs once per file over ALL
+    /// comments, mirroring `on_new_investigation`.
+    ///
+    /// Only two kinds of comment lines are checked (`first_comment_line? ||
+    /// inline_comment?`): the first line of a run of consecutive own-line
+    /// comments (a "paragraph" — later lines in that paragraph are exempt,
+    /// per the cop's own doc comment, to avoid misfiring on prose), and any
+    /// EOL/inline comment (code precedes the `#` on its line) regardless of
+    /// what precedes or follows it.
+    pub(crate) fn check_comment_annotation(&mut self) {
+        const COP: &str = "Style/CommentAnnotation";
+        if !self.on(COP) || self.comments.is_empty() {
+            return;
+        }
+        // `Keywords` is an array-valued default absent from the generated
+        // schema (only scalar defaults live there) — hardcode rubocop's
+        // default.yml value as the fallback.
+        let keywords: Vec<String> = match self.cfg.get(COP, "Keywords") {
+            Some(v) => crate::config::parse_allowed_list(v),
+            None => ["TODO", "FIXME", "OPTIMIZE", "HACK", "REVIEW", "NOTE"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        };
+        if keywords.is_empty() {
+            return;
+        }
+        let requires_colon = self.cfg.get(COP, "RequireColon") != Some("false");
+
+        // `Regexp.union(keywords.sort_by { |w| -w.length })`: longer
+        // keywords must be tried first so a phrase like `TODO LATER` wins
+        // over a plain `TODO` prefix (Rust's regex crate, like Ruby's
+        // Onigmo, picks the first alternative that matches at a position —
+        // not the longest — so the ordering is load-bearing here).
+        let mut sorted_kw = keywords.clone();
+        sorted_kw.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        let alts = sorted_kw.iter().map(|k| regex::escape(k)).collect::<Vec<_>>().join("|");
+        // Mirrors AnnotationComment's regex exactly:
+        //   /^(# ?)(\b#{keywords_regex}\b)(\s*:)?(\s+)?(\S+)?/i
+        let pattern = format!(r"(?i)^(# ?)(\b(?:{alts})\b)(\s*:)?(\s+)?(\S+)?");
+        let Ok(re) = regex::Regex::new(&pattern) else { return };
+
+        for i in 0..self.comments.len() {
+            let (line, start, end) = self.comments[i];
+            // `first_comment_line?`: this is the very first comment in the
+            // file, or the previous comment sits on a non-adjacent line
+            // (i.e. this comment opens a new paragraph).
+            let first_comment_line = i == 0 || self.comments[i - 1].0 < line - 1;
+            // `inline_comment?`: code precedes the `#` on this physical
+            // line (the line as a whole isn't `^\s*#`).
+            let line_start = self.idx.starts[line - 1];
+            let inline_comment = self.src[line_start..start].iter().any(|b| !b.is_ascii_whitespace());
+            if !(first_comment_line || inline_comment) {
+                continue;
+            }
+
+            let Ok(text) = std::str::from_utf8(&self.src[start..end]) else { continue };
+            let Some(caps) = re.captures(text) else { continue };
+            let margin = caps.get(1).expect("group 1 required by pattern");
+            let keyword_m = caps.get(2).expect("group 2 required alongside margin");
+            let colon = caps.get(3);
+            let space = caps.get(4);
+            let note = caps.get(5);
+
+            // `keyword_appearance?`: keyword && (colon || space).
+            if colon.is_none() && space.is_none() {
+                continue;
+            }
+            let keyword_str = keyword_m.as_str();
+            // `just_keyword_of_sentence?`: a capitalized (not all-caps)
+            // keyword, no colon, followed by space + note — reads as an
+            // ordinary sentence ("Optimize if you want."), not an
+            // annotation.
+            if keyword_str == ruby_capitalize(keyword_str) && colon.is_none() && space.is_some() && note.is_some() {
+                continue;
+            }
+
+            // `correct?(colon: requires_colon?)`.
+            let is_correct = space.is_some()
+                && note.is_some()
+                && keyword_str == keyword_str.to_uppercase()
+                && (colon.is_none() == !requires_colon);
+            if is_correct {
+                continue;
+            }
+
+            let bounds_start = start + margin.end();
+            let bounds_len = keyword_str.len()
+                + colon.map_or(0, |m| m.as_str().len())
+                + space.map_or(0, |m| m.as_str().len());
+            let bounds_end = bounds_start + bounds_len;
+
+            let message = if note.is_some() {
+                if requires_colon {
+                    format!(
+                        "Annotation keywords like `{keyword_str}` should be all upper case, followed by a colon, and a space, then a note describing the problem."
+                    )
+                } else {
+                    format!(
+                        "Annotation keywords like `{keyword_str}` should be all upper case, followed by a space, then a note describing the problem."
+                    )
+                }
+            } else {
+                format!("Annotation comment, with keyword `{keyword_str}`, is missing a note.")
+            };
+
+            // `next if annotation.note.nil?` inside the add_offense block:
+            // a missing-note offense is registered but never autocorrected.
+            let correctable = note.is_some();
+            self.push(bounds_start, COP, correctable, message);
+            if correctable {
+                let replacement = if requires_colon {
+                    format!("{}: ", keyword_str.to_uppercase())
+                } else {
+                    format!("{} ", keyword_str.to_uppercase())
+                };
+                self.fixes.push((bounds_start, bounds_end, replacement.into_bytes()));
+            }
+        }
+    }
+}
