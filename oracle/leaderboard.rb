@@ -143,6 +143,7 @@ COPS = {
   'Style/ComparableClamp'            => 'style/comparable_clamp',
   'Style/RedundantFreeze'            => 'style/redundant_freeze',
   'Lint/LiteralInInterpolation'      => 'lint/literal_in_interpolation',
+  'Lint/EmptyBlock'                  => 'lint/empty_block',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

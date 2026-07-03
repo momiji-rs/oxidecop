@@ -5092,3 +5092,71 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Lint/EmptyBlock — checks for blocks without a body.
+    /// Handles both BlockNodes attached to calls and their parent calls.
+    /// Empty lambdas/procs are allowed by default (AllowEmptyLambdas: true).
+    /// Comments inside the block suppress the offense by default (AllowComments: true).
+    pub(crate) fn check_empty_block_call(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/EmptyBlock";
+        if !self.on(COP) {
+            return;
+        }
+
+        let Some(block) = node.block().and_then(|b| b.as_block_node()) else { return };
+
+        // Block has a body, skip
+        if block.body().is_some() {
+            return;
+        }
+
+        // Check if this is a lambda/proc call
+        let allow_empty_lambdas = self.cfg.get(COP, "AllowEmptyLambdas") != Some("false");
+        if allow_empty_lambdas && is_lambda_or_proc_call(node) {
+            return;
+        }
+
+        // Check for comments in the block
+        let allow_comments = self.cfg.get(COP, "AllowComments") != Some("false");
+        if allow_comments {
+            let start_line = self.idx.loc(block.location().start_offset()).0;
+            let end_line = self.idx.loc(block.closing_loc().start_offset()).0 + 1;
+            if self.comments.iter().any(|(line, _, _)| *line >= start_line && *line < end_line) {
+                return;
+            }
+        }
+
+        self.push(node.location().start_offset(), COP, false, "Empty block detected.");
+    }
+
+    /// Lint/EmptyBlock for LambdaNodes (`-> {}`).
+    pub(crate) fn check_empty_block_lambda(&mut self, node: &ruby_prism::LambdaNode) {
+        const COP: &str = "Lint/EmptyBlock";
+        if !self.on(COP) {
+            return;
+        }
+        // Lambda has a body, skip
+        if node.body().is_some() {
+            return;
+        }
+
+        // Check AllowEmptyLambdas
+        let allow_empty_lambdas = self.cfg.get(COP, "AllowEmptyLambdas") != Some("false");
+        if allow_empty_lambdas {
+            return;
+        }
+
+        // Check for comments in the lambda
+        let allow_comments = self.cfg.get(COP, "AllowComments") != Some("false");
+        if allow_comments {
+            let start_line = self.idx.loc(node.location().start_offset()).0;
+            let end_line = self.idx.loc(node.closing_loc().start_offset()).0 + 1;
+            if self.comments.iter().any(|(line, _, _)| *line >= start_line && *line < end_line) {
+                return;
+            }
+        }
+
+        self.push(node.location().start_offset(), COP, false, "Empty block detected.");
+    }
+}
