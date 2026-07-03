@@ -916,7 +916,6 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
-        self.check_ascii_symbol(node);
         self.check_boolean_symbol(node);
         self.check_symbol_literal(node);
     }
@@ -1170,6 +1169,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_global_variable_target_node(&mut self, node: &ruby_prism::GlobalVariableTargetNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
+    }
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.check_ascii_identifiers_in_name(node.name().as_slice(), node.location().start_offset(), false);
     }
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
         self.check_ascii_local_variable_write(node);
@@ -1963,6 +1965,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_sample(node);
         self.check_nested_parenthesized_calls(node);
         self.check_require_parentheses(node);
+        // Naming/AsciiIdentifiers scans tIDENTIFIER tokens — method call
+        // selectors included (weird.なまえ); operators/[] have no message_loc
+        // worth checking and setters end in =, both ASCII-guarded anyway.
+        if let Some(ml) = node.message_loc() {
+            self.check_ascii_identifiers_in_name(node.name().as_slice(), ml.start_offset(), false);
+        }
         self.check_case_equality(node);
         self.check_redundant_exception(node);
         self.check_self_assignment_send(node);

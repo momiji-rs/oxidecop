@@ -826,11 +826,4 @@ impl<'a> super::Cops<'a> {
         }
     }
 
-    pub(crate) fn check_ascii_symbol(&mut self, node: &ruby_prism::SymbolNode) {
-        // Check symbol names (they're identifiers)
-        if let Some(value_loc) = node.value_loc() {
-            let symbol_bytes = &self.src[value_loc.start_offset()..value_loc.end_offset()];
-            self.check_ascii_identifiers_in_name(symbol_bytes, value_loc.start_offset(), false);
-        }
-    }
 }
