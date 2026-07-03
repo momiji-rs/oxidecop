@@ -2898,3 +2898,180 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+impl<'a> Cops<'a> {
+    /// Layout/EmptyLinesAroundExceptionHandlingKeywords — ported from
+    /// rubocop's cop of the same name, which (unlike the `EmptyLinesAround*`
+    /// family above) does NOT check the body's own beginning/end — it walks
+    /// the `rescue`/`else`/`ensure` KEYWORDS inside a `def`/block/`begin`
+    /// body and flags a blank line immediately above or below each one.
+    ///
+    /// rubocop's `keyword_locations` (via `keyword_locations_in_rescue` /
+    /// `keyword_locations_in_ensure`) recurses through whitequork's nested
+    /// `:ensure`/`:rescue` node shapes, but prism collapses all three
+    /// clauses onto ONE `BeginNode` (`rescue_clause`/`else_clause`/
+    /// `ensure_clause` fields) — so the same flat set of keywords is
+    /// obtained directly: the `ensure` keyword (if any), then the `else`
+    /// keyword (if any — only legal alongside `rescue`), then each `rescue`
+    /// keyword in source order via `RescueNode#subsequent`. This mirrors the
+    /// nesting order rubocop actually produces (`keyword_locations_in_ensure`
+    /// prepends its own keyword to its nested rescue-body's
+    /// `[else, *rescue_keywords]`), which matters only for which message
+    /// wins when `add_offense`'s location-dedup collapses two adjacent
+    /// checks onto the same blank line (see below).
+    fn el_ex_keyword_locations(begin: &ruby_prism::BeginNode) -> Vec<(usize, &'static str)> {
+        let mut locs = Vec::new();
+        if let Some(ens) = begin.ensure_clause() {
+            locs.push((ens.ensure_keyword_loc().start_offset(), "ensure"));
+        }
+        if let Some(els) = begin.else_clause() {
+            locs.push((els.else_keyword_loc().start_offset(), "else"));
+        }
+        let mut cur = begin.rescue_clause();
+        while let Some(r) = cur {
+            locs.push((r.keyword_loc().start_offset(), "rescue"));
+            cur = r.subsequent();
+        }
+        locs
+    }
+
+    /// `last_body_and_end_on_same_line?` — an early-exit guard computed ONCE
+    /// per `check_body` call (it depends only on the body/enclosing `end`,
+    /// not on which keyword is being tested): when the tail of the body
+    /// collapses onto the same physical line as the enclosing `end`, every
+    /// keyword's before/after check is skipped for this body.
+    ///
+    /// - With an `ensure` clause present (rubocop's non-`rescue_type?`
+    ///   branch — `ensure` is always the outermost wrapper when both
+    ///   `ensure` and `rescue` occur): compares the `ensure` body's own last
+    ///   content line (or the `ensure` keyword's own line when the `ensure`
+    ///   body is empty) against `end_line`.
+    /// - Otherwise, with only a `rescue` clause: compares the `else`
+    ///   keyword's line (if present) or the LAST `rescue` clause's own
+    ///   keyword line against `end_line`.
+    fn el_ex_last_body_and_end_on_same_line(&self, begin: &ruby_prism::BeginNode, end_line: usize) -> bool {
+        let last_line = if let Some(ens) = begin.ensure_clause() {
+            match ens.statements().and_then(|s| s.body().iter().last()) {
+                Some(n) => self.idx.loc(n.location().end_offset()).0,
+                None => self.idx.loc(ens.ensure_keyword_loc().start_offset()).0,
+            }
+        } else if let Some(els) = begin.else_clause() {
+            self.idx.loc(els.else_keyword_loc().start_offset()).0
+        } else {
+            let mut cur = begin.rescue_clause();
+            let mut line = 0usize;
+            while let Some(r) = cur {
+                line = self.idx.loc(r.keyword_loc().start_offset()).0;
+                cur = r.subsequent();
+            }
+            line
+        };
+        last_line == end_line
+    }
+
+    /// `check_body` — shared by the `def`/block ("implicit" `body` — a plain
+    /// `BeginNode` prism synthesizes around a rescue/ensure/else-bearing body,
+    /// spanning through the def's/block's own closing keyword, per the
+    /// prism-vs-whitequark trap) and explicit `begin`/`end` (kwbegin) call
+    /// sites: `body` is the node to inspect (`None`/non-`BeginNode` bodies
+    /// have no keywords to check — mirrors rubocop's `case node.type` falling
+    /// through to `[]` for anything but `:rescue`/`:ensure`), `owner_line` is
+    /// the `def`/block-selector/`begin` keyword's own line, and `end_line` is
+    /// the enclosing `end` (or block closer)'s own line.
+    pub(crate) fn check_empty_lines_around_exception_handling_keywords(
+        &mut self,
+        body: Option<ruby_prism::Node>,
+        owner_line: usize,
+        end_line: usize,
+    ) {
+        const COP: &str = "Layout/EmptyLinesAroundExceptionHandlingKeywords";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = body else { return };
+        let Some(begin) = body.as_begin_node() else { return };
+        let locs = Self::el_ex_keyword_locations(&begin);
+        if locs.is_empty() {
+            return;
+        }
+        if self.el_ex_last_body_and_end_on_same_line(&begin, end_line) {
+            return;
+        }
+
+        for (off, keyword) in locs {
+            let line = self.idx.loc(off).0;
+            if line == owner_line {
+                continue;
+            }
+            // below the keyword
+            if self.el_is_blank_line(line + 1) {
+                let boff = self.idx.starts[line];
+                if self.el_offended.insert((COP, boff)) {
+                    self.push(boff, COP, true, format!("Extra empty line detected after the `{keyword}`."));
+                    self.fixes.push((boff, boff + 1, Vec::new()));
+                }
+            }
+            // above the keyword
+            if line >= 2 && self.el_is_blank_line(line - 1) {
+                let boff = self.idx.starts[line - 2];
+                if self.el_offended.insert((COP, boff)) {
+                    self.push(boff, COP, true, format!("Extra empty line detected before the `{keyword}`."));
+                    self.fixes.push((boff, boff + 1, Vec::new()));
+                }
+            }
+        }
+    }
+
+    /// `on_def`/`on_defs` (prism unifies both under `DefNode`): `owner_line`
+    /// is the def's own first line (the `def` keyword always starts the
+    /// node); `end_line` is `None` for an endless `def` — which has no
+    /// `end_keyword_loc` and whose body can never be a rescue/ensure-bearing
+    /// `BeginNode` anyway (a `rescue` modifier there parses as a distinct
+    /// `RescueModifierNode`, not a clause on the method body), so skipping is
+    /// safe.
+    pub(crate) fn check_empty_lines_around_exception_handling_keywords_def(&mut self, node: &ruby_prism::DefNode) {
+        let Some(end_loc) = node.end_keyword_loc() else { return };
+        let owner_line = self.idx.loc(node.location().start_offset()).0;
+        let end_line = self.idx.loc(end_loc.start_offset()).0;
+        self.check_empty_lines_around_exception_handling_keywords(node.body(), owner_line, end_line);
+    }
+
+    /// `on_block`/`on_numblock` (prism has no separate numbered-block node
+    /// type — both alias to the same `BlockNode`): `owner_line` anchors on
+    /// the enclosing call's own SELECTOR (`message_loc`), not the receiver
+    /// chain, per the prism-vs-whitequark block-range trap — matching
+    /// whitequork's block node, whose own `loc.line` starts at the `send`
+    /// node it wraps. Only reached from `visit_call_node`'s block handling
+    /// (mirroring this port's `Layout/EmptyLinesAroundBlockBody`, which is
+    /// likewise never invoked for a block attached to `super`/`zsuper`).
+    pub(crate) fn check_empty_lines_around_exception_handling_keywords_block(
+        &mut self,
+        call: &ruby_prism::CallNode,
+        block: &ruby_prism::BlockNode,
+    ) {
+        let owner_off = call.message_loc().map(|l| l.start_offset()).unwrap_or_else(|| call.location().start_offset());
+        let owner_line = self.idx.loc(owner_off).0;
+        let end_line = self.idx.loc(block.closing_loc().start_offset()).0;
+        self.check_empty_lines_around_exception_handling_keywords(block.body(), owner_line, end_line);
+    }
+
+    /// `on_kwbegin`: only explicit `begin`/`end` blocks reach here — the
+    /// implicit `BeginNode` prism synthesizes around a `def`/block's own
+    /// rescue/ensure body has no `begin_keyword_loc` and is handled by the
+    /// `_def`/`_block` entry points above instead (matching rubocop's
+    /// `on_kwbegin`, which never fires for that implicit shape either).
+    /// Unlike those two, the node inspected for keywords IS the visited node
+    /// itself, not a separate `body` field — prism's `BeginNode` holds its
+    /// own `rescue_clause`/`else_clause`/`ensure_clause` directly, where
+    /// whitequork nests a distinct child node under the `kwbegin` wrapper.
+    pub(crate) fn check_empty_lines_around_exception_handling_keywords_kwbegin(
+        &mut self,
+        node: &ruby_prism::BeginNode,
+    ) {
+        let Some(begin_loc) = node.begin_keyword_loc() else { return };
+        let Some(end_loc) = node.end_keyword_loc() else { return };
+        let owner_line = self.idx.loc(begin_loc.start_offset()).0;
+        let end_line = self.idx.loc(end_loc.start_offset()).0;
+        self.check_empty_lines_around_exception_handling_keywords(Some(node.as_node()), owner_line, end_line);
+    }
+}

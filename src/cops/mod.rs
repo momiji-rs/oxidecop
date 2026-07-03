@@ -146,6 +146,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ConditionPosition", "Naming/HeredocDelimiterNaming", "Style/MultilineWhenThen", "Naming/MethodParameterName", "Layout/EmptyLinesAroundBeginBody", "Layout/EmptyLinesAroundBlockBody", "Style/ClassVars", "Lint/NestedPercentLiteral", "Lint/PercentSymbolArray", "Style/MinMax", "Style/TrailingMethodEndStatement", "Style/OptionalBooleanParameter", "Layout/SpaceInsideStringInterpolation", "Layout/EmptyLinesAroundMethodBody", "Style/NestedTernaryOperator", "Layout/AssignmentIndentation", "Lint/CircularArgumentReference", "Lint/BinaryOperatorWithIdenticalOperands", "Lint/InterpolationCheck", "Lint/FloatComparison", "Layout/SpaceInsidePercentLiteralDelimiters", "Lint/EmptyWhen", "Lint/InheritException", "Lint/ConstantDefinitionInBlock", "Lint/ElseLayout", "Layout/EmptyLinesAroundModuleBody", "Lint/DisjunctiveAssignmentInConstructor", "Lint/IneffectiveAccessModifier", "Layout/LeadingCommentSpace", "Lint/DeprecatedOpenSSLConstant", "Lint/AssignmentInCondition", "Layout/EmptyLinesAroundClassBody", "Lint/AmbiguousRegexpLiteral", "Layout/BlockEndNewline",
     "Metrics/CyclomaticComplexity", "Metrics/PerceivedComplexity", "Metrics/AbcSize",
     "Layout/EmptyLinesAroundAttributeAccessor", "Style/RedundantSortBy", "Layout/SpaceInLambdaLiteral", "Layout/SpaceAroundEqualsInParameterDefault", "Layout/EndOfLine", "Lint/AmbiguousBlockAssociation", "Lint/AmbiguousOperator",
+    "Layout/EmptyLinesAroundExceptionHandlingKeywords",
     "Style/DefWithParentheses",
     "Layout/InitialIndentation", "Layout/TrailingEmptyLines", "Lint/EmptyFile",
     "Lint/EmptyInterpolation", "Lint/EnsureReturn", "Style/BeginBlock",
@@ -1122,6 +1123,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_duplicate_rescue_exception(node);
         self.check_useless_else_without_rescue(node);
         self.check_empty_lines_around_begin_body(node);
+        self.check_empty_lines_around_exception_handling_keywords_kwbegin(node);
         let kwbegin = node.begin_keyword_loc().is_some();
         if kwbegin {
             self.usage_block_depth += 1;
@@ -1273,6 +1275,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_trailing_method_end_statement(node);
         self.check_optional_boolean_parameter(node);
         self.check_empty_lines_around_method_body(node);
+        self.check_empty_lines_around_exception_handling_keywords_def(node);
         self.check_disjunctive_assignment_in_constructor(node);
         self.check_metrics_complexity_def(node);
         self.check_def_with_parentheses(node);
@@ -1345,6 +1348,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if let Some(bn) = b.as_block_node() {
                 self.check_empty_block_parameter(&bn);
                 self.check_block_parameter_name(&bn);
+                let owner_line = self.idx.loc(node.keyword_loc().start_offset()).0;
+                let end_line = self.idx.loc(bn.closing_loc().start_offset()).0;
+                self.check_empty_lines_around_exception_handling_keywords(bn.body(), owner_line, end_line);
             }
             let has_args = node.arguments().is_some_and(|a| a.arguments().iter().count() > 0);
             let last_end = if node.lparen_loc().is_some() {
@@ -1368,6 +1374,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if let Some((off, msg)) = self.symbol_proc_super(&b.as_node(), false, None) {
                 self.push(off, "Style/SymbolProc", true, msg);
             }
+            let owner_line = self.idx.loc(node.location().start_offset()).0;
+            let end_line = self.idx.loc(b.closing_loc().start_offset()).0;
+            self.check_empty_lines_around_exception_handling_keywords(b.body(), owner_line, end_line);
         }
         ruby_prism::visit_forwarding_super_node(self, node);
     }
@@ -1570,6 +1579,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_block_parameter_name(&bn);
                 self.check_empty_lines_around_block_body(&bn);
                 self.check_metrics_complexity_define_method(node, &bn);
+                self.check_empty_lines_around_exception_handling_keywords_block(node, &bn);
             }
             self.check_multiline_block_chain(node);
             // A block is "scoping" (allows nested defs) if it's a class
