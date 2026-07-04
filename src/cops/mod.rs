@@ -232,7 +232,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
-    "Lint/UnreachableLoop",
+    "Lint/UnreachableLoop", "Style/InfiniteLoop",
 ];
 
 impl Engine {
@@ -936,6 +936,14 @@ pub(crate) struct Cops<'a> {
     // the loop in `visit_statements_node`.
     pub(crate) renv_pending_kwbegin_stack: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
     pub(crate) renv_just_closed_kwbegin_renames: Vec<(Vec<u8>, Vec<u8>)>,
+    // Style/InfiniteLoop: `while`/`until` node start-offsets for which
+    // upstream's `VariableForce`-based scope analysis would suppress the
+    // offense entirely (a variable is introduced inside the loop body and
+    // still referenced after it, so wrapping in `loop do...end` would change
+    // scoping semantics). Precomputed once over the whole file before the
+    // main visitor runs, since the check needs assignments/references that
+    // occur textually AFTER the loop too — see `infinite_loop_skips`.
+    pub(crate) il_no_offense: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1986,6 +1994,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
         self.check_loop_while(node);
         self.check_unreachable_loop_while(node);
+        self.check_infinite_loop(
+            style::il_truthy_literal(&node.predicate()),
+            node.location(),
+            node.keyword_loc(),
+            &node.predicate(),
+            node.statements(),
+            node.do_keyword_loc(),
+            node.closing_loc(),
+            node.is_begin_modifier(),
+        );
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_assignment_in_condition(&node.predicate());
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
@@ -2018,6 +2036,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
         self.check_loop_until(node);
         self.check_unreachable_loop_until(node);
+        self.check_infinite_loop(
+            style::il_falsey_literal(&node.predicate()),
+            node.location(),
+            node.keyword_loc(),
+            &node.predicate(),
+            node.statements(),
+            node.do_keyword_loc(),
+            node.closing_loc(),
+            node.is_begin_modifier(),
+        );
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_assignment_in_condition(&node.predicate());
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
@@ -3016,6 +3044,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         renv_resbody_depth: 0,
         renv_pending_kwbegin_stack: Vec::new(),
         renv_just_closed_kwbegin_renames: Vec::new(),
+        il_no_offense: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);
@@ -3040,6 +3069,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
 
     // ---- AST-based cops ----
     cops.ll_prepare();
+    if cops.on("Style/InfiniteLoop") {
+        cops.il_no_offense = style::infinite_loop_skips(&result.node());
+    }
     cops.visit(&result.node());
     // needs the breakable nominations the walk collected
     cops.check_line_length();

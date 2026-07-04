@@ -13367,3 +13367,364 @@ fn cli_scan_named_capture(src: &[u8]) -> bool {
     }
     false
 }
+
+
+/// rubocop-ast's `Node::TRUTHY_LITERALS` — the literal node types that make
+/// a `while` condition unconditionally true for Style/InfiniteLoop's
+/// `truthy_literal?` guard (`while 1`, `while [1]`, `while {}`, ...).
+pub(crate) fn il_truthy_literal(n: &ruby_prism::Node) -> bool {
+    n.as_string_node().is_some()
+        || n.as_interpolated_string_node().is_some()
+        || n.as_x_string_node().is_some()
+        || n.as_interpolated_x_string_node().is_some()
+        || n.as_integer_node().is_some()
+        || n.as_float_node().is_some()
+        || n.as_symbol_node().is_some()
+        || n.as_interpolated_symbol_node().is_some()
+        || n.as_array_node().is_some()
+        || n.as_hash_node().is_some()
+        || n.as_regular_expression_node().is_some()
+        || n.as_interpolated_regular_expression_node().is_some()
+        || n.as_true_node().is_some()
+        || n.as_range_node().is_some()
+        || n.as_imaginary_node().is_some()
+        || n.as_rational_node().is_some()
+}
+
+/// rubocop-ast's `Node::FALSEY_LITERALS` — for Style/InfiniteLoop's
+/// `falsey_literal?` guard on an `until` condition (`until false`,
+/// `until nil`).
+pub(crate) fn il_falsey_literal(n: &ruby_prism::Node) -> bool {
+    n.as_false_node().is_some() || n.as_nil_node().is_some()
+}
+
+/// Style/InfiniteLoop's `VariableForce`-based scope guard, precomputed once
+/// over the whole file (see `Cops::check_infinite_loop`'s doc comment for
+/// why it can't be computed inline while visiting the loop node). Mirrors
+/// `VariableForce::SCOPE_TYPES` (top level, `def`/`defs`, block, lambda,
+/// `class`, `module`, `class << self`) — `while`/`until`/`for` are NOT
+/// scope boundaries, so a loop's variables live in its enclosing method's
+/// or the top-level scope. Within each scope, collects local variable
+/// assignment ranges and reference (read) start offsets, then for every
+/// `while true`/`until false` loop recorded in that scope (regardless of
+/// nesting inside other loops), flags it for suppression when some
+/// variable is: assigned somewhere inside the loop's own range, never
+/// assigned anywhere before the loop starts, and read again somewhere
+/// after the loop ends — the case where `loop do...end` would turn that
+/// variable into a fresh block-scoped one and break the later read.
+/// Instance/global/class variables are never tracked (matching
+/// `VariableForce`, which only ever knows about `lvasgn`/`lvar`), so an
+/// offense they'd otherwise gate is never suppressed by this pass.
+pub(crate) fn infinite_loop_skips(root: &ruby_prism::Node) -> std::collections::HashSet<usize> {
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+
+    #[derive(Default)]
+    struct Scope {
+        assigns: HashMap<Vec<u8>, Vec<(usize, usize)>>,
+        refs: HashMap<Vec<u8>, Vec<usize>>,
+        loops: Vec<(usize, usize, usize)>, // (range_start, range_end, offense_anchor)
+    }
+
+    struct V {
+        stack: Vec<Scope>,
+        skip: HashSet<usize>,
+    }
+
+    impl V {
+        fn assign(&mut self, name: &[u8], start: usize, end: usize) {
+            self.stack.last_mut().unwrap().assigns.entry(name.to_vec()).or_default().push((start, end));
+        }
+        fn reference(&mut self, name: &[u8], pos: usize) {
+            self.stack.last_mut().unwrap().refs.entry(name.to_vec()).or_default().push(pos);
+        }
+        fn record_loop(&mut self, start: usize, end: usize, anchor: usize) {
+            self.stack.last_mut().unwrap().loops.push((start, end, anchor));
+        }
+        // Multiple-assignment target (`a, b = 1, 2` / `a, *b = arr`) —
+        // only plain local-variable targets are `VariableForce`-tracked
+        // assignments; splats/nested destructuring are unwrapped, anything
+        // else (ivar/gvar/const/call/index targets) is just walked for any
+        // nested loops/references it might still contain.
+        fn masgn_target(&mut self, t: &ruby_prism::Node) {
+            use ruby_prism::Visit;
+            if let Some(lv) = t.as_local_variable_target_node() {
+                let l = lv.location();
+                self.assign(l.as_slice(), l.start_offset(), l.end_offset());
+            } else if let Some(sp) = t.as_splat_node() {
+                if let Some(e) = sp.expression() {
+                    self.masgn_target(&e);
+                }
+            } else if let Some(mt) = t.as_multi_target_node() {
+                for inner in mt.lefts().iter().chain(mt.rest()).chain(mt.rights().iter()) {
+                    self.masgn_target(&inner);
+                }
+            } else {
+                self.visit(t);
+            }
+        }
+        fn finish_scope(&mut self) {
+            let scope = self.stack.pop().expect("infinite_loop_skips: scope stack underflow");
+            for &(rs, re, anchor) in &scope.loops {
+                let hit = scope.assigns.iter().any(|(name, ranges)| {
+                    if !ranges.iter().any(|&(s, e)| rs <= s && e <= re) {
+                        return false; // not assigned_inside_loop?
+                    }
+                    if ranges.iter().any(|&(_, e)| e < rs) {
+                        return false; // assigned_before_loop?
+                    }
+                    scope.refs.get(name).is_some_and(|pos| pos.iter().any(|&p| p > re))
+                });
+                if hit {
+                    self.skip.insert(anchor);
+                }
+            }
+        }
+    }
+
+    impl<'pr> ruby_prism::Visit<'pr> for V {
+        fn visit_local_variable_read_node(&mut self, n: &ruby_prism::LocalVariableReadNode<'pr>) {
+            let l = n.location();
+            self.reference(l.as_slice(), l.start_offset());
+        }
+        fn visit_local_variable_write_node(&mut self, n: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            // rhs scanned before the assignment lands, matching
+            // `process_variable_assignment` (`foo = foo + 1` sees the OLD
+            // `foo` as a reference, not the one being created).
+            self.visit(&n.value());
+            let l = n.name_loc();
+            self.assign(l.as_slice(), l.start_offset(), l.end_offset());
+        }
+        fn visit_local_variable_operator_write_node(
+            &mut self,
+            n: &ruby_prism::LocalVariableOperatorWriteNode<'pr>,
+        ) {
+            // `foo += 1` is a reference to the old `foo` AND an assignment
+            // — matches `process_variable_operator_assignment`.
+            let l = n.name_loc();
+            self.reference(l.as_slice(), l.start_offset());
+            self.visit(&n.value());
+            self.assign(l.as_slice(), l.start_offset(), l.end_offset());
+        }
+        fn visit_local_variable_and_write_node(&mut self, n: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            let l = n.name_loc();
+            self.reference(l.as_slice(), l.start_offset());
+            self.visit(&n.value());
+            self.assign(l.as_slice(), l.start_offset(), l.end_offset());
+        }
+        fn visit_local_variable_or_write_node(&mut self, n: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            let l = n.name_loc();
+            self.reference(l.as_slice(), l.start_offset());
+            self.visit(&n.value());
+            self.assign(l.as_slice(), l.start_offset(), l.end_offset());
+        }
+        fn visit_multi_write_node(&mut self, n: &ruby_prism::MultiWriteNode<'pr>) {
+            self.visit(&n.value());
+            for t in n.lefts().iter().chain(n.rest()).chain(n.rights().iter()) {
+                self.masgn_target(&t);
+            }
+        }
+        fn visit_while_node(&mut self, n: &ruby_prism::WhileNode<'pr>) {
+            if il_truthy_literal(&n.predicate()) {
+                let l = n.location();
+                self.record_loop(l.start_offset(), l.end_offset(), n.keyword_loc().start_offset());
+            }
+            ruby_prism::visit_while_node(self, n);
+        }
+        fn visit_until_node(&mut self, n: &ruby_prism::UntilNode<'pr>) {
+            if il_falsey_literal(&n.predicate()) {
+                let l = n.location();
+                self.record_loop(l.start_offset(), l.end_offset(), n.keyword_loc().start_offset());
+            }
+            ruby_prism::visit_until_node(self, n);
+        }
+        // Scope boundaries (`VariableForce::SCOPE_TYPES`): a fresh
+        // assignment/reference table, evaluated and popped once its body
+        // has been fully walked (so it sees occurrences on either side of
+        // any loop nested directly inside it).
+        fn visit_def_node(&mut self, n: &ruby_prism::DefNode<'pr>) {
+            // `defs`'s receiver (`def self.foo`) is evaluated in the OUTER
+            // scope — rubocop-ast's `TWISTED_SCOPE_TYPES`.
+            if let Some(r) = n.receiver() {
+                self.visit(&r);
+            }
+            self.stack.push(Scope::default());
+            if let Some(b) = n.body() {
+                self.visit(&b);
+            }
+            self.finish_scope();
+        }
+        fn visit_block_node(&mut self, n: &ruby_prism::BlockNode<'pr>) {
+            self.stack.push(Scope::default());
+            if let Some(b) = n.body() {
+                self.visit(&b);
+            }
+            self.finish_scope();
+        }
+        fn visit_lambda_node(&mut self, n: &ruby_prism::LambdaNode<'pr>) {
+            self.stack.push(Scope::default());
+            if let Some(b) = n.body() {
+                self.visit(&b);
+            }
+            self.finish_scope();
+        }
+        fn visit_class_node(&mut self, n: &ruby_prism::ClassNode<'pr>) {
+            if let Some(sc) = n.superclass() {
+                self.visit(&sc);
+            }
+            self.stack.push(Scope::default());
+            if let Some(b) = n.body() {
+                self.visit(&b);
+            }
+            self.finish_scope();
+        }
+        fn visit_module_node(&mut self, n: &ruby_prism::ModuleNode<'pr>) {
+            self.stack.push(Scope::default());
+            if let Some(b) = n.body() {
+                self.visit(&b);
+            }
+            self.finish_scope();
+        }
+        fn visit_singleton_class_node(&mut self, n: &ruby_prism::SingletonClassNode<'pr>) {
+            // `class << expr`'s `expr` is evaluated in the OUTER scope.
+            self.visit(&n.expression());
+            self.stack.push(Scope::default());
+            if let Some(b) = n.body() {
+                self.visit(&b);
+            }
+            self.finish_scope();
+        }
+    }
+
+    let mut v = V { stack: vec![Scope::default()], skip: HashSet::new() };
+    use ruby_prism::Visit;
+    v.visit(root);
+    v.finish_scope();
+    v.skip
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/InfiniteLoop — `while true`/`until false`, in any of its
+    /// shapes (full `while/until ... end`, single- or multi-line modifier
+    /// form, or the post-condition `begin...end while/until`), should use
+    /// `Kernel#loop` instead. `on_while`/`on_while_post` are literal
+    /// aliases of the same handler upstream — prism gives both shapes
+    /// (`while true; end` and `begin; end while true`) the SAME node type
+    /// (distinguished only by `is_begin_modifier`), so one call site here
+    /// covers both, unlike the `while`/`while_post` split in whitequark's
+    /// AST.
+    ///
+    /// Before registering anything, this defers to the `VariableForce`
+    /// scope guard precomputed in `infinite_loop_skips`: if a variable
+    /// introduced inside the loop body is still read after the loop ends,
+    /// wrapping it in `loop do...end` would make that variable
+    /// block-scoped and break the later read, so upstream suppresses the
+    /// offense ENTIRELY (not just the autocorrect). That check needs to
+    /// see the whole enclosing scope — including code physically AFTER
+    /// this loop — which a single forward visitor pass can't see yet at
+    /// the point this node is reached, hence the whole-file precompute.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn check_infinite_loop(
+        &mut self,
+        is_infinite: bool,
+        node_loc: ruby_prism::Location,
+        keyword_loc: ruby_prism::Location,
+        predicate: &ruby_prism::Node,
+        statements: Option<ruby_prism::StatementsNode>,
+        do_keyword_loc: Option<ruby_prism::Location>,
+        closing_loc: Option<ruby_prism::Location>,
+        is_begin_modifier: bool,
+    ) {
+        const COP: &str = "Style/InfiniteLoop";
+        if !self.on(COP) || !is_infinite {
+            return;
+        }
+        let kw_start = keyword_loc.start_offset();
+        if self.il_no_offense.contains(&kw_start) {
+            return;
+        }
+        self.push(kw_start, COP, true, "Use `Kernel#loop` for infinite loops.");
+
+        if is_begin_modifier {
+            // `begin ... end while/until cond` (a "post-condition loop"):
+            // `begin` -> `loop do`; everything from the inner `end`
+            // through the end of the WHOLE node (` while cond`/`
+            // until cond` — never a trailing same-line comment, which
+            // sits outside the node's own source range) is dropped.
+            let Some(stmts) = statements else { return };
+            let Some(begin_node) = stmts.body().iter().find_map(|n| n.as_begin_node()) else {
+                return;
+            };
+            let (Some(begin_kw), Some(end_kw)) =
+                (begin_node.begin_keyword_loc(), begin_node.end_keyword_loc())
+            else {
+                return;
+            };
+            self.fixes.push((begin_kw.start_offset(), begin_kw.end_offset(), b"loop do".to_vec()));
+            self.fixes.push((end_kw.end_offset(), node_loc.end_offset(), Vec::new()));
+        } else if closing_loc.is_none() {
+            // Modifier form (`node.modifier_form?`: no `end` keyword at
+            // all): `body while/until cond` -> `loop { body }` on one
+            // line, or a fully reindented `loop do...end` block otherwise.
+            let Some(stmts) = statements else { return };
+            let node_start = node_loc.start_offset();
+            let node_end = node_loc.end_offset();
+            let (start_line, _) = self.idx.loc(node_start);
+            let (end_line, _) = self.idx.loc(node_end.saturating_sub(1));
+            let body_loc = stmts.location();
+            let body_src = body_loc.as_slice();
+            let replacement = if start_line == end_line {
+                let mut r = b"loop { ".to_vec();
+                r.extend_from_slice(body_src);
+                r.extend_from_slice(b" }");
+                r
+            } else {
+                // `Alignment#indentation(node)`: `node.loc.column`
+                // synthetic spaces (always plain spaces, even over a
+                // tab-indented original) plus the configured
+                // `Layout/IndentationWidth`, reapplied to EVERY line of
+                // the body (`body.source.gsub(/^/, indentation(node))`).
+                let (_, node_col) = self.idx.loc(node_start); // 1-based
+                let width = self.cfg.int("Layout/IndentationWidth", "Width");
+                let synth_indent = " ".repeat((node_col - 1) + width);
+                // The body's own source line's literal leading whitespace
+                // (tabs and all) separates `loop do`/`end` from the
+                // (already-reindented) body — the join separator in
+                // `modifier_replacement`.
+                let (body_line, _) = self.idx.loc(body_loc.start_offset());
+                let line_start = self.idx.starts[body_line - 1];
+                let mut ws_end = line_start;
+                while ws_end < self.src.len() && matches!(self.src[ws_end], b' ' | b'\t') {
+                    ws_end += 1;
+                }
+                let line_ws = &self.src[line_start..ws_end];
+
+                let mut indented_body = Vec::new();
+                for (i, line) in body_src.split(|&b| b == b'\n').enumerate() {
+                    if i > 0 {
+                        indented_body.push(b'\n');
+                    }
+                    indented_body.extend_from_slice(synth_indent.as_bytes());
+                    indented_body.extend_from_slice(line);
+                }
+
+                let mut r = b"loop do\n".to_vec();
+                r.extend_from_slice(line_ws);
+                r.extend_from_slice(&indented_body);
+                r.push(b'\n');
+                r.extend_from_slice(line_ws);
+                r.extend_from_slice(b"end");
+                r
+            };
+            self.fixes.push((node_start, node_end, replacement));
+        } else {
+            // Regular `while cond [do] ... end` / `until cond [do] ... end`:
+            // `while`/`until` through the `do` keyword (if any, else
+            // through the condition) becomes `loop do`; the body and the
+            // closing `end` are untouched.
+            let end_off =
+                do_keyword_loc.map(|d| d.end_offset()).unwrap_or_else(|| predicate.location().end_offset());
+            self.fixes.push((kw_start, end_off, b"loop do".to_vec()));
+        }
+    }
+}
