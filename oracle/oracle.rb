@@ -245,6 +245,38 @@ def parse_config_sections(joined)
   sections.empty? ? nil : sections
 end
 
+# Resolve a bare-identifier `let` reference through the scope's let chain
+# (RSpec lazy-let semantics, statically approximated). Handles `ident`,
+# `ident.merge(PAIRS)` (later keys win, like Hash#merge), and hash-literal
+# terminals; cycles/depth are cut at 8 hops.
+def resolve_let_chain(text, lets, depth = 0)
+  text = text.strip
+  return text if depth > 8
+  if text =~ /\A(\w+)\z/ && lets[Regexp.last_match(1)]
+    return resolve_let_chain(lets[Regexp.last_match(1)], lets, depth + 1)
+  end
+  if (m = text.match(/\A(\w+)\.merge\((.*)\)\z/m)) && lets[m[1]]
+    base = resolve_let_chain(lets[m[1]], lets, depth + 1)
+    pairs = m[2].strip
+    return base.sub(/\}\s*\z/, ", #{pairs} }") if base =~ /\A\{.*\}\z/m
+  end
+  text
+end
+
+# `RuboCop::Config.new(config_data)` — a bare identifier (or ident.merge(...))
+# whose value lives in `let`s. Inline the resolved hash text so
+# parse_config_sections sees literal sections; nil when the arg isn't such a
+# reference or doesn't resolve to hash text (yet — lets may appear later).
+def inline_config_new_arg(joined, lets)
+  m = joined.match(/RuboCop::Config\s*\.\s*new\((\w+(?:\.merge\(.*\))?)\)/m)
+  return nil unless m
+
+  resolved = resolve_let_chain(m[1], lets)
+  return nil unless (inner = resolved[/\A\{(.*)\}\z/m, 1])
+
+  joined.sub(m[0], "RuboCop::Config.new(#{inner.strip})")
+end
+
 examples = []
 # `name = { ... }` locals at example-group level — some specs stash the
 # cop_config hash in one and reference it from the let.
@@ -305,6 +337,7 @@ while i < lines.length
     inh_rb   = cfg_stack.any? ? cfg_stack.last[6] : nil
     inh_lets = cfg_stack.any? ? cfg_stack.last[7].dup : {}
     inh_oc   = cfg_stack.any? ? cfg_stack.last[8] : 'default'
+    inh_cfgtext = cfg_stack.any? ? cfg_stack.last[9] : nil
     # a `:rubyXY` context tag pins TargetRubyVersion for its examples
     inh_rb = "#{Regexp.last_match(1)}.#{Regexp.last_match(2)}" if l =~ /,\s*:ruby(\d)(\d)\b/
     # A shared_examples group runs at its it_behaves_like call sites, with
@@ -313,7 +346,7 @@ while i < lines.length
     shared = !(l =~ /^\s*shared_examples\b/).nil?
     cfg_stack.push([indent, inh_cfg,
                     inh_skip || l.include?('unsupported_on: :prism') || shared,
-                    inh_as, inh_sec, inh_ovr, inh_rb, inh_lets, inh_oc])
+                    inh_as, inh_sec, inh_ovr, inh_rb, inh_lets, inh_oc, inh_cfgtext])
   elsif l =~ /^\s*(it|specify)\b/
     # An `it` at indent N means every context defined at indent >= N has
     # closed — without this, a trailing top-level example would inherit the
@@ -349,6 +382,24 @@ while i < lines.length
   if cfg_stack.any? && l =~ /let\(:(\w+)\)\s*\{\s*(true|false|-?\d+|'[^']*'|"[^"]*"|\{.*\})\s*\}\s*\z/ &&
      !%w[cop_config config cop other_cops].include?(Regexp.last_match(1))
     cfg_stack.last[7][Regexp.last_match(1)] = Regexp.last_match(2)
+  end
+  # A `let(:name)` holding a bare identifier, an ident.merge(...) chain, or a
+  # multi-line do..end hash — config-building lets (`let(:config_data)
+  # { cop_config_data }`) that a bare-identifier RuboCop::Config.new(arg)
+  # resolves through. Scoped like the scalar lets above.
+  if cfg_stack.any? && !%w[cop_config config cop other_cops].include?(l[/let\(:(\w+)\)/, 1].to_s)
+    if l =~ /let\(:(\w+)\)\s*\{\s*(\w+(?:\.merge\(.*\))?)\s*\}\s*\z/
+      cfg_stack.last[7][Regexp.last_match(1)] = Regexp.last_match(2)
+    elsif l =~ /let\(:(\w+)\)\s*do\s*\z/
+      let_name = Regexp.last_match(1)
+      blk = []
+      i += 1
+      while i < lines.length && lines[i] !~ /\A\s*end\s*\z/
+        blk << lines[i]
+        i += 1
+      end
+      cfg_stack.last[7][let_name] = blk.join(' ').strip
+    end
   end
   # `let(:other_cops)` — extra config SECTIONS the example needs (e.g.
   # Style/StringLiterals EnforcedStyle for Style/EmptyLiteral). Same scoping
@@ -402,8 +453,14 @@ while i < lines.length
     if (m = joined.match(/ActiveSupportExtensionsEnabled'\s*=>\s*(true|false)/)) && cfg_stack.any?
       cfg_stack.last[3] = m[1]
     end
-    if cfg_stack.any? && (sections = parse_config_sections(joined))
-      cfg_stack.last[4] = sections
+    if cfg_stack.any?
+      if (sections = parse_config_sections(joined))
+        cfg_stack.last[4] = sections
+      elsif joined =~ /RuboCop::Config\s*\.\s*new\(\w+/
+        # bare-identifier arg: resolve through lets now and again whenever a
+        # participating let is (re)defined later (frame slot 9).
+        cfg_stack.last[9] = joined
+      end
     end
   end
   # `subject(:cop) { described_class.new(RuboCop::Config.new(...)) }` — another
@@ -420,6 +477,14 @@ while i < lines.length
     if cfg_stack.any? && (sections = parse_config_sections(blk.join(' ')))
       cfg_stack.last[4] = sections
     end
+  end
+  # Re-resolve a bare-identifier let(:config) whenever its let chain can now
+  # be satisfied in this scope (lets defined after — or overridden below —
+  # the let(:config) line itself).
+  if cfg_stack.any? && cfg_stack.last[9] &&
+     (inlined = inline_config_new_arg(cfg_stack.last[9], cfg_stack.last[7])) &&
+     (sections = parse_config_sections(inlined))
+    cfg_stack.last[4] = sections
   end
   cur_cfg = cfg_stack.any? ? cfg_stack.last[1] : 'default'
   cur_skip = cfg_stack.any? ? cfg_stack.last[2] : false
