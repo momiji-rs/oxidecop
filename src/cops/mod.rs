@@ -369,7 +369,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
-    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional",
+    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next",
 ];
 
 impl Engine {
@@ -1502,6 +1502,16 @@ pub(crate) struct Cops<'a> {
     // first use, since our single-pass traversal has no per-cop memoized
     // accessor to hang the laziness off of).
     pub(crate) sigex_custom_fail_defined: bool,
+    // Style/Next's `@reindented_lines` (`Hash.new(0)`, reset per
+    // `on_new_investigation` i.e. once per file — matched here by simply
+    // being a fresh field on each per-file `Cops` instance): cumulative
+    // dedent already queued for a given 1-based line by an EARLIER (outer)
+    // `next` correction in this SAME file, keyed by line number, so a
+    // nested correction's own reindent widens the existing removal instead
+    // of emitting a second, byte-identical-or-conflicting edit the apply
+    // step would just drop. Maps line -> (index into `fixes` of that line's
+    // current removal edit if one's been pushed yet, cumulative delta).
+    pub(crate) nx_reindented: HashMap<usize, (Option<usize>, i64)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2996,6 +3006,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        self.check_next_while(node);
         self.check_loop_while(node);
         self.check_unreachable_loop_while(node);
         self.check_infinite_loop(
@@ -3065,6 +3076,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth -= 1;
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        self.check_next_until(node);
         self.check_loop_until(node);
         self.check_unreachable_loop_until(node);
         self.check_infinite_loop(
@@ -3127,6 +3139,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth -= 1;
     }
     fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
+        self.check_next_for(node);
         self.check_for(node);
         self.check_unreachable_loop_for(node);
         if let Some(do_kw) = node.do_keyword_loc() {
@@ -4228,6 +4241,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_method_length_block(node, &bn);
                 self.check_empty_lines_around_exception_handling_keywords_block(node, &bn);
                 self.check_block_length(node, &bn);
+                self.check_next_block(node, &bn);
             }
             // Lint/NonLocalExitFromIterator: stash this call's shape
             // (`send_node.method?(:lambda)`, `define_method?`,
@@ -4474,6 +4488,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         dn_ancestors: Vec::new(),
         dn_return_arg_offsets: HashSet::new(),
         dn_pending_define_method: None,
+        nx_reindented: HashMap::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),

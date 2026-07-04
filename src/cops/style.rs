@@ -25254,3 +25254,529 @@ fn snc_range_with_surrounding_space_no_nl(src: &[u8], mut start: usize, mut end:
     }
     (start, end)
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/Next — `on_block`/`on_numblock`/`on_itblock` (all one prism
+    /// `BlockNode` — numbered-param/`it` blocks get no special casing
+    /// anywhere below, since their predicate/body text is just whatever
+    /// source they contain), hooked from `visit_call_node` right where the
+    /// call's attached `BlockNode` is already in hand. Upstream's guard is
+    /// `node.send_node.call_type? && node.send_node.enumerator_method?` —
+    /// prism's `CallNode` already covers both plain and safe-navigation
+    /// calls in one type (matching rubocop-ast's `call_type?`, true for
+    /// BOTH `:send`/`:csend`), so the safe-navigation `[]&.each do |o| ...
+    /// end` fixture case needs no special casing here either.
+    pub(crate) fn check_next_block(&mut self, call: &ruby_prism::CallNode, block: &ruby_prism::BlockNode) {
+        if !self.on("Style/Next") {
+            return;
+        }
+        if !nx_enumerator_method(call.name().as_slice()) {
+            return;
+        }
+        let list = nx_block_stmt_list(block.body());
+        self.nx_check(&list);
+    }
+
+    /// `on_while`. Upstream's `on_while` is never invoked for the
+    /// `begin...end while` post-condition-loop shape — whitequark gives
+    /// that a distinct `:while_post` type this cop's `alias on_until
+    /// on_while` never touches; prism's `is_begin_modifier()` marks the
+    /// same shape on the very same `WhileNode` type, so it needs an
+    /// explicit guard here (see the sibling note on `WhileUntilModifier`).
+    pub(crate) fn check_next_while(&mut self, node: &ruby_prism::WhileNode) {
+        if !self.on("Style/Next") || node.is_begin_modifier() {
+            return;
+        }
+        let list = nx_stmt_list(node.statements());
+        self.nx_check(&list);
+    }
+
+    /// `on_until` (aliased to `on_while` upstream) — same post-condition
+    /// exclusion as `check_next_while`.
+    pub(crate) fn check_next_until(&mut self, node: &ruby_prism::UntilNode) {
+        if !self.on("Style/Next") || node.is_begin_modifier() {
+            return;
+        }
+        let list = nx_stmt_list(node.statements());
+        self.nx_check(&list);
+    }
+
+    /// `on_for` (aliased to `on_while` upstream) — `for` has no
+    /// post-condition variant.
+    pub(crate) fn check_next_for(&mut self, node: &ruby_prism::ForNode) {
+        if !self.on("Style/Next") {
+            return;
+        }
+        let list = nx_stmt_list(node.statements());
+        self.nx_check(&list);
+    }
+
+    /// `check(node)`: `ends_with_condition?` reduces, for a flat statement
+    /// list (prism never wraps a multi-statement body in an extra node the
+    /// way whitequark's implicit `begin` does), to just examining the LAST
+    /// entry — true whether the body holds one statement or many. Likewise
+    /// `offense_node`'s destructuring trick always resolves to that same
+    /// last entry: for a single-statement body it hands back the whole body
+    /// (which, being one node, IS the list's only/last element); for a
+    /// multi-statement one it explicitly picks the last child.
+    fn nx_check(&mut self, list: &[ruby_prism::Node]) {
+        const COP: &str = "Style/Next";
+        let Some(offending) = list.last() else { return };
+        let style_always = self.cfg.enforced_style(COP) == "always";
+        let min_body_length = self
+            .cfg
+            .get(COP, "MinBodyLength")
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(3);
+        if !nx_simple_if_without_break(offending, self.idx, style_always, min_body_length) {
+            return;
+        }
+        // `allowed_consecutive_conditionals? && consecutive_conditionals?`:
+        // the latter is `if_node.parent&.begin_type? &&
+        // left_sibling&.if_type?` — "parent is a begin" is exactly "there
+        // are 2+ statements in this body" for our flat list, and the left
+        // sibling is simply the entry right before the offending one.
+        if list.len() > 1 {
+            let allow_consecutive = self.cfg.get(COP, "AllowConsecutiveConditionals") == Some("true");
+            if allow_consecutive && nx_is_if_or_unless(&list[list.len() - 2]) {
+                return;
+            }
+        }
+        let start = offending.location().start_offset();
+        self.push(start, COP, true, "Use `next` to skip iteration.");
+        if nx_modifier_form(offending) {
+            self.nx_autocorrect_modifier(offending);
+        } else {
+            self.nx_autocorrect_block(offending);
+        }
+    }
+
+    /// `autocorrect_modifier`: replace the WHOLE modifier-if/unless node
+    /// (whose own range starts at the body EXPRESSION, not the keyword —
+    /// `puts o if a == 1`'s node spans "puts o if a == 1" in full, so a
+    /// trailing comment past the condition is naturally left untouched)
+    /// with the swapped `next inverse_keyword cond` line followed by the
+    /// body re-indented to the node's own original column.
+    fn nx_autocorrect_modifier(&mut self, node: &ruby_prism::Node) {
+        let Some(pred) = nx_predicate(node) else { return };
+        let Some(stmts) = nx_statements(node) else { return };
+        let Some(body_stmt) = stmts.body().iter().next() else { return };
+        let inverse_kw = nx_inverse_keyword(node);
+        let loc = node.location();
+        let start = loc.start_offset();
+        let end = loc.end_offset();
+        let column = self.idx.loc(start).1 - 1;
+        let cond_src = self.node_src(&pred).to_vec();
+        let body_src = self.node_src(&body_stmt).to_vec();
+        let mut repl = Vec::with_capacity(cond_src.len() + body_src.len() + column + 16);
+        repl.extend_from_slice(b"next ");
+        repl.extend_from_slice(inverse_kw.as_bytes());
+        repl.push(b' ');
+        repl.extend_from_slice(&cond_src);
+        repl.push(b'\n');
+        repl.extend(std::iter::repeat(b' ').take(column));
+        repl.extend_from_slice(&body_src);
+        self.fixes.push((start, end, repl));
+    }
+
+    /// `autocorrect_block`: insert the `next inverse_keyword cond` line
+    /// before the node, delete the `if/unless cond [then]` header text and
+    /// the (possibly-misaligned) `end` line, then dedent whatever's left in
+    /// between to match the node's original column.
+    fn nx_autocorrect_block(&mut self, node: &ruby_prism::Node) {
+        let Some(pred) = nx_predicate(node) else { return };
+        let inverse_kw = nx_inverse_keyword(node);
+        let cond_src = self.node_src(&pred).to_vec();
+        let start = node.location().start_offset();
+        let mut next_code = Vec::with_capacity(cond_src.len() + 8);
+        next_code.extend_from_slice(b"next ");
+        next_code.extend_from_slice(inverse_kw.as_bytes());
+        next_code.push(b' ');
+        next_code.extend_from_slice(&cond_src);
+
+        // Upstream does this as `insert_before(node, next_code)` PLUS a
+        // separate `remove(cond_range)` — two edits sharing the same start.
+        // Our engine's overlap-skip apply step (unlike rubocop's rewriter)
+        // requires each edit's END to fall at-or-before the PREVIOUS edit's
+        // START, so an insert-then-remove pair at the same start collides;
+        // folding them into one `replace` from the node's start through the
+        // end of `then` (when present — eating `then` entirely) or else the
+        // condition's own end produces byte-identical output as one edit.
+        let cond_end = nx_then_keyword_loc(node)
+            .map(|l| l.end_offset())
+            .unwrap_or_else(|| pred.location().end_offset());
+        self.fixes.push((start, cond_end, next_code));
+
+        // `end_range`: the `end` keyword's own line (from its line-start,
+        // through the keyword's own end — NOT its trailing newline),
+        // extended one byte further left (swallowing the PRECEDING line's
+        // trailing newline instead) whenever nothing but whitespace follows
+        // `end` before the next newline — the trick that collapses the
+        // `end` line away without leaving a blank line behind.
+        if let Some(end_kw) = nx_end_keyword_loc(node) {
+            let end_pos = end_kw.end_offset();
+            let end_line = self.idx.loc(end_kw.start_offset()).0;
+            let mut begin_pos = self.idx.starts[end_line - 1];
+            if nx_end_followed_by_whitespace_only(self.src, end_pos) {
+                begin_pos = begin_pos.saturating_sub(1);
+            }
+            // Nested corrections: this node's own `end` line may ALSO be
+            // one an ENCLOSING `next` correction already queued a small
+            // leading-whitespace reindent for (its `reindentable_lines`
+            // range runs through every line up to, but not including, ITS
+            // OWN `end` — which can be well past ours). Upstream's
+            // Parser::TreeRewriter freely nests a smaller queued removal
+            // inside a larger one later found to fully contain it; our
+            // simpler engine instead needs that smaller edit cleared first,
+            // or its now-stale (and non-nested-by-position) presence would
+            // make the apply step drop THIS whole `end`-line removal.
+            self.nx_clear_reindent_in_range(begin_pos, end_pos);
+            self.fixes.push((begin_pos, end_pos, Vec::new()));
+        }
+
+        self.nx_reindent(node, &pred);
+    }
+
+    /// `reindentable_lines` + `reindent`: dedent every non-blank,
+    /// non-heredoc-body line strictly between the node's own line and its
+    /// `end` keyword's line, by the uniform delta between the shallowest of
+    /// those lines' indentation and the condition's own line's indentation.
+    ///
+    /// `reindent_line`'s `@reindented_lines` accumulator: a NESTED `next`
+    /// correction (an inner offense whose own reindent range overlaps an
+    /// outer one's, e.g. the shared body line of two nested one-statement
+    /// loops) must WIDEN the earlier removal rather than queue a second,
+    /// separate edit at the same line-start — our apply step (unlike
+    /// rubocop's rewriter) drops a same-start edit that doesn't nest
+    /// cleanly inside the first one already applied, rather than merging
+    /// it. `self.nx_reindented` tracks, per line, the cumulative delta and
+    /// (if one's been pushed) that line's edit's index in `self.fixes`, so
+    /// a later call in the SAME investigation extends that same edit's end
+    /// in place instead of appending a colliding one.
+    fn nx_reindent(&mut self, node: &ruby_prism::Node, cond: &ruby_prism::Node) {
+        let Some(end_kw) = nx_end_keyword_loc(node) else { return };
+        let start_line = self.idx.loc(node.location().start_offset()).0;
+        let end_line = self.idx.loc(end_kw.start_offset()).0;
+        if end_line <= start_line + 1 {
+            return;
+        }
+        let lines: Vec<usize> = (start_line + 1..end_line)
+            .filter(|&l| !self.heredoc_lines.iter().any(|(f, t, _, _)| l >= *f && l <= *t))
+            .filter(|&l| self.nx_first_non_ws_col(l).is_some())
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let cond_line = self.idx.loc(cond.location().start_offset()).0;
+        let Some(target_indent) = self.nx_first_non_ws_col(cond_line) else { return };
+        let Some(actual_indent) = lines.iter().filter_map(|&l| self.nx_first_non_ws_col(l)).min() else { return };
+        let delta = actual_indent as i64 - target_indent as i64;
+        for l in lines {
+            let (prev_idx, prev_delta) = self.nx_reindented.get(&l).copied().unwrap_or((None, 0));
+            let adjustment = delta + prev_delta;
+            let line_start = self.idx.starts[l - 1];
+            let new_idx = if adjustment > 0 {
+                if let Some(idx) = prev_idx {
+                    self.fixes[idx].1 = line_start + adjustment as usize;
+                    Some(idx)
+                } else {
+                    let idx = self.fixes.len();
+                    self.fixes.push((line_start, line_start + adjustment as usize, Vec::new()));
+                    Some(idx)
+                }
+            } else {
+                // Non-positive: shrink any existing edit to a no-op
+                // (same start/end) rather than dropping it from the Vec —
+                // that would invalidate every OTHER line's stored index.
+                if let Some(idx) = prev_idx {
+                    self.fixes[idx].1 = self.fixes[idx].0;
+                }
+                prev_idx
+            };
+            self.nx_reindented.insert(l, (new_idx, adjustment));
+        }
+    }
+
+    /// Drop any already-queued reindent edit (from an ENCLOSING `next`
+    /// correction processed earlier) whose byte range falls fully inside
+    /// `[start, end)` — see the call site in `nx_autocorrect_block`. Merely
+    /// zeroing such an edit's content isn't enough: our apply step's
+    /// overlap rule keys off an edit's START position, not its content, so
+    /// even an empty (no-op) edit sitting at a start strictly inside
+    /// `[start, end)` would still block the wider removal from applying in
+    /// the same round (any edit at or after `start` sets the "nothing may
+    /// cross this point" boundary the wider removal's END then fails to
+    /// clear). The entry has to be REMOVED from `fixes` outright, which
+    /// means renumbering every other tracked index above it.
+    fn nx_clear_reindent_in_range(&mut self, start: usize, end: usize) {
+        let mut to_remove: Vec<usize> = self
+            .nx_reindented
+            .values()
+            .filter_map(|&(idx, _)| idx)
+            .filter(|&i| {
+                let (fs, fe, _) = &self.fixes[i];
+                *fs >= start && *fe <= end
+            })
+            .collect();
+        if to_remove.is_empty() {
+            return;
+        }
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        to_remove.dedup();
+        for idx in to_remove {
+            self.fixes.remove(idx);
+            for (_, (other_idx, _)) in self.nx_reindented.iter_mut() {
+                match other_idx {
+                    Some(oi) if *oi == idx => *other_idx = None,
+                    Some(oi) if *oi > idx => *oi -= 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// `source_line =~ /\S/` — the column (0-based) of the first
+    /// non-whitespace byte on 1-based line `line`, or `None` when blank.
+    fn nx_first_non_ws_col(&self, line: usize) -> Option<usize> {
+        let start = self.idx.starts[line - 1];
+        let end = self.idx.starts.get(line).copied().unwrap_or(self.src.len());
+        self.src[start..end].iter().position(|&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+    }
+}
+
+/// `MethodIdentifierPredicates::ENUMERATOR_METHODS` plus the `each_*` prefix
+/// rule — the same set `Lint/NextWithoutAccumulator`'s private
+/// `ul_is_enumerator_method` helper carries in lint_cops.rs, duplicated here
+/// since that one isn't visible outside its own module.
+fn nx_enumerator_method(name: &[u8]) -> bool {
+    if name.starts_with(b"each_") {
+        return true;
+    }
+    matches!(
+        name,
+        b"collect"
+            | b"collect_concat"
+            | b"detect"
+            | b"downto"
+            | b"each"
+            | b"find"
+            | b"find_all"
+            | b"find_index"
+            | b"inject"
+            | b"loop"
+            | b"map!"
+            | b"map"
+            | b"reduce"
+            | b"reject"
+            | b"reject!"
+            | b"reverse_each"
+            | b"select"
+            | b"select!"
+            | b"times"
+            | b"upto"
+    )
+}
+
+/// A `while`/`until`/`for` node's body, flattened — empty when there's no
+/// body at all (`return unless node.body`).
+fn nx_stmt_list<'pr>(stmts: Option<ruby_prism::StatementsNode<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+    stmts.map(|s| s.body().iter().collect()).unwrap_or_default()
+}
+
+/// Same, but for `BlockNode#body`, which is a bare `Option<Node>` (either a
+/// `StatementsNode`, or — for a block with its own `rescue`/`ensure` — a
+/// `BeginNode`, which this cop's whitequark original never specially
+/// unwraps either; it just fails `ends_with_condition?`'s checks naturally,
+/// same as here, since a `BeginNode` is never an `if`/`unless`).
+fn nx_block_stmt_list<'pr>(body: Option<ruby_prism::Node<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+    match body {
+        None => Vec::new(),
+        Some(n) => match n.as_statements_node() {
+            Some(s) => s.body().iter().collect(),
+            None => vec![n],
+        },
+    }
+}
+
+/// `if_type?` in rubocop-ast's unified sense: whitequark folds BOTH `if`
+/// and `unless` into one `:if` node type; prism keeps them as distinct
+/// `IfNode`/`UnlessNode` types, so anywhere upstream tests `if_type?` this
+/// checks both.
+fn nx_is_if_or_unless(n: &ruby_prism::Node) -> bool {
+    n.as_if_node().is_some() || n.as_unless_node().is_some()
+}
+
+/// `node.ternary?` — only `IfNode` can be one: prism gives it no
+/// `if_keyword_loc` when the source used `cond ? a : b`. `UnlessNode`
+/// always carries a real `unless` keyword, so it's never a ternary.
+fn nx_is_ternary(n: &ruby_prism::Node) -> bool {
+    n.as_if_node().is_some_and(|i| i.if_keyword_loc().is_none())
+}
+
+/// `node.else?` — normalized across `if`/`unless`: an `IfNode`'s
+/// `subsequent` (an `ElseNode`, OR another `IfNode` for an `elsif` chain —
+/// `else?` "returns true for nodes containing an elsif clause" per its own
+/// doc) or an `UnlessNode`'s `else_clause`.
+fn nx_has_else(n: &ruby_prism::Node) -> bool {
+    if let Some(i) = n.as_if_node() {
+        return i.subsequent().is_some();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return u.else_clause().is_some();
+    }
+    false
+}
+
+/// `if_without_else?`: `node&.if_type? && !node.ternary? && !node.else?`.
+fn nx_if_without_else(n: &ruby_prism::Node) -> bool {
+    nx_is_if_or_unless(n) && !nx_is_ternary(n) && !nx_has_else(n)
+}
+
+/// The written branch (`if_branch`, normalized for `unless` — prism's
+/// `UnlessNode#statements` already IS that normalized branch directly, so
+/// no swap like whitequark's `node_parts` is needed).
+fn nx_statements<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::StatementsNode<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return i.statements();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return u.statements();
+    }
+    None
+}
+
+fn nx_predicate<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return Some(i.predicate());
+    }
+    if let Some(u) = n.as_unless_node() {
+        return Some(u.predicate());
+    }
+    None
+}
+
+fn nx_then_keyword_loc<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Location<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return i.then_keyword_loc();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return u.then_keyword_loc();
+    }
+    None
+}
+
+fn nx_end_keyword_loc<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Location<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return i.end_keyword_loc();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return u.end_keyword_loc();
+    }
+    None
+}
+
+/// `ModifierNode#modifier_form?` (`loc.end.nil?`) — no real `end` keyword.
+fn nx_modifier_form(n: &ruby_prism::Node) -> bool {
+    nx_end_keyword_loc(n).is_none()
+}
+
+/// `inverse_keyword`: `if` <-> `unless` (never called on a ternary, which
+/// this cop always excludes before reaching here).
+fn nx_inverse_keyword(n: &ruby_prism::Node) -> &'static str {
+    if n.as_unless_node().is_some() {
+        "if"
+    } else {
+        "unless"
+    }
+}
+
+/// `if_else_children?`: `node.each_child_node(:if).any?(&:else?)` — a
+/// DIRECT child (the predicate, or the branch when it's a single UNWRAPPED
+/// statement — whitequark never wraps a single-statement branch in a
+/// `begin`, so it sits directly in that child slot) that is itself an
+/// `if`/`unless` carrying an `else`.
+fn nx_if_else_children(n: &ruby_prism::Node) -> bool {
+    if let Some(pred) = nx_predicate(n) {
+        if nx_is_if_or_unless(&pred) && nx_has_else(&pred) {
+            return true;
+        }
+    }
+    if let Some(stmts) = nx_statements(n) {
+        let body = stmts.body();
+        if body.iter().count() == 1 {
+            let only = body.iter().next().unwrap();
+            if nx_is_if_or_unless(&only) && nx_has_else(&only) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `exit_body_type?`: the written branch, when it's EXACTLY one statement,
+/// is a bare `break`/`return`.
+fn nx_exit_body_type(n: &ruby_prism::Node) -> bool {
+    let Some(stmts) = nx_statements(n) else { return false };
+    let body = stmts.body();
+    if body.iter().count() != 1 {
+        return false;
+    }
+    let only = body.iter().next().unwrap();
+    only.as_break_node().is_some() || only.as_return_node().is_some()
+}
+
+/// `min_body_length?`: `(loc.end.line - loc.keyword.line) > min_body_length`
+/// — only ever reached on a non-modifier (real `end`) node.
+fn nx_min_body_length(n: &ruby_prism::Node, idx: &super::LineIndex, min_body_length: i64) -> bool {
+    let Some(end_kw) = nx_end_keyword_loc(n) else { return false };
+    let kw_loc = if let Some(i) = n.as_if_node() { i.if_keyword_loc() } else { n.as_unless_node().map(|u| u.keyword_loc()) };
+    let Some(kw_loc) = kw_loc else { return false };
+    let end_line = idx.loc(end_kw.start_offset()).0;
+    let kw_line = idx.loc(kw_loc.start_offset()).0;
+    (end_line as i64 - kw_line as i64) > min_body_length
+}
+
+/// `allowed_modifier_if?`: modifier form is exempt under `skip_modifier_ifs`
+/// (the default style); block form is exempt when its body is too short
+/// (`MinBodyLength`).
+fn nx_allowed_modifier_if(n: &ruby_prism::Node, idx: &super::LineIndex, style_always: bool, min_body_length: i64) -> bool {
+    if nx_modifier_form(n) {
+        !style_always
+    } else {
+        !nx_min_body_length(n, idx, min_body_length)
+    }
+}
+
+/// `simple_if_without_break?`.
+fn nx_simple_if_without_break(n: &ruby_prism::Node, idx: &super::LineIndex, style_always: bool, min_body_length: i64) -> bool {
+    if !nx_if_without_else(n) {
+        return false;
+    }
+    if nx_if_else_children(n) {
+        return false;
+    }
+    if nx_allowed_modifier_if(n, idx, style_always, min_body_length) {
+        return false;
+    }
+    !nx_exit_body_type(n)
+}
+
+/// `end_followed_by_whitespace_only?`: is the rest of the KEYWORD'S OWN
+/// LINE, after it, either empty or pure whitespace? (Ruby's `/\A\s*$/`
+/// looks like it tests the whole rest of the buffer, but `$` matches right
+/// before ANY `\n` and `\s*` can match zero characters, so the match
+/// succeeds/fails based only on what sits between `end_pos` and the next
+/// newline — content further into the file never affects the result.)
+fn nx_end_followed_by_whitespace_only(src: &[u8], end_pos: usize) -> bool {
+    for &b in &src[end_pos..] {
+        if b == b'\n' {
+            return true;
+        }
+        if !matches!(b, b' ' | b'\t' | b'\r') {
+            return false;
+        }
+    }
+    true
+}
