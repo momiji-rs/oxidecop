@@ -23686,3 +23686,299 @@ fn tp_node_args_need_parens(node: &ruby_prism::Node<'_>) -> bool {
         false
     }
 }
+
+
+/// Style/SignalException's `kernel_call?` node matcher —
+/// `(send (const {nil? cbase} :Kernel) %1 ...)` — a bare `Kernel` constant
+/// or a top-level-rooted `::Kernel` (never a namespaced `Foo::Kernel`).
+/// Identical shape to `Style::EvalWithLocation`'s own receiver check, so
+/// reused verbatim rather than redefined.
+fn sigex_command_or_kernel_call(node: &ruby_prism::CallNode, name: &[u8]) -> bool {
+    if node.name().as_slice() != name {
+        return false;
+    }
+    match node.receiver() {
+        // `command?(name)`: no explicit receiver at all.
+        None => true,
+        Some(r) => eval_wl_kernel_receiver(&r),
+    }
+}
+
+/// `each_command_or_kernel_call`'s `on_node(:send, node, :rescue)` — a
+/// depth-first scan of `root`'s ENTIRE subtree (root itself included, same
+/// as upstream's `on_node`) for `raise`/`fail` command-or-`Kernel`-calls
+/// named `name`, stopping (never descending further) at any nested
+/// `:rescue`-shaped construct: an explicit/implicit `begin`/`rescue` (a
+/// `BeginNode` with an actual `rescue_clause`) or a modifier `expr rescue
+/// handler` (`RescueModifierNode`) — both map to the SAME classic-AST
+/// `:rescue` node type upstream's `on_node(..., excludes: :rescue)` treats
+/// as opaque, since that nested construct gets its own independent
+/// `on_rescue`-equivalent scan (`check_signal_exception_rescue`/
+/// `_rescue_modifier`) elsewhere in the traversal. A plain `begin/end` with
+/// no rescue clause, or a `def`/`class`/block boundary, is NOT a stop —
+/// upstream's `on_node` only ever excludes actual `:rescue` nodes.
+/// A found `raise`/`fail` command-or-`Kernel`-call: the call's own start
+/// offset (the `ignore_node`/`ignored_node?` identity key) plus its
+/// selector's byte range (`node.loc.selector`, the `add_offense`/
+/// `corrector.replace` anchor) and whether it's spelled `raise` (vs `fail`).
+struct SigexMatch {
+    start: usize,
+    sel_start: usize,
+    sel_end: usize,
+    is_raise: bool,
+}
+
+fn sigex_scan(root: &ruby_prism::Node, name: &'static [u8]) -> Vec<SigexMatch> {
+    struct Finder<'pr> {
+        name: &'static [u8],
+        matches: Vec<SigexMatch>,
+        _marker: std::marker::PhantomData<&'pr ()>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder<'pr> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if sigex_command_or_kernel_call(node, self.name) {
+                if let Some(sel) = node.message_loc() {
+                    self.matches.push(SigexMatch {
+                        start: node.location().start_offset(),
+                        sel_start: sel.start_offset(),
+                        sel_end: sel.end_offset(),
+                        is_raise: node.name().as_slice() == b"raise",
+                    });
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
+            if node.rescue_clause().is_some() {
+                return;
+            }
+            ruby_prism::visit_begin_node(self, node);
+        }
+        fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
+            // Only ever reached as the deliberate ROOT of a scoped scan (one
+            // `resbody` branch) — classic AST's `resbody_branches` are FLAT
+            // siblings of the parent `:rescue` node, never nested in each
+            // other, so a scan rooted at ONE branch must never bleed into
+            // the next `rescue`/`rescue X` clause via `.subsequent()`.
+            for ex in &node.exceptions() {
+                self.visit(&ex);
+            }
+            if let Some(r) = node.reference() {
+                self.visit(&r);
+            }
+            if let Some(st) = node.statements() {
+                self.visit_statements_node(&st);
+            }
+        }
+        fn visit_rescue_modifier_node(&mut self, _node: &ruby_prism::RescueModifierNode<'pr>) {
+            // Boundary — see doc above.
+        }
+    }
+    let mut f = Finder { name, matches: Vec::new(), _marker: std::marker::PhantomData };
+    use ruby_prism::Visit;
+    f.visit(root);
+    f.matches
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/SignalException — checks for uses of `fail` and `raise` per
+    /// `EnforcedStyle` (`only_raise` default, `only_fail`, `semantic`).
+    /// Ported from `ConfigurableEnforcedStyle` + `AutoCorrector`; see
+    /// `sigex_scan`'s doc for the `on_node(..., excludes: :rescue)` replica.
+    ///
+    /// `only_raise`/`only_fail` are simple per-`on_send` checks
+    /// (`check_signal_exception_send`, below). `semantic` additionally needs
+    /// `on_rescue`'s scoped scans, hooked from `visit_begin_node`
+    /// (`check_signal_exception_rescue`) and `visit_rescue_modifier_node`
+    /// (`check_signal_exception_rescue_modifier`) — both must run BEFORE the
+    /// normal traversal reaches the `raise`/`fail` `CallNode`s they cover,
+    /// so `sigex_ignored` (upstream's `ignore_node`) is already populated by
+    /// the time `check_signal_exception_send`'s generic `on_send` fallback
+    /// visits those same nodes.
+    ///
+    /// All three styles reduce `autocorrect`'s `case style; ...; end` (and
+    /// `message`'s) branching down to one fact: whichever spelling was
+    /// actually written is always replaced with — and only ever offended
+    /// under a message describing — the OTHER of `raise`/`fail` (see
+    /// `sigex_report`), since `check_send`'s target `method_name` argument
+    /// at each upstream call site is always the single name that style's
+    /// branch can ever flag.
+    pub(crate) fn check_signal_exception_prescan(&mut self, node: &ruby_prism::ProgramNode) {
+        const COP: &str = "Style/SignalException";
+        if !self.on(COP) {
+            return;
+        }
+        // `custom_fail_defined?`'s `custom_fail_methods` def_node_search:
+        // `{(def :fail ...) (defs _ :fail ...)}` — ANY receiver (or none)
+        // named `fail`, found anywhere in the whole file.
+        struct Finder {
+            found: bool,
+        }
+        impl<'pr> ruby_prism::Visit<'pr> for Finder {
+            fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+                if node.name().as_slice() == b"fail" {
+                    self.found = true;
+                }
+                ruby_prism::visit_def_node(self, node);
+            }
+        }
+        let mut f = Finder { found: false };
+        use ruby_prism::Visit;
+        f.visit(&node.as_node());
+        self.sigex_custom_fail_defined = f.found;
+    }
+
+    /// `on_send` — `RESTRICT_ON_SEND = %i[raise fail]` is just a dispatch
+    /// filter upstream; here every `CallNode` is checked, and `name` (below)
+    /// re-derives the same restriction.
+    pub(crate) fn check_signal_exception_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/SignalException";
+        if !self.on(COP) {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        let name = node.name().as_slice();
+        match style {
+            "semantic" => {
+                // `check_send(:raise, node) unless ignored_node?(node)` — a
+                // `fail` node always no-ops inside `check_send(:raise, ...)`
+                // (`command_or_kernel_call?(:raise, node)` requires
+                // `node.method?(:raise)`), so filtering on `name` up front
+                // is an equivalent, cheaper reordering of the same guards.
+                if name != b"raise" {
+                    return;
+                }
+                if self.sigex_ignored.contains(&node.location().start_offset()) {
+                    return;
+                }
+                if !sigex_command_or_kernel_call(node, b"raise") {
+                    return;
+                }
+                let Some(sel) = node.message_loc() else {
+                    return;
+                };
+                self.sigex_report(sel.start_offset(), sel.end_offset(), true);
+            }
+            "only_raise" => {
+                if self.sigex_custom_fail_defined {
+                    return;
+                }
+                if !sigex_command_or_kernel_call(node, b"fail") {
+                    return;
+                }
+                let Some(sel) = node.message_loc() else {
+                    return;
+                };
+                self.sigex_report(sel.start_offset(), sel.end_offset(), false);
+            }
+            "only_fail" => {
+                if !sigex_command_or_kernel_call(node, b"raise") {
+                    return;
+                }
+                let Some(sel) = node.message_loc() else {
+                    return;
+                };
+                self.sigex_report(sel.start_offset(), sel.end_offset(), true);
+            }
+            _ => {}
+        }
+    }
+
+    /// `add_offense(node.loc.selector, message: message(method_name)) do
+    /// |corrector| autocorrect(corrector, node) end` — anchors on the
+    /// selector (bare `raise`, or the `raise`/`fail` half of a
+    /// `Kernel.raise` call, never the receiver), always correctable.
+    /// `is_raise` is the actual spelling written at `sel_start..sel_end`.
+    fn sigex_report(&mut self, sel_start: usize, sel_end: usize, is_raise: bool) {
+        const COP: &str = "Style/SignalException";
+        let style = self.cfg.enforced_style(COP);
+        let msg = match style {
+            "semantic" => {
+                if is_raise {
+                    "Use `fail` instead of `raise` to signal exceptions."
+                } else {
+                    "Use `raise` instead of `fail` to rethrow exceptions."
+                }
+            }
+            "only_raise" => "Always use `raise` to signal exceptions.",
+            "only_fail" => "Always use `fail` to signal exceptions.",
+            _ => return,
+        };
+        self.push(sel_start, COP, true, msg);
+        let replacement: &[u8] = if is_raise { b"fail" } else { b"raise" };
+        self.fixes.push((sel_start, sel_end, replacement.to_vec()));
+    }
+
+    /// `on_rescue` (`semantic` style only) — `check_scope(:raise,
+    /// node.body)` over the pre-`rescue` statements, then for each
+    /// `resbody_branches` element (prism's `rescue_clause` +
+    /// `.subsequent()` chain): `check_scope(:fail, rescue_node)` followed by
+    /// `allow(:raise, rescue_node)`. The `else` branch is deliberately never
+    /// scanned here (upstream's `node.body` excludes it too) — any
+    /// `raise`/`fail` there falls through to the generic `on_send` handler,
+    /// same as upstream.
+    pub(crate) fn check_signal_exception_rescue(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Style/SignalException";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.enforced_style(COP) != "semantic" {
+            return;
+        }
+        let Some(first_branch) = node.rescue_clause() else {
+            return;
+        };
+        if let Some(stmts) = node.statements() {
+            self.sigex_check_scope(&stmts.as_node(), b"raise");
+        }
+        let mut branch = Some(first_branch);
+        while let Some(b) = branch {
+            let root = b.as_node();
+            self.sigex_check_scope(&root, b"fail");
+            self.sigex_mark_ignored(&root, b"raise");
+            branch = b.subsequent();
+        }
+    }
+
+    /// `on_rescue` for the modifier form (`expr rescue handler`) — classic
+    /// AST folds `expr rescue handler` into the SAME `:rescue` node shape
+    /// as `begin`/`rescue` (a single `resbody` with nil exception list/
+    /// variable), so it gets independent `on_rescue` treatment too:
+    /// `check_scope(:raise, expr)`, then `check_scope(:fail, handler)` +
+    /// `allow(:raise, handler)`.
+    pub(crate) fn check_signal_exception_rescue_modifier(&mut self, node: &ruby_prism::RescueModifierNode) {
+        const COP: &str = "Style/SignalException";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.enforced_style(COP) != "semantic" {
+            return;
+        }
+        let expr = node.expression();
+        self.sigex_check_scope(&expr, b"raise");
+        let handler = node.rescue_expression();
+        self.sigex_check_scope(&handler, b"fail");
+        self.sigex_mark_ignored(&handler, b"raise");
+    }
+
+    /// `check_scope`: scan `root` for `name` command-or-kernel-calls, report
+    /// (and mark ignored) each one not already ignored.
+    fn sigex_check_scope(&mut self, root: &ruby_prism::Node, name: &'static [u8]) {
+        for m in sigex_scan(root, name) {
+            if self.sigex_ignored.contains(&m.start) {
+                continue;
+            }
+            self.sigex_report(m.sel_start, m.sel_end, m.is_raise);
+            self.sigex_ignored.insert(m.start);
+        }
+    }
+
+    /// `allow`: scan `root` for `name` command-or-kernel-calls, marking each
+    /// one ignored WITHOUT reporting (a legitimate rethrow inside a
+    /// `rescue` handler).
+    fn sigex_mark_ignored(&mut self, root: &ruby_prism::Node, name: &'static [u8]) {
+        for m in sigex_scan(root, name) {
+            self.sigex_ignored.insert(m.start);
+        }
+    }
+}

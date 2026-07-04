@@ -369,7 +369,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
-    "Style/YodaCondition", "Style/TernaryParentheses",
+    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException",
 ];
 
 impl Engine {
@@ -1473,6 +1473,20 @@ pub(crate) struct Cops<'a> {
     // `find_last_child` (which can itself be `None`, e.g. an argument-less
     // call — still a real `def_node` upstream, just with a `nil` last_child).
     pub(crate) dn_pending_define_method: Option<Option<DnLastChild>>,
+    // Style/SignalException (`semantic` style): `raise`/`fail` CallNode
+    // start offsets already classified by `on_rescue`'s scoped scans
+    // (`check_scope`/`allow`, upstream's `ignore_node`/`ignored_node?`) so
+    // the generic `on_send` handler never double-reports or misclassifies
+    // them (a `raise` legitimately rethrown inside a `rescue` handler, or a
+    // `raise`/`fail` already scored via a `begin`/`resbody` scope walk).
+    pub(crate) sigex_ignored: HashSet<usize>,
+    // Style/SignalException (`only_raise` style): memoized
+    // `custom_fail_defined?` — true iff the file defines a `fail` instance
+    // or singleton method anywhere (`def_node_search` over the whole AST,
+    // computed once up front in `visit_program_node` rather than lazily on
+    // first use, since our single-pass traversal has no per-cop memoized
+    // accessor to hang the laziness off of).
+    pub(crate) sigex_custom_fail_defined: bool,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2734,6 +2748,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
+        self.check_signal_exception_rescue_modifier(node);
         self.check_suppressed_exception_modifier(node);
         self.check_rescue_modifier(node);
         // Layout/SpaceAroundKeyword's `on_resbody`: whitequark parses a
@@ -3124,6 +3139,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_post_execution_node(self, node);
     }
     fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
+        self.check_signal_exception_rescue(node);
         self.check_duplicate_rescue_exception(node);
         self.check_useless_else_without_rescue(node);
         self.check_empty_lines_around_begin_body(node);
@@ -3352,6 +3368,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.interp_depth -= 1;
     }
     fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
+        self.check_signal_exception_prescan(node);
         self.check_block_nesting(node);
         self.check_duplicated_gem(node);
         self.check_duplicated_group(node);
@@ -3798,6 +3815,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.check_double_negation(node);
+        self.check_signal_exception_send(node);
         // Lint/UselessMethodDefinition: register def-arguments of generic
         // macro calls (anything but a receiver-less access modifier).
         if let Some(args) = node.arguments() {
@@ -4507,6 +4525,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         aa_unbracketed_rhs_parent: HashMap::new(),
         aa_registered_ranges: Vec::new(),
         oorr_valid_ref: Some(0),
+        sigex_ignored: HashSet::new(),
+        sigex_custom_fail_defined: false,
     };
 
     let t = tick(&T_PREP, t);
