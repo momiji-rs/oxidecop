@@ -10878,3 +10878,954 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// ============================================================================
+// Layout/IndentationWidth
+//
+// Ported from rubocop's `IndentationWidth` cop plus the mixins it includes:
+// `EndKeywordAlignment` (unused here beyond `ConfigurableEnforcedStyle`'s
+// style-parameter override — this cop's OWN `EnforcedStyleAlignWith` powers
+// `block_body_indentation_base`, nothing to do with `end`-keyword alignment
+// itself), `Alignment` (`configured_indentation_width`, the `AlignmentCorrector`
+// autocorrect), `CheckAssignment` (the `on_lvasgn`-family + `on_send` dispatch
+// for an if/while/until used as an assignment's right-hand side), and
+// `AllowedPattern` (`AllowedPatterns`, reused via the engine's generic
+// `Cops::allowed` — populated from the SAME per-cop `AllowedPatterns` config
+// section this cop's schema entry declares).
+//
+// The core primitive is `check_indentation(base, body, style)`: is `body`'s
+// own first line indented exactly `configured_indentation_width` columns past
+// `base`'s line? Every hook below (rescue/resbody/ensure/kwbegin/block/class/
+// module/sclass/send/def/while/until/case/case_match/if/unless/assignment)
+// ultimately just resolves a `(base, body)` pair and calls it — see
+// `iw_check_indentation`.
+// ============================================================================
+
+/// Where a `def`/block/class/module's implicit rescue/ensure `BeginNode`
+/// content STARTS — prism gives this synthetic (no explicit `begin` keyword)
+/// wrapper the exact SAME `location()` as the enclosing construct itself
+/// (verified directly against `ruby-prism`: for `def foo\n  a = 1\nrescue\n
+/// a = 2\nend`, the body `BeginNode`'s `location()` starts at byte 0 — the
+/// `def` keyword — not at `a = 1`), so its raw start offset is as unusable as
+/// its end offset (see `iw_begin_node_content_end` for the same trap on the
+/// other side). Whitequark's own rescue/ensure-wrapper node instead starts at
+/// the first REAL clause: the leading (pre-rescue) statements if any, else
+/// the first `rescue`, else (only reachable if a rescue-less body somehow
+/// still parses an `else`) the `else`, else `ensure` alone. A near-duplicate
+/// of `metrics::ml_begin_node_content_start` kept local to this dept file
+/// rather than shared across dept files.
+fn iw_begin_node_content_start(b: &ruby_prism::BeginNode) -> usize {
+    if let Some(stmts) = b.statements() {
+        return stmts.location().start_offset();
+    }
+    if let Some(resc) = b.rescue_clause() {
+        return resc.location().start_offset();
+    }
+    if let Some(els) = b.else_clause() {
+        return els.location().start_offset();
+    }
+    if let Some(ens) = b.ensure_clause() {
+        return ens.location().start_offset();
+    }
+    b.location().start_offset()
+}
+
+/// The symmetric counterpart to `iw_begin_node_content_start`: where the
+/// content actually ENDS, instead of prism's `BeginNode::location()` end,
+/// which extends through the enclosing construct's own `end` keyword.
+fn iw_begin_node_content_end(b: &ruby_prism::BeginNode) -> usize {
+    if let Some(ens) = b.ensure_clause() {
+        return match ens.statements() {
+            Some(s) => s.location().end_offset(),
+            None => ens.ensure_keyword_loc().end_offset(),
+        };
+    }
+    if let Some(els) = b.else_clause() {
+        return match els.statements() {
+            Some(s) => s.location().end_offset(),
+            None => els.else_keyword_loc().end_offset(),
+        };
+    }
+    if let Some(mut resc) = b.rescue_clause() {
+        while let Some(next) = resc.subsequent() {
+            resc = next;
+        }
+        return match resc.statements() {
+            Some(s) => s.location().end_offset(),
+            None => resc.location().end_offset(),
+        };
+    }
+    match b.statements() {
+        Some(s) => s.location().end_offset(),
+        None => b.location().end_offset(),
+    }
+}
+
+/// A `check_indentation` "body" node's true content start: for a def/block/
+/// class/module's implicit rescue/ensure wrapper (a `BeginNode` with no
+/// `begin_keyword_loc`, OR the SAME `BeginNode` reused as its own "body" by
+/// `check_indentation_width_kwbegin` for an EXPLICIT `begin...rescue...end`),
+/// `iw_begin_node_content_start`; otherwise the node's own plain start.
+fn iw_body_start(body: &ruby_prism::Node) -> usize {
+    match body.as_begin_node() {
+        Some(b) if b.rescue_clause().is_some() || b.ensure_clause().is_some() => {
+            iw_begin_node_content_start(&b)
+        }
+        _ => body.location().start_offset(),
+    }
+}
+
+/// The symmetric counterpart used for the offense/autocorrect TARGET's own
+/// end (never the "is this a rescue/ensure body at all" body passed to
+/// `check_indentation` itself — see `iw_offense`'s narrowing).
+fn iw_target_end(target: &ruby_prism::Node) -> usize {
+    match target.as_begin_node() {
+        Some(b) if b.rescue_clause().is_some() || b.ensure_clause().is_some() => {
+            iw_begin_node_content_end(&b)
+        }
+        _ => target.location().end_offset(),
+    }
+}
+
+/// `MethodDispatchNode#bare_access_modifier?`: a receiverless, argument-less,
+/// block-less `public`/`protected`/`private`/`module_function` call.
+fn iw_is_bare_access_modifier(node: &ruby_prism::Node) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    call.receiver().is_none()
+        && call.arguments().is_none_or(|a| a.arguments().len() == 0)
+        && call.block().is_none()
+        && matches!(call.name().as_slice(), b"public" | b"protected" | b"private" | b"module_function")
+}
+
+/// `MethodDispatchNode#access_modifier?`: `bare_access_modifier? ||
+/// non_bare_access_modifier?` — same four names, but WITH arguments allowed
+/// too (`private :foo`). Used only to SKIP a statement in
+/// `check_members_for_normal_style`, where every candidate is already a
+/// direct child of a class/module/sclass/qualifying-block body (inherently
+/// in macro scope), so the `macro?`/`in_macro_scope?` half of upstream's
+/// predicate is always true here and not separately reproduced.
+fn iw_is_access_modifier_call(node: &ruby_prism::Node) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    call.receiver().is_none()
+        && matches!(call.name().as_slice(), b"public" | b"protected" | b"private" | b"module_function")
+}
+
+/// `MethodDispatchNode#special_modifier?`: a bare access modifier whose name
+/// is `private`/`protected` specifically — NOT `public`/`module_function`.
+fn iw_is_special_modifier(node: &ruby_prism::Node) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    call.receiver().is_none()
+        && call.arguments().is_none_or(|a| a.arguments().len() == 0)
+        && call.block().is_none()
+        && matches!(call.name().as_slice(), b"private" | b"protected")
+}
+
+/// `starts_with_access_modifier?`: `body`'s FIRST statement (only meaningful
+/// when `body` is a plain multi/single-statement wrapper, never a
+/// rescue/ensure `BeginNode`) is a bare access modifier.
+fn iw_starts_with_access_modifier(body: &ruby_prism::Node) -> bool {
+    let Some(stmts) = body.as_statements_node() else { return false };
+    match stmts.body().iter().next() {
+        Some(first) => iw_is_bare_access_modifier(&first),
+        None => false,
+    }
+}
+
+/// `contains_access_modifier?`: `body` is a GENUINE multi-statement wrapper
+/// (2+ children — prism always wraps even a lone statement, unlike
+/// whitequark, so a 1-child `StatementsNode` does NOT count as `begin_type?`
+/// here) with at least one bare-access-modifier child anywhere in it.
+fn iw_contains_access_modifier(body: Option<ruby_prism::Node>) -> bool {
+    let Some(body) = body else { return false };
+    let Some(stmts) = body.as_statements_node() else { return false };
+    if stmts.body().len() < 2 {
+        return false;
+    }
+    stmts.body().iter().any(|c| iw_is_bare_access_modifier(&c))
+}
+
+/// `Util#first_part_of_call_chain`: unwrap a trailing method-call chain
+/// (`a.b.c`, walking `.receiver` — prism folds a `call-with-block` into the
+/// same `CallNode`, so upstream's separate `any_block_type?` branch is
+/// structurally unreachable here) down to its ultimate receiver-root.
+/// Returns `None` if the chain bottoms out at a receiverless call (the
+/// `while node` loop exits with `node = nil` in that case upstream).
+fn iw_first_part_of_call_chain(mut node: Option<ruby_prism::Node>) -> Option<ruby_prism::Node> {
+    loop {
+        match node {
+            Some(n) => {
+                if let Some(call) = n.as_call_node() {
+                    node = call.receiver();
+                } else {
+                    return Some(n);
+                }
+            }
+            None => return None,
+        }
+    }
+}
+
+/// `AlignmentCorrector`'s `inside_string_ranges`/`inside_string_range`: byte
+/// ranges this cop's autocorrect must never touch — a heredoc's body PLUS its
+/// closing terminator line, or (for a plain delimited string literal) just
+/// the text strictly between its opening and closing delimiters. Scoped to a
+/// single autocorrect target's own subtree (`node.each_node(:any_str)`).
+struct IwTabooFinder {
+    ranges: Vec<(usize, usize)>,
+}
+impl IwTabooFinder {
+    fn note(&mut self, opening: Option<ruby_prism::Location>, closing: Option<ruby_prism::Location>, content: Option<ruby_prism::Location>) {
+        let (Some(o), Some(c)) = (opening, closing) else { return };
+        if o.as_slice().starts_with(b"<<") {
+            let body_start = content.map(|c| c.start_offset()).unwrap_or_else(|| o.end_offset());
+            // prism's heredoc `closing_loc` includes the terminator's own
+            // trailing newline (`"GOO\n"`); whitequark's `loc.heredoc_end`
+            // does not — trim it so the very NEXT physical line's start
+            // isn't wrongly swallowed into the protected zone (`within?`'s
+            // `<=` would otherwise treat that boundary as still "inside").
+            let mut end = c.end_offset();
+            if c.as_slice().last() == Some(&b'\n') {
+                end -= 1;
+            }
+            self.ranges.push((body_start, end));
+        } else {
+            self.ranges.push((o.end_offset(), c.start_offset()));
+        }
+    }
+}
+impl<'pr> ruby_prism::Visit<'pr> for IwTabooFinder {
+    fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
+        self.note(node.opening_loc(), node.closing_loc(), Some(node.content_loc()));
+    }
+    fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
+        self.note(node.opening_loc(), node.closing_loc(), None);
+        ruby_prism::visit_interpolated_string_node(self, node);
+    }
+    fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
+        self.note(Some(node.opening_loc()), Some(node.closing_loc()), Some(node.content_loc()));
+    }
+    fn visit_interpolated_x_string_node(&mut self, node: &ruby_prism::InterpolatedXStringNode<'pr>) {
+        self.note(Some(node.opening_loc()), Some(node.closing_loc()), None);
+        ruby_prism::visit_interpolated_x_string_node(self, node);
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// `Alignment#configured_indentation_width` for this cop's OWN mixin use:
+    /// `cop_config['IndentationWidth']` is always nil here (this cop's own
+    /// schema has no such key — only `Width`), so it collapses to
+    /// `config.for_cop('Layout/IndentationWidth')['Width']` — itself.
+    fn iw_configured_width(&self) -> i64 {
+        self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()).unwrap_or(2)
+    }
+
+    /// `Util#begins_its_line?`: nothing but whitespace precedes `off` on its
+    /// own physical line.
+    fn iw_begins_its_line(&self, off: usize) -> bool {
+        let (line, _) = self.idx.loc(off);
+        let line_start = self.idx.starts[line - 1];
+        self.src[line_start..off].iter().all(|b| b.is_ascii_whitespace())
+    }
+
+    /// `RangeHelp#effective_column` (no BOM handling — irrelevant here): the
+    /// 0-based CHARACTER column of `off` on its own line (not byte column,
+    /// not `Alignment#display_column`'s Unicode East-Asian display width —
+    /// this cop's own indentation math is plain character columns).
+    fn iw_char_col(&self, off: usize) -> i64 {
+        let (line, byte_col) = self.idx.loc(off);
+        let line_start = self.idx.starts[line - 1];
+        let prefix = &self.src[line_start..off];
+        if prefix.is_ascii() {
+            (byte_col - 1) as i64
+        } else {
+            String::from_utf8_lossy(prefix).chars().count() as i64
+        }
+    }
+
+    /// `AllowedPattern#allowed_line?`: any of this cop's configured
+    /// `AllowedPatterns` matches the FULL PHYSICAL LINE `off` sits on —
+    /// reuses the engine's generic `Cops::allowed`, whose per-cop pattern
+    /// table is populated straight from the same config section.
+    fn iw_allowed_line(&self, off: usize) -> bool {
+        let (line, _) = self.idx.loc(off);
+        let line_start = self.idx.starts[line - 1];
+        let line_end = self.line_end(line);
+        self.allowed("Layout/IndentationWidth", &self.src[line_start..line_end])
+    }
+
+    /// `IndentationWidth#line_uses_tabs?`: the text from line start through
+    /// `off` (its own column) contains a literal tab.
+    fn iw_line_uses_tabs(&self, off: usize) -> bool {
+        let (line, _) = self.idx.loc(off);
+        let line_start = self.idx.starts[line - 1];
+        self.src[line_start..off].contains(&b'\t')
+    }
+
+    /// `IndentationWidth#visual_column`: tabs count as a full configured
+    /// indentation width each, spaces count as 1 — used only for the
+    /// `EnforcedStyle: tabs` + mixed-whitespace `column_offset_between`
+    /// override below (invisible to the oracle's own fixture parsing — see
+    /// the dept-level doc comment — but implemented for genuine verbatim
+    /// fidelity to upstream regardless).
+    fn iw_visual_column(&self, off: usize) -> i64 {
+        let (line, _) = self.idx.loc(off);
+        let line_start = self.idx.starts[line - 1];
+        let indent = &self.src[line_start..off];
+        let tabs = indent.iter().filter(|&&b| b == b'\t').count() as i64;
+        let spaces = indent.iter().filter(|&&b| b == b' ').count() as i64;
+        tabs * self.iw_configured_width() + spaces
+    }
+
+    /// `IndentationWidth#column_offset_between` override: plain character-
+    /// column difference UNLESS `EnforcedStyle: tabs` and at least one of the
+    /// two lines actually contains a tab, in which case tabs/spaces are
+    /// weighed by `iw_visual_column` instead.
+    fn iw_column_offset(&self, body_start: usize, base_start: usize) -> i64 {
+        let using_tabs = self.cfg.enforced_style("Layout/IndentationStyle") == "tabs";
+        if using_tabs && (self.iw_line_uses_tabs(base_start) || self.iw_line_uses_tabs(body_start)) {
+            return self.iw_visual_column(body_start) - self.iw_visual_column(base_start);
+        }
+        self.iw_char_col(body_start) - self.iw_char_col(base_start)
+    }
+
+    /// `IndentationWidth#skip_check?`.
+    fn iw_skip_check(&self, base_start: usize, body: &ruby_prism::Node) -> bool {
+        if self.iw_allowed_line(base_start) {
+            return true;
+        }
+        let body_start = iw_body_start(body);
+        if self.idx.loc(body_start).0 == self.idx.loc(base_start).0 {
+            return true;
+        }
+        if iw_starts_with_access_modifier(body) {
+            return true;
+        }
+        let (line, _) = self.idx.loc(body_start);
+        let line_start = self.idx.starts[line - 1];
+        !self.src[line_start..body_start].iter().all(|b| b.is_ascii_whitespace())
+    }
+
+    /// `IndentationWidth#indentation_to_check?`: `skip_check?` first, then —
+    /// for a rescue/ensure-shaped `body` (see `iw_body_start`'s doc) — only
+    /// when there's a genuine (non-empty) protected main body; otherwise
+    /// always checked.
+    fn iw_indentation_to_check(&self, base_start: usize, body: &ruby_prism::Node) -> bool {
+        if self.iw_skip_check(base_start, body) {
+            return false;
+        }
+        if let Some(b) = body.as_begin_node() {
+            if b.rescue_clause().is_some() || b.ensure_clause().is_some() {
+                return b.statements().is_some();
+            }
+        }
+        true
+    }
+
+    /// `IndentationWidth#check_indentation`: the shared core every hook below
+    /// funnels through. `base_start` is a byte offset standing in for
+    /// upstream's `base_loc` — only its OWN start position is ever read
+    /// downstream (never an end/length), so a bare offset loses nothing.
+    fn iw_check_indentation(&mut self, base_start: usize, body: Option<ruby_prism::Node>, style: &'static str) {
+        let Some(body) = body else { return };
+        if !self.iw_indentation_to_check(base_start, &body) {
+            return;
+        }
+        let body_start = iw_body_start(&body);
+        let indentation = self.iw_column_offset(body_start, base_start);
+        let width = self.iw_configured_width();
+        if width - indentation == 0 {
+            return;
+        }
+        self.iw_offense(body, indentation, style, width);
+    }
+
+    /// `IndentationWidth#offense` + `#offending_range` + `#message`: narrows
+    /// `body` to its own first child when it's a plain multi/single-statement
+    /// wrapper (never for a rescue/ensure `BeginNode` — whitequark's
+    /// `:rescue`/`:ensure` node types are never `begin_type?`; a genuinely
+    /// PARENTHESIZED multi-statement group, upstream's other exemption, has
+    /// no prism equivalent reachable from any of this cop's body positions),
+    /// registers the offense, and — unless another already-registered
+    /// offense's own target nests this one — autocorrects.
+    fn iw_offense(&mut self, body: ruby_prism::Node, indentation: i64, style: &'static str, width: i64) {
+        const COP: &str = "Layout/IndentationWidth";
+        let target: ruby_prism::Node = match body.as_statements_node() {
+            Some(stmts) => stmts.body().iter().next().unwrap_or(body),
+            None => body,
+        };
+        let target_start = iw_body_start(&target);
+        let using_tabs = self.cfg.enforced_style("Layout/IndentationStyle") == "tabs";
+        let anchor = if using_tabs {
+            let (line, _) = self.idx.loc(target_start);
+            self.idx.starts[line - 1]
+        } else if indentation >= 0 {
+            target_start.saturating_sub(indentation as usize)
+        } else {
+            target_start
+        };
+        let message = self.iw_message(indentation, style, width);
+        let t_start = target_start;
+        let t_end = iw_target_end(&target);
+        let nested = self.iw_other_offense_in_same_range(t_start, t_end);
+        self.push(anchor, COP, true, message);
+        if !nested {
+            self.iw_autocorrect_align(&target, t_start, t_end, (width - indentation) as isize);
+        }
+    }
+
+    /// `IndentationWidth#message` + `#message_for_tabs`/`#message_for_spaces`.
+    fn iw_message(&self, indentation: i64, style: &'static str, width: i64) -> String {
+        let name = if style == "normal" { String::new() } else { format!(" {style}") };
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            let actual_tabs = indentation.div_euclid(width.max(1));
+            format!("Use 1 (not {actual_tabs}) tabs for{name} indentation.")
+        } else {
+            format!("Use {width} (not {indentation}) spaces for{name} indentation.")
+        }
+    }
+
+    /// `IndentationWidth#other_offense_in_same_range?`: does THIS target
+    /// range nest inside one already registered this run? If not, register
+    /// it (so a LATER nested offense is suppressed instead).
+    fn iw_other_offense_in_same_range(&mut self, start: usize, end: usize) -> bool {
+        if self.iw_offense_ranges.iter().any(|&(s, e)| start >= s && end <= e) {
+            return true;
+        }
+        self.iw_offense_ranges.push((start, end));
+        false
+    }
+
+    /// `AlignmentCorrector.correct`: shift every physical line `target` spans
+    /// by the same `delta` columns — widen by inserting `delta` spaces right
+    /// before each line's own first character (never on an entirely blank
+    /// line), or shrink by deleting up to `-delta` leading whitespace bytes.
+    /// A no-op entirely under `EnforcedStyle: tabs`, inside a `=begin`/`=end`
+    /// block comment contained in `target`'s own span, or wherever a
+    /// heredoc/string-literal descendant's protected content would be hit.
+    fn iw_autocorrect_align(&mut self, target: &ruby_prism::Node, node_start: usize, node_end: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            return;
+        }
+        if self.iw_block_comment_within(node_start, node_end) {
+            return;
+        }
+        use ruby_prism::Visit;
+        let mut finder = IwTabooFinder { ranges: Vec::new() };
+        finder.visit(target);
+        let taboo = finder.ranges;
+        let within_taboo = |r: (usize, usize)| taboo.iter().any(|&(ts, te)| r.0 >= ts && r.1 <= te);
+
+        let (start_line, _) = self.idx.loc(node_start);
+        let last_byte = node_end.saturating_sub(1).max(node_start);
+        let (end_line, _) = self.idx.loc(last_byte);
+
+        for line in start_line..=end_line {
+            let cur_begin = if line == start_line { node_start } else { self.idx.starts[line - 1] };
+            if delta > 0 {
+                if self.src.get(cur_begin) == Some(&b'\n') {
+                    continue;
+                }
+                if within_taboo((cur_begin, cur_begin)) {
+                    continue;
+                }
+                self.fixes.push((cur_begin, cur_begin, vec![b' '; delta as usize]));
+            } else {
+                let n = (-delta) as usize;
+                let starts_with_space = self.src.get(cur_begin) == Some(&b' ');
+                let (rs, re) = if starts_with_space {
+                    (cur_begin, (cur_begin + n).min(self.src.len()))
+                } else {
+                    (cur_begin.saturating_sub(n), cur_begin)
+                };
+                if re <= rs {
+                    continue;
+                }
+                if !self.src[rs..re].iter().all(|&b| b == b' ' || b == b'\t') {
+                    continue;
+                }
+                if within_taboo((rs, re)) {
+                    continue;
+                }
+                self.fixes.push((rs, re, Vec::new()));
+            }
+        }
+    }
+
+    /// `AlignmentCorrector.block_comment_within?`: a `=begin`/`=end` document
+    /// comment fully contained in `[start, end)`.
+    fn iw_block_comment_within(&self, start: usize, end: usize) -> bool {
+        self.comments.iter().any(|&(_, s, e)| self.src.get(s) == Some(&b'=') && s >= start && e <= end)
+    }
+
+    // ---- check_members (class/module/sclass bodies + indented_internal_methods blocks) ----
+
+    /// `IndentationWidth#check_members` + `#select_check_member` +
+    /// `#check_members_for_normal_style` / `#check_members_for_indented_
+    /// internal_methods_style` / `#each_member`.
+    fn iw_check_members(&mut self, base_start: usize, body: Option<ruby_prism::Node>) {
+        let Some(body) = body else { return };
+        let first = body.as_statements_node().and_then(|s| s.body().iter().next());
+        let use_first = first.as_ref().is_some_and(iw_is_bare_access_modifier);
+        let outdent = use_first && self.cfg.enforced_style("Layout/AccessModifierIndentation") == "outdent";
+        let children_2plus: Option<Vec<ruby_prism::Node>> = body.as_statements_node().and_then(|s| {
+            let v: Vec<ruby_prism::Node> = s.body().iter().collect();
+            if v.len() >= 2 {
+                Some(v)
+            } else {
+                None
+            }
+        });
+        if outdent {
+            self.iw_check_indentation(base_start, None, "normal");
+        } else if use_first {
+            self.iw_check_indentation(base_start, first, "normal");
+        } else {
+            self.iw_check_indentation(base_start, Some(body), "normal");
+        }
+        let Some(children) = children_2plus else { return };
+        if self.cfg.enforced_style("Layout/IndentationConsistency") == "indented_internal_methods" {
+            let style = "indented_internal_methods";
+            let mut previous_modifier: Option<ruby_prism::Node> = None;
+            for member in children {
+                if iw_is_special_modifier(&member) {
+                    previous_modifier = Some(member);
+                } else if let Some(prev) = previous_modifier.take() {
+                    self.iw_check_indentation(prev.location().start_offset(), Some(member), style);
+                }
+            }
+        } else {
+            for member in children {
+                if iw_is_access_modifier_call(&member) {
+                    continue;
+                }
+                self.iw_check_indentation(base_start, Some(member), "normal");
+            }
+        }
+    }
+
+    fn iw_check_class_like(&mut self, keyword_start: usize, body: Option<ruby_prism::Node>) {
+        if let Some(b) = &body {
+            if self.idx.loc(iw_body_start(b)).0 == self.idx.loc(keyword_start).0 {
+                return;
+            }
+        }
+        self.iw_check_members(keyword_start, body);
+    }
+
+    pub(crate) fn check_indentation_width_class(&mut self, node: &ruby_prism::ClassNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        self.iw_check_class_like(node.class_keyword_loc().start_offset(), node.body());
+    }
+    pub(crate) fn check_indentation_width_module(&mut self, node: &ruby_prism::ModuleNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        self.iw_check_class_like(node.module_keyword_loc().start_offset(), node.body());
+    }
+    pub(crate) fn check_indentation_width_sclass(&mut self, node: &ruby_prism::SingletonClassNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        self.iw_check_class_like(node.class_keyword_loc().start_offset(), node.body());
+    }
+
+    // ---- on_block ----
+
+    /// `IndentationWidth#block_body_indentation_base` + `#dot_on_new_line?` +
+    /// `#selector_on_new_line?`: only consulted under `EnforcedStyleAlignWith:
+    /// relative_to_receiver`.
+    fn iw_block_body_base(&self, call: &ruby_prism::CallNode, end_start: usize) -> usize {
+        let Some(dot) = call.call_operator_loc() else { return end_start };
+        let Some(receiver) = call.receiver() else { return end_start };
+        let recv_last_line = self.idx.loc(receiver.location().end_offset().saturating_sub(1)).0;
+        let dot_line = self.idx.loc(dot.start_offset()).0;
+        if recv_last_line < dot_line {
+            return dot.start_offset();
+        }
+        if let Some(sel) = call.message_loc() {
+            if recv_last_line < self.idx.loc(sel.start_offset()).0 {
+                return sel.start_offset();
+            }
+        }
+        end_start
+    }
+
+    /// `IndentationWidth#on_block` (+ `on_numblock`/`on_itblock`, all one
+    /// prism `CallNode`+`BlockNode` pair). Called from `visit_call_node`
+    /// alongside this cop's block-attached siblings.
+    pub(crate) fn check_indentation_width_block(&mut self, call: &ruby_prism::CallNode, block: &ruby_prism::BlockNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let end_start = block.closing_loc().start_offset();
+        if !self.iw_begins_its_line(end_start) {
+            return;
+        }
+        let style_rel = self.cfg.get(COP, "EnforcedStyleAlignWith").unwrap_or("start_of_line") == "relative_to_receiver";
+        let base_start = if style_rel { self.iw_block_body_base(call, end_start) } else { end_start };
+        self.iw_check_indentation(base_start, block.body(), "normal");
+        if self.cfg.enforced_style("Layout/IndentationConsistency") != "indented_internal_methods" {
+            return;
+        }
+        if !iw_contains_access_modifier(block.body()) {
+            return;
+        }
+        self.iw_check_members(end_start, block.body());
+    }
+
+    // ---- rescue / resbody / ensure / kwbegin / for ----
+
+    pub(crate) fn check_indentation_width_rescue(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        if node.rescue_clause().is_none() {
+            return;
+        }
+        let Some(els) = node.else_clause() else { return };
+        let kw = els.else_keyword_loc().start_offset();
+        self.iw_check_indentation(kw, els.statements().map(|s| s.as_node()), "normal");
+    }
+
+    pub(crate) fn check_indentation_width_resbody(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let mut cur = node.rescue_clause();
+        while let Some(r) = cur {
+            let kw = r.keyword_loc().start_offset();
+            self.iw_check_indentation(kw, r.statements().map(|s| s.as_node()), "normal");
+            cur = r.subsequent();
+        }
+    }
+
+    pub(crate) fn check_indentation_width_ensure(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(ens) = node.ensure_clause() else { return };
+        let kw = ens.ensure_keyword_loc().start_offset();
+        self.iw_check_indentation(kw, ens.statements().map(|s| s.as_node()), "normal");
+    }
+
+    /// `IndentationWidth#on_kwbegin`: only an EXPLICIT `begin...end` (a
+    /// `begin_keyword_loc` implies this isn't the implicit rescue/ensure
+    /// wrapper prism synthesizes around a def/block body — that shape is
+    /// handled by the `_rescue`/`_ensure`/`_def`/`_block` entry points
+    /// instead). When this same node ALSO carries a rescue/ensure clause
+    /// directly (prism flattens the whole `begin/rescue/else/ensure/end`
+    /// onto one node, where whitequark nests a distinct `:rescue`/`:ensure`
+    /// child under the `:kwbegin` wrapper), `body` is this SAME node — its
+    /// content-adjusted start/end (see `iw_body_start`/`iw_target_end`) already
+    /// gives exactly the child whitequark would report. Otherwise `body` is
+    /// this node's own (possibly absent) plain statement list.
+    pub(crate) fn check_indentation_width_kwbegin(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        if node.begin_keyword_loc().is_none() {
+            return;
+        }
+        let Some(end_loc) = node.end_keyword_loc() else { return };
+        let end_start = end_loc.start_offset();
+        if !self.iw_begins_its_line(end_start) {
+            return;
+        }
+        let body: Option<ruby_prism::Node> = if node.rescue_clause().is_some() || node.ensure_clause().is_some() {
+            Some(node.as_node())
+        } else {
+            node.statements().map(|s| s.as_node())
+        };
+        self.iw_check_indentation(end_start, body, "normal");
+    }
+
+    pub(crate) fn check_indentation_width_for(&mut self, node: &ruby_prism::ForNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let kw = node.for_keyword_loc().start_offset();
+        self.iw_check_indentation(kw, node.statements().map(|s| s.as_node()), "normal");
+    }
+
+    // ---- def ----
+
+    pub(crate) fn check_indentation_width_def(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.iw_ignored.contains(&start) {
+            return;
+        }
+        let kw = node.def_keyword_loc().start_offset();
+        self.iw_check_indentation(kw, node.body(), "normal");
+    }
+
+    // ---- send: adjacent def-modifier + CheckAssignment#on_send ----
+
+    /// `IndentationWidth#on_send` (`super` — `CheckAssignment#on_send` — then
+    /// this cop's own `adjacent_def_modifier?` branch) + `on_csend` (prism
+    /// unifies both into one `CallNode`).
+    pub(crate) fn check_indentation_width_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        // `CheckAssignment#on_send`: ANY call whose LAST argument is (after
+        // unwrapping a trailing receiver-chain) an if/while/until used as a
+        // value — covers a setter/index-assignment RHS (`foo.bar = if x; y;
+        // end`, `foo[i] = ...`), which prism represents as a plain `CallNode`
+        // rather than a dedicated write-node type.
+        if let Some(args) = node.arguments() {
+            if let Some(last) = args.arguments().iter().last() {
+                self.check_indentation_width_assignment(node.location().start_offset(), last);
+            }
+        }
+        // `adjacent_def_modifier?`: `(send nil? _ (any_def ...))` — a
+        // receiverless call with EXACTLY one argument that is directly a
+        // `def`/`defs` (no recursion through further wrapping calls, unlike
+        // `Layout/DefEndAlignment`'s `def_modifier?`).
+        if node.receiver().is_some() {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let items: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        if items.len() != 1 {
+            return;
+        }
+        let Some(def) = items[0].as_def_node() else { return };
+        let def_start = def.location().start_offset();
+        let style = self.cfg.get("Layout/DefEndAlignment", "EnforcedStyleAlignWith").unwrap_or("start_of_line");
+        let base_start = if style == "def" {
+            def_start
+        } else {
+            // `leftmost_modifier_of` — see `iw_chain_stack`'s field doc.
+            self.iw_chain_stack.first().copied().unwrap_or_else(|| node.location().start_offset())
+        };
+        self.iw_ignored.insert(def_start);
+        self.iw_check_indentation(base_start, def.body(), "normal");
+    }
+
+    // ---- if / unless / while / until (+ CheckAssignment dispatch) ----
+
+    fn iw_check_if_core(&mut self, body: Option<ruby_prism::Node>, subsequent: Option<ruby_prism::Node>, base_start: usize) {
+        self.iw_check_indentation(base_start, body, "normal");
+        let Some(subsequent) = subsequent else { return };
+        if subsequent.as_if_node().is_some() {
+            // an `elsif` link: it gets its own `on_if` call when visited.
+            return;
+        }
+        if let Some(else_node) = subsequent.as_else_node() {
+            let kw = else_node.else_keyword_loc().start_offset();
+            self.iw_check_indentation(kw, else_node.statements().map(|s| s.as_node()), "normal");
+        }
+    }
+
+    fn iw_dispatch_if(&mut self, node: &ruby_prism::IfNode, base_start: usize) {
+        let start = node.location().start_offset();
+        if self.iw_ignored.contains(&start) {
+            return;
+        }
+        if node.if_keyword_loc().is_none() {
+            return; // ternary
+        }
+        if node.end_keyword_loc().is_none() {
+            return; // modifier form
+        }
+        self.iw_check_if_core(node.statements().map(|s| s.as_node()), node.subsequent(), base_start);
+    }
+
+    fn iw_dispatch_unless(&mut self, node: &ruby_prism::UnlessNode, base_start: usize) {
+        let start = node.location().start_offset();
+        if self.iw_ignored.contains(&start) {
+            return;
+        }
+        if node.end_keyword_loc().is_none() {
+            return; // modifier form
+        }
+        self.iw_check_indentation(base_start, node.statements().map(|s| s.as_node()), "normal");
+        if let Some(else_node) = node.else_clause() {
+            let kw = else_node.else_keyword_loc().start_offset();
+            self.iw_check_indentation(kw, else_node.statements().map(|s| s.as_node()), "normal");
+        }
+    }
+
+    fn iw_check_while_until_core(
+        &mut self,
+        node_start: usize,
+        is_begin_modifier: bool,
+        kw_start: usize,
+        pred_start: usize,
+        body: Option<ruby_prism::Node>,
+        base_start: usize,
+    ) {
+        if self.iw_ignored.contains(&node_start) {
+            return;
+        }
+        // `on_while` (and `on_until`, aliased) is never invoked upstream for
+        // the `begin...end while cond` post-condition-loop shape (a distinct
+        // whitequark `:while_post`/`:until_post` node type) — see
+        // `is_begin_modifier`'s use in `visit_while_node`/`visit_until_node`.
+        if is_begin_modifier {
+            return;
+        }
+        // `ConditionalNode#single_line_condition?`: the keyword and the
+        // predicate's own first line coincide.
+        if self.idx.loc(kw_start).0 != self.idx.loc(pred_start).0 {
+            return;
+        }
+        self.iw_check_indentation(base_start, body, "normal");
+    }
+
+    fn iw_dispatch_while(&mut self, node: &ruby_prism::WhileNode, base_start: usize) {
+        let start = node.location().start_offset();
+        self.iw_check_while_until_core(
+            start,
+            node.is_begin_modifier(),
+            node.keyword_loc().start_offset(),
+            node.predicate().location().start_offset(),
+            node.statements().map(|s| s.as_node()),
+            base_start,
+        );
+    }
+    fn iw_dispatch_until(&mut self, node: &ruby_prism::UntilNode, base_start: usize) {
+        let start = node.location().start_offset();
+        self.iw_check_while_until_core(
+            start,
+            node.is_begin_modifier(),
+            node.keyword_loc().start_offset(),
+            node.predicate().location().start_offset(),
+            node.statements().map(|s| s.as_node()),
+            base_start,
+        );
+    }
+
+    pub(crate) fn check_indentation_width_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        self.iw_dispatch_if(node, start);
+    }
+    pub(crate) fn check_indentation_width_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        self.iw_dispatch_unless(node, start);
+    }
+    pub(crate) fn check_indentation_width_while(&mut self, node: &ruby_prism::WhileNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        self.iw_dispatch_while(node, start);
+    }
+    pub(crate) fn check_indentation_width_until(&mut self, node: &ruby_prism::UntilNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        self.iw_dispatch_until(node, start);
+    }
+
+    // ---- case / case_match ----
+
+    pub(crate) fn check_indentation_width_case(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let mut last_kw: Option<usize> = None;
+        for cond in node.conditions().iter() {
+            if let Some(w) = cond.as_when_node() {
+                let kw = w.keyword_loc().start_offset();
+                last_kw = Some(kw);
+                self.iw_check_indentation(kw, w.statements().map(|s| s.as_node()), "normal");
+            }
+        }
+        if let Some(kw) = last_kw {
+            self.iw_check_indentation(kw, node.else_clause().and_then(|e| e.statements()).map(|s| s.as_node()), "normal");
+        }
+    }
+
+    pub(crate) fn check_indentation_width_case_match(&mut self, node: &ruby_prism::CaseMatchNode) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let mut last_kw: Option<usize> = None;
+        for cond in node.conditions().iter() {
+            if let Some(inn) = cond.as_in_node() {
+                let kw = inn.in_loc().start_offset();
+                last_kw = Some(kw);
+                self.iw_check_indentation(kw, inn.statements().map(|s| s.as_node()), "normal");
+            }
+        }
+        if let Some(kw) = last_kw {
+            self.iw_check_indentation(kw, node.else_clause().and_then(|e| e.statements()).map(|s| s.as_node()), "normal");
+        }
+    }
+
+    // ---- CheckAssignment: on_lvasgn family + masgn ----
+
+    /// `IndentationWidth#check_assignment`: called from every write-node
+    /// visitor (`assignment_write!`-family macros + `visit_multi_write_node`)
+    /// with `own_start_offset` = the write node's OWN start (same position as
+    /// its `name_loc`/`target` — a plain/path/masgn write's whitequark node
+    /// always starts there too) and `rhs` = its value expression.
+    pub(crate) fn check_indentation_width_assignment(&mut self, own_start_offset: usize, rhs: ruby_prism::Node) {
+        const COP: &str = "Layout/IndentationWidth";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(rhs) = iw_first_part_of_call_chain(Some(rhs)) else { return };
+        let rhs_start = rhs.location().start_offset();
+        let end_style = self.cfg.get("Layout/EndAlignment", "EnforcedStyleAlignWith").unwrap_or("keyword");
+        let own_line = self.idx.loc(own_start_offset).0;
+        let rhs_line = self.idx.loc(rhs_start).0;
+        // `EndKeywordAlignment#variable_alignment?` + `#line_break_before_keyword?`.
+        let variable_alignment = end_style != "keyword" && !(rhs_line > own_line);
+        let base_start = if variable_alignment { own_start_offset } else { rhs_start };
+        // whitequark folds `unless` into the same `:if` node type `on_if`
+        // already handles — mirrored here with a parallel `UnlessNode` arm.
+        let matched = if let Some(ifn) = rhs.as_if_node() {
+            self.iw_dispatch_if(&ifn, base_start);
+            true
+        } else if let Some(un) = rhs.as_unless_node() {
+            self.iw_dispatch_unless(&un, base_start);
+            true
+        } else if let Some(w) = rhs.as_while_node() {
+            self.iw_dispatch_while(&w, base_start);
+            true
+        } else if let Some(u) = rhs.as_until_node() {
+            self.iw_dispatch_until(&u, base_start);
+            true
+        } else {
+            false
+        };
+        if matched {
+            self.iw_ignored.insert(rhs_start);
+        }
+    }
+}
