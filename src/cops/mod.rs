@@ -387,7 +387,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
-    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment",
+    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
 ];
 
 impl Engine {
@@ -1196,6 +1196,30 @@ pub(crate) struct Cops<'a> {
     // the offense message (computed from the outermost call in a multi-level
     // chain) reports a different column.
     pub(crate) dea_parent: HashMap<usize, usize>,
+    // Layout/IndentationWidth: node start offsets already handled elsewhere
+    // (a def consumed by an enclosing def-modifier `on_send`, or an if/while/
+    // until consumed as the rhs of an assignment via `check_assignment`) —
+    // rubocop's `ignore_node`/`ignored_node?`.
+    pub(crate) iw_ignored: HashSet<usize>,
+    // Layout/IndentationWidth: (start, end) byte ranges of every offense's
+    // own (already-narrowed) autocorrect target registered so far this run,
+    // in visitation order — rubocop's `@offense_ranges`/`other_offense_in_
+    // same_range?`. A later offense whose own target range nests inside an
+    // earlier one skips autocorrection (still reports the offense) so two
+    // corrections never fight over the same text.
+    pub(crate) iw_offense_ranges: Vec<(usize, usize)>,
+    // Layout/IndentationWidth: start offsets of currently-open, receiverless,
+    // exactly-one-argument `CallNode`s — an approximation of
+    // `leftmost_modifier_of`'s upward `node.parent&.send_type?` climb (prism
+    // has no parent pointers). Pushed/popped around `visit_call_node`
+    // whenever a call has that shape; `first()` at the moment a nested call
+    // matches `adjacent_def_modifier?` gives the outermost such wrapper
+    // (`public foo def self.test` -> `public`), matching the common case.
+    // Does NOT reproduce upstream's true any-ancestor-is-a-send generality
+    // (a receiver-having or multi-argument ancestor breaks the chain here
+    // but wouldn't upstream) — undocumented in the fixture, not worth a real
+    // parent map for.
+    pub(crate) iw_chain_stack: Vec<usize>,
     // Layout/ClosingHeredocIndentation: a CallNode's own start offset -> the
     // climbed-chain root it inherits from an ENCLOSING call that found it as
     // its receiver or a (non-safe-nav) argument — `find_node_used_heredoc_
@@ -2189,6 +2213,7 @@ macro_rules! assignment_write {
         let op_end = $node.operator_loc().end_offset();
         $self.aa_note_unbracketed_rhs(lhs_start, &$node.value());
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+        $self.check_indentation_width_assignment(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
     }};
@@ -2199,6 +2224,7 @@ macro_rules! assignment_operator_write {
         let op_end = $node.binary_operator_loc().end_offset();
         $self.aa_note_unbracketed_rhs(lhs_start, &$node.value());
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+        $self.check_indentation_width_assignment(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
     }};
@@ -2208,6 +2234,7 @@ macro_rules! assignment_path_write {
         let lhs_start = $node.target().location().start_offset();
         let op_end = $node.operator_loc().end_offset();
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+        $self.check_indentation_width_assignment(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
     }};
@@ -2217,6 +2244,7 @@ macro_rules! assignment_path_operator_write {
         let lhs_start = $node.target().location().start_offset();
         let op_end = $node.binary_operator_loc().end_offset();
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+        $self.check_indentation_width_assignment(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
     }};
@@ -2662,6 +2690,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_ternary_parentheses(node);
         self.check_else_layout_if(node);
         self.check_assignment_in_condition(&node.predicate());
+        self.check_indentation_width_if(node);
         self.check_negated_if(node);
         self.check_redundant_conditional(node);
         self.check_redundant_condition(node);
@@ -2801,6 +2830,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Prism DOES give `unless` its own `UnlessNode`, so it needs its own
         // hook here to match.
         self.check_assignment_in_condition(&node.predicate());
+        self.check_indentation_width_unless(node);
         self.check_parens_around_condition("unless", false, &node.predicate());
         self.check_redundant_conditional_unless(node);
         self.check_redundant_condition_unless(node);
@@ -3146,6 +3176,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.aa_masgn_rhs.insert(node.value().location().start_offset());
         }
         self.assignment_indentation_hook(lhs_start, op_end, node.value());
+        self.check_indentation_width_assignment(lhs_start, node.value());
         self.check_self_assignment_masgn(node);
         self.check_trailing_underscore_variable(node);
         // Style/RedundantSelf: only plain local-var masgn targets carry a
@@ -3259,6 +3290,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_float_comparison_case(node);
         self.check_empty_when(node);
         self.check_case_indentation(node);
+        self.check_indentation_width_case(node);
         self.check_empty_else_case(node);
         self.check_hash_like_case(node);
         self.check_empty_case_condition(node);
@@ -3284,6 +3316,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.rsn_cond_pos.insert(pred.location().start_offset());
         }
         self.check_case_match_indentation(node);
+        self.check_indentation_width_case_match(node);
         self.check_identical_conditional_branches_case_match(node);
         self.check_conditional_assignment_case_match(node);
         self.check_literal_as_condition_case_match(node);
@@ -3945,6 +3978,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if !node.is_begin_modifier() {
             self.check_parens_around_condition("while", true, &node.predicate());
         }
+        self.check_indentation_width_while(node);
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
         if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
             self.check_condition_position(b"while", node.keyword_loc().start_offset(), &node.predicate());
@@ -4028,6 +4062,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if !node.is_begin_modifier() {
             self.check_parens_around_condition("until", true, &node.predicate());
         }
+        self.check_indentation_width_until(node);
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
         if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
             self.check_condition_position(b"until", node.keyword_loc().start_offset(), &node.predicate());
@@ -4081,6 +4116,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_next_for(node);
         self.check_for(node);
         self.check_unreachable_loop_for(node);
+        self.check_indentation_width_for(node);
         if let Some(do_kw) = node.do_keyword_loc() {
             self.sak_check(do_kw.start_offset(), do_kw.end_offset(), b"do");
             self.sak_check_end(node.end_keyword_loc().start_offset(), b"end");
@@ -4124,6 +4160,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_lines_around_begin_body(node);
         self.check_empty_lines_around_exception_handling_keywords_kwbegin(node);
         self.check_begin_end_alignment(node);
+        // Order matters for `other_offense_in_same_range?`: upstream's real
+        // top-down traversal visits the OUTERMOST wrapper first — `kwbegin`
+        // (whose own target, when a rescue/ensure clause is present, already
+        // spans the whole protected-body-through-last-handler range), then
+        // `ensure`, then `rescue`, then each `resbody` — so a wider offense's
+        // range gets registered BEFORE any narrower one nested inside it.
+        self.check_indentation_width_kwbegin(node);
+        self.check_indentation_width_ensure(node);
+        self.check_indentation_width_rescue(node);
+        self.check_indentation_width_resbody(node);
         let kwbegin = node.begin_keyword_loc().is_some();
         // Layout/IndentationConsistency's `on_kwbegin`: fires only for an
         // EXPLICIT `begin...end` (whitequark never wraps the implicit
@@ -4553,6 +4599,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_accessor_grouping(node.body());
         self.check_empty_lines_around_class_body(node);
         self.check_access_modifier_indentation_class(node);
+        self.check_indentation_width_class(node);
         self.check_struct_inheritance(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.dm_enter_namespace(&node.constant_path());
@@ -4624,6 +4671,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_mixin_grouping(node.body());
         self.check_accessor_grouping(node.body());
         self.check_access_modifier_indentation_module(node);
+        self.check_indentation_width_module(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.dm_enter_namespace(&node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
@@ -4692,6 +4740,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_optional_boolean_parameter(node);
         self.check_empty_lines_around_method_body(node);
         self.check_empty_lines_around_exception_handling_keywords_def(node);
+        self.check_indentation_width_def(node);
         self.check_disjunctive_assignment_in_constructor(node);
         self.check_useless_setter_call(node);
         self.check_useless_method_definition(node);
@@ -4940,6 +4989,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_class_length_sclass(node);
         self.check_empty_lines_around_sclass_body(node);
         self.check_access_modifier_indentation_sclass(node);
+        self.check_indentation_width_sclass(node);
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(), node.body().is_some(), false, true);
         self.check_trailing_body_on_class(node.class_keyword_loc().start_offset(), l.end_offset(), node.body());
@@ -5056,6 +5106,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // call's own shape — see the `ha_ignored`/`ha_incompatible` field docs.
         self.ha_ignore_last_arg(node.arguments());
         self.ha_check_fixed_indentation(node);
+        // Layout/IndentationWidth's `adjacent_def_modifier?` (`private def
+        // foo; end`) — must run BEFORE `iw_chain_stack` gets this call's own
+        // entry pushed below, so it only sees OUTER wrapping calls.
+        self.check_indentation_width_send(node);
         if let Some(args) = node.arguments() {
             self.ium_register_collection(&node.as_node(), args.arguments().iter().collect());
         }
@@ -5416,6 +5470,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             .map(|l| (l.start_offset(), l.end_offset()))
             .unwrap_or((node_off, node_off));
         self.call_stack.push(name_span);
+        // Layout/IndentationWidth: see `iw_chain_stack`'s field doc.
+        let iw_chainable =
+            node.receiver().is_none() && node.arguments().is_some_and(|a| a.arguments().len() == 1);
+        if iw_chainable {
+            self.iw_chain_stack.push(node.location().start_offset());
+        }
         // Style/FormatStringToken: see `FstFrame`/`fst_stack`'s doc.
         {
             let args = node.arguments();
@@ -5619,6 +5679,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_metrics_complexity_define_method(node, &bn);
                 self.check_method_length_block(node, &bn);
                 self.check_empty_lines_around_exception_handling_keywords_block(node, &bn);
+                self.check_indentation_width_block(node, &bn);
                 self.check_block_length(node, &bn);
                 self.check_next_block(node, &bn);
                 self.check_guard_clause_block(node, &bn);
@@ -5709,6 +5770,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.call_stack.pop();
+        if iw_chainable {
+            self.iw_chain_stack.pop();
+        }
         self.fst_stack.pop();
         self.ll_exit_collection();
     }
@@ -5955,6 +6019,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         ha_ignored: HashSet::new(),
         ha_incompatible: HashSet::new(),
         dea_parent: HashMap::new(),
+        iw_ignored: HashSet::new(),
+        iw_offense_ranges: Vec::new(),
+        iw_chain_stack: Vec::new(),
         chi_call_root: HashMap::new(),
         chi_heredoc_ctx: HashMap::new(),
         squish_heredoc: HashSet::new(),
