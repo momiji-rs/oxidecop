@@ -11958,3 +11958,186 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+/// Method names for which RuboCop's `operator_method?` (rubocop-ast's
+/// `MethodIdentifierPredicates::OPERATOR_METHODS`) returns true — used by
+/// `Style/For`'s `ForToEachCorrector#requires_parentheses?` to decide
+/// whether the collection expression needs wrapping in `(...)` before
+/// `.each` is appended.
+const FOR_OPERATOR_METHODS: &[&[u8]] = &[
+    b"|", b"^", b"&", b"<=>", b"==", b"===", b"=~", b">", b">=", b"<", b"<=", b"<<", b">>", b"+",
+    b"-", b"*", b"/", b"%", b"**", b"~", b"+@", b"-@", b"!@", b"~@", b"[]", b"[]=", b"!", b"!=",
+    b"!~", b"`",
+];
+
+/// `ForToEachCorrector#requires_parentheses?` — true when the collection
+/// expression would change meaning (or read ambiguously) if `.each` were
+/// simply appended after it without wrapping parens: an unparenthesized
+/// operator-method call (`a + b`, `a | b`, ...), a bare range literal
+/// (`1...value`), or an `&&`/`||` expression. A collection that's ALREADY
+/// wrapped in literal parens (prism's `ParenthesesNode`) is none of these
+/// node types, so it's correctly left untouched (its `.source` already
+/// includes the parens).
+fn for_collection_requires_parens(node: &ruby_prism::Node) -> bool {
+    if let Some(call) = node.as_call_node() {
+        if !call.is_safe_navigation() && FOR_OPERATOR_METHODS.contains(&call.name().as_slice()) {
+            return true;
+        }
+    }
+    node.as_range_node().is_some() || node.as_and_node().is_some() || node.as_or_node().is_some()
+}
+
+/// `EachToForCorrector`'s pick of `argument_node.children.first` — the
+/// leftmost declared block parameter (by written order: required, then
+/// optional, then rest, then post, then keyword, then keyword-rest, then
+/// block-pass), used verbatim (`.source`) as the `for` loop's variable
+/// name/destructure target.
+fn for_first_block_param<'pr>(params: &ruby_prism::ParametersNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    params
+        .requireds()
+        .iter()
+        .next()
+        .or_else(|| params.optionals().iter().next())
+        .or_else(|| params.rest())
+        .or_else(|| params.posts().iter().next())
+        .or_else(|| params.keywords().iter().next())
+        .or_else(|| params.keyword_rest())
+        .or_else(|| params.block().map(|b| b.as_node()))
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/For — enforces `for` vs `#each` per `EnforcedStyle` (`each`,
+    /// the default, wants `.each`; `for` wants the `for` keyword). Ported
+    /// from rubocop's `Style::For` (`ConfigurableEnforcedStyle` +
+    /// `AutoCorrector`), which dispatches `on_for`/`on_block` (and its
+    /// `on_numblock`/`on_itblock` aliases — prism collapses all three into
+    /// one `BlockNode` shape, so `check_for_each` below covers all of
+    /// them).
+    ///
+    /// `correct_style_detected`/`opposite_style_detected` are
+    /// `ConfigurableEnforcedStyle` bookkeeping that only feeds
+    /// `--auto-gen-config` output upstream — they never change whether an
+    /// offense is reported or corrected, so they're dropped in this port.
+    ///
+    /// This half is the `each`-direction: every `for` loop is an offense
+    /// when `EnforcedStyle` isn't `for`, autocorrected via
+    /// `ForToEachCorrector`'s exact text surgery.
+    pub(crate) fn check_for(&mut self, node: &ruby_prism::ForNode) {
+        const COP: &str = "Style/For";
+        if !self.on(COP) {
+            return;
+        }
+        // `style == :each` — `EnforcedStyle` defaults to `each` per schema;
+        // only an explicit `for` flips this cop into the opposite (no-op
+        // here — see `check_for_each`) direction.
+        if self.cfg.get(COP, "EnforcedStyle") == Some("for") {
+            return;
+        }
+
+        let start = node.location().start_offset();
+        self.push(start, COP, true, "Prefer `each` over `for`.");
+
+        let index_src = self.node_src(&node.index());
+        let collection = node.collection();
+        let collection_src = self.node_src(&collection);
+
+        // `collection_node.csend_type? ? '&.' : '.'`
+        let dot: &[u8] = if collection.as_call_node().is_some_and(|c| c.is_safe_navigation()) {
+            b"&."
+        } else {
+            b"."
+        };
+
+        let mut correction: Vec<u8> = Vec::with_capacity(collection_src.len() + index_src.len() + 12);
+        if for_collection_requires_parens(&collection) {
+            correction.push(b'(');
+            correction.extend_from_slice(collection_src);
+            correction.push(b')');
+        } else {
+            correction.extend_from_slice(collection_src);
+        }
+        correction.extend_from_slice(dot);
+        correction.extend_from_slice(b"each do |");
+        correction.extend_from_slice(index_src);
+        correction.push(b'|');
+
+        // `for_node.do?` — an explicit `do` keyword (not a bare newline or
+        // `;`) replaces through its own end; otherwise the replacement ends
+        // right after the collection expression (prism's node location
+        // already spans the full, possibly-parenthesized, text either way).
+        let end = match node.do_keyword_loc() {
+            Some(do_loc) => do_loc.end_offset(),
+            None => collection.location().end_offset(),
+        };
+        self.fixes.push((start, end, correction));
+    }
+
+    /// Style/For, `for`-direction — `on_block`/`on_numblock`/`on_itblock`:
+    /// a multiline receiver-having `#each` call with no arguments passed to
+    /// `each` itself (`suspect_enumerable?`) is corrected back to a `for`
+    /// loop via `EachToForCorrector`, but only when `EnforcedStyle: for`
+    /// (otherwise upstream just does `correct_style_detected` bookkeeping —
+    /// no offense).
+    pub(crate) fn check_for_each(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/For";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.get(COP, "EnforcedStyle") != Some("for") {
+            return;
+        }
+
+        let Some(block) = node.block().and_then(|b| b.as_block_node()) else { return };
+
+        // `suspect_enumerable?`: `node.multiline?` (`BlockNode#multiline?`
+        // compares the OPENING/CLOSING delimiter lines — `do`/`{` vs
+        // `end`/`}` — not the receiver-chain start), `node.method?(:each)`,
+        // `!node.send_node.arguments?`.
+        if node.name().as_slice() != b"each" {
+            return;
+        }
+        if node.arguments().is_some() {
+            return;
+        }
+        let open_line = self.idx.loc(block.opening_loc().start_offset()).0;
+        let close_line = self.idx.loc(block.closing_loc().start_offset()).0;
+        if open_line == close_line {
+            return;
+        }
+
+        // `return unless node.receiver` — a bare `each do ... end` (implicit
+        // self) is never corrected, regardless of style.
+        let Some(receiver) = node.receiver() else { return };
+
+        let start = node.location().start_offset();
+        self.push(start, COP, true, "Prefer `for` over `each`.");
+
+        let receiver_src = self.node_src(&receiver);
+
+        // `block_node.arguments?` is hardcoded false for numblocks/itblocks
+        // (numbered params / `it`) as well as a bare `do ... end` or an
+        // empty `do || ... end` — all four fall back to the `_`
+        // placeholder, matching `CORRECTION_WITHOUT_ARGUMENTS`.
+        let bp = block.parameters().and_then(|p| p.as_block_parameters_node());
+        let params = bp.as_ref().and_then(|bp| bp.parameters());
+
+        let mut correction: Vec<u8> = b"for ".to_vec();
+        let end = if let Some(params) = params {
+            let var_src = for_first_block_param(&params)
+                .map(|n| self.node_src(&n))
+                .unwrap_or(b"_");
+            correction.extend_from_slice(var_src);
+            correction.extend_from_slice(b" in ");
+            correction.extend_from_slice(receiver_src);
+            correction.extend_from_slice(b" do");
+            bp.expect("params implies bp").location().end_offset()
+        } else {
+            correction.extend_from_slice(b"_ in ");
+            correction.extend_from_slice(receiver_src);
+            correction.extend_from_slice(b" do");
+            block.opening_loc().end_offset()
+        };
+        self.fixes.push((start, end, correction));
+    }
+}

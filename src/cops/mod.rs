@@ -231,7 +231,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException",
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
-    "Style/MultilineTernaryOperator", "Style/CommentedKeyword",
+    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For",
 ];
 
 impl Engine {
@@ -1869,6 +1869,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_until_node(self, node);
         self.cond_depth -= 1;
     }
+    fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
+        self.check_for(node);
+        ruby_prism::visit_for_node(self, node);
+    }
     fn visit_pre_execution_node(&mut self, node: &ruby_prism::PreExecutionNode<'pr>) {
         if self.on("Style/BeginBlock") {
             self.push(node.keyword_loc().start_offset(), "Style/BeginBlock", false,
@@ -2381,6 +2385,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_space_before_first_arg(node);
         self.check_redundant_string_coercion_in_call(node);
         self.check_each_for_simple_loop(node);
+        self.check_for_each(node);
         self.check_redundant_with_index(node);
         self.check_redundant_with_object(node);
         self.check_dot_position(node);

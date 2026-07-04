@@ -228,6 +228,7 @@ COPS = {
   'Style/IfWithSemicolon'            => 'style/if_with_semicolon',
   'Style/MultilineTernaryOperator'   => 'style/multiline_ternary_operator',
   'Style/CommentedKeyword'           => 'style/commented_keyword',
+  'Style/For'                        => 'style/for',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
