@@ -631,6 +631,10 @@ fn print_simple(results: &[(String, Vec<cops::Offense>)], nfiles: usize, color: 
             } else {
                 o.message.clone()
             };
+            // rubocop's clang/emacs-style formatters render a multi-line
+            // message (Lint/Syntax's `(Using Ruby ...)` suffix) on ONE line,
+            // newlines as spaces.
+            let msg = msg.replace('\n', " ");
             println!("{sev}:{:>3}:{:>3}: {}{}: {}", o.line, o.col, c, o.cop, msg);
         }
         total += offenses.len();
