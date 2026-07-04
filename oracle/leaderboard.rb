@@ -318,6 +318,7 @@ COPS = {
   'Style/SoleNestedConditional'      => 'style/sole_nested_conditional',
   'Style/Next'                       => 'style/next',
   'Style/RegexpLiteral'              => 'style/regexp_literal',
+  'Lint/ShadowedException'           => 'lint/shadowed_exception',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

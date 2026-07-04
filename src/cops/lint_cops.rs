@@ -11503,3 +11503,318 @@ impl<'a> Cops<'a> {
         self.fixes.push((start, end, content));
     }
 }
+
+
+// Lint/ShadowedException: a `rescue` clause that can never fire because a
+// less-specific exception was already rescued earlier in the same chain, or
+// because a single `rescue` clause lists two exceptions where one is an
+// ancestor of the other (`rescue Exception, StandardError` behaves exactly
+// like `rescue Exception` alone). Ported from rubocop's `ShadowedException`
+// (`include RescueNode, RangeHelp`).
+//
+// Upstream's `on_rescue(node)` fires once per `:rescue` AST node — the WHOLE
+// begin/def/block rescue chain (whitequark flattens every `resbody` sibling
+// under one `:rescue` parent; prism instead links each clause via
+// `RescueNode#subsequent`). We hook `visit_begin_node` (`BeginNode`, whose
+// `rescue_clause()` is the head of that linked list) exactly like
+// `Lint/DuplicateRescueException` does — NOT `visit_rescue_node`, which the
+// default walk re-enters once per LINK and would score each chain multiple
+// times. `BeginNode` also covers a `def`'s implicit rescue/ensure body,
+// which prism wraps in a `BeginNode` even without an explicit `begin`
+// keyword.
+//
+// The modifier form (`foo rescue nil`) upstream translates to the SAME
+// `:rescue`/`:resbody` shape, so its `on_rescue` fires too — but a modifier
+// rescue is always exactly one resbody with no exception class (implicit
+// `StandardError`), so `rescue_group_rescues_multiple_levels` is always
+// false and `sorted?` is trivially true (a single-group list has no
+// `each_cons(2)` pairs): it can never produce an offense. There's no
+// `RescueModifierNode` visitor hook here at all — that's the same outcome
+// as replicating upstream's always-true-for-this-shape `rescue_modifier?`
+// guard, without the dead code.
+//
+// Exception resolution: upstream calls `Kernel.const_get(exception.source)`
+// to resolve each rescued name's RAW SOURCE TEXT to a live Ruby class,
+// falling back to `nil` on `NameError` (undefined/custom names, method
+// calls, splats, array literals — anything whose source text isn't a real
+// top-level constant path). We can't load Ruby at lint time, so `shx_chain`
+// hardcodes the static parent-chain table for every core Ruby exception
+// class (`Class#superclass`, verbatim from a stock `ruby -e
+// 'ObjectSpace.each_object(Class){|k| ... }'` dump — see table comment)
+// plus a generic `Errno::<NAME>` rule (every `Errno::X` is a direct
+// `SystemCallError` subclass, matching Ruby's dynamically-generated `Errno`
+// namespace). Anything else resolves to `None`, exactly like a rescued
+// `NameError`.
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_shadowed_exception(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Lint/ShadowedException";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(head) = node.rescue_clause() else { return };
+        let mut rescues: Vec<ruby_prism::RescueNode> = Vec::new();
+        let mut cur = Some(head);
+        while let Some(r) = cur {
+            cur = r.subsequent();
+            rescues.push(r);
+        }
+        let groups: Vec<Vec<Option<&'a [u8]>>> =
+            rescues.iter().map(|r| self.shx_evaluate_exceptions(r)).collect();
+
+        let rescue_group_rescues_multiple_levels =
+            groups.iter().any(|g| shx_contains_multiple_levels(g));
+        if !rescue_group_rescues_multiple_levels && shx_sorted(&groups) {
+            return;
+        }
+        if let Some(idx) = shx_find_shadowing(&groups) {
+            let start = rescues[idx].keyword_loc().start_offset();
+            self.push(start, COP, false, "Do not shadow rescued Exceptions.");
+        }
+    }
+
+    /// `evaluate_exceptions`: a bare `rescue` (no exception list) behaves
+    /// like `rescue StandardError`; otherwise resolve each listed
+    /// exception's raw source text.
+    fn shx_evaluate_exceptions(&self, resbody: &ruby_prism::RescueNode) -> Vec<Option<&'a [u8]>> {
+        let list: Vec<ruby_prism::Node> = resbody.exceptions().iter().collect();
+        if list.is_empty() {
+            return vec![Some(&b"StandardError"[..])];
+        }
+        list.iter()
+            .map(|n| {
+                let src = self.node_src(n);
+                if shx_chain(src).is_some() { Some(src) } else { None }
+            })
+            .collect()
+    }
+}
+
+/// Is `name` a direct `SystemCallError` subclass, i.e. an `Errno::<NAME>`
+/// path? (`system_call_err?`: `error.ancestors[1] == SystemCallError`.)
+/// Ruby generates an `Errno` class for every platform errno code at boot, so
+/// this is a name-shape rule rather than a fixed list.
+fn shx_is_errno(name: &[u8]) -> bool {
+    match name.strip_prefix(b"Errno::") {
+        Some(rest) if !rest.is_empty() => {
+            rest[0].is_ascii_uppercase()
+                && rest.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        }
+        _ => false,
+    }
+}
+
+/// The numeric-errno-code group an `Errno::X` name belongs to, for
+/// `exception.const_get(:Errno) != other.const_get(:Errno)`. Real errno
+/// values are platform-dependent (rubocop's own spec exercises this exact
+/// ambiguity with `stub_const('Errno::EAGAIN::Errno', ...)`  precisely to
+/// pin it down); `EAGAIN`/`EWOULDBLOCK` sharing a code is the portable,
+/// nearly-universal case the spec models, so it's the one alias hardcoded
+/// here. Every other name is its own group.
+fn shx_errno_group(name: &[u8]) -> &[u8] {
+    let rest = name.strip_prefix(b"Errno::").unwrap_or(name);
+    if rest == b"EWOULDBLOCK" { b"EAGAIN" } else { rest }
+}
+
+/// `(child, parent)` — the core Ruby `Exception` hierarchy's `superclass`
+/// chain (stock Ruby 3.4, `ObjectSpace.each_object(Class)` filtered to `<=
+/// Exception`, gem-defined classes excluded). `Exception` itself is the
+/// implicit root and has no entry.
+static SHX_PARENT: &[(&[u8], &[u8])] = &[
+    (b"NoMemoryError", b"Exception"),
+    (b"ScriptError", b"Exception"),
+    (b"LoadError", b"ScriptError"),
+    (b"NotImplementedError", b"ScriptError"),
+    (b"SyntaxError", b"ScriptError"),
+    (b"SecurityError", b"Exception"),
+    (b"SignalException", b"Exception"),
+    (b"Interrupt", b"SignalException"),
+    (b"SystemExit", b"Exception"),
+    (b"SystemStackError", b"Exception"),
+    (b"StandardError", b"Exception"),
+    (b"ArgumentError", b"StandardError"),
+    (b"UncaughtThrowError", b"ArgumentError"),
+    (b"EncodingError", b"StandardError"),
+    (b"FiberError", b"StandardError"),
+    (b"IOError", b"StandardError"),
+    (b"EOFError", b"IOError"),
+    (b"IO::TimeoutError", b"IOError"),
+    (b"IndexError", b"StandardError"),
+    (b"KeyError", b"IndexError"),
+    (b"StopIteration", b"IndexError"),
+    (b"ClosedQueueError", b"StopIteration"),
+    (b"LocalJumpError", b"StandardError"),
+    (b"NameError", b"StandardError"),
+    (b"NoMethodError", b"NameError"),
+    (b"RangeError", b"StandardError"),
+    (b"FloatDomainError", b"RangeError"),
+    (b"RegexpError", b"StandardError"),
+    (b"Regexp::TimeoutError", b"RegexpError"),
+    (b"RuntimeError", b"StandardError"),
+    (b"FrozenError", b"RuntimeError"),
+    // `TimeoutError` is a deprecated top-level alias for `Timeout::Error`
+    // (from the `timeout` stdlib); resolving it prints a runtime deprecation
+    // warning upstream silences via `RuboCop::Util.silence_warnings` — we
+    // emit no such warning at all, so there's nothing to suppress, but the
+    // name still needs to resolve (not raise `NameError`) to match upstream
+    // behavior for `rescue TimeoutError`.
+    (b"TimeoutError", b"RuntimeError"),
+    (b"Timeout::Error", b"RuntimeError"),
+    (b"SystemCallError", b"StandardError"),
+    (b"ThreadError", b"StandardError"),
+    (b"TypeError", b"StandardError"),
+    (b"ZeroDivisionError", b"StandardError"),
+    (b"NoMatchingPatternError", b"StandardError"),
+    (b"NoMatchingPatternKeyError", b"NoMatchingPatternError"),
+    (b"Math::DomainError", b"StandardError"),
+];
+
+/// The ancestor chain from `name` up to (and including) `Exception`, or
+/// `None` if `name` isn't a known core exception class / valid `Errno::X`
+/// path — mirrors `Kernel.const_get(name)` raising `NameError` for anything
+/// else (custom classes, typos, method-call/splat/array-literal source
+/// text, ...).
+fn shx_chain(name: &[u8]) -> Option<Vec<&[u8]>> {
+    if name == b"Exception" {
+        return Some(vec![b"Exception"]);
+    }
+    if shx_is_errno(name) {
+        return Some(vec![name, b"SystemCallError", b"StandardError", b"Exception"]);
+    }
+    let mut chain: Vec<&[u8]> = vec![name];
+    let mut cur = name;
+    loop {
+        match SHX_PARENT.iter().find(|(child, _)| *child == cur) {
+            Some((_, parent)) => {
+                chain.push(parent);
+                if *parent == b"Exception" {
+                    return Some(chain);
+                }
+                cur = parent;
+            }
+            None => return None,
+        }
+    }
+}
+
+/// `Module#<=>`: `Some(0)` same class, `Some(-1)` `a` is a subclass of `b`,
+/// `Some(1)` `a` is a superclass of `b`, `None` if unrelated. Both
+/// `compare_exceptions` and `sorted?`'s raw array comparison reduce to this.
+fn shx_cmp(a: &[u8], b: &[u8]) -> Option<i32> {
+    if a == b {
+        // still validate `a` resolves at all (an unresolved/`None` element
+        // never reaches this far — callers guard that — but keep it total).
+        shx_chain(a)?;
+        return Some(0);
+    }
+    let ca = shx_chain(a)?;
+    let cb = shx_chain(b)?;
+    if ca[1..].contains(&b) {
+        return Some(-1);
+    }
+    if cb[1..].contains(&a) {
+        return Some(1);
+    }
+    None
+}
+
+/// `compare_exceptions`: truthy (in Ruby's sense — anything but `nil`/
+/// `false`) iff the pair "shadows" within the same `rescue` clause. `Some(0)`
+/// (identical classes, e.g. `rescue NameError, NameError`) counts as truthy
+/// here exactly like upstream, since `0` is truthy in Ruby.
+fn shx_shadow_pair(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
+    let (Some(a), Some(b)) = (a, b) else { return false };
+    if shx_is_errno(a) && shx_is_errno(b) {
+        if shx_errno_group(a) == shx_errno_group(b) {
+            return false;
+        }
+        shx_cmp(a, b).is_some()
+    } else {
+        shx_cmp(a, b).is_some()
+    }
+}
+
+/// `contains_multiple_levels_of_exceptions?`: `Exception` alongside anything
+/// else in the same clause always counts (`Exception` is always treated as
+/// the top level); otherwise any shadowing pair within the group counts.
+fn shx_contains_multiple_levels(group: &[Option<&[u8]>]) -> bool {
+    if group.len() > 1 && group.iter().any(|e| *e == Some(&b"Exception"[..])) {
+        return true;
+    }
+    for i in 0..group.len() {
+        for j in (i + 1)..group.len() {
+            if shx_shadow_pair(group[i], group[j]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `Array#<=>` over two exception-name lists: element-wise via `shx_cmp`
+/// (with `nil <=> nil` = `0`, any other `nil` pairing = unrelated/`None`,
+/// short-circuiting the whole comparison exactly like Ruby's `Array#<=>`);
+/// a common all-equal prefix falls through to comparing lengths.
+fn shx_group_cmp(x: &[Option<&[u8]>], y: &[Option<&[u8]>]) -> Option<i32> {
+    let n = x.len().min(y.len());
+    for i in 0..n {
+        let c = match (x[i], y[i]) {
+            (None, None) => Some(0),
+            (Some(a), Some(b)) => shx_cmp(a, b),
+            _ => None,
+        };
+        match c {
+            None => return None,
+            Some(0) => continue,
+            Some(v) => return Some(v),
+        }
+    }
+    Some((x.len() as i64 - y.len() as i64).signum() as i32)
+}
+
+/// `sorted?`'s single-pair body (reused directly by `find_shadowing_rescue`,
+/// which calls it on one `each_cons(2)` pair at a time): `Exception` in the
+/// earlier group always breaks order; `Exception` in the later group (or
+/// either group being empty/all-`nil`) is vacuously fine; otherwise fall
+/// back to the raw array comparison, treating `nil` (unrelated ancestry) as
+/// "not backwards" — `(x <=> y || 0) <= 0`.
+fn shx_pair_sorted(x: &[Option<&[u8]>], y: &[Option<&[u8]>]) -> bool {
+    let has_exception = |g: &[Option<&[u8]>]| g.iter().any(|e| *e == Some(&b"Exception"[..]));
+    if has_exception(x) {
+        return false;
+    }
+    if has_exception(y) {
+        return true;
+    }
+    let all_none = |g: &[Option<&[u8]>]| g.iter().all(|e| e.is_none());
+    if all_none(x) || all_none(y) {
+        return true;
+    }
+    match shx_group_cmp(x, y) {
+        Some(v) => v <= 0,
+        None => true,
+    }
+}
+
+/// `sorted?` over the whole chain: every consecutive pair must be in order.
+fn shx_sorted(groups: &[Vec<Option<&[u8]>>]) -> bool {
+    groups.windows(2).all(|w| shx_pair_sorted(&w[0], &w[1]))
+}
+
+/// `find_shadowing_rescue`: an internally-shadowing group (checked across
+/// ALL groups first, regardless of position) wins over an out-of-order
+/// adjacent pair; the offense anchors on the EARLIER clause of a violating
+/// pair (`rescues[i]`, not `rescues[i+1]`) — the one whose overly-broad
+/// rescue shadows what follows it.
+fn shx_find_shadowing(groups: &[Vec<Option<&[u8]>>]) -> Option<usize> {
+    for (i, g) in groups.iter().enumerate() {
+        if shx_contains_multiple_levels(g) {
+            return Some(i);
+        }
+    }
+    for i in 0..groups.len().saturating_sub(1) {
+        if !shx_pair_sorted(&groups[i], &groups[i + 1]) {
+            return Some(i);
+        }
+    }
+    None
+}

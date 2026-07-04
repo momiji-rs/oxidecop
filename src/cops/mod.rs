@@ -369,7 +369,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
-    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral",
+    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException",
 ];
 
 impl Engine {
@@ -3181,6 +3181,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
         self.check_signal_exception_rescue(node);
         self.check_duplicate_rescue_exception(node);
+        self.check_shadowed_exception(node);
         self.check_useless_else_without_rescue(node);
         self.check_empty_lines_around_begin_body(node);
         self.check_empty_lines_around_exception_handling_keywords_kwbegin(node);
