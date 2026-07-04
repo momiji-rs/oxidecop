@@ -15298,3 +15298,126 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/MixinGrouping — flags `include`/`extend`/`prepend` macro calls
+    /// (no receiver, direct statements of a `class`/`module` body) with the
+    /// "wrong" arity for the configured style.
+    ///
+    /// `separated` (default): a call with 2+ mixin args gets split into one
+    /// call per arg. `grouped`: any set of 2+ SAME-METHOD macro calls
+    /// anywhere in the body (not necessarily adjacent — other statements may
+    /// sit between them) gets merged into a single call.
+    ///
+    /// Ported from `on_class`/`check_grouped_style`/`check_separated_style`.
+    /// `sibling_mixins` matches upstream's `send_node.parent.each_child_node`
+    /// scan: ALL same-method macros in the body, regardless of adjacency.
+    /// `range_to_remove_for_subsequent_mixin` extends a later mixin's own
+    /// removal range back to the END of the PREVIOUS same-method mixin only
+    /// when the text between them is pure whitespace — if another statement
+    /// (e.g. `do_something_else`) sits between, only the mixin's own range is
+    /// blanked, leaving an indent-only blank line behind (see the
+    /// `trailing_whitespace` cases in the fixture).
+    pub(crate) fn check_mixin_grouping(&mut self, body: Option<ruby_prism::Node>) {
+        const COP: &str = "Style/MixinGrouping";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = body else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        let items: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+
+        struct Mixin {
+            start: usize,
+            end: usize,
+            method: Vec<u8>,
+            // (start, end) byte offsets of each argument's own source range,
+            // in original left-to-right order.
+            args: Vec<(usize, usize)>,
+        }
+
+        let mut mixins: Vec<Mixin> = Vec::new();
+        for item in &items {
+            let Some(call) = item.as_call_node() else { continue };
+            if call.receiver().is_some() {
+                continue;
+            }
+            let name = call.name();
+            if !matches!(name.as_slice(), b"extend" | b"include" | b"prepend") {
+                continue;
+            }
+            let Some(args_node) = call.arguments() else { continue };
+            let arg_list: Vec<ruby_prism::Node> = args_node.arguments().iter().collect();
+            if arg_list.is_empty() {
+                continue;
+            }
+            let l = call.location();
+            let args: Vec<(usize, usize)> = arg_list
+                .iter()
+                .map(|a| {
+                    let al = a.location();
+                    (al.start_offset(), al.end_offset())
+                })
+                .collect();
+            mixins.push(Mixin { start: l.start_offset(), end: l.end_offset(), method: name.as_slice().to_vec(), args });
+        }
+
+        let grouped = self.cfg.get(COP, "EnforcedStyle") == Some("grouped");
+
+        if grouped {
+            for i in 0..mixins.len() {
+                let siblings: Vec<usize> = (0..mixins.len()).filter(|&j| mixins[j].method == mixins[i].method).collect();
+                if siblings.len() == 1 {
+                    continue;
+                }
+                let method_str = String::from_utf8_lossy(&mixins[i].method).into_owned();
+                let msg = format!("Put `{method_str}` mixins in a single statement.");
+                self.push(mixins[i].start, COP, true, msg);
+
+                if i == siblings[0] {
+                    // `mixins.reverse.flat_map { |m| m.arguments.map(&:source) }`
+                    let mut names: Vec<String> = Vec::new();
+                    for &s in siblings.iter().rev() {
+                        for (a_start, a_end) in &mixins[s].args {
+                            names.push(String::from_utf8_lossy(&self.src[*a_start..*a_end]).into_owned());
+                        }
+                    }
+                    let replacement = format!("{method_str} {}", names.join(", "));
+                    self.fixes.push((mixins[i].start, mixins[i].end, replacement.into_bytes()));
+                } else {
+                    let pos = siblings.iter().position(|&s| s == i).unwrap();
+                    let prev_end = mixins[siblings[pos - 1]].end;
+                    let between = &self.src[prev_end..mixins[i].start];
+                    let whitespace_only = !between.iter().any(|b| !b.is_ascii_whitespace());
+                    let range_start = if whitespace_only { prev_end } else { mixins[i].start };
+                    self.fixes.push((range_start, mixins[i].end, Vec::new()));
+                }
+            }
+        } else {
+            for m in &mixins {
+                if m.args.len() <= 1 {
+                    continue;
+                }
+                let method_str = String::from_utf8_lossy(&m.method).into_owned();
+                let msg = format!("Put `{method_str}` mixins in separate statements.");
+                self.push(m.start, COP, true, msg);
+
+                // `separate_mixins`: reversed args, one call per line,
+                // subsequent lines indented to the ORIGINAL call's column.
+                let indent = " ".repeat(self.idx.loc(m.start).1 - 1);
+                let mut lines: Vec<String> = Vec::new();
+                for (k, (a_start, a_end)) in m.args.iter().rev().enumerate() {
+                    let arg_src = String::from_utf8_lossy(&self.src[*a_start..*a_end]).into_owned();
+                    if k == 0 {
+                        lines.push(format!("{method_str} {arg_src}"));
+                    } else {
+                        lines.push(format!("{indent}{method_str} {arg_src}"));
+                    }
+                }
+                let replacement = lines.join("\n");
+                self.fixes.push((m.start, m.end, replacement.into_bytes()));
+            }
+        }
+    }
+}

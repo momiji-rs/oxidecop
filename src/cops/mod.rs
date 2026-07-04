@@ -244,7 +244,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
     "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops", "Style/SlicingWithRange",
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
-    "Layout/SpaceAroundKeyword",
+    "Layout/SpaceAroundKeyword", "Style/MixinGrouping",
 ];
 
 impl Engine {
@@ -2555,6 +2555,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_inherit_exception_class(node);
         self.check_ineffective_access_modifier(node.body());
         self.check_bisected_attr_accessor(node.body());
+        self.check_mixin_grouping(node.body());
         self.check_empty_lines_around_class_body(node);
         self.check_access_modifier_indentation_class(node);
         self.check_struct_inheritance(node);
@@ -2601,6 +2602,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_lines_around_module_body(node);
         self.check_ineffective_access_modifier(node.body());
         self.check_bisected_attr_accessor(node.body());
+        self.check_mixin_grouping(node.body());
         self.check_access_modifier_indentation_module(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));

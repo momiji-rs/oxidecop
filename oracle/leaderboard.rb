@@ -263,6 +263,7 @@ COPS = {
   'Style/RedundantInterpolation'     => 'style/redundant_interpolation',
   'Style/BisectedAttrAccessor'       => 'style/bisected_attr_accessor',
   'Layout/SpaceAroundKeyword'        => 'layout/space_around_keyword',
+  'Style/MixinGrouping'              => 'style/mixin_grouping',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
