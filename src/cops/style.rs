@@ -13728,3 +13728,188 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+/// `Style/OrAssignment`'s `{lvar ivar cvar gvar}` read-node whitelist —
+/// prism's read-node `name()` already carries the sigil (`@foo`, `@@foo`,
+/// `$foo`) exactly like whitequark's symbol, so a bare byte-slice comparison
+/// across variable kinds can never collide (an ivar named `foo` reads as
+/// `@foo`, never `foo`).
+fn oa_read_name<'pr>(node: &ruby_prism::Node<'pr>) -> Option<&'pr [u8]> {
+    if let Some(n) = node.as_local_variable_read_node() {
+        return Some(n.name().as_slice());
+    }
+    if let Some(n) = node.as_instance_variable_read_node() {
+        return Some(n.name().as_slice());
+    }
+    if let Some(n) = node.as_class_variable_read_node() {
+        return Some(n.name().as_slice());
+    }
+    if let Some(n) = node.as_global_variable_read_node() {
+        return Some(n.name().as_slice());
+    }
+    None
+}
+
+/// `Style/OrAssignment`'s `{lvasgn ivasgn cvasgn gvasgn}` write-node
+/// whitelist, paired with the assigned value node
+/// (`take_variable_and_default_from_unless`'s `node.if_branch`/
+/// `node.else_branch` upstream).
+fn oa_write_name_value<'pr>(node: &ruby_prism::Node<'pr>) -> Option<(&'pr [u8], ruby_prism::Node<'pr>)> {
+    if let Some(n) = node.as_local_variable_write_node() {
+        return Some((n.name().as_slice(), n.value()));
+    }
+    if let Some(n) = node.as_instance_variable_write_node() {
+        return Some((n.name().as_slice(), n.value()));
+    }
+    if let Some(n) = node.as_class_variable_write_node() {
+        return Some((n.name().as_slice(), n.value()));
+    }
+    if let Some(n) = node.as_global_variable_write_node() {
+        return Some((n.name().as_slice(), n.value()));
+    }
+    None
+}
+
+/// `Style/OrAssignment` — checks for potential usage of the `||=` operator.
+/// Upstream has two node matchers:
+///
+/// - `ternary_assignment?` + `on_lvasgn`/`on_ivasgn`/`on_cvasgn`/`on_gvasgn`:
+///   `var = var ? var : default` and `var = if var; var; else; default; end`
+///   — one shape in prism too, since a ternary is an `IfNode` with no
+///   `if_keyword_loc` (see `check_or_assignment_write`, hooked from the four
+///   `visit_*_variable_write_node`s).
+/// - `unless_assignment?` + `on_if`: `unless var; var = default; end` and
+///   `if var; else; var = default; end`. whitequark canonicalizes a real
+///   `unless` into `(if cond nil body)`, so upstream's single `on_if` catches
+///   both for free; prism gives `unless` its own dedicated `UnlessNode`, so
+///   this needs two separate hooks below (`check_or_assignment_if` for the
+///   `if`/empty-then/else shape, `check_or_assignment_unless` for the real
+///   `unless` keyword AND modifier forms).
+impl<'a> super::Cops<'a> {
+    /// `ternary_assignment?` + `on_lvasgn` family: `write` is the whole
+    /// write-node (`node.as_node()`), `name` its assigned variable (sigil
+    /// included, e.g. `@foo`), `value` its RHS.
+    pub(crate) fn check_or_assignment_write(
+        &mut self,
+        write: &ruby_prism::Node,
+        name: &[u8],
+        value: &ruby_prism::Node,
+    ) {
+        const COP: &str = "Style/OrAssignment";
+        const MSG: &str = "Use the double pipe equals operator `||=` instead.";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(iff) = value.as_if_node() else { return };
+        if oa_read_name(&iff.predicate()) != Some(name) {
+            return;
+        }
+        let Some(then_stmts) = iff.statements() else { return };
+        let then_body = then_stmts.body();
+        if then_body.len() != 1 || oa_read_name(&then_body.iter().next().unwrap()) != Some(name) {
+            return;
+        }
+        // `return if else_branch.if_type?` — an `elsif` chain reuses this
+        // position for another `IfNode` in prism's `subsequent()` too (no
+        // `ElseNode` wrapper), so `as_else_node()` naturally excludes it.
+        let Some(else_node) = iff.subsequent().and_then(|s| s.as_else_node()) else { return };
+        let Some(else_stmts) = else_node.statements() else { return };
+
+        let full = write.location();
+        self.push(full.start_offset(), COP, true, MSG);
+
+        let default_src = self.node_src(&else_stmts.as_node());
+        let mut replacement = Vec::with_capacity(name.len() + 5 + default_src.len());
+        replacement.extend_from_slice(name);
+        replacement.extend_from_slice(b" ||= ");
+        replacement.extend_from_slice(default_src);
+        self.fixes.push((full.start_offset(), full.end_offset(), replacement));
+    }
+
+    /// `unless_assignment?` + `on_if`, the `if var; else; var = default; end`
+    /// half — empty "then" branch (`nil?` on the if-branch position upstream)
+    /// with a real `else`. The real `unless var; var = default; end` shape is
+    /// `check_or_assignment_unless` below, since prism keeps `unless` as its
+    /// own node type instead of canonicalizing into this `IfNode` shape.
+    pub(crate) fn check_or_assignment_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/OrAssignment";
+        const MSG: &str = "Use the double pipe equals operator `||=` instead.";
+        if !self.on(COP) {
+            return;
+        }
+        if node.statements().is_some() {
+            return;
+        }
+        let predicate = node.predicate();
+        let Some(pred_name) = oa_read_name(&predicate) else { return };
+        // excludes `elsif` chains: those reuse this position for another
+        // `IfNode`, not an `ElseNode`.
+        let Some(else_node) = node.subsequent().and_then(|s| s.as_else_node()) else { return };
+        let Some(else_stmts) = else_node.statements() else { return };
+        let else_body = else_stmts.body();
+        if else_body.len() != 1 {
+            return;
+        }
+        let Some((wname, wvalue)) = oa_write_name_value(&else_body.iter().next().unwrap()) else {
+            return;
+        };
+        if wname != pred_name {
+            return;
+        }
+
+        let full = node.location();
+        self.push(full.start_offset(), COP, true, MSG);
+
+        let default_src = self.node_src(&wvalue);
+        let mut replacement = Vec::with_capacity(pred_name.len() + 5 + default_src.len());
+        replacement.extend_from_slice(pred_name);
+        replacement.extend_from_slice(b" ||= ");
+        replacement.extend_from_slice(default_src);
+        self.fixes.push((full.start_offset(), full.end_offset(), replacement));
+    }
+
+    /// `unless_assignment?` + `on_if`, the real `unless var; var = default;
+    /// end` half (keyword AND modifier forms — prism gives both a dedicated
+    /// `UnlessNode`, unlike whitequark which canonicalizes them into the same
+    /// `(if cond nil body)` shape `on_if` matches upstream). The assignment
+    /// lives directly in `.statements()` (unless's primary/only body), NOT in
+    /// an `else` slot — prism doesn't do whitequark's branch-flip
+    /// canonicalization, so there is no `subsequent`/`else` lookup here.
+    pub(crate) fn check_or_assignment_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Style/OrAssignment";
+        const MSG: &str = "Use the double pipe equals operator `||=` instead.";
+        if !self.on(COP) {
+            return;
+        }
+        // a real `unless ... else ... end` flips which branch is nil in
+        // whitequark's compiled `if` shape (the if-branch is no longer nil),
+        // so upstream's pattern wouldn't match it either.
+        if node.else_clause().is_some() {
+            return;
+        }
+        let predicate = node.predicate();
+        let Some(pred_name) = oa_read_name(&predicate) else { return };
+        let Some(stmts) = node.statements() else { return };
+        let body = stmts.body();
+        if body.len() != 1 {
+            return;
+        }
+        let Some((wname, wvalue)) = oa_write_name_value(&body.iter().next().unwrap()) else {
+            return;
+        };
+        if wname != pred_name {
+            return;
+        }
+
+        let full = node.location();
+        self.push(full.start_offset(), COP, true, MSG);
+
+        let default_src = self.node_src(&wvalue);
+        let mut replacement = Vec::with_capacity(pred_name.len() + 5 + default_src.len());
+        replacement.extend_from_slice(pred_name);
+        replacement.extend_from_slice(b" ||= ");
+        replacement.extend_from_slice(default_src);
+        self.fixes.push((full.start_offset(), full.end_offset(), replacement));
+    }
+}

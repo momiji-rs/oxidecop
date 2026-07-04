@@ -232,7 +232,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
-    "Lint/UnreachableLoop", "Style/InfiniteLoop",
+    "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment",
 ];
 
 impl Engine {
@@ -1406,6 +1406,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_one_line_conditional_if(node);
         self.check_if_with_semicolon(node);
         self.check_safe_navigation_with_empty(&node.predicate());
+        self.check_or_assignment_if(node);
         if let Some(kw) = node.if_keyword_loc() {
             if matches!(kw.as_slice(), b"if" | b"elsif") {
                 let kw_text = if kw.as_slice() == b"elsif" { "elsif" } else { "if" };
@@ -1459,6 +1460,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_else_unless(node);
         self.check_non_nil_check_unless(node);
         self.check_if_with_semicolon_unless(node);
+        self.check_or_assignment_unless(node);
         self.check_multiline_if_then(
             node.then_keyword_loc(),
             node.end_keyword_loc(),
@@ -1487,6 +1489,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_cvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_cvar(node);
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
+        self.check_or_assignment_write(&node.as_node(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_class_variable_write_node(self, node);
@@ -1528,6 +1531,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_self_assignment_gvar(node);
         self.check_global_std_stream_gvasgn(node.name().as_slice(), &node.value());
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
+        self.check_or_assignment_write(&node.as_node(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_global_variable_write_node(self, node);
@@ -1577,6 +1581,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_lvar(node);
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
+        self.check_or_assignment_write(&node.as_node(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
@@ -1615,6 +1620,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_ivar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_ivar(node);
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
+        self.check_or_assignment_write(&node.as_node(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_instance_variable_write_node(self, node);

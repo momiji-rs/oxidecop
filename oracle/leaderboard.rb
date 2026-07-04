@@ -237,6 +237,7 @@ COPS = {
   'Naming/RescuedExceptionsVariableName' => 'naming/rescued_exceptions_variable_name',
   'Lint/UnreachableLoop'             => 'lint/unreachable_loop',
   'Style/InfiniteLoop'               => 'style/infinite_loop',
+  'Style/OrAssignment'               => 'style/or_assignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
