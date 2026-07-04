@@ -6890,3 +6890,238 @@ fn sabp_left_space_begin(src: &[u8], start: usize) -> usize {
     }
     pos
 }
+
+
+/// Layout/HeredocIndentation shared helpers (free functions so they're usable
+/// without an existing offense/`self` borrow conflict inside the corrector).
+
+/// Ruby's `\s` character class (ASCII-only, no `/u`): space, tab, CR, FF, VT
+/// — used for the leading-whitespace counts this cop's `indent_level`
+/// (`Heredoc` mixin) and `heredoc_end`'s own gsub rely on. `\n` is
+/// deliberately excluded — these are always called on content that's
+/// already been split on newlines, so it never appears mid-slice.
+fn hi_is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | 0x0b | 0x0c)
+}
+
+fn hi_ws_len(s: &[u8]) -> usize {
+    s.iter().take_while(|&&b| hi_is_ws(b)).count()
+}
+
+/// `str.lines` for a heredoc body: split on `\n`, dropping the trailing
+/// empty piece a body ending in `\n` produces (every non-empty heredoc body
+/// ends in `\n` — it always runs up to, but not including, the closing
+/// delimiter's own line).
+fn hi_body_lines(body: &str) -> Vec<&str> {
+    let mut v: Vec<&str> = body.split('\n').collect();
+    if v.last() == Some(&"") {
+        v.pop();
+    }
+    v
+}
+
+/// `Heredoc#indent_level`: minimum leading-whitespace width across all
+/// lines, EXCLUDING lines that are entirely whitespace (blank lines don't
+/// participate — `.reject { |line| line.end_with?("\n") }`, true exactly
+/// when the leading-whitespace match consumed the whole line including its
+/// terminator).
+fn hi_min_indent(lines: &[&str]) -> usize {
+    let mut min: Option<usize> = None;
+    for line in lines {
+        let ws = hi_ws_len(line.as_bytes());
+        if ws == line.len() {
+            continue;
+        }
+        min = Some(min.map_or(ws, |m| m.min(ws)));
+    }
+    min.unwrap_or(0)
+}
+
+impl<'a> super::Cops<'a> {
+    /// `configured_indentation_width` (`Alignment` mixin): this cop's own
+    /// `IndentationWidth` param (no schema default — `Layout/
+    /// HeredocIndentation` doesn't ship one) falling back to `Layout/
+    /// IndentationWidth`'s `Width` (schema default 2), then a hardcoded 2.
+    fn hi_configured_width(&self) -> usize {
+        self.cfg
+            .param("Layout/HeredocIndentation", "IndentationWidth")
+            .and_then(|v| v.parse::<usize>().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse::<usize>().ok()))
+            .unwrap_or(2)
+    }
+
+    /// Leading-whitespace width of the physical line containing byte offset
+    /// `off` — `base_indent_level`'s `indent_level(base_line)` collapses to
+    /// this (a heredoc's own opening line, or its closing-delimiter line,
+    /// is never blank, so the multi-line `indent_level`'s "reject blank
+    /// lines" branch never applies).
+    fn hi_line_indent(&self, off: usize) -> usize {
+        let line = self.idx.loc(off).0;
+        let start = self.idx.starts[line - 1];
+        let end = self.line_end(line);
+        hi_ws_len(&self.src[start..end])
+    }
+
+    /// `line_too_long?` — deliberately reads `Layout/LineLength`'s RAW
+    /// `Enabled` param (not `cfg.cop_config_enabled`/`self.on`): the oracle
+    /// harness's own `AllCops: DisabledByDefault: true` (scoping which cop
+    /// THIS run investigates) has no equivalent in the real spec's `:config`
+    /// shared context, where `other_cops` sections are merged in WITHOUT an
+    /// `Enabled` key and default to enabled — `Config#enable_cop?`'s
+    /// `cop_options.fetch('Enabled') { !for_all_cops['DisabledByDefault'] }`
+    /// with a real config's `AllCops` never carrying that flag.
+    fn hi_line_too_long(&self, base_indent: usize, width: usize, body_lines: &[&str]) -> bool {
+        if self.cfg.param("Layout/LineLength", "Enabled") == Some("false") {
+            return false; // `max_line_length` returns nil -> falsy
+        }
+        let max = self.cfg.get("Layout/LineLength", "Max").and_then(|v| v.parse::<i64>().ok()).unwrap_or(120);
+        if self.cfg.get("Layout/LineLength", "AllowHeredoc") == Some("true") {
+            return false; // `unlimited_heredoc_length?`
+        }
+        let body_indent = hi_min_indent(body_lines) as i64;
+        let expected_indent = (base_indent + width) as i64;
+        let increase_indent_level = expected_indent - body_indent;
+        let longest = body_lines.iter().map(|l| l.chars().count() as i64).max().unwrap_or(0);
+        longest + increase_indent_level >= max
+    }
+
+    /// `adjust_squiggly`: reindents every body line (only the shared
+    /// `body_indent_level`-wide leading run is touched — shorter/blank
+    /// lines whose own prefix doesn't reach that width are left as-is,
+    /// exactly like the upstream `gsub(/^[^\S\r\n]{n}/, ...)`), then, if the
+    /// closing delimiter is currently indented LESS than the heredoc's own
+    /// opening line, pulls it in to match.
+    fn hi_adjust_squiggly(
+        &mut self,
+        closing: ruby_prism::Location,
+        body_start: usize,
+        body_end: usize,
+        body_lines: &[&str],
+        body_indent_level: usize,
+        base_indent: usize,
+        width: usize,
+    ) {
+        let correct_body_indent = base_indent + width;
+        let mut new_body = String::new();
+        for (i, line) in body_lines.iter().enumerate() {
+            if i > 0 {
+                new_body.push('\n');
+            }
+            let ws = hi_ws_len(line.as_bytes());
+            if ws >= body_indent_level {
+                new_body.push_str(&" ".repeat(correct_body_indent));
+                new_body.push_str(&line[body_indent_level..]);
+            } else {
+                new_body.push_str(line);
+            }
+        }
+        new_body.push('\n');
+        self.fixes.push((body_start, body_end, new_body.into_bytes()));
+
+        let end_indent = hi_ws_len(closing.as_slice());
+        if end_indent < base_indent {
+            let start = closing.start_offset();
+            self.fixes.push((start, start + end_indent, vec![b' '; base_indent]));
+        }
+    }
+
+    /// `adjust_minus`: `heredoc_beginning.sub(/<<-?/, '<<~')` — strip the
+    /// opening token's leading `<<` (and an optional immediately-following
+    /// `-`), splice `<<~` back in front of whatever's left (quote char and/or
+    /// delimiter name).
+    fn hi_adjust_minus(&mut self, opening: ruby_prism::Location) {
+        let slice = opening.as_slice();
+        let mut rest = &slice[2.min(slice.len())..];
+        if rest.first() == Some(&b'-') {
+            rest = &rest[1..];
+        }
+        let mut new = Vec::with_capacity(3 + rest.len());
+        new.extend_from_slice(b"<<~");
+        new.extend_from_slice(rest);
+        self.fixes.push((opening.start_offset(), opening.end_offset(), new));
+    }
+
+    /// Layout/HeredocIndentation — `Heredoc#on_str`/`#on_dstr`/`#on_xstr`.
+    /// whitequark's `xstring_compose` builds a plain `:xstr` node whether or
+    /// not it has interpolation (there's no separate `:dxstr` type), so
+    /// `#on_xstr` — aliased to `#on_str` — covers `InterpolatedXStringNode`
+    /// too; it's wired up from `visit_interpolated_x_string_node` just like
+    /// the other three heredoc-capable node kinds. `opening_loc`/`closing_
+    /// loc` are the heredoc's own delimiter locations; `body_start`/
+    /// `body_end` bracket `node.loc.heredoc_body` — for a plain `StringNode`/
+    /// `XStringNode` that's `content_loc()` directly, for an interpolated
+    /// one (`InterpolatedStringNode`/`InterpolatedXStringNode`) it's the
+    /// first part's start through the closing delimiter's own start
+    /// (mirrors `HeredocFinder::add_span`).
+    pub(crate) fn check_heredoc_indentation(
+        &mut self,
+        opening_loc: Option<ruby_prism::Location>,
+        closing_loc: Option<ruby_prism::Location>,
+        body_start: usize,
+        body_end: usize,
+    ) {
+        const COP: &str = "Layout/HeredocIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(opening) = opening_loc else { return };
+        let op = opening.as_slice();
+        if !op.starts_with(b"<<") {
+            return;
+        }
+        let Some(closing) = closing_loc else { return };
+        if body_start >= body_end {
+            return; // `body.strip.empty?`
+        }
+        let Ok(body) = std::str::from_utf8(&self.src[body_start..body_end]) else { return };
+        if body.trim().is_empty() {
+            return; // `body.strip.empty?`
+        }
+
+        let body_lines = hi_body_lines(body);
+        let body_indent_level = hi_min_indent(&body_lines);
+        // `node.source[/^<<([~-])/, 1]` — '~', '-', or bare (neither).
+        let indent_type = match op.get(2) {
+            Some(b'~') => Some(b'~'),
+            Some(b'-') => Some(b'-'),
+            _ => None,
+        };
+        let width = self.hi_configured_width();
+        let base_indent = self.hi_line_indent(opening.start_offset());
+
+        // `heredoc_squish?`: only relevant off the squiggly branch (upstream
+        // never even calls it when `heredoc_indent_type == '~'`).
+        let squish = indent_type != Some(b'~') && self.squish_heredoc.contains(&opening.start_offset());
+
+        if indent_type == Some(b'~') {
+            let expected_indent_level = base_indent + width;
+            if expected_indent_level == body_indent_level {
+                return;
+            }
+        } else if !(body_indent_level == 0 || squish) {
+            return;
+        }
+
+        if self.hi_line_too_long(base_indent, width, &body_lines) {
+            return;
+        }
+
+        let message = match indent_type {
+            Some(b'~') => format!("Use {width} spaces for indentation in a heredoc."),
+            Some(b'-') => {
+                format!("Use {width} spaces for indentation in a heredoc by using `<<~` instead of `<<-`.")
+            }
+            _ => format!("Use {width} spaces for indentation in a heredoc by using `<<~` instead of `<<`."),
+        };
+        self.push(body_start, COP, true, message);
+
+        if indent_type == Some(b'~') {
+            self.hi_adjust_squiggly(closing, body_start, body_end, &body_lines, body_indent_level, base_indent, width);
+        } else if squish {
+            self.hi_adjust_squiggly(closing, body_start, body_end, &body_lines, body_indent_level, base_indent, width);
+            self.hi_adjust_minus(opening);
+        } else {
+            self.hi_adjust_minus(opening);
+        }
+    }
+}

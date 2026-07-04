@@ -313,6 +313,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
+    "Layout/HeredocIndentation",
 ];
 
 impl Engine {
@@ -1002,6 +1003,12 @@ pub(crate) struct Cops<'a> {
     // cases `argument_indentation_correct?` special-cases; everything else
     // falls back to the plain opening-vs-closing-line comparison.
     pub(crate) chi_heredoc_ctx: HashMap<usize, (usize, bool)>,
+    // Layout/HeredocIndentation: opening-token start offsets of heredocs that
+    // are the receiver of a zero-argument `.squish`/`.squish!` call —
+    // `squish_method?`'s `(send _ {:squish :squish!})` pattern, precomputed
+    // top-down in `visit_call_node` the same way `chi_heredoc_ctx` is (the
+    // receiver is visited AFTER this call registers it).
+    pub(crate) squish_heredoc: HashSet<usize>,
     // Lint/ImplicitStringConcatenation: start offsets of nodes that are a
     // direct ELEMENT of an array literal — rubocop's `node.parent&.array_type?`
     // guard, consulted only to pick the "separate array elements" message
@@ -1557,6 +1564,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_heredoc_delimiter_naming(node.opening_loc(), node.closing_loc());
         self.check_heredoc_delimiter_case(node.opening_loc(), node.closing_loc());
         self.check_closing_heredoc_indentation(node.opening_loc(), node.closing_loc());
+        {
+            let c = node.content_loc();
+            self.check_heredoc_indentation(node.opening_loc(), node.closing_loc(), c.start_offset(), c.end_offset());
+        }
         self.check_interpolation_check(node);
         self.check_redundant_percent_q_str(node);
         self.check_percent_q_literals(node);
@@ -1571,6 +1582,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_heredoc_delimiter_naming(node.opening_loc(), node.closing_loc());
         self.check_heredoc_delimiter_case(node.opening_loc(), node.closing_loc());
         self.check_closing_heredoc_indentation(node.opening_loc(), node.closing_loc());
+        // `on_dstr` (Heredoc mixin aliases it to `on_str`): the body location
+        // isn't a single `content_loc` for an interpolated node — mirror
+        // `HeredocFinder`'s own span (first part's start through the closing
+        // delimiter's start).
+        if let (Some(first), Some(close)) = (node.parts().iter().next(), node.closing_loc()) {
+            self.check_heredoc_indentation(
+                node.opening_loc(),
+                node.closing_loc(),
+                first.location().start_offset(),
+                close.start_offset(),
+            );
+        }
         self.check_interpolation_check_dstr(node);
         self.check_redundant_percent_q_dstr(node);
         self.check_lii_dstr(node);
@@ -1636,6 +1659,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_lii_ixstr(node);
         self.check_heredoc_delimiter_case(Some(node.opening_loc()), Some(node.closing_loc()));
         self.check_closing_heredoc_indentation(Some(node.opening_loc()), Some(node.closing_loc()));
+        // whitequark's `xstring_compose` always builds a plain `:xstr` node
+        // (interpolated or not — there is no `:dxstr`), so `Heredoc#on_xstr`
+        // (aliased to `#on_str`) covers THIS node too; body span mirrors the
+        // `InterpolatedStringNode` case (first part's start through the
+        // closing delimiter's own start).
+        if let Some(first) = node.parts().iter().next() {
+            self.check_heredoc_indentation(
+                Some(node.opening_loc()),
+                Some(node.closing_loc()),
+                first.location().start_offset(),
+                node.closing_loc().start_offset(),
+            );
+        }
         self.xstr_interp_base.push(self.interp_depth);
         self.interpolated_node_depth += 1;
         let prev_brace_eligible = self.sgv_brace_eligible;
@@ -1649,6 +1685,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_heredoc_delimiter_naming(Some(node.opening_loc()), Some(node.closing_loc()));
         self.check_heredoc_delimiter_case(Some(node.opening_loc()), Some(node.closing_loc()));
         self.check_closing_heredoc_indentation(Some(node.opening_loc()), Some(node.closing_loc()));
+        {
+            let c = node.content_loc();
+            self.check_heredoc_indentation(
+                Some(node.opening_loc()),
+                Some(node.closing_loc()),
+                c.start_offset(),
+                c.end_offset(),
+            );
+        }
         self.check_space_inside_percent_literal_delimiters_xstr(node);
         ruby_prism::visit_x_string_node(self, node);
     }
@@ -3570,7 +3615,21 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let mto_is_assign_method = mto_name.as_slice().ends_with(b"=")
             && !matches!(mto_name.as_slice(), b"==" | b"===" | b"!=" | b"<=" | b">=");
         let mto_call_start = node.location().start_offset();
+        // Layout/HeredocIndentation's `heredoc_squish?`: `squish_method?`
+        // needs `active_support_extensions_enabled?` too, and only a plain
+        // `send` (not `&.`) with no arguments matches `(send _ {:squish
+        // :squish!})`.
+        let hi_squish_track = !node.is_safe_navigation()
+            && node.arguments().is_none()
+            && self.hot.active_support
+            && matches!(node.name().as_slice(), b"squish" | b"squish!")
+            && self.on("Layout/HeredocIndentation");
         if let Some(r) = node.receiver() {
+            if hi_squish_track {
+                if let Some(hoff) = layout::chi_heredoc_offset(&r) {
+                    self.squish_heredoc.insert(hoff);
+                }
+            }
             if track_args {
                 self.assumed_arg_offsets.insert(r.location().start_offset());
             }
@@ -3931,6 +3990,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         dea_parent: HashMap::new(),
         chi_call_root: HashMap::new(),
         chi_heredoc_ctx: HashMap::new(),
+        squish_heredoc: HashSet::new(),
         isc_array_child: HashSet::new(),
         isc_send_child: HashSet::new(),
         alias_scope_stack: Vec::new(),
