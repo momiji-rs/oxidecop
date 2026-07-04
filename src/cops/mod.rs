@@ -386,7 +386,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
-    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken",
+    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment",
 ];
 
 impl Engine {
@@ -2354,6 +2354,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // — `NAME = alias_method :a, :b`.
         self.alias_value_offsets.insert(v.location().start_offset());
         self.check_ascii_constant_write(node);
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         self.check_constant_name(node.name().as_slice(), node.name_loc().start_offset(), Some(&v));
         self.check_self_assignment_const(node.location().start_offset(), node.name().as_slice(), &v);
         self.mto_note_child(&v, node.location().start_offset(), false);
@@ -2378,6 +2379,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_multiline_memoization(node.location().start_offset(), &v);
         self.check_class_length_casgn(&v);
         self.check_mutable_constant(node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
         ruby_prism::visit_constant_or_write_node(self, node);
     }
@@ -2387,6 +2389,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
         self.check_ascii_constant_path_write(node);
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         let t = node.target();
         if let Some(name) = t.name() {
             let v = node.value();
@@ -2425,16 +2428,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_constant_and_write_node(&mut self, node: &ruby_prism::ConstantAndWriteNode<'pr>) {
         self.check_self_assignment_const(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_class_length_casgn(&node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
         ruby_prism::visit_constant_and_write_node(self, node);
     }
     fn visit_constant_operator_write_node(&mut self, node: &ruby_prism::ConstantOperatorWriteNode<'pr>) {
         self.check_class_length_casgn(&node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_operator_write!(self, node);
         ruby_prism::visit_constant_operator_write_node(self, node);
     }
     fn visit_constant_path_operator_write_node(&mut self, node: &ruby_prism::ConstantPathOperatorWriteNode<'pr>) {
         self.check_class_length_casgn(&node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_path_operator_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_operator_write_node(self, node);
@@ -2443,12 +2449,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
         self.check_class_length_casgn(&node.value());
         self.check_mutable_constant(node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_or_write_node(self, node);
     }
     fn visit_constant_path_and_write_node(&mut self, node: &ruby_prism::ConstantPathAndWriteNode<'pr>) {
         self.check_class_length_casgn(&node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_and_write_node(self, node);
@@ -2518,6 +2526,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_case_like_if(node);
         self.check_empty_else_if(node);
         self.check_if_inside_else(node);
+        self.check_conditional_assignment_if(node);
         self.check_one_line_conditional_if(node);
         self.check_if_with_semicolon(node);
         self.check_safe_navigation_with_empty(&node.predicate());
@@ -2640,6 +2649,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_safe_navigation_with_empty(&node.predicate());
         self.check_negated_unless(node);
         self.check_unless_else(node);
+        self.check_conditional_assignment_unless(node);
         self.check_one_line_conditional_unless(node);
         self.check_empty_conditional_body_unless(node);
         self.check_empty_else_unless(node);
@@ -2718,6 +2728,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_class_variable_write_node(&mut self, node: &ruby_prism::ClassVariableWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         self.check_self_assignment_shorthand_cvar(node);
         self.check_self_assignment_cvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_cvar(node);
@@ -2733,6 +2744,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_class_variable_operator_write_node(&mut self, node: &ruby_prism::ClassVariableOperatorWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_operator_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
@@ -2742,6 +2754,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
         self.check_self_assignment_cvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
@@ -2750,6 +2763,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_class_variable_and_write_node(&mut self, node: &ruby_prism::ClassVariableAndWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
         self.check_self_assignment_cvar(node.location().start_offset(), node.name().as_slice(), &node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
@@ -2772,6 +2786,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_gvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_gvar(node);
         self.check_global_std_stream_gvasgn(node.name().as_slice(), &node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         self.check_or_assignment_write(&node.as_node(), node.name().as_slice(), &node.value());
         // Lint/RedundantSplatExpansion's `ASSIGNMENT_TYPES` (`gvasgn` here) —
@@ -2784,6 +2799,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_global_variable_operator_write_node(&mut self, node: &ruby_prism::GlobalVariableOperatorWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_operator_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
@@ -2793,6 +2809,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
         self.check_self_assignment_gvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
@@ -2801,6 +2818,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_global_variable_and_write_node(&mut self, node: &ruby_prism::GlobalVariableAndWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
         self.check_self_assignment_gvar(node.location().start_offset(), node.name().as_slice(), &node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
@@ -2828,6 +2846,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
         self.check_ascii_local_variable_write(node);
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         self.check_self_assignment_shorthand_lvar(node);
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_lvar(node);
@@ -2855,6 +2874,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.mcwap_assign_stack.pop();
     }
     fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_operator_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
@@ -2865,6 +2885,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
@@ -2875,6 +2896,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
@@ -2894,6 +2916,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
         self.check_self_assignment_shorthand_ivar(node);
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         self.check_self_assignment_ivar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_ivar(node);
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
@@ -2910,6 +2933,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         &mut self,
         node: &ruby_prism::InstanceVariableOperatorWriteNode<'pr>,
     ) {
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_operator_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
@@ -2918,6 +2942,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_instance_variable_or_write_node(&mut self, node: &ruby_prism::InstanceVariableOrWriteNode<'pr>) {
         self.check_self_assignment_ivar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
@@ -2925,6 +2950,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_instance_variable_and_write_node(&mut self, node: &ruby_prism::InstanceVariableAndWriteNode<'pr>) {
         self.check_self_assignment_ivar(node.location().start_offset(), node.name().as_slice(), &node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
@@ -2939,6 +2965,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
         self.check_class_length_casgn(&node.value());
+        self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         let lhs_start = node.location().start_offset();
         let op_end = node.operator_loc().end_offset();
         // Layout/ArrayAlignment's `node.parent&.masgn_type?` guard — the
@@ -3042,6 +3069,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_hash_like_case(node);
         self.check_empty_case_condition(node);
         self.check_identical_conditional_branches_case(node);
+        self.check_conditional_assignment_case(node);
         self.check_literal_as_condition_case(node);
         {
             let kw = node.case_keyword_loc();
@@ -3063,6 +3091,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.check_case_match_indentation(node);
         self.check_identical_conditional_branches_case_match(node);
+        self.check_conditional_assignment_case_match(node);
         self.check_literal_as_condition_case_match(node);
         {
             let kw = node.case_keyword_loc();
@@ -4944,6 +4973,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_required_ruby_version(node);
         self.check_non_deterministic_require_order(node);
         self.check_format_string(node);
+        self.check_conditional_assignment_send(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
         let n = node.as_node();

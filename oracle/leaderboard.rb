@@ -343,6 +343,7 @@ COPS = {
   'Style/IfUnlessModifier'           => 'style/if_unless_modifier',
   'Style/FormatString'               => 'style/format_string',
   'Style/FormatStringToken'          => 'style/format_string_token',
+  'Style/ConditionalAssignment'      => 'style/conditional_assignment_assign_to_condition',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

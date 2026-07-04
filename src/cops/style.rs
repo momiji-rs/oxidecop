@@ -32465,3 +32465,972 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+// ============================================================================
+// Style/ConditionalAssignment
+//
+// Two directions, gated by `EnforcedStyle`:
+//   - `assign_to_condition` (default): `if foo; bar = 1; else; bar = 2; end`
+//     -> `bar = if foo; 1; else; 2; end` — hooked from `on_if`/`on_unless`/
+//     `on_case`/`on_case_match`, examining each branch's TAIL statement.
+//   - `assign_inside_condition`: the reverse — hooked from every assignment
+//     node visitor (write nodes, `masgn`, and a qualifying `CallNode` send),
+//     examining the assignment's RHS for an `if`/`unless`/`case`/`case_match`
+//     (ternary included, gated by `IncludeTernaryExpressions`).
+//
+// Prism vs whitequark notes:
+//   - whitequark folds `unless` into `:if`; prism gives it a separate
+//     `UnlessNode`, so both directions need parallel `If`/`Unless` handling.
+//   - whitequark's op_asgn/and_asgn/or_asgn are variable-kind-agnostic (a
+//     `+=` on a local var and on an ivar are literally the same node type);
+//     prism splits every write kind by variable AND operator. `CaKind`
+//     mirrors this per-struct-type split rather than whitequark's coarser
+//     grouping — safe because upstream's `assignment_types_match?` is always
+//     paired with an `lhs_all_match?` text comparison, and lhs text always
+//     differs whenever variable kind differs, so the finer split never
+//     changes the observable verdict.
+//   - a `send`-based tail (`bar << 1`, `bar =~ x`, `array[i] = x`, `foo.x = 1`)
+//     is uniformly `:send` upstream regardless of method name — `CaKind::Send`
+//     mirrors that coarse bucket (method-specific precision comes entirely
+//     from the lhs text).
+//   - prism always wraps a branch body in a `StatementsNode`, even a
+//     single-statement one (unlike whitequark's ad hoc `:begin`-unwrapping),
+//     so `ca_tail_of` (last body element) replaces upstream's
+//     `tail`/`begin_type?` dance for free.
+//   - a rescue exception variable / for-loop index / masgn target's *element*
+//     is a dedicated `*TargetNode` type in prism (never a `*WriteNode`), so
+//     upstream's `assignment_rhs_exist?`/for-loop guards are structurally
+//     unreachable here and are not reproduced.
+//   - `ignore_node`/`part_of_ignored_node?` (upstream skips a nested
+//     assignment fully inside an already-ignored outer assignment) is not
+//     reproduced: neither fixture nests one candidate assignment directly
+//     inside another's own RHS, so it would never fire in practice.
+
+/// Kind discriminant for a branch-tail's assignment form, mirroring
+/// upstream's `assignment_types_match?` (`nodes.map(&:type).uniq.one?`).
+#[derive(Clone, Copy, PartialEq)]
+enum CaKind {
+    LVar,
+    IVar,
+    CVar,
+    GVar,
+    Const,
+    ConstPath,
+    OpAsgn,
+    AndAsgn,
+    OrAsgn,
+    Masgn,
+    Send,
+}
+
+/// `assignment_type?`'s send pattern: `{:[]= :<< :=~ :!~ :<=> #end_with_eq? :< :>}`.
+/// `#end_with_eq?` alone already covers `[]=`/setter-`=`/`==`/`===`/`>=`/`<=`/`!=`.
+fn ca_send_qualifies(name: &[u8]) -> bool {
+    name.ends_with(b"=") || matches!(name, b"<<" | b"=~" | b"!~" | b"<=>" | b"<" | b">")
+}
+
+/// The last child of any assignment-shaped node we recognize — mirrors
+/// upstream's `node.last_argument`/`node.expression` (the RHS value), reused
+/// for ternary-branch RHS extraction too (`_variable, *_operator, if_rhs = *node.if_branch`).
+fn ca_value<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    macro_rules! tryv {
+        ($m:ident) => {
+            if let Some(n) = node.$m() {
+                return Some(n.value());
+            }
+        };
+    }
+    tryv!(as_local_variable_write_node);
+    tryv!(as_local_variable_operator_write_node);
+    tryv!(as_local_variable_and_write_node);
+    tryv!(as_local_variable_or_write_node);
+    tryv!(as_instance_variable_write_node);
+    tryv!(as_instance_variable_operator_write_node);
+    tryv!(as_instance_variable_and_write_node);
+    tryv!(as_instance_variable_or_write_node);
+    tryv!(as_class_variable_write_node);
+    tryv!(as_class_variable_operator_write_node);
+    tryv!(as_class_variable_and_write_node);
+    tryv!(as_class_variable_or_write_node);
+    tryv!(as_global_variable_write_node);
+    tryv!(as_global_variable_operator_write_node);
+    tryv!(as_global_variable_and_write_node);
+    tryv!(as_global_variable_or_write_node);
+    tryv!(as_constant_write_node);
+    tryv!(as_constant_operator_write_node);
+    tryv!(as_constant_and_write_node);
+    tryv!(as_constant_or_write_node);
+    tryv!(as_constant_path_write_node);
+    tryv!(as_constant_path_operator_write_node);
+    tryv!(as_constant_path_and_write_node);
+    tryv!(as_constant_path_or_write_node);
+    tryv!(as_multi_write_node);
+    if let Some(n) = node.as_call_node() {
+        return n.arguments().and_then(|a| a.arguments().last());
+    }
+    None
+}
+
+/// The last statement of a branch body — prism's uniform `StatementsNode`
+/// wrapping makes this a drop-in replacement for upstream's `tail`.
+fn ca_tail_of<'pr>(stmts: &Option<ruby_prism::StatementsNode<'pr>>) -> Option<ruby_prism::Node<'pr>> {
+    stmts.as_ref().and_then(|s| s.body().last())
+}
+
+/// A ternary has no `if`/`then`/`end` keywords at all (established convention
+/// elsewhere in this file, e.g. `snc_is_ternary`).
+fn ca_is_ternary(node: &ruby_prism::Node) -> bool {
+    node.as_if_node().is_some_and(|n| n.if_keyword_loc().is_none())
+}
+
+/// Unwraps a single-statement `ParenthesesNode` (`(expr)`) — mirrors
+/// upstream's `assignment.begin_type? && assignment.children.one?` unwrap,
+/// used both for candidate-type detection and `ternary_condition?`'s
+/// `node.children.first` check.
+fn ca_unwrap_single(node: ruby_prism::Node) -> ruby_prism::Node {
+    if let Some(p) = node.as_parentheses_node() {
+        if let Some(body) = p.body() {
+            if let Some(stmts) = body.as_statements_node() {
+                if stmts.body().len() == 1 {
+                    return stmts.body().last().expect("len == 1");
+                }
+            }
+        }
+    }
+    node
+}
+
+/// Walks an `if` node's `subsequent` chain (assign-TO-condition direction):
+/// returns `None` when there's no terminating `else` anywhere in the chain
+/// (mirrors upstream's `return unless else_branch`).
+#[allow(clippy::type_complexity)]
+fn ca_outside_expand<'pr>(
+    subsequent: Option<ruby_prism::Node<'pr>>,
+) -> Option<(Vec<Option<ruby_prism::StatementsNode<'pr>>>, Option<ruby_prism::StatementsNode<'pr>>)> {
+    let mut elsifs = Vec::new();
+    let mut cur = subsequent;
+    loop {
+        let node = cur?;
+        if let Some(elsif) = node.as_if_node() {
+            elsifs.push(elsif.statements());
+            cur = elsif.subsequent();
+            continue;
+        }
+        if let Some(els) = node.as_else_node() {
+            return Some((elsifs, els.statements()));
+        }
+        return None;
+    }
+}
+
+/// Walks an `if` node's `subsequent` chain (assign-INSIDE-condition
+/// direction): each level pairs its OWN body with the keyword that follows
+/// it (the next `elsif`'s `if_keyword_loc`, or the terminal `else`'s
+/// `else_keyword_loc`) — mirroring `branch.parent.loc.else`'s per-level
+/// dedent target in upstream's `IfCorrector#move_branch_inside_condition`.
+/// The terminal `else`'s own body is appended pointing at that same
+/// `else_keyword_loc` (redundant with the previous level's target, matching
+/// upstream's harmlessly-repeated `remove_preceding` call).
+///
+/// Unlike the assign-TO-condition direction, upstream's candidate check here
+/// (`assignment.else_branch`) is the RAW, unexpanded 3rd child of the
+/// outermost `if` — truthy as soon as ANY `elsif`/`else` follows, even an
+/// `elsif` chain with no final `else` (`RuboCop::AST::IfNode#branches` simply
+/// stops collecting once the chain runs out). So `None` here means only "no
+/// `elsif`/`else` at all", or a terminal `else` whose body is empty; a chain
+/// that ends in a bare `elsif` (no trailing keyword to dedent) is valid and
+/// its last level carries `None` for the keyword.
+#[allow(clippy::type_complexity)]
+fn ca_if_levels<'pr>(
+    iff: &ruby_prism::IfNode<'pr>,
+) -> Option<Vec<(Option<ruby_prism::StatementsNode<'pr>>, Option<ruby_prism::Location<'pr>>)>> {
+    iff.subsequent()?;
+    let mut levels = Vec::new();
+    let mut cur_body = iff.statements();
+    let mut cur_subsequent = iff.subsequent();
+    loop {
+        match cur_subsequent {
+            None => {
+                levels.push((cur_body, None));
+                return Some(levels);
+            }
+            Some(node) => {
+                if let Some(elsif) = node.as_if_node() {
+                    levels.push((cur_body, elsif.if_keyword_loc()));
+                    cur_body = elsif.statements();
+                    cur_subsequent = elsif.subsequent();
+                    continue;
+                }
+                if let Some(els) = node.as_else_node() {
+                    let else_stmts = els.statements()?;
+                    levels.push((cur_body, Some(els.else_keyword_loc())));
+                    levels.push((Some(else_stmts), Some(els.else_keyword_loc())));
+                    return Some(levels);
+                }
+                return None;
+            }
+        }
+    }
+}
+
+impl<'a> Cops<'a> {
+    /// `lhs(node)`'s `case`/`op_asgn`/`and_asgn`/`or_asgn`/`casgn`/variable
+    /// branches, keyed off prism's concrete write-node type. Also doubles as
+    /// `assignment_type?`'s "is this tail a recognized assignment" gate:
+    /// `None` here means the tail isn't one, exactly like upstream's
+    /// `assignment_types_match?` requiring `assignment_type?(nodes.first)`.
+    fn ca_classify_tail(&self, node: &ruby_prism::Node) -> Option<(CaKind, Vec<u8>)> {
+        macro_rules! plain {
+            ($as:ident, $kind:expr) => {
+                if let Some(n) = node.$as() {
+                    let mut lhs = n.name().as_slice().to_vec();
+                    lhs.extend_from_slice(b" = ");
+                    return Some(($kind, lhs));
+                }
+            };
+        }
+        macro_rules! opish {
+            ($as:ident, $kind:expr, $op:ident) => {
+                if let Some(n) = node.$as() {
+                    let mut lhs = n.name().as_slice().to_vec();
+                    lhs.push(b' ');
+                    lhs.extend_from_slice(n.$op().as_slice());
+                    lhs.push(b' ');
+                    return Some(($kind, lhs));
+                }
+            };
+        }
+        plain!(as_local_variable_write_node, CaKind::LVar);
+        opish!(as_local_variable_operator_write_node, CaKind::OpAsgn, binary_operator_loc);
+        opish!(as_local_variable_and_write_node, CaKind::AndAsgn, operator_loc);
+        opish!(as_local_variable_or_write_node, CaKind::OrAsgn, operator_loc);
+        plain!(as_instance_variable_write_node, CaKind::IVar);
+        opish!(as_instance_variable_operator_write_node, CaKind::OpAsgn, binary_operator_loc);
+        opish!(as_instance_variable_and_write_node, CaKind::AndAsgn, operator_loc);
+        opish!(as_instance_variable_or_write_node, CaKind::OrAsgn, operator_loc);
+        plain!(as_class_variable_write_node, CaKind::CVar);
+        opish!(as_class_variable_operator_write_node, CaKind::OpAsgn, binary_operator_loc);
+        opish!(as_class_variable_and_write_node, CaKind::AndAsgn, operator_loc);
+        opish!(as_class_variable_or_write_node, CaKind::OrAsgn, operator_loc);
+        plain!(as_global_variable_write_node, CaKind::GVar);
+        opish!(as_global_variable_operator_write_node, CaKind::OpAsgn, binary_operator_loc);
+        opish!(as_global_variable_and_write_node, CaKind::AndAsgn, operator_loc);
+        opish!(as_global_variable_or_write_node, CaKind::OrAsgn, operator_loc);
+        plain!(as_constant_write_node, CaKind::Const);
+        opish!(as_constant_operator_write_node, CaKind::OpAsgn, binary_operator_loc);
+        opish!(as_constant_and_write_node, CaKind::AndAsgn, operator_loc);
+        opish!(as_constant_or_write_node, CaKind::OrAsgn, operator_loc);
+        if let Some(n) = node.as_constant_path_write_node() {
+            let mut lhs = self.node_src(&n.target().as_node()).to_vec();
+            lhs.extend_from_slice(b" = ");
+            return Some((CaKind::ConstPath, lhs));
+        }
+        if let Some(n) = node.as_constant_path_operator_write_node() {
+            let mut lhs = self.node_src(&n.target().as_node()).to_vec();
+            lhs.push(b' ');
+            lhs.extend_from_slice(n.binary_operator_loc().as_slice());
+            lhs.push(b' ');
+            return Some((CaKind::OpAsgn, lhs));
+        }
+        if let Some(n) = node.as_constant_path_and_write_node() {
+            let mut lhs = self.node_src(&n.target().as_node()).to_vec();
+            lhs.push(b' ');
+            lhs.extend_from_slice(n.operator_loc().as_slice());
+            lhs.push(b' ');
+            return Some((CaKind::AndAsgn, lhs));
+        }
+        if let Some(n) = node.as_constant_path_or_write_node() {
+            let mut lhs = self.node_src(&n.target().as_node()).to_vec();
+            lhs.push(b' ');
+            lhs.extend_from_slice(n.operator_loc().as_slice());
+            lhs.push(b' ');
+            return Some((CaKind::OrAsgn, lhs));
+        }
+        if node.as_multi_write_node().is_some() {
+            return Some((CaKind::Masgn, Vec::new()));
+        }
+        if let Some(n) = node.as_call_node() {
+            if ca_send_qualifies(n.name().as_slice()) {
+                return Some((CaKind::Send, self.ca_lhs_for_send(&n)));
+            }
+        }
+        None
+    }
+
+    /// `lhs_for_send`: `[]=` reconstructs `recv[idx, ...] = `; a real setter
+    /// (`.attr=`, detected via `equal_loc` — prism's equivalent of
+    /// `setter_method?`/`loc?(:operator)`) reconstructs `recv.attr = `;
+    /// anything else (comparison methods, `<<`) is `recv OP `.
+    fn ca_lhs_for_send(&self, call: &ruby_prism::CallNode) -> Vec<u8> {
+        let receiver_src: Vec<u8> = call.receiver().map(|r| self.node_src(&r).to_vec()).unwrap_or_default();
+        let name = call.name().as_slice();
+        if name == b"[]=" {
+            let args: Vec<ruby_prism::Node> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            let n = args.len().saturating_sub(1);
+            let mut out = receiver_src;
+            out.push(b'[');
+            for (i, a) in args[..n].iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                out.extend_from_slice(self.node_src(a));
+            }
+            out.extend_from_slice(b"] = ");
+            out
+        } else if call.equal_loc().is_some() {
+            let msg = call.message_loc().map(|l| l.as_slice()).unwrap_or(b"");
+            let mut out = receiver_src;
+            out.push(b'.');
+            out.extend_from_slice(msg);
+            out.extend_from_slice(b" = ");
+            out
+        } else {
+            let msg = call.message_loc().map(|l| l.as_slice()).unwrap_or(name);
+            let mut out = receiver_src;
+            out.push(b' ');
+            out.extend_from_slice(msg);
+            out.push(b' ');
+            out
+        }
+    }
+
+    /// `allowed_statements?`: every branch must be present and non-empty,
+    /// their tails must all classify as the SAME recognized assignment kind
+    /// (never `masgn`), and their reconstructed lhs text must all match.
+    /// Returns the shared lhs on success.
+    fn ca_allowed_statements(&self, branches: &[Option<ruby_prism::StatementsNode>]) -> Option<Vec<u8>> {
+        if branches.iter().any(|b| b.is_none()) {
+            return None;
+        }
+        let mut classified: Vec<(CaKind, Vec<u8>)> = Vec::with_capacity(branches.len());
+        for b in branches {
+            let tail = ca_tail_of(b)?;
+            classified.push(self.ca_classify_tail(&tail)?);
+        }
+        let (first_kind, first_lhs) = classified.first()?.clone();
+        if first_kind == CaKind::Masgn {
+            return None;
+        }
+        if classified.iter().any(|(k, _)| *k != first_kind) {
+            return None;
+        }
+        if classified.iter().any(|(_, l)| *l != first_lhs) {
+            return None;
+        }
+        Some(first_lhs)
+    }
+
+    /// `indent(cop, source)`: `Layout/EndAlignment`'s `EnforcedStyleAlignWith`
+    /// of `keyword` pads the `end` line to match the hoisted lhs's width;
+    /// any other value (default `start_of_line`) needs no padding.
+    fn ca_indent(&self, lhs: &[u8]) -> Vec<u8> {
+        if self.cfg.get("Layout/EndAlignment", "EnforcedStyleAlignWith") == Some("keyword") {
+            vec![b' '; String::from_utf8_lossy(lhs).chars().count()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// `correction_exceeds_line_limit?`/`longest_line`: with `Layout/LineLength`
+    /// enabled, find the node's longest source line after stripping ONE
+    /// occurrence of the (whitespace-flexible) lhs pattern from each line,
+    /// and check whether `lhs + longest_line` would overflow `Max`.
+    fn ca_correction_exceeds_line_limit(&self, node_start: usize, node_end: usize, lhs: &[u8]) -> bool {
+        const LL: &str = "Layout/LineLength";
+        if self.cfg.get(LL, "Enabled") == Some("false") {
+            return false;
+        }
+        let max = self.cfg.get(LL, "Max").and_then(|v| v.parse::<usize>().ok()).unwrap_or(120);
+        let lhs_str = String::from_utf8_lossy(lhs).into_owned();
+        let mut pattern = String::from(r"\s*");
+        for (i, seg) in lhs_str.split(' ').enumerate() {
+            if i > 0 {
+                pattern.push_str(r"\s*");
+            }
+            pattern.push_str(&regex::escape(seg));
+        }
+        let Ok(re) = regex::Regex::new(&pattern) else { return false };
+        let full_src = String::from_utf8_lossy(&self.src[node_start..node_end]);
+        let mut longest = 0usize;
+        for line in full_src.lines() {
+            let replaced = re.replacen(line, 1, "");
+            let len = replaced.chars().count();
+            if len > longest {
+                longest = len;
+            }
+        }
+        lhs_str.chars().count() + longest > max
+    }
+
+    /// Replace the WHOLE branch (assignment node) with just its RHS source —
+    /// `replace_branch_assignment`: an unbracketed array RHS (`bar = 2, 5, 6`)
+    /// gets `[...]`-wrapped so the extracted expression stays valid.
+    fn ca_replace_branch_assignment(&mut self, branch: &ruby_prism::Node) {
+        let Some(value) = ca_value(branch) else { return };
+        let loc = branch.location();
+        let src = self.node_src(&value).to_vec();
+        let replacement = if let Some(arr) = value.as_array_node() {
+            if arr.opening_loc().is_none() {
+                let mut v = vec![b'['];
+                v.extend_from_slice(&src);
+                v.push(b']');
+                v
+            } else {
+                src
+            }
+        } else {
+            src
+        };
+        self.fixes.push((loc.start_offset(), loc.end_offset(), replacement));
+    }
+
+    /// `correct_branches`: replace the branch with just its RHS source,
+    /// verbatim (no array-bracket handling — only the if/else "reference"
+    /// branch gets that treatment upstream).
+    fn ca_replace_branch_plain(&mut self, branch: &ruby_prism::Node) {
+        let Some(value) = ca_value(branch) else { return };
+        let loc = branch.location();
+        let src = self.node_src(&value).to_vec();
+        self.fixes.push((loc.start_offset(), loc.end_offset(), src));
+    }
+
+    /// `IfCorrector.correct`/`CaseCorrector.correct`'s shared shape: hoist
+    /// `lhs` before the node, rewrite each branch down to its bare RHS, and
+    /// pad the `end` line per `Layout/EndAlignment`.
+    fn ca_correct_if_like(
+        &mut self,
+        node_start: usize,
+        end_kw_start: usize,
+        lhs: &[u8],
+        if_tail: &ruby_prism::Node,
+        elsif_tails: &[ruby_prism::Node],
+        else_tail: &ruby_prism::Node,
+    ) {
+        self.fixes.push((node_start, node_start, lhs.to_vec()));
+        self.ca_replace_branch_assignment(if_tail);
+        for t in elsif_tails {
+            self.ca_replace_branch_plain(t);
+        }
+        self.ca_replace_branch_assignment(else_tail);
+        let indent = self.ca_indent(lhs);
+        self.fixes.push((end_kw_start, end_kw_start, indent));
+    }
+
+    /// `CaseCorrector.correct`: same shape, but the hoisted lhs/array-wrap
+    /// treatment is keyed off the ELSE branch rather than the first branch.
+    fn ca_correct_case_like(
+        &mut self,
+        node_start: usize,
+        end_kw_start: usize,
+        lhs: &[u8],
+        when_tails: &[ruby_prism::Node],
+        else_tail: &ruby_prism::Node,
+    ) {
+        self.fixes.push((node_start, node_start, lhs.to_vec()));
+        for t in when_tails {
+            self.ca_replace_branch_plain(t);
+        }
+        self.ca_replace_branch_assignment(else_tail);
+        let indent = self.ca_indent(lhs);
+        self.fixes.push((end_kw_start, end_kw_start, indent));
+    }
+
+    /// `TernaryCorrector.correct`: replace the whole ternary with
+    /// `lhs (cond ? if_rhs : else_rhs)` — parenthesized only when the
+    /// if-branch is itself a `send`-based assignment other than `[]=`
+    /// (`element_assignment?`).
+    fn ca_correct_ternary_outside(&mut self, node: &ruby_prism::IfNode) {
+        let Some(if_tail) = ca_tail_of(&node.statements()) else { return };
+        let Some(else_node) = node.subsequent().and_then(|s| s.as_else_node()) else { return };
+        let Some(else_tail) = ca_tail_of(&else_node.statements()) else { return };
+        let Some((_, lhs)) = self.ca_classify_tail(&if_tail) else { return };
+        let Some(if_rhs) = ca_value(&if_tail) else { return };
+        let Some(else_rhs) = ca_value(&else_tail) else { return };
+        let cond_src = self.node_src(&node.predicate()).to_vec();
+        let if_rhs_src = self.node_src(&if_rhs).to_vec();
+        let else_rhs_src = self.node_src(&else_rhs).to_vec();
+        let mut expr = Vec::new();
+        expr.extend_from_slice(&cond_src);
+        expr.extend_from_slice(b" ? ");
+        expr.extend_from_slice(&if_rhs_src);
+        expr.extend_from_slice(b" : ");
+        expr.extend_from_slice(&else_rhs_src);
+        let element_assignment = if_tail.as_call_node().is_some_and(|c| c.name().as_slice() != b"[]=");
+        let mut replacement = lhs;
+        if element_assignment {
+            replacement.push(b'(');
+            replacement.extend_from_slice(&expr);
+            replacement.push(b')');
+        } else {
+            replacement.extend_from_slice(&expr);
+        }
+        let loc = node.location();
+        self.fixes.push((loc.start_offset(), loc.end_offset(), replacement));
+    }
+
+    /// `on_if` (assign-TO-condition direction): a real `if`/`unless`/ternary
+    /// whose branches all end in the same assignment form gets that
+    /// assignment hoisted out and the branches collapsed to bare values.
+    pub(crate) fn check_conditional_assignment_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/ConditionalAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.enforced_style(COP) != "assign_to_condition" {
+            return;
+        }
+        // `return if node.elsif?` — an elsif is visited independently too;
+        // its own outer `if` (or a further-out elsif) already handled it.
+        if node.if_keyword_loc().is_some_and(|l| l.as_slice() == b"elsif") {
+            return;
+        }
+        let is_ternary = node.if_keyword_loc().is_none();
+        if is_ternary && self.cfg.get(COP, "IncludeTernaryExpressions") == Some("false") {
+            return;
+        }
+        let Some((elsif_branches, else_branch)) = ca_outside_expand(node.subsequent()) else { return };
+        let mut branches = Vec::with_capacity(2 + elsif_branches.len());
+        branches.push(node.statements());
+        branches.extend(elsif_branches);
+        branches.push(else_branch);
+        let Some(lhs) = self.ca_allowed_statements(&branches) else { return };
+        let single_line_only = self.cfg.get(COP, "SingleLineConditionsOnly") != Some("false");
+        if single_line_only && branches.iter().any(|b| b.as_ref().is_some_and(|s| s.body().len() > 1)) {
+            return;
+        }
+        let node_loc = node.location();
+        if self.ca_correction_exceeds_line_limit(node_loc.start_offset(), node_loc.end_offset(), &lhs) {
+            return;
+        }
+        self.push(
+            node_loc.start_offset(),
+            COP,
+            true,
+            "Use the return of the conditional for variable assignment and comparison.".to_string(),
+        );
+        if is_ternary {
+            self.ca_correct_ternary_outside(node);
+            return;
+        }
+        let Some(end_loc) = node.end_keyword_loc() else { return };
+        let Some(if_tail) = ca_tail_of(&branches[0]) else { return };
+        let n = branches.len();
+        let elsif_tails: Option<Vec<ruby_prism::Node>> = branches[1..n - 1].iter().map(ca_tail_of).collect();
+        let Some(elsif_tails) = elsif_tails else { return };
+        let Some(else_tail) = ca_tail_of(&branches[n - 1]) else { return };
+        self.ca_correct_if_like(node_loc.start_offset(), end_loc.start_offset(), &lhs, &if_tail, &elsif_tails, &else_tail);
+    }
+
+    /// `on_if` for `unless` (no elsif chain — prism's `UnlessNode` is a
+    /// separate type, so this mirrors `check_conditional_assignment_if`
+    /// without the elsif-expansion machinery).
+    pub(crate) fn check_conditional_assignment_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Style/ConditionalAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.enforced_style(COP) != "assign_to_condition" {
+            return;
+        }
+        let Some(else_node) = node.else_clause() else { return };
+        let branches = vec![node.statements(), else_node.statements()];
+        let Some(lhs) = self.ca_allowed_statements(&branches) else { return };
+        let single_line_only = self.cfg.get(COP, "SingleLineConditionsOnly") != Some("false");
+        if single_line_only && branches.iter().any(|b| b.as_ref().is_some_and(|s| s.body().len() > 1)) {
+            return;
+        }
+        let node_loc = node.location();
+        if self.ca_correction_exceeds_line_limit(node_loc.start_offset(), node_loc.end_offset(), &lhs) {
+            return;
+        }
+        self.push(
+            node_loc.start_offset(),
+            COP,
+            true,
+            "Use the return of the conditional for variable assignment and comparison.".to_string(),
+        );
+        let Some(end_loc) = node.end_keyword_loc() else { return };
+        let Some(if_tail) = ca_tail_of(&branches[0]) else { return };
+        let Some(else_tail) = ca_tail_of(&branches[1]) else { return };
+        self.ca_correct_if_like(node_loc.start_offset(), end_loc.start_offset(), &lhs, &if_tail, &[], &else_tail);
+    }
+
+    /// `on_case` (assign-TO-condition direction).
+    pub(crate) fn check_conditional_assignment_case(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Style/ConditionalAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.enforced_style(COP) != "assign_to_condition" {
+            return;
+        }
+        let Some(else_node) = node.else_clause() else { return };
+        let mut branches: Vec<Option<ruby_prism::StatementsNode>> =
+            node.conditions().iter().filter_map(|c| c.as_when_node()).map(|w| w.statements()).collect();
+        branches.push(else_node.statements());
+        let Some(lhs) = self.ca_allowed_statements(&branches) else { return };
+        let single_line_only = self.cfg.get(COP, "SingleLineConditionsOnly") != Some("false");
+        if single_line_only && branches.iter().any(|b| b.as_ref().is_some_and(|s| s.body().len() > 1)) {
+            return;
+        }
+        let node_loc = node.location();
+        if self.ca_correction_exceeds_line_limit(node_loc.start_offset(), node_loc.end_offset(), &lhs) {
+            return;
+        }
+        self.push(
+            node_loc.start_offset(),
+            COP,
+            true,
+            "Use the return of the conditional for variable assignment and comparison.".to_string(),
+        );
+        let end_loc = node.end_keyword_loc();
+        let n = branches.len();
+        let when_tails: Option<Vec<ruby_prism::Node>> = branches[..n - 1].iter().map(ca_tail_of).collect();
+        let Some(when_tails) = when_tails else { return };
+        let Some(else_tail) = ca_tail_of(&branches[n - 1]) else { return };
+        self.ca_correct_case_like(node_loc.start_offset(), end_loc.start_offset(), &lhs, &when_tails, &else_tail);
+    }
+
+    /// `on_case_match` (assign-TO-condition direction).
+    pub(crate) fn check_conditional_assignment_case_match(&mut self, node: &ruby_prism::CaseMatchNode) {
+        const COP: &str = "Style/ConditionalAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.enforced_style(COP) != "assign_to_condition" {
+            return;
+        }
+        let Some(else_node) = node.else_clause() else { return };
+        let mut branches: Vec<Option<ruby_prism::StatementsNode>> =
+            node.conditions().iter().filter_map(|c| c.as_in_node()).map(|w| w.statements()).collect();
+        branches.push(else_node.statements());
+        let Some(lhs) = self.ca_allowed_statements(&branches) else { return };
+        let single_line_only = self.cfg.get(COP, "SingleLineConditionsOnly") != Some("false");
+        if single_line_only && branches.iter().any(|b| b.as_ref().is_some_and(|s| s.body().len() > 1)) {
+            return;
+        }
+        let node_loc = node.location();
+        if self.ca_correction_exceeds_line_limit(node_loc.start_offset(), node_loc.end_offset(), &lhs) {
+            return;
+        }
+        self.push(
+            node_loc.start_offset(),
+            COP,
+            true,
+            "Use the return of the conditional for variable assignment and comparison.".to_string(),
+        );
+        let end_loc = node.end_keyword_loc();
+        let n = branches.len();
+        let when_tails: Option<Vec<ruby_prism::Node>> = branches[..n - 1].iter().map(ca_tail_of).collect();
+        let Some(when_tails) = when_tails else { return };
+        let Some(else_tail) = ca_tail_of(&branches[n - 1]) else { return };
+        self.ca_correct_case_like(node_loc.start_offset(), end_loc.start_offset(), &lhs, &when_tails, &else_tail);
+    }
+
+    /// Content-level dedent for a single top-level statement inside a branch
+    /// being pulled inside a condition — `white_space_range`: strip the
+    /// `(column_of(node) - column - 2)` bytes immediately preceding `node`,
+    /// but ONLY when that span is pure whitespace (never touches same-line
+    /// non-indentation text, e.g. a mid-line node's preceding " = ").
+    fn ca_dedent_stmt(&mut self, node: &ruby_prism::Node, column: usize) {
+        let loc = node.location();
+        let start = loc.start_offset();
+        let col = self.idx.loc(start).1 - 1;
+        if col < column + 2 {
+            return;
+        }
+        let diff = col - column - 2;
+        if diff == 0 || diff > start {
+            return;
+        }
+        let begin = start - diff;
+        let ws = &self.src[begin..start];
+        if ws.iter().all(|&b| b == b' ' || b == b'\t' || b == b'\n' || b == b'\r') {
+            self.fixes.push((begin, start, Vec::new()));
+        }
+    }
+
+    /// Keyword-level dedent (`elsif`/`else`/`when`/`in`/`end`) —
+    /// `remove_preceding(kw, kw.column - column)`: unconditional (unlike the
+    /// statement dedent above), skipped when `kw` is on the same source line
+    /// as `same_line_ref` (a one-liner like `else 2 end` needs no reflow).
+    fn ca_dedent_keyword(&mut self, kw_loc: &ruby_prism::Location, column: usize, same_line_ref: usize) {
+        let kw_start = kw_loc.start_offset();
+        if self.idx.loc(kw_start).0 == self.idx.loc(same_line_ref).0 {
+            return;
+        }
+        let kw_col = self.idx.loc(kw_start).1 - 1;
+        if kw_col <= column || kw_col - column > kw_start {
+            return;
+        }
+        let diff = kw_col - column;
+        self.fixes.push((kw_start - diff, kw_start, Vec::new()));
+    }
+
+    /// Inserts `assignment_bytes` before a branch's tail statement and
+    /// dedents every top-level statement in the branch.
+    fn ca_move_body_inside(&mut self, stmts: &ruby_prism::StatementsNode, assignment_bytes: &[u8], column: usize) {
+        if let Some(tail) = stmts.body().last() {
+            let ts = tail.location().start_offset();
+            self.fixes.push((ts, ts, assignment_bytes.to_vec()));
+        }
+        for stmt in stmts.body().iter() {
+            self.ca_dedent_stmt(&stmt, column);
+        }
+    }
+
+    /// Removes the `[start, assign_end)` assignment prefix (and, if the RHS
+    /// was parenthesized, the parens themselves — `remove_parentheses`),
+    /// returning the removed prefix bytes for re-insertion into each branch.
+    fn ca_remove_assignment_prefix(
+        &mut self,
+        start: usize,
+        assign_end: usize,
+        parens: &Option<ruby_prism::ParenthesesNode>,
+    ) -> Vec<u8> {
+        let bytes = self.src[start..assign_end].to_vec();
+        self.fixes.push((start, assign_end, Vec::new()));
+        if let Some(p) = parens {
+            let op = p.opening_loc();
+            self.fixes.push((op.start_offset(), op.end_offset(), Vec::new()));
+            let cl = p.closing_loc();
+            self.fixes.push((cl.start_offset(), cl.end_offset(), Vec::new()));
+        }
+        bytes
+    }
+
+    /// `TernaryCorrector.move_assignment_inside_condition`.
+    fn ca_process_ternary(
+        &mut self,
+        start: usize,
+        assign_end: usize,
+        parens: Option<ruby_prism::ParenthesesNode>,
+        single_line_only: bool,
+        iff: &ruby_prism::IfNode,
+    ) {
+        const COP: &str = "Style/ConditionalAssignment";
+        let Some(if_tail_stmts) = iff.statements() else { return };
+        let Some(else_node) = iff.subsequent().and_then(|s| s.as_else_node()) else { return };
+        let Some(else_tail_stmts) = else_node.statements() else { return };
+        if single_line_only && (if_tail_stmts.body().len() > 1 || else_tail_stmts.body().len() > 1) {
+            return;
+        }
+        self.push(start, COP, true, "Assign variables inside of conditionals.".to_string());
+        let assignment_bytes = self.ca_remove_assignment_prefix(start, assign_end, &parens);
+        if let Some(t) = if_tail_stmts.body().last() {
+            let ts = t.location().start_offset();
+            self.fixes.push((ts, ts, assignment_bytes.clone()));
+        }
+        if let Some(t) = else_tail_stmts.body().last() {
+            let ts = t.location().start_offset();
+            self.fixes.push((ts, ts, assignment_bytes));
+        }
+    }
+
+    /// `IfCorrector.move_assignment_inside_condition`.
+    fn ca_process_if(
+        &mut self,
+        start: usize,
+        assign_end: usize,
+        parens: Option<ruby_prism::ParenthesesNode>,
+        single_line_only: bool,
+        iff: &ruby_prism::IfNode,
+    ) {
+        const COP: &str = "Style/ConditionalAssignment";
+        let Some(levels) = ca_if_levels(iff) else { return };
+        if single_line_only {
+            // Upstream's `allowed_single_line?` here only ever examines the
+            // if-branch and (when there's no elsif) the direct else body —
+            // an elsif chain's raw 3rd child is a nested `:if`, never
+            // `begin_type?`, so elsif bodies' multi-statement-ness is never
+            // independently checked. See the module doc for why this quirk
+            // is worth preserving exactly.
+            let if_multi = iff.statements().is_some_and(|s| s.body().len() > 1);
+            let else_multi = match iff.subsequent() {
+                Some(n) => n.as_else_node().is_some_and(|e| e.statements().is_some_and(|s| s.body().len() > 1)),
+                None => false,
+            };
+            if if_multi || else_multi {
+                return;
+            }
+        }
+        self.push(start, COP, true, "Assign variables inside of conditionals.".to_string());
+        let assignment_bytes = self.ca_remove_assignment_prefix(start, assign_end, &parens);
+        let column = self.idx.loc(start).1 - 1;
+        let mut last_tail_start = None;
+        for (body, kw_loc) in &levels {
+            if let Some(stmts) = body {
+                self.ca_move_body_inside(stmts, &assignment_bytes, column);
+                last_tail_start = stmts.body().last().map(|t| t.location().start_offset());
+            }
+            if let Some(kw_loc) = kw_loc {
+                self.ca_dedent_keyword(kw_loc, column, start);
+            }
+        }
+        if let (Some(end_loc), Some(last_start)) = (iff.end_keyword_loc(), last_tail_start) {
+            self.ca_dedent_keyword(&end_loc, column, last_start);
+        }
+    }
+
+    /// `IfCorrector.move_assignment_inside_condition` for `unless` (no
+    /// elsif chain to walk).
+    fn ca_process_unless(
+        &mut self,
+        start: usize,
+        assign_end: usize,
+        parens: Option<ruby_prism::ParenthesesNode>,
+        single_line_only: bool,
+        un: &ruby_prism::UnlessNode,
+    ) {
+        const COP: &str = "Style/ConditionalAssignment";
+        let Some(else_node) = un.else_clause() else { return };
+        let Some(else_stmts) = else_node.statements() else { return };
+        if single_line_only {
+            let un_multi = un.statements().is_some_and(|s| s.body().len() > 1);
+            if un_multi || else_stmts.body().len() > 1 {
+                return;
+            }
+        }
+        self.push(start, COP, true, "Assign variables inside of conditionals.".to_string());
+        let assignment_bytes = self.ca_remove_assignment_prefix(start, assign_end, &parens);
+        let column = self.idx.loc(start).1 - 1;
+        let kw = else_node.else_keyword_loc();
+        if let Some(stmts) = un.statements() {
+            self.ca_move_body_inside(&stmts, &assignment_bytes, column);
+        }
+        self.ca_dedent_keyword(&kw, column, start);
+        self.ca_move_body_inside(&else_stmts, &assignment_bytes, column);
+        self.ca_dedent_keyword(&kw, column, start);
+        if let Some(end_loc) = un.end_keyword_loc() {
+            if let Some(last) = else_stmts.body().last() {
+                self.ca_dedent_keyword(&end_loc, column, last.location().start_offset());
+            }
+        }
+    }
+
+    /// `CaseCorrector.move_assignment_inside_condition`.
+    fn ca_process_case(
+        &mut self,
+        start: usize,
+        assign_end: usize,
+        parens: Option<ruby_prism::ParenthesesNode>,
+        single_line_only: bool,
+        case_n: &ruby_prism::CaseNode,
+    ) {
+        const COP: &str = "Style/ConditionalAssignment";
+        let Some(else_node) = case_n.else_clause() else { return };
+        let Some(else_stmts) = else_node.statements() else { return };
+        if single_line_only && else_stmts.body().len() > 1 {
+            return;
+        }
+        self.push(start, COP, true, "Assign variables inside of conditionals.".to_string());
+        let assignment_bytes = self.ca_remove_assignment_prefix(start, assign_end, &parens);
+        let column = self.idx.loc(start).1 - 1;
+        let whens: Vec<ruby_prism::WhenNode> = case_n.conditions().iter().filter_map(|c| c.as_when_node()).collect();
+        for w in &whens {
+            if let Some(stmts) = w.statements() {
+                self.ca_move_body_inside(&stmts, &assignment_bytes, column);
+            }
+            self.ca_dedent_keyword(&w.keyword_loc(), column, start);
+        }
+        self.ca_move_body_inside(&else_stmts, &assignment_bytes, column);
+        self.ca_dedent_keyword(&else_node.else_keyword_loc(), column, start);
+        if let Some(last) = else_stmts.body().last() {
+            self.ca_dedent_keyword(&case_n.end_keyword_loc(), column, last.location().start_offset());
+        }
+    }
+
+    /// `CaseCorrector.move_assignment_inside_condition` for `case`/`in`.
+    fn ca_process_case_match(
+        &mut self,
+        start: usize,
+        assign_end: usize,
+        parens: Option<ruby_prism::ParenthesesNode>,
+        single_line_only: bool,
+        cm: &ruby_prism::CaseMatchNode,
+    ) {
+        const COP: &str = "Style/ConditionalAssignment";
+        let Some(else_node) = cm.else_clause() else { return };
+        let Some(else_stmts) = else_node.statements() else { return };
+        if single_line_only && else_stmts.body().len() > 1 {
+            return;
+        }
+        self.push(start, COP, true, "Assign variables inside of conditionals.".to_string());
+        let assignment_bytes = self.ca_remove_assignment_prefix(start, assign_end, &parens);
+        let column = self.idx.loc(start).1 - 1;
+        let ins: Vec<ruby_prism::InNode> = cm.conditions().iter().filter_map(|c| c.as_in_node()).collect();
+        for i in &ins {
+            if let Some(stmts) = i.statements() {
+                self.ca_move_body_inside(&stmts, &assignment_bytes, column);
+            }
+            self.ca_dedent_keyword(&i.in_loc(), column, start);
+        }
+        self.ca_move_body_inside(&else_stmts, &assignment_bytes, column);
+        self.ca_dedent_keyword(&else_node.else_keyword_loc(), column, start);
+        if let Some(last) = else_stmts.body().last() {
+            self.ca_dedent_keyword(&cm.end_keyword_loc(), column, last.location().start_offset());
+        }
+    }
+
+    /// Common entry point for the assign-INSIDE-condition direction, reached
+    /// from every assignment-node visitor with that node's own start offset
+    /// and RHS value. `candidate_condition?`/`allowed_ternary?`: the RHS
+    /// (after unwrapping a single-statement parenthesized wrapper) must be
+    /// an `if`/`unless`/`case`/`case_match`, with a ternary additionally
+    /// gated by `IncludeTernaryExpressions`.
+    fn ca_check_inside(&mut self, start: usize, raw_value: ruby_prism::Node) {
+        const COP: &str = "Style/ConditionalAssignment";
+        let assign_end = raw_value.location().start_offset();
+        let parens = raw_value.as_parentheses_node();
+        let candidate = ca_unwrap_single(raw_value);
+        let single_line_only = self.cfg.get(COP, "SingleLineConditionsOnly") != Some("false");
+        if ca_is_ternary(&candidate) {
+            if self.cfg.get(COP, "IncludeTernaryExpressions") == Some("false") {
+                return;
+            }
+            let Some(iff) = candidate.as_if_node() else { return };
+            self.ca_process_ternary(start, assign_end, parens, single_line_only, &iff);
+            return;
+        }
+        if let Some(iff) = candidate.as_if_node() {
+            self.ca_process_if(start, assign_end, parens, single_line_only, &iff);
+        } else if let Some(un) = candidate.as_unless_node() {
+            self.ca_process_unless(start, assign_end, parens, single_line_only, &un);
+        } else if let Some(cn) = candidate.as_case_node() {
+            self.ca_process_case(start, assign_end, parens, single_line_only, &cn);
+        } else if let Some(cm) = candidate.as_case_match_node() {
+            self.ca_process_case_match(start, assign_end, parens, single_line_only, &cm);
+        }
+    }
+
+    /// Hook for every `*WriteNode`/`MultiWriteNode` visitor (assign-INSIDE
+    /// direction): `node.expression` is simply that node's own RHS `value`.
+    pub(crate) fn check_conditional_assignment_write(&mut self, start: usize, value: ruby_prism::Node) {
+        const COP: &str = "Style/ConditionalAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.enforced_style(COP) != "assign_inside_condition" {
+            return;
+        }
+        self.ca_check_inside(start, value);
+    }
+
+    /// `on_send` (assign-INSIDE direction): a qualifying send's
+    /// `last_argument` is its RHS (`foo[:a] = if bar?; ...`, `self.attrs = foo? ? 1 : 2`).
+    pub(crate) fn check_conditional_assignment_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/ConditionalAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.enforced_style(COP) != "assign_inside_condition" {
+            return;
+        }
+        if !ca_send_qualifies(node.name().as_slice()) {
+            return;
+        }
+        let Some(value) = node.arguments().and_then(|a| a.arguments().last()) else { return };
+        self.ca_check_inside(node.location().start_offset(), value);
+    }
+}
