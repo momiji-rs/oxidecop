@@ -386,7 +386,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
-    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment",
+    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations",
 ];
 
 impl Engine {
@@ -1093,6 +1093,36 @@ pub(crate) struct Cops<'a> {
     // `Struct.new`/`Data.define` constructor — consumed by the immediately
     // following `visit_block_node` call.
     pub(crate) el_am_ctor_block: bool,
+    // Style/AccessModifierDeclarations: one-shot flag mirroring
+    // `el_am_block_owns_next_stmts` — set in `visit_block_node` right before
+    // descending into a block's own (single) `StatementsNode` body, consumed
+    // by the very next `visit_statements_node` call. Needed for this cop's
+    // own `allowed?` gate (`node.parent&.type?(:pair, :any_block)` — a
+    // modifier that's the SOLE statement of a block's body has that block as
+    // its logical whitequark parent, so it's exempt).
+    pub(crate) amd_block_owns_next_stmts: bool,
+    // Style/AccessModifierDeclarations: byte offset of each currently-open
+    // REAL class/module/sclass node's own `end` keyword (innermost last) —
+    // upstream's `node.each_ancestor(:class, :module, :sclass).first`. A
+    // `Class.new`/`Module.new`/`Struct.new`/`Data.define` block is never a
+    // real `:class`/`:module`/`:sclass` node in either AST, so ctor blocks
+    // (and everything else) never push/pop this stack — only the three
+    // `visit_class_node`/`visit_module_node`/`visit_singleton_class_node`
+    // hooks do.
+    pub(crate) amd_class_end_stack: Vec<usize>,
+    // Style/AccessModifierDeclarations GROUP style's `return false if
+    // node.parent ? node.parent.if_type? : ...`: start offsets of a
+    // `StatementsNode` that is the SOLE-statement then/else branch of an
+    // `if`/`unless` (a `stmt if cond` modifier being the prototypical case —
+    // whitequark never wraps a single-statement branch in its own `:begin`,
+    // so that statement's logical parent IS the `:if` node itself; a 2+
+    // -statement branch gets its own `:begin` wrapper instead, and does NOT
+    // quality — matching prism's own `body.len() == 1` correlate exactly).
+    // Populated eagerly by `visit_if_node`/`visit_unless_node` before
+    // descending, looked up by the `StatementsNode`'s own start offset
+    // (order-independent, unlike a one-shot consumed flag) since either
+    // branch could be visited in either order relative to the predicate.
+    pub(crate) amd_if_branch_stmts: HashSet<usize>,
     // One-shot flag set by `visit_call_node` right before descending into a
     // block it owns, when that block is specifically a `Struct.new`/`Data.define`
     // constructor (NOT Class.new or Module.new) — consumed by the immediately
@@ -2608,6 +2638,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `hs_modifier_depth` for its whole subtree (predicate + body) — see
         // the field docs.
         self.hs_call_like_ctx.insert(node.predicate().location().start_offset());
+        // Style/AccessModifierDeclarations: see `amd_if_branch_stmts`'s doc.
+        if let Some(stmts) = node.statements() {
+            if stmts.body().iter().count() == 1 {
+                self.amd_if_branch_stmts.insert(stmts.location().start_offset());
+            }
+        }
+        if let Some(else_stmts) =
+            node.subsequent().and_then(|s| s.as_else_node()).and_then(|e| e.statements())
+        {
+            if else_stmts.body().iter().count() == 1 {
+                self.amd_if_branch_stmts.insert(else_stmts.location().start_offset());
+            }
+        }
         let hs_modifier = node.if_keyword_loc().is_some() && node.end_keyword_loc().is_none();
         if hs_modifier {
             self.hs_modifier_depth += 1;
@@ -2708,6 +2751,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth += 1;
         self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
         self.hs_call_like_ctx.insert(node.predicate().location().start_offset());
+        // Style/AccessModifierDeclarations: see `amd_if_branch_stmts`'s doc.
+        if let Some(stmts) = node.statements() {
+            if stmts.body().iter().count() == 1 {
+                self.amd_if_branch_stmts.insert(stmts.location().start_offset());
+            }
+        }
+        if let Some(else_stmts) = node.else_clause().and_then(|e| e.statements()) {
+            if else_stmts.body().iter().count() == 1 {
+                self.amd_if_branch_stmts.insert(else_stmts.location().start_offset());
+            }
+        }
         let hs_modifier = node.end_keyword_loc().is_none();
         if hs_modifier {
             self.hs_modifier_depth += 1;
@@ -3387,6 +3441,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_constant_definition_in_block(node);
         self.check_empty_lines_around_attribute_accessor(node);
         self.check_empty_lines_around_access_modifier(node);
+        self.check_access_modifier_declarations(node);
         self.check_unreachable_code(node);
         self.check_empty_line_between_defs(node);
         self.check_predicate_prefix_sig_scan(node);
@@ -3609,6 +3664,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if body.as_statements_node().is_some() {
                 self.block_owns_next_stmts = true;
                 self.el_am_block_owns_next_stmts = true;
+                self.amd_block_owns_next_stmts = true;
                 // Lint/Void's `on_block`/`on_numblock`/`on_itblock`: a
                 // SINGLE-statement, non-`begin` body is checked directly
                 // (`check_void_op`/`check_expression`, no group/pop logic)
@@ -4256,6 +4312,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ).0);
         self.el_am_class_last_line = Some(self.idx.loc(l.end_offset().saturating_sub(1)).0);
         self.el_am_scope.push(true);
+        // Style/AccessModifierDeclarations: `node.each_ancestor(:class,
+        // :module, :sclass).first` — see the `amd_class_end_stack` field doc.
+        self.amd_class_end_stack.push(node.end_keyword_loc().start_offset());
         // Style/Attr: check if this class has a custom `attr` method
         let has_custom_attr = Self::has_custom_attr_method_in_body(&node.body());
         self.style_attr_custom_method_stack.push(has_custom_attr);
@@ -4278,6 +4337,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ms_scope_depth -= 1;
         self.ms_class_stack.pop();
         self.style_attr_custom_method_stack.pop();
+        self.amd_class_end_stack.pop();
         self.el_am_scope.pop();
         self.respond_to_missing_stack.pop();
         self.exception_siblings_stack.pop();
@@ -4313,6 +4373,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.el_am_class_first_line = Some(self.idx.loc(ml.start_offset()).0);
         self.el_am_class_last_line = Some(self.idx.loc(ml.end_offset().saturating_sub(1)).0);
         self.el_am_scope.push(true);
+        self.amd_class_end_stack.push(node.end_keyword_loc().start_offset());
         // Style/Attr: check if this module has a custom `attr` method
         let has_custom_attr = Self::has_custom_attr_method_in_body(&node.body());
         self.style_attr_custom_method_stack.push(has_custom_attr);
@@ -4328,6 +4389,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ms_scope_depth -= 1;
         self.class_module_depth -= 1;
         self.style_attr_custom_method_stack.pop();
+        self.amd_class_end_stack.pop();
         self.el_am_scope.pop();
         self.respond_to_missing_stack.pop();
         self.exception_siblings_stack.pop();
@@ -4626,6 +4688,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // ancestor for `callback_method_def?`'s existence check.
         self.ms_scope_depth += 1;
         self.el_am_scope.push(true);
+        self.amd_class_end_stack.push(node.end_keyword_loc().start_offset());
         self.respond_to_missing_stack.push(Self::scan_respond_to_missing(&node.body()));
         // Style/TrivialAccessors: `sclass` is a `class`/`sclass` barrier too
         // (see `ta_barrier`'s doc) — a nested def's ancestor walk stops here,
@@ -4638,6 +4701,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.dm_leave_sclass();
         self.ta_barrier.pop();
         self.respond_to_missing_stack.pop();
+        self.amd_class_end_stack.pop();
         self.el_am_scope.pop();
         self.ms_scope_depth -= 1;
         self.scoping_depth -= 1;
@@ -5579,6 +5643,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         el_am_block_line: None,
         el_am_block_owns_next_stmts: false,
         el_am_ctor_block: false,
+        amd_block_owns_next_stmts: false,
+        amd_class_end_stack: Vec::new(),
+        amd_if_branch_stmts: HashSet::new(),
         metrics_ctor_block: false,
         metrics_in_struct_data_define_block: Vec::new(),
         gss_gvasgn_skip: HashSet::new(),

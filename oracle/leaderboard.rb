@@ -344,6 +344,7 @@ COPS = {
   'Style/FormatString'               => 'style/format_string',
   'Style/FormatStringToken'          => 'style/format_string_token',
   'Style/ConditionalAssignment'      => 'style/conditional_assignment_assign_to_condition',
+  'Style/AccessModifierDeclarations' => 'style/access_modifier_declarations',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -33434,3 +33434,479 @@ impl<'a> Cops<'a> {
         self.ca_check_inside(node.location().start_offset(), value);
     }
 }
+
+
+// ============================================================================
+// Style/AccessModifierDeclarations
+// ============================================================================
+//
+// Ported from rubocop's cop of the same name (`on_send`, restricted to
+// `private`/`protected`/`public`/`module_function`, plus a handful of
+// `ConfigurableEnforcedStyle`/`RangeHelp` private helpers).
+//
+// Architecture note: this cop needs SIBLING context — an access-modifier
+// call's own `right_siblings`/`each_child_node(:def)` reach across the
+// WHOLE enclosing statement list, not just its immediate neighbors — so it
+// runs once per `StatementsNode` from `visit_statements_node`, same shape
+// as `Layout/EmptyLinesAroundAccessModifier`/`Layout/EmptyLineBetweenDefs`
+// above. `node.access_modifier?` upstream requires `in_macro_scope?` (root,
+// or a class/module/sclass/`class_constructor?`, transparently through
+// kwbegin/begin/any_block/if-branch wrappers) — reused directly via
+// `el_am_scope`, which already tracks exactly that predicate.
+//
+// Multi-round convergence: rubocop's own `expect_correction` (and a real
+// `rubocop -A` run) re-investigates after EVERY correction until the source
+// stops changing — `right_siblings_same_inline_method?` means only the LAST
+// inlined occurrence of a given modifier name in a scope gets an OFFICIAL
+// offense in any one round, but a "run" of N such occurrences still all end
+// up merged into one group after enough rounds (confirmed against the real
+// cop with `rubocop -A --cache false`, cache disabled, on hand-built
+// examples beyond the fixture's own 2-occurrence case). Rather than
+// simulate that loop by hand, this cop is written as a literal, one-round
+// translation of `on_send`/`offense?`/`autocorrect_*_style`; the crate's
+// own top-level `apply_fixes_iter` (which already re-runs the whole lint
+// pass on the corrected source up to 200 times — see `main.rs`) supplies
+// the convergence for free, exactly mirroring `expect_correction`'s own
+// `loop: true` default that the oracle's `run_fix` helper also relies on.
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_access_modifier_declarations(&mut self, stmts: &ruby_prism::StatementsNode<'_>) {
+        const COP: &str = "Style/AccessModifierDeclarations";
+        // One-shot flag `visit_block_node` set right before descending into
+        // THIS exact statements list, if (and only if) it's a block's own
+        // body — consumed unconditionally, cop-enabled or not, mirroring
+        // `el_am_block_owns_next_stmts`.
+        let is_block_body = std::mem::take(&mut self.amd_block_owns_next_stmts);
+        if !self.on(COP) {
+            return;
+        }
+        // `in_macro_scope?` for every direct child of THIS statements list.
+        if !self.el_am_scope.last().copied().unwrap_or(true) {
+            return;
+        }
+        let body: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        // `node.parent&.type?(:pair, :any_block)`'s `:any_block` disjunct via
+        // a call's own SOLE-statement position in a block's body (the OTHER
+        // way to get there — a call with its own attached block — is a
+        // per-call check in `amd_allowed`).
+        let is_sole_block_stmt = is_block_body && body.len() == 1;
+        // `node.parent` is `nil` only for the ROOT program's own single,
+        // unwrapped top-level statement — prism always wraps in a
+        // `StatementsNode` even then, so this needs `stmts_stack` (empty
+        // only for the outermost, program-level list) alongside the
+        // 1-element check.
+        let is_lone_top_level = self.stmts_stack.is_empty() && body.len() == 1;
+        let stmts_start = stmts.location().start_offset();
+        // `node.parent.if_type?`: this exact statements list is the SOLE-
+        // statement then/else branch of an `if`/`unless` — see
+        // `amd_if_branch_stmts`'s doc.
+        let is_if_branch_stmt = self.amd_if_branch_stmts.contains(&stmts_start);
+        if self.cfg.enforced_style(COP) == "inline" {
+            self.amd_check_inline(COP, &body, is_sole_block_stmt);
+        } else {
+            self.amd_check_group(COP, &body, is_sole_block_stmt, is_lone_top_level, is_if_branch_stmt);
+        }
+    }
+
+    /// `allowed?(node)`, minus the `!node.access_modifier?` disjunct's own
+    /// `in_macro_scope?` half (already gated by the caller via `el_am_scope`
+    /// before this is ever reached) — covers the remaining pieces:
+    /// receiver/name shape, the `:pair`/`:any_block`-parent exemption, and
+    /// the three `AllowModifiersOn*` config gates.
+    fn amd_allowed(&self, cop: &str, call: &ruby_prism::CallNode, is_sole_block_stmt: bool) -> bool {
+        if call.receiver().is_some() {
+            return true;
+        }
+        let name_id = call.name();
+        let name = name_id.as_slice();
+        if !matches!(name, b"private" | b"protected" | b"public" | b"module_function") {
+            return true;
+        }
+        // `node.parent&.type?(:pair, :any_block)`: a call with its OWN
+        // attached block (`private { ... }`) is never bare in whitequark
+        // (wrapped in `:block`, whose parent this check is about), and a
+        // call that's the SOLE statement of an enclosing block's body has
+        // that block as its logical parent either way.
+        if call.block().is_some() || is_sole_block_stmt {
+            return true;
+        }
+        if amd_symbol_method_names(call).is_some() && self.cfg.get(cop, "AllowModifiersOnSymbols") != Some("false") {
+            return true;
+        }
+        if amd_attr_call(call) && self.cfg.get(cop, "AllowModifiersOnAttrs") != Some("false") {
+            return true;
+        }
+        if amd_alias_method_call(call) && self.cfg.get(cop, "AllowModifiersOnAliasMethod") != Some("false") {
+            return true;
+        }
+        false
+    }
+
+    /// GROUP style: `offense?`'s `if group_style?` branch plus
+    /// `autocorrect_group_style`/`replace_defs`, run per candidate directly
+    /// (see the module doc for why a single round suffices).
+    fn amd_check_group(
+        &mut self,
+        cop: &'static str,
+        body: &[ruby_prism::Node],
+        is_sole_block_stmt: bool,
+        is_lone_top_level: bool,
+        is_if_branch_stmt: bool,
+    ) {
+        for i in 0..body.len() {
+            let Some(call) = body[i].as_call_node() else { continue };
+            if self.amd_allowed(cop, &call, is_sole_block_stmt) {
+                continue;
+            }
+            if amd_arg_count(&call) == 0 {
+                continue; // bare — never a group-style offense on its own
+            }
+            // `return false if node.parent ? node.parent.if_type? : access_modifier_with_symbol?(node)`:
+            // `node.parent.if_type?` — this call is the sole statement of an
+            // `if`/`unless` branch (a `stmt if cond` modifier being the
+            // prototypical case) — always wins over the symbol-form check,
+            // regardless of `AllowModifiersOnSymbols`.
+            if is_if_branch_stmt {
+                continue;
+            }
+            // The only other way `node.parent` is falsy is a lone top-level
+            // statement (see `is_lone_top_level`'s doc).
+            if is_lone_top_level && amd_symbol_method_names(&call).is_some() {
+                continue;
+            }
+            let name_id = call.name();
+            let name = name_id.as_slice().to_vec();
+            // `right_siblings_same_inline_method?`: any LATER sibling (any
+            // position, not just adjacent) that's itself a correctable
+            // group-style offense with the SAME method name suppresses this
+            // one's OWN offense.
+            let suppressed = body[i + 1..].iter().any(|n| {
+                n.as_call_node().is_some_and(|c| {
+                    !self.amd_allowed(cop, &c, is_sole_block_stmt)
+                        && amd_arg_count(&c) > 0
+                        && c.name().as_slice() == name.as_slice()
+                        && !amd_find_corresponding_def_nodes(&c, body).is_empty()
+                })
+            });
+            if suppressed {
+                continue;
+            }
+            let sel = call.message_loc().unwrap_or(call.location());
+            let name_str = String::from_utf8_lossy(&name).into_owned();
+            let def_nodes = amd_find_corresponding_def_nodes(&call, body);
+            // `autocorrect_group_style` bails without defs, leaving the
+            // corrector block empty — real rubocop reports such an offense
+            // WITHOUT the `[Correctable]` tag (confirmed against a real
+            // `rubocop` run: a splat/mismatched-symbol form still offends,
+            // never autocorrects).
+            self.push(
+                sel.start_offset(),
+                cop,
+                !def_nodes.is_empty(),
+                format!("`{name_str}` should not be inlined in method definitions."),
+            );
+            if def_nodes.is_empty() {
+                continue;
+            }
+            let source = self.amd_def_source(&call, &def_nodes);
+            let call_range = amd_node_pos(&call.as_node());
+            if let Some((_, anchor_end)) = amd_find_argument_less_modifier(&name, body) {
+                self.fixes.push((anchor_end, anchor_end, format!("\n\n{source}").into_bytes()));
+                self.amd_remove_defs_and_call(&def_nodes, call_range);
+            } else if let Some(&ancestor_end) = self.amd_class_end_stack.last() {
+                self.fixes.push((ancestor_end, ancestor_end, format!("{name_str}\n\n{source}\n").into_bytes()));
+                self.amd_remove_defs_and_call(&def_nodes, call_range);
+            } else {
+                // No pre-existing bare sibling, no enclosing class/module/
+                // sclass: `corrector.replace(node, ...)` then an immediate
+                // `return` upstream — deliberately skips the shared
+                // `remove_nodes` call (the replace already subsumes
+                // `node`'s own text, and any def embedded WITHIN it).
+                let (call_start, call_end) = call_range;
+                self.fixes.push((call_start, call_end, format!("{name_str}\n\n{source}").into_bytes()));
+            }
+        }
+    }
+
+    /// `remove_nodes(corrector, *def_nodes, node)`: whole-line + own-leading-
+    /// comment removal for each def node and the modifier call itself — a
+    /// def node fully CONTAINED within the call's own range (the `private
+    /// def foo; end` shape, where the def is embedded as the call's own
+    /// argument rather than a separate statement) is skipped since the
+    /// call's own removal already covers that text; a symbol-form call's
+    /// def nodes are always separate statements and get their own removal.
+    fn amd_remove_defs_and_call(&mut self, def_nodes: &[(usize, usize)], call_range: (usize, usize)) {
+        let (cs, ce) = call_range;
+        for &(ds, de) in def_nodes {
+            if ds >= cs && de <= ce {
+                continue;
+            }
+            self.amd_remove_with_comments((ds, de));
+        }
+        self.amd_remove_with_comments(call_range);
+    }
+
+    /// `range_with_comments_and_lines(node)`: extend to the node's own
+    /// leading comments and whole physical lines, including the trailing
+    /// newline.
+    fn amd_remove_with_comments(&mut self, target: (usize, usize)) {
+        let (t_start, t_end) = target;
+        let first_line = self.idx.loc(t_start).0;
+        let lead_start = self.amd_leading_comments(first_line).first().map_or(t_start, |&(_, s, _)| s);
+        self.amd_push_line_removal(lead_start, t_end);
+    }
+
+    fn amd_push_line_removal(&mut self, start: usize, end: usize) {
+        let (start_line, _) = self.idx.loc(start);
+        let (end_line, _) = self.idx.loc(end.saturating_sub(1));
+        let line_start = self.idx.starts[start_line - 1];
+        let mut line_end = self.line_end(end_line);
+        if line_end < self.src.len() {
+            line_end += 1; // include_final_newline
+        }
+        self.fixes.push((line_start, line_end, Vec::new()));
+    }
+
+    /// `range_with_comments`/`first_comment_or_node_start`'s shared "leading
+    /// comments" primitive: walk physical lines UPWARD from `first_line`,
+    /// collecting whole-line comments and skipping blank lines, stopping at
+    /// the first line that's neither — mirrors upstream's greedy
+    /// `Parser::Source::Comment::Associator` (a comment belongs to whichever
+    /// node comes next, regardless of blank lines in between, as long as no
+    /// actual code sits between them) without needing this node's sibling
+    /// context to bound the search: real code (a previous statement, a
+    /// `class`/`module` header, …) always stops the walk on its own.
+    /// Returned oldest-first (matches upstream's own comment stream order).
+    fn amd_leading_comments(&self, first_line: usize) -> Vec<(usize, usize, usize)> {
+        let mut lines: Vec<usize> = Vec::new();
+        let mut line = first_line;
+        while line > 1 {
+            line -= 1;
+            if self.amd_line_is_comment(line) {
+                lines.push(line);
+                continue;
+            }
+            if self.amd_line_blank(line) {
+                continue;
+            }
+            break;
+        }
+        lines.reverse();
+        lines.into_iter().filter_map(|l| self.comments.iter().find(|&&(cl, _, _)| cl == l).copied()).collect()
+    }
+
+    /// The whole line, ignoring leading whitespace, is a `#` comment.
+    fn amd_line_is_comment(&self, line: usize) -> bool {
+        let Some(&s) = self.idx.starts.get(line - 1) else { return false };
+        let e = self.line_end(line);
+        match self.src[s..e].iter().position(|b| !b.is_ascii_whitespace()) {
+            Some(p) => self.src[s + p] == b'#',
+            None => false,
+        }
+    }
+
+    /// Empty or whitespace-only (or past EOF).
+    fn amd_line_blank(&self, line: usize) -> bool {
+        match self.idx.starts.get(line - 1) {
+            None => true,
+            Some(&s) => self.src[s..self.line_end(line)].iter().all(|b| b.is_ascii_whitespace()),
+        }
+    }
+
+    /// `def_source(node, def_nodes)`: the modifier's own leading comments,
+    /// then each def node's own source text, joined by newlines.
+    fn amd_def_source(&self, call: &ruby_prism::CallNode, def_nodes: &[(usize, usize)]) -> String {
+        let (cs, _) = amd_node_pos(&call.as_node());
+        let mut parts: Vec<String> = Vec::new();
+        for (_, s, e) in self.amd_leading_comments(self.idx.loc(cs).0) {
+            parts.push(String::from_utf8_lossy(&self.src[s..e]).into_owned());
+        }
+        for &(ds, de) in def_nodes {
+            parts.push(String::from_utf8_lossy(&self.src[ds..de]).into_owned());
+        }
+        parts.join("\n")
+    }
+
+    /// INLINE style: `offense?`'s `else` branch plus
+    /// `autocorrect_inline_style`.
+    fn amd_check_inline(&mut self, cop: &'static str, body: &[ruby_prism::Node], is_sole_block_stmt: bool) {
+        // `node.parent&.begin_type?`: prism always wraps in a
+        // `StatementsNode`, so a 2+-element body is whitequark's implicit
+        // `:begin` wrapper; a 1-element body is unwrapped — but a bare
+        // modifier alone in a 1-element body has no right siblings to
+        // group, so it can never reach the autocorrect branch below anyway.
+        let is_begin_parent = body.len() >= 2;
+        for i in 0..body.len() {
+            let Some(call) = body[i].as_call_node() else { continue };
+            if self.amd_allowed(cop, &call, is_sole_block_stmt) {
+                continue;
+            }
+            if amd_arg_count(&call) != 0 {
+                continue; // already inlined — not an inline-style offense
+            }
+            let grouped = amd_select_grouped_def_nodes(body, i);
+            if grouped.is_empty() {
+                continue;
+            }
+            let name_id = call.name();
+            let name_str = String::from_utf8_lossy(name_id.as_slice()).into_owned();
+            let sel = call.message_loc().unwrap_or(call.location());
+            self.push(sel.start_offset(), cop, true, format!("`{name_str}` should be inlined in method definitions."));
+            if is_begin_parent {
+                // `remove_modifier_node_within_begin`: the LITERAL next
+                // sibling overall (regardless of type), stopping the
+                // removal at its first preceding comment (if any) rather
+                // than swallowing a comment meant for it.
+                if let Some(next) = body.get(i + 1) {
+                    let next_start = next.location().start_offset();
+                    let leads = self.amd_leading_comments(self.idx.loc(next_start).0);
+                    let end_pos = leads.first().map_or(next_start, |&(_, s, _)| s);
+                    self.fixes.push((call.location().start_offset(), end_pos, Vec::new()));
+                }
+            } else {
+                self.amd_remove_with_comments(amd_node_pos(&call.as_node()));
+            }
+            for &(gs, _) in &grouped {
+                self.fixes.push((gs, gs, format!("{name_str} ").into_bytes()));
+            }
+        }
+    }
+}
+
+fn amd_arg_count(call: &ruby_prism::CallNode) -> usize {
+    call.arguments().map_or(0, |a| a.arguments().iter().count())
+}
+
+fn amd_node_pos(n: &ruby_prism::Node) -> (usize, usize) {
+    let l = n.location();
+    (l.start_offset(), l.end_offset())
+}
+
+/// `access_modifier_with_symbol?`: all-args-are-symbols (1+), or a single
+/// splat wrapping a `%i`/`%I` array literal, a constant, or a call. Returns
+/// the plain symbol names found — empty for the splat shapes, which
+/// deliberately never resolve to any def (mirrors upstream's `filter_map`
+/// silently dropping the non-`sym` argument rather than failing the match).
+fn amd_symbol_method_names(call: &ruby_prism::CallNode) -> Option<Vec<Vec<u8>>> {
+    let args = call.arguments()?;
+    let items: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+    if items.is_empty() {
+        return None;
+    }
+    if items.iter().all(|a| a.as_symbol_node().is_some()) {
+        return Some(items.iter().map(|a| a.as_symbol_node().unwrap().unescaped().to_vec()).collect());
+    }
+    if items.len() == 1 {
+        if let Some(splat) = items[0].as_splat_node() {
+            if let Some(expr) = splat.expression() {
+                if amd_percent_symbol_array(&expr)
+                    || expr.as_constant_read_node().is_some()
+                    || expr.as_constant_path_node().is_some()
+                    || expr.as_call_node().is_some()
+                {
+                    return Some(Vec::new());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn amd_percent_symbol_array(node: &ruby_prism::Node) -> bool {
+    node.as_array_node().is_some_and(|a| {
+        a.opening_loc().is_some_and(|o| {
+            let s = o.as_slice();
+            s.starts_with(b"%i") || s.starts_with(b"%I")
+        })
+    })
+}
+
+/// `access_modifier_with_attr?`: exactly one argument, itself a bare call to
+/// `attr`/`attr_reader`/`attr_writer`/`attr_accessor` with 1+ arguments.
+fn amd_attr_call(call: &ruby_prism::CallNode) -> bool {
+    let Some(args) = call.arguments() else { return false };
+    let items: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+    if items.len() != 1 {
+        return false;
+    }
+    let Some(inner) = items[0].as_call_node() else { return false };
+    inner.receiver().is_none()
+        && matches!(inner.name().as_slice(), b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor")
+        && inner.arguments().is_some_and(|a| !a.arguments().is_empty())
+}
+
+/// `access_modifier_with_alias_method?`: exactly one argument, itself a bare
+/// `alias_method` call with exactly 2 arguments.
+fn amd_alias_method_call(call: &ruby_prism::CallNode) -> bool {
+    let Some(args) = call.arguments() else { return false };
+    let items: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+    if items.len() != 1 {
+        return false;
+    }
+    let Some(inner) = items[0].as_call_node() else { return false };
+    inner.receiver().is_none()
+        && inner.name().as_slice() == b"alias_method"
+        && inner.arguments().is_some_and(|a| a.arguments().iter().count() == 2)
+}
+
+/// `find_corresponding_def_nodes`: for a symbol-form call, ALL `def` nodes
+/// anywhere in `body` (any position, not just after the call) whose name is
+/// one of the listed symbols — only when EVERY listed symbol resolved to
+/// exactly one def (upstream: `def_nodes.size == method_names.size`,
+/// otherwise `[]`, skipping autocorrection). For any other inlined shape,
+/// just the call's own first argument (typically an embedded `def`, or an
+/// `attr*`/`alias_method` call when its own `AllowModifiersOn*` config is
+/// `false`).
+fn amd_find_corresponding_def_nodes(call: &ruby_prism::CallNode, body: &[ruby_prism::Node]) -> Vec<(usize, usize)> {
+    if let Some(names) = amd_symbol_method_names(call) {
+        if names.is_empty() {
+            return Vec::new();
+        }
+        let defs: Vec<(usize, usize)> = body
+            .iter()
+            .filter(|n| n.as_def_node().is_some_and(|d| names.iter().any(|nm| nm.as_slice() == d.name().as_slice())))
+            .map(amd_node_pos)
+            .collect();
+        if defs.len() == names.len() { defs } else { Vec::new() }
+    } else if let Some(args) = call.arguments() {
+        args.arguments().iter().next().map(|n| amd_node_pos(&n)).into_iter().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// `find_argument_less_modifier_node`: the FIRST direct element of `body`
+/// that's itself a bare (`0`-arg, no receiver, no block) call to `name`,
+/// anywhere in document order — not gated by `allowed?`/macro-scope at all,
+/// matching upstream's plain `each_child_node(:send).find`.
+fn amd_find_argument_less_modifier(name: &[u8], body: &[ruby_prism::Node]) -> Option<(usize, usize)> {
+    body.iter()
+        .find(|n| {
+            n.as_call_node().is_some_and(|c| {
+                c.receiver().is_none() && c.block().is_none() && c.name().as_slice() == name && amd_arg_count(&c) == 0
+            })
+        })
+        .map(amd_node_pos)
+}
+
+/// `select_grouped_def_nodes`: right siblings of `body[i]` up to (excluding)
+/// the next bare access-modifier-shaped call of ANY of the 4 names — the
+/// raw `bare_access_modifier_declaration?` shape, deliberately NOT gated by
+/// `allowed?`/macro-scope (upstream's pattern match doesn't consult either).
+fn amd_select_grouped_def_nodes(body: &[ruby_prism::Node], i: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for n in &body[i + 1..] {
+        if let Some(c) = n.as_call_node() {
+            if c.receiver().is_none()
+                && c.block().is_none()
+                && amd_arg_count(&c) == 0
+                && matches!(c.name().as_slice(), b"private" | b"protected" | b"public" | b"module_function")
+            {
+                break;
+            }
+        }
+        if n.as_def_node().is_some() {
+            out.push(amd_node_pos(n));
+        }
+    }
+    out
+}
