@@ -2171,3 +2171,326 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Metrics/MethodLength — reuses the same `CodeLength`-mixin port as
+// `Metrics/ModuleLength` above (`ml_*` helpers, `MlFoldableTypes`,
+// `MlFoldWalker`, `ml_apply_folding`, `ml_irrelevant_file_line`), but hits
+// `CodeLengthCalculator#code_length`'s NON-classlike branch: `def`/`defs`
+// (one `DefNode` type either way in prism) and `define_method(...) do ...
+// end` blocks (`on_block`/`on_numblock`/`on_itblock` — numbered-parameter
+// and `it`-parameter blocks stay the same `BlockNode` shape in prism).
+//
+// Known gaps (none exercised by the spec fixture):
+//  - `omit_length` (bare-hash-argument method-call folding correction) isn't
+//    replicated — same gap as noted above `Metrics::ModuleLength`.
+//  - An endless `def`/block whose ENTIRE body is one bare heredoc (no
+//    wrapping `StatementsNode` for `node_with_heredoc?`'s
+//    `each_descendant` — which never tests `node` itself — to find) falls
+//    through to the plain `body.source.lines` branch and undercounts,
+//    mirroring `ModuleLength`'s equivalent unreplicated
+//    `source_from_node_with_heredoc` gap for a classlike/casgn body.
+//  - `MlFoldWalker` (shared, unmodified, with `Metrics::ModuleLength` above)
+//    folds a call THAT HAS ITS OWN LITERAL BLOCK attached (`foo(...) do
+//    ... end`) as one unit spanning through that block's `end`/`}` when
+//    `CountAsOne` includes `method_call` — verified directly against real
+//    rubocop to be WRONG whenever the call's own head (receiver/args, i.e.
+//    what whitequark treats as the separate `send_node` child of its own
+//    composite `:block` node) spans a different line count than prism's
+//    block-inclusive `CallNode::location()`. Upstream independently
+//    re-tests/re-folds the send head AND the block's body as two unrelated
+//    top-level children; prism's single fused `CallNode` (whose own
+//    `location()` already reaches through the block) has no clean
+//    equivalent split without a bespoke helper, so this is left as a
+//    latent gap shared with `ModuleLength` rather than patched here. Only
+//    matters for `CountAsOne: [method_call]` combined with a call-with-block
+//    appearing anywhere in the measured span; harmless (no-op) whenever
+//    that call's own head is single-line, which is the overwhelmingly
+//    common case (e.g. plain `define_method(:m) do ... end`).
+// ---------------------------------------------------------------------------
+
+/// `CodeLengthCalculator#node_with_heredoc?`'s own narrow
+/// `each_descendant(:str, :dstr)` filter — a heredoc `xstr`/`` `cmd` ``
+/// node alone does NOT gate this branch, even though it's still
+/// `heredoc_node?` true once inside it (see `MlHeredocEndScanner`, which
+/// upstream's own `each_descendant` walk — no type filter there — would
+/// also pick up). Never tests the root node itself (`each_descendant`
+/// excludes self).
+struct MlPlainHeredocGate {
+    is_root: bool,
+    found: bool,
+}
+impl<'pr> Visit<'pr> for MlPlainHeredocGate {
+    fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+        self.check(&node);
+    }
+    fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+        self.check(&node);
+    }
+}
+impl MlPlainHeredocGate {
+    fn check(&mut self, node: &ruby_prism::Node) {
+        if std::mem::replace(&mut self.is_root, false) || self.found {
+            return;
+        }
+        let is_plain_str = node.as_string_node().is_some() || node.as_interpolated_string_node().is_some();
+        if is_plain_str && super::breakable::is_heredoc_node(node) {
+            self.found = true;
+        }
+    }
+}
+
+/// `CodeLengthCalculator#source_from_node_with_heredoc`'s
+/// `node.each_descendant { |d| ... }` max-last-line scan — driven by the
+/// generic `visit_branch_node_enter`/`visit_leaf_node_enter` hooks (fired
+/// for literally every node, branch or leaf, ahead of the type-specific
+/// dispatch) so no per-type override list is needed. `each_descendant`
+/// excludes the root itself, and that exclusion is NOT just pedantry here:
+/// when `body` is the implicit rescue/ensure `BeginNode`, its own
+/// `location()` extends through the enclosing `def`'s/block's own `end`
+/// keyword (see `ml_begin_node_content_start`'s doc comment) — a bogus
+/// candidate that would inflate, not just harmlessly duplicate, the max.
+struct MlHeredocEndScanner<'i> {
+    idx: &'i LineIndex,
+    is_root: bool,
+    max_line: usize,
+}
+impl<'i, 'pr> Visit<'pr> for MlHeredocEndScanner<'i> {
+    fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+        self.record(&node);
+    }
+    fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+        self.record(&node);
+    }
+}
+impl<'i> MlHeredocEndScanner<'i> {
+    fn record(&mut self, node: &ruby_prism::Node) {
+        if std::mem::replace(&mut self.is_root, false) {
+            return;
+        }
+        let line = if super::breakable::is_heredoc_node(node) {
+            let closing = if let Some(n) = node.as_string_node() {
+                n.closing_loc()
+            } else if let Some(n) = node.as_interpolated_string_node() {
+                n.closing_loc()
+            } else if let Some(n) = node.as_x_string_node() {
+                Some(n.closing_loc())
+            } else if let Some(n) = node.as_interpolated_x_string_node() {
+                Some(n.closing_loc())
+            } else {
+                None
+            };
+            match closing {
+                Some(c) => self.idx.loc(c.start_offset()).0,
+                None => self.idx.loc(node.location().end_offset().saturating_sub(1)).0,
+            }
+        } else {
+            self.idx.loc(node.location().end_offset().saturating_sub(1)).0
+        };
+        if line > self.max_line {
+            self.max_line = line;
+        }
+    }
+}
+
+/// Where a `def`/block body's implicit rescue/ensure `BeginNode` content
+/// ends — mirrors whitequark's rescue/ensure wrapper ranges (ensure body,
+/// else else-body, else last rescue clause, else plain statements) instead
+/// of prism's own `BeginNode::location()`, which extends through the
+/// enclosing `def`'s/block's own `end` keyword (a documented
+/// prism-vs-whitequark trap: never use a def-with-rescue/ensure body's
+/// location END as "content end"). A near-duplicate of
+/// `style::begin_node_content_end` kept local to this dept file rather than
+/// shared across dept files.
+fn ml_begin_node_content_end(b: &ruby_prism::BeginNode) -> usize {
+    if let Some(ens) = b.ensure_clause() {
+        return match ens.statements() {
+            Some(stmts) => stmts.location().end_offset(),
+            None => ens.ensure_keyword_loc().end_offset(),
+        };
+    }
+    if let Some(els) = b.else_clause() {
+        return match els.statements() {
+            Some(stmts) => stmts.location().end_offset(),
+            None => els.else_keyword_loc().end_offset(),
+        };
+    }
+    if let Some(mut resc) = b.rescue_clause() {
+        while let Some(next) = resc.subsequent() {
+            resc = next;
+        }
+        return match resc.statements() {
+            Some(stmts) => stmts.location().end_offset(),
+            None => resc.location().end_offset(),
+        };
+    }
+    match b.statements() {
+        Some(stmts) => stmts.location().end_offset(),
+        None => b.location().end_offset(),
+    }
+}
+
+/// Where a `def`/block body's implicit rescue/ensure `BeginNode` content
+/// STARTS — the symmetric counterpart to `ml_begin_node_content_end`, and
+/// just as necessary: prism gives this synthetic (no explicit `begin`
+/// keyword) `BeginNode` the exact SAME `location()` as the enclosing
+/// `def`/block itself (verified directly against `ruby-prism`: for `def
+/// foo\n  a = 1\nrescue\n  a = 2\nend`, the body `BeginNode`'s `location()`
+/// starts at byte 0 — the `def` keyword — not at `a = 1`), so its start
+/// offset is exactly as unusable as its end offset. Whitequark's own
+/// rescue/ensure-wrapper node instead starts at the first REAL clause: the
+/// leading (pre-rescue) statements if any, else the first `rescue`, else
+/// (only reachable if a rescue-less body somehow still parses an `else`)
+/// the `else`, else `ensure` alone.
+fn ml_begin_node_content_start(b: &ruby_prism::BeginNode) -> usize {
+    if let Some(stmts) = b.statements() {
+        return stmts.location().start_offset();
+    }
+    if let Some(resc) = b.rescue_clause() {
+        return resc.location().start_offset();
+    }
+    if let Some(els) = b.else_clause() {
+        return els.location().start_offset();
+    }
+    if let Some(ens) = b.ensure_clause() {
+        return ens.location().start_offset();
+    }
+    b.location().start_offset()
+}
+
+/// Resolves a `def`/block body's true content start, correcting for the
+/// implicit-`BeginNode` trap `ml_begin_node_content_start` documents.
+fn ml_body_content_start(body: &ruby_prism::Node) -> usize {
+    match body.as_begin_node() {
+        Some(b) => ml_begin_node_content_start(&b),
+        None => body.location().start_offset(),
+    }
+}
+
+/// `method_name.basic_literal?`'s extraction of `method_name.value`,
+/// restricted to what `define_method`'s first argument realistically is: a
+/// plain (non-interpolated) `:sym` or `str` literal. `basic_literal?` is
+/// FALSE for `dsym`/`dstr` (any real `#{}` interpolation) and everything
+/// else, so those never consult the allow-list at all — `None` here means
+/// exactly that "always proceed to check_code_length" case.
+fn ml_basic_literal_value(node: &ruby_prism::Node) -> Option<Vec<u8>> {
+    if let Some(sym) = node.as_symbol_node() {
+        Some(sym.unescaped().to_vec())
+    } else if let Some(s) = node.as_string_node() {
+        Some(s.unescaped().to_vec())
+    } else {
+        None
+    }
+}
+
+impl<'a> Cops<'a> {
+    /// `CodeLengthCalculator#code_length`'s non-classlike/non-heredoc `else`
+    /// branch, restricted to what a `def`/`defs`/`block`/`numblock`/
+    /// `itblock`'s OWN body (`extract_body` already unwrapped `node` down to
+    /// `body` before this runs) can be: `body.source.lines` counted via
+    /// `irrelevant_line?`, EXCEPT when `body` contains a plain `str`/`dstr`
+    /// heredoc descendant — then rubocop widens the counted range to raw
+    /// file lines from `body`'s own first line through the true max end
+    /// line (`source_from_node_with_heredoc`), since a heredoc node's own
+    /// `source_range`/`location()` stops at its opener token and would
+    /// otherwise silently drop the heredoc's body/closing-delimiter lines.
+    fn ml_method_body_length(&self, body: &ruby_prism::Node, count_comments: bool) -> i64 {
+        let mut gate = MlPlainHeredocGate { is_root: true, found: false };
+        gate.visit(body);
+        let start = ml_body_content_start(body);
+        if gate.found {
+            let first_line = self.idx.loc(start).0;
+            let mut scanner = MlHeredocEndScanner { idx: self.idx, is_root: true, max_line: first_line };
+            scanner.visit(body);
+            let mut length = 0i64;
+            for line in first_line..=scanner.max_line {
+                if !self.ml_irrelevant_file_line(line, count_comments) {
+                    length += 1;
+                }
+            }
+            length
+        } else {
+            let end = match body.as_begin_node() {
+                Some(b) => ml_begin_node_content_end(&b),
+                None => body.location().end_offset(),
+            };
+            if end > start { ml_count_text_fragment(&self.src[start..end], count_comments) } else { 0 }
+        }
+    }
+
+    /// `on_def`/`on_defs` — prism gives both the same `DefNode` shape, so
+    /// there's nothing to distinguish; `allowed?(node.method_name)` is
+    /// `AllowedMethods`/`AllowedPatterns`, already generalized as `self.allowed`.
+    pub(crate) fn check_method_length_def(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Metrics/MethodLength";
+        if !self.on(COP) {
+            return;
+        }
+        if self.allowed(COP, node.name().as_slice()) {
+            return;
+        }
+        let Some(body) = node.body() else { return };
+        let (max, count_comments, foldable) = self.ml_config(COP);
+        let mut length = self.ml_method_body_length(&body, count_comments);
+        if foldable.any() {
+            let mut walker = MlFoldWalker { foldable, matches: Vec::new() };
+            ruby_prism::visit_def_node(&mut walker, node);
+            length = self.ml_apply_folding(length, walker.matches, count_comments);
+        }
+        if length > max {
+            let msg = format!("Method has too many lines. [{length}/{max}]");
+            self.push(node.location().start_offset(), COP, false, msg);
+        }
+    }
+
+    /// `on_block`/`on_numblock`/`on_itblock` guarded by
+    /// `node.method?(:define_method)` — rubocop-ast's `method?` only
+    /// compares `method_name`, so (unlike
+    /// `check_metrics_complexity_define_method`'s stricter receiverless
+    /// `define_method?` node-pattern) this fires for ANY call literally
+    /// named `define_method`, receiver or not.
+    pub(crate) fn check_method_length_block(&mut self, call: &ruby_prism::CallNode, block: &ruby_prism::BlockNode) {
+        const COP: &str = "Metrics/MethodLength";
+        if !self.on(COP) {
+            return;
+        }
+        if call.name().as_slice() != b"define_method" {
+            return;
+        }
+        // `method_name = node.send_node.first_argument; return if
+        // method_name.basic_literal? && allowed?(method_name.value)`.
+        if let Some(arg) = call.arguments().and_then(|a| a.arguments().iter().next()) {
+            if let Some(value) = ml_basic_literal_value(&arg) {
+                if self.allowed(COP, &value) {
+                    return;
+                }
+            }
+        }
+        let Some(body) = block.body() else { return };
+        let (max, count_comments, foldable) = self.ml_config(COP);
+        let mut length = self.ml_method_body_length(&body, count_comments);
+        if foldable.any() {
+            let mut walker = MlFoldWalker { foldable, matches: Vec::new() };
+            // Walk from the CALL, not just the block — whitequark's `:block`
+            // node has THREE direct children (send, args, body), and
+            // `each_top_level_descendant` starts from all of them; anchoring
+            // the fold-walk on `call` (via `visit_call_node`'s default walk:
+            // receiver, arguments, then the block itself) reaches all three
+            // — correctly for array/hash/heredoc folds found among the
+            // call's own arguments, but see the module-level doc comment
+            // for the `method_call`-folds-the-whole-call-plus-block gap this
+            // shares with `ModuleLength`.
+            ruby_prism::visit_call_node(&mut walker, call);
+            length = self.ml_apply_folding(length, walker.matches, count_comments);
+        }
+        if length > max {
+            let msg = format!("Method has too many lines. [{length}/{max}]");
+            // rubocop's own `:block` node range spans from the CALL's start
+            // through the block's `end`/`}` (see `ModuleLength`'s sibling
+            // comment on the same prism-vs-whitequark trap for
+            // `check_metrics_complexity_define_method`) — anchor on the call.
+            self.push(call.location().start_offset(), COP, false, msg);
+        }
+    }
+}

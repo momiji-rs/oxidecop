@@ -293,6 +293,7 @@ COPS = {
   'Metrics/BlockNesting'             => 'metrics/block_nesting',
   'Lint/FormatParameterMismatch'     => 'lint/format_parameter_mismatch',
   'Style/TrailingCommaInArrayLiteral' => 'style/trailing_comma_in_array_literal',
+  'Metrics/MethodLength'             => 'metrics/method_length',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

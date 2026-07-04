@@ -312,7 +312,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
-    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral",
+    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength",
 ];
 
 impl Engine {
@@ -3058,6 +3058,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_accessor_method_name(node);
         self.check_metrics_complexity_def(node);
         self.check_metrics_parameter_lists(node);
+        self.check_method_length_def(node);
         self.check_def_with_parentheses(node);
         self.check_space_after_method_name(node);
         self.check_colon_method_definition(node);
@@ -3665,6 +3666,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_block_parameter_name(&bn);
                 self.check_empty_lines_around_block_body(&bn);
                 self.check_metrics_complexity_define_method(node, &bn);
+                self.check_method_length_block(node, &bn);
                 self.check_empty_lines_around_exception_handling_keywords_block(node, &bn);
                 self.check_block_length(node, &bn);
             }
