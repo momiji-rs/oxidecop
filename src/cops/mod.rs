@@ -387,7 +387,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
-    "Layout/SpaceInsideHashLiteralBraces",
+    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets",
 ];
 
 impl Engine {
@@ -3148,6 +3148,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             &key_args,
             &node.value(),
         );
+        self.check_space_inside_reference_brackets_write(
+            node.receiver(),
+            node.opening_loc(),
+            node.closing_loc(),
+            node.arguments().is_some(),
+        );
         ruby_prism::visit_index_and_write_node(self, node);
     }
     fn visit_index_or_write_node(&mut self, node: &ruby_prism::IndexOrWriteNode<'pr>) {
@@ -3161,7 +3167,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             &node.value(),
         );
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
+        self.check_space_inside_reference_brackets_write(
+            node.receiver(),
+            node.opening_loc(),
+            node.closing_loc(),
+            node.arguments().is_some(),
+        );
         ruby_prism::visit_index_or_write_node(self, node);
+    }
+    fn visit_index_operator_write_node(&mut self, node: &ruby_prism::IndexOperatorWriteNode<'pr>) {
+        self.check_space_inside_reference_brackets_write(
+            node.receiver(),
+            node.opening_loc(),
+            node.closing_loc(),
+            node.arguments().is_some(),
+        );
+        ruby_prism::visit_index_operator_write_node(self, node);
+    }
+    fn visit_index_target_node(&mut self, node: &ruby_prism::IndexTargetNode<'pr>) {
+        self.check_space_inside_reference_brackets_target(node);
+        ruby_prism::visit_index_target_node(self, node);
     }
     fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
         if let Some(pred) = node.predicate() {
@@ -4911,6 +4936,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.arguments().as_ref(),
         );
         self.check_duplicate_methods_send(node);
+        self.check_space_inside_reference_brackets_call(node);
         // Lint/DuplicateMethods' `anon_block_scope_id`: when THIS call has a
         // receiver and one of its arguments is directly a `Class.new`/
         // `Module.new do...end` block, record (receiver source, this call's

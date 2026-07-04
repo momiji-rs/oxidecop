@@ -7304,3 +7304,181 @@ fn sihlb_is_space_tab(b: u8) -> bool {
 fn sihlb_is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c)
 }
+
+
+impl<'a> Cops<'a> {
+    /// Layout/SpaceInsideReferenceBrackets — port of `on_send`/`autocorrect`
+    /// plus the `SurroundingSpace`/`ConfigurableEnforcedStyle` mixins.
+    /// Upstream walks a real Lexer token stream (`tokens_within(node)`,
+    /// `left_ref_bracket`/`closing_bracket` token-index scans) to find the
+    /// reference brackets belonging to a `[]`/`[]=` send and their true
+    /// partner, guarding against lookalikes (array-literal brackets,
+    /// method-call parens on `obj.[](x)`/`def self.[]`). We don't have a
+    /// token stream, but prism's `opening_loc`/`closing_loc` on the node
+    /// kinds below already give the CORRECTLY PAIRED bracket locations for
+    /// THIS call directly (no nesting-depth scan needed) — filtering to
+    /// literal `"["`/`"]"` bytes (vs `"("`/`")"` for the explicit dot-call
+    /// form `subject.[](0)`) reproduces upstream's `left_ref_bracket?`
+    /// token-type check for free, and `def Vector.[](*array)` is a
+    /// `DefNode` never routed here at all.
+    ///
+    /// KNOWN DIVERGENCE: upstream's `left_ref_bracket` has a quirk for
+    /// `[]=` sends — because `tokens_within(node)` spans the WHOLE call
+    /// (receiver through the assigned value), and the method finds the
+    /// FIRST `tLBRACK2` token in that entire range whenever `node.method?
+    /// (:[]=)`, a chained bracketed receiver (`c[1][2] = 3`) gets its
+    /// spacing checked against the RECEIVER's inner bracket (`c[1]`), not
+    /// this call's own (`[2]`) — a real upstream bug, never exercised by
+    /// the fixture (every `[]=`-chain example there uses a plain
+    /// non-bracketed receiver). We always use this call's own (correctly
+    /// paired, semantically "right") bracket instead.
+    fn sirb_check(
+        &mut self,
+        opening: ruby_prism::Location,
+        closing: ruby_prism::Location,
+        has_args: bool,
+        span_start: usize,
+        span_end: usize,
+    ) {
+        const COP: &str = "Layout/SpaceInsideReferenceBrackets";
+        if !self.on(COP) {
+            return;
+        }
+        // `left_ref_bracket?`'s token-type guard: only a literal `[`/`]`
+        // bracket pair qualifies. An explicit dot-call (`subject.[](0)`)
+        // has `(`/`)` opening/closing instead — upstream's `tokens.find(&:
+        // left_ref_bracket?)` would find nothing and bail via `return
+        // unless left_token`.
+        if opening.as_slice() != b"[" || closing.as_slice() != b"]" {
+            return;
+        }
+        let src = self.src;
+        let open_end = opening.end_offset();
+        let close_start = closing.start_offset();
+
+        if !has_args {
+            // `empty_brackets?`/`empty_offenses`/`SpaceCorrector.
+            // empty_corrections` — anchor and fix cover the interior
+            // (`open_end..close_start`); the offense range for the
+            // ANCHOR itself is the whole `[...]` text
+            // (`range_between(left.begin_pos, right.end_pos)`), but only
+            // its START offset matters for line:col.
+            let style = self.cfg.get(COP, "EnforcedStyleForEmptyBrackets").unwrap_or("no_space");
+            let interior_len = close_start - open_end;
+            let space_between = interior_len == 1 && src.get(open_end) == Some(&b' ');
+            let no_char_between = interior_len == 0;
+            if style == "space" && !space_between {
+                self.push(opening.start_offset(), COP, true, "Use one space inside empty reference brackets.");
+                self.fixes.push((open_end, close_start, b" ".to_vec()));
+            } else if style == "no_space" && !no_char_between {
+                self.push(opening.start_offset(), COP, true, "Do not use space inside empty reference brackets.");
+                self.fixes.push((open_end, close_start, Vec::new()));
+            }
+            return;
+        }
+
+        // `return if node.multiline?` — only guards the non-empty branch;
+        // the empty-bracket check above runs regardless of line span.
+        let (start_line, _) = self.idx.loc(span_start);
+        let (end_line, _) = self.idx.loc(span_end.saturating_sub(1).max(span_start));
+        if start_line != end_line {
+            return;
+        }
+
+        let style = self.cfg.enforced_style(COP);
+        if style == "no_space" {
+            // `no_space_offenses`: flag (and strip) a run of spaces/tabs
+            // clinging to either bracket's inner side.
+            if matches!(src.get(open_end), Some(b' ') | Some(b'\t')) {
+                let mut run_end = open_end;
+                while matches!(src.get(run_end), Some(b' ') | Some(b'\t')) {
+                    run_end += 1;
+                }
+                self.push(open_end, COP, true, "Do not use space inside reference brackets.");
+                self.fixes.push((open_end, run_end, Vec::new()));
+            }
+            if matches!(src.get(close_start.wrapping_sub(1)), Some(b' ') | Some(b'\t')) {
+                let mut run_start = close_start;
+                while run_start > open_end && matches!(src.get(run_start - 1), Some(b' ') | Some(b'\t')) {
+                    run_start -= 1;
+                }
+                self.push(run_start, COP, true, "Do not use space inside reference brackets.");
+                self.fixes.push((run_start, close_start, Vec::new()));
+            }
+        } else {
+            // `space_offenses`: flag (and insert) a single space on
+            // either bracket's inner side when ENTIRELY absent — an
+            // already-present run of 2+ spaces is left alone (upstream
+            // only checks presence, never excess, for this style).
+            if !matches!(src.get(open_end), Some(b' ') | Some(b'\t')) {
+                self.push(opening.start_offset(), COP, true, "Use space inside reference brackets.");
+                self.fixes.push((open_end, open_end, b" ".to_vec()));
+            }
+            if !matches!(src.get(close_start.wrapping_sub(1)), Some(b' ') | Some(b'\t')) {
+                self.push(closing.start_offset(), COP, true, "Use space inside reference brackets.");
+                self.fixes.push((close_start, close_start, b" ".to_vec()));
+            }
+        }
+    }
+
+    /// `[]`/`[]=` sends written with real bracket syntax (plain reads
+    /// `a[b]`, plain reference-assigns `a[b] = c` — the latter's own
+    /// `node.location()` legitimately extends through the assigned value,
+    /// matching upstream's `node.multiline?` check on the same node).
+    pub(crate) fn check_space_inside_reference_brackets_call(&mut self, node: &ruby_prism::CallNode) {
+        if !self.on("Layout/SpaceInsideReferenceBrackets") {
+            return;
+        }
+        if !matches!(node.name().as_slice(), b"[]" | b"[]=") {
+            return;
+        }
+        let (Some(opening), Some(closing)) = (node.opening_loc(), node.closing_loc()) else {
+            return;
+        };
+        let has_args = node.arguments().is_some();
+        let span = node.location();
+        self.sirb_check(opening, closing, has_args, span.start_offset(), span.end_offset());
+    }
+
+    /// `IndexTargetNode` — the `[]=`-shaped assignment-target form used in
+    /// multiple-assignment / `for`-loop / rescue-variable targets (e.g.
+    /// `a[1], b[2] = 1, 2`); rubocop-ast's Prism translation gives each
+    /// element a `send`/`:[]=` node bounded to just `a[1]` (no trailing
+    /// `=`/value), matching this node's own (already bounded) location.
+    pub(crate) fn check_space_inside_reference_brackets_target(&mut self, node: &ruby_prism::IndexTargetNode) {
+        if !self.on("Layout/SpaceInsideReferenceBrackets") {
+            return;
+        }
+        let opening = node.opening_loc();
+        let closing = node.closing_loc();
+        let has_args = node.arguments().is_some();
+        let span = node.location();
+        self.sirb_check(opening, closing, has_args, span.start_offset(), span.end_offset());
+    }
+
+    /// `IndexOperatorWriteNode`/`IndexAndWriteNode`/`IndexOrWriteNode`
+    /// (`a[1] += 2`, `&&=`, `||=`) — rubocop-ast's Prism translation
+    /// decomposes each of these into an `op_asgn`/`and_asgn`/`or_asgn`
+    /// wrapping a plain `send`/`:[]` READ node bounded to `receiver[args]`
+    /// only (NOT the operator/value), so upstream's `node.multiline?`
+    /// there only ever sees that bounded span. We rebuild the same bounded
+    /// span (`receiver.location.start` .. `closing_loc.end`) here, since
+    /// these node kinds' own `location()` extends through the value.
+    pub(crate) fn check_space_inside_reference_brackets_write(
+        &mut self,
+        receiver: Option<ruby_prism::Node>,
+        opening: ruby_prism::Location,
+        closing: ruby_prism::Location,
+        has_args: bool,
+    ) {
+        if !self.on("Layout/SpaceInsideReferenceBrackets") {
+            return;
+        }
+        let Some(receiver) = receiver else {
+            return;
+        };
+        let start = receiver.location().start_offset();
+        let end = closing.end_offset();
+        self.sirb_check(opening, closing, has_args, start, end);
+    }
+}

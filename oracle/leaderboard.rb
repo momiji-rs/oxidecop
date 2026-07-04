@@ -348,6 +348,7 @@ COPS = {
   'Style/BlockDelimiters'            => 'style/block_delimiters',
   'Style/RedundantParentheses'       => 'style/redundant_parentheses',
   'Layout/SpaceInsideHashLiteralBraces' => 'layout/space_inside_hash_literal_braces',
+  'Layout/SpaceInsideReferenceBrackets' => 'layout/space_inside_reference_brackets',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
