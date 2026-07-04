@@ -28161,3 +28161,371 @@ fn hs_simple_ident(s: &[u8]) -> bool {
     };
     mid.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
 }
+
+
+// Style/HashEachMethods ------------------------------------------------------
+//
+// Port of `hash_each_methods.rb` (+ mixin `AllowedReceivers`). Two distinct
+// shapes, both keyed off a `CallNode` named `each`:
+//
+//   1. `kv_each`: the `.each` call's own receiver is itself a `.keys`/
+//      `.values` call — `recv.keys.each { ... }` -> `recv.each_key { ... }`.
+//      Also covers the block-PASS flavor (`recv.keys.each(&:sym)`), which
+//      upstream handles via a SEPARATE `on_block_pass` hook that skips the
+//      `handleable?` gate entirely (no array-converter/root-receiver/
+//      hash-mutation checks apply there — only `AllowedReceivers`).
+//   2. `each_arguments`: a plain `recv.each { |k, v| ... }` with exactly two
+//      NAMED block params (not `_1`/`it`) where one is provably unused in
+//      the body -> rewritten to `each_key`/`each_value` with the unused
+//      param removed.
+//
+// Prism fuses a call and its trailing block into ONE `CallNode` (`.block()`
+// holds a `BlockNode` for `{}`/`do..end`, or a `BlockArgumentNode` for
+// `&sym`/`&blk`) — both shapes are examined from a single `visit_call_node`
+// hook instead of upstream's separate `on_block`/`on_numblock`/`on_itblock`/
+// `on_block_pass`. A `CallNode`'s OWN `.location()` spans through the
+// trailing block's `end`/`}` (verified live against `parser_engine:
+// :parser_prism`), so any range meant to mirror upstream's SEND-only
+// `target.source_range` must be built from `.message_loc()` (the `each`
+// selector), never `.location().end_offset()`.
+//
+// `AllowedReceivers`'s real default.yml value (`['Thread.current']`) is
+// hardcoded as the `cfg.param` None-fallback — array defaults never make it
+// into the generated SCHEMA table, and RuboCop's own RSpec harness merges
+// `ConfigLoader.default_configuration.for_cop(...)` under `cop_config`, so
+// examples that don't override `AllowedReceivers` still see this default.
+const DEFAULT_HASH_EACH_METHODS_ALLOWED_RECEIVERS: &[&str] = &["Thread.current"];
+
+const HEM_ARRAY_CONVERTER_METHODS: &[&[u8]] =
+    &[b"assoc", b"chunk", b"flatten", b"rassoc", b"sort", b"sort_by", b"to_a"];
+
+/// "each_#{name.chop}" for `:keys`/`:values` (rubocop's `format_message`/
+/// `correct_key_value_each`'s `name` computation) — always one of these two,
+/// guarded by callers matching `b"keys" | b"values"` first.
+fn hem_prefer_name(method: &[u8]) -> &'static str {
+    if method == b"keys" { "each_key" } else { "each_value" }
+}
+
+/// `Node#receiver` (rubocop-ast's UNIVERSAL `def_node_matcher :receiver,
+/// '{(send $_ ...) (any_block (call $_ ...) ...)}'`) — total on every node
+/// type, `None` unless `n` is itself a call (prism fuses a call-with-block
+/// into the same `CallNode`, so `any_block` needs no separate case here).
+fn hem_node_receiver<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    n.as_call_node().and_then(|c| c.receiver())
+}
+
+/// `root_receiver(node)`: walks `.receiver` chains down to the leftmost
+/// receiver that either has no receiver of its own, or isn't a call/block
+/// shape at all (a literal, local variable, constant, `self`, ...).
+fn hem_root_receiver<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    let receiver = hem_node_receiver(n)?;
+    if hem_node_receiver(&receiver).is_some() { hem_root_receiver(&receiver) } else { Some(receiver) }
+}
+
+/// `AllowedReceivers#receiver_name`: NOT a plain dotted-source rendering —
+/// a non-const receiver chain collapses straight to its own deepest
+/// non-const/non-send terminal (dropping every intermediate method name),
+/// and the `foo.bar` dotted form only reappears at the level whose OWN
+/// receiver is a constant (e.g. `Thread.current` in `Thread.current.foo`
+/// still resolves to `"Thread.current"`, silently dropping `.foo`). Ported
+/// verbatim since `AllowedReceivers: ['Thread.current']` depends on it.
+fn hem_receiver_name(src: &[u8], node: &ruby_prism::Node) -> Vec<u8> {
+    if let Some(nested) = hem_node_receiver(node) {
+        let nested_is_const =
+            nested.as_constant_read_node().is_some() || nested.as_constant_path_node().is_some();
+        if !nested_is_const {
+            return hem_receiver_name(src, &nested);
+        }
+    }
+    if let Some(call) = node.as_call_node() {
+        if let Some(r) = call.receiver() {
+            let mut s = hem_receiver_name(src, &r);
+            s.push(b'.');
+            s.extend_from_slice(call.name().as_slice());
+            s
+        } else {
+            call.name().as_slice().to_vec()
+        }
+    } else {
+        let l = node.location();
+        src[l.start_offset()..l.end_offset()].to_vec()
+    }
+}
+
+/// `hash_mutated?`: a def_node_matcher search (backtick = self-or-any-
+/// descendant) for `(send %1 :[]= ...)` where `%1` is `root` — a
+/// structurally-equal (here: byte-identical source text) receiver being
+/// written to via `[]=` anywhere under `node` (the whole `.each` call,
+/// receiver chain and block body alike — prism's default `visit_call_node`
+/// already descends into both).
+fn hem_hash_mutated(src: &[u8], node: &ruby_prism::Node, root: &ruby_prism::Node) -> bool {
+    struct Finder<'s> {
+        src: &'s [u8],
+        target: &'s [u8],
+        found: bool,
+    }
+    impl<'pr, 's> ruby_prism::Visit<'pr> for Finder<'s> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if self.found {
+                return;
+            }
+            if node.name().as_slice() == b"[]=" {
+                if let Some(r) = node.receiver() {
+                    let l = r.location();
+                    if &self.src[l.start_offset()..l.end_offset()] == self.target {
+                        self.found = true;
+                        return;
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let rl = root.location();
+    let mut f = Finder { src, target: &src[rl.start_offset()..rl.end_offset()], found: false };
+    f.visit(node);
+    f.found
+}
+
+/// `use_array_converter_method_as_preceding?`: the `.each` call's OWN
+/// receiver (one level up — NOT the recursive root) is itself a call (bare
+/// or block-attached, both the same `CallNode` shape in prism) named one of
+/// `ARRAY_CONVERTER_METHODS`.
+fn hem_array_converter_preceding(call: &ruby_prism::CallNode) -> bool {
+    call.receiver()
+        .and_then(|r| r.as_call_node())
+        .is_some_and(|rc| HEM_ARRAY_CONVERTER_METHODS.contains(&rc.name().as_slice()))
+}
+
+/// `handleable?`, minus the block-pass path (upstream's `on_block_pass`
+/// skips this gate entirely — see the module doc).
+fn hem_handleable(src: &[u8], call: &ruby_prism::CallNode) -> bool {
+    if hem_array_converter_preceding(call) {
+        return false;
+    }
+    let Some(root) = hem_root_receiver(&call.as_node()) else { return false };
+    if hem_hash_mutated(src, &call.as_node(), &root) {
+        return false;
+    }
+    !cli_is_literal(&root) || root.as_hash_node().is_some()
+}
+
+/// Every top-level positional slot of a block's parameter list, in
+/// declaration order (`requireds, optionals, rest, posts` — Ruby's only
+/// legal ordering). `(args $_key $_value)`'s fixed arity-2 match also
+/// requires NO keyword/keyword-rest/block param (any of those adds a third
+/// `args` child upstream, breaking the match).
+fn hem_two_params<'pr>(
+    pp: &ruby_prism::ParametersNode<'pr>,
+) -> Option<(ruby_prism::Node<'pr>, ruby_prism::Node<'pr>)> {
+    if pp.keywords().iter().next().is_some() || pp.keyword_rest().is_some() || pp.block().is_some() {
+        return None;
+    }
+    let mut ordered: Vec<ruby_prism::Node<'pr>> = pp.requireds().iter().collect();
+    ordered.extend(pp.optionals().iter());
+    if let Some(r) = pp.rest() {
+        ordered.push(r);
+    }
+    ordered.extend(pp.posts().iter());
+    if ordered.len() == 2 {
+        let mut it = ordered.into_iter();
+        let key = it.next().unwrap();
+        let value = it.next().unwrap();
+        Some((key, value))
+    } else {
+        None
+    }
+}
+
+/// `unused_block_arg_exist?`: for a destructured (`MultiTargetNode`) param,
+/// ALL leaf `arg`/`restarg` names must be unused; for a simple arg/restarg,
+/// its own (possibly absent, for an anonymous `*`) name must be. Reuses
+/// `rs_collect_param_name` (Style/RedundantSelf's block-param name
+/// collector) — its `MultiTargetNode`/`SplatNode` recursion and "anonymous
+/// splat contributes no name" behavior already match `each_descendant(:arg,
+/// :restarg)` + `source.delete_prefix('*')` exactly, and an empty leaf list
+/// (anonymous splat) makes `.all?` vacuously true just like upstream's
+/// `lvar_sources.none?("")`.
+fn hem_is_unused(lvar_names: &std::collections::HashSet<Vec<u8>>, arg: &ruby_prism::Node) -> bool {
+    let mut leaves = Vec::new();
+    rs_collect_param_name(&mut leaves, arg);
+    leaves.iter().all(|n| !lvar_names.contains(n))
+}
+
+/// `node.body.each_descendant(:lvar).map(&:source)` — every local-variable
+/// READ anywhere under the block body, regardless of nesting (upstream does
+/// no scope analysis, so a shadowing nested block still "uses" the name).
+struct HemLvarCollector {
+    names: std::collections::HashSet<Vec<u8>>,
+}
+impl<'pr> ruby_prism::Visit<'pr> for HemLvarCollector {
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.names.insert(node.name().as_slice().to_vec());
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// `AllowedReceivers#allowed_receiver?` — reads `AllowedReceivers` via
+    /// `cfg.param` (not `cfg.get`: array defaults aren't in the generated
+    /// SCHEMA, so the None-fallback is hardcoded here, matching every other
+    /// array-config cop's convention).
+    fn hem_allowed_receiver(&self, receiver: &ruby_prism::Node) -> bool {
+        const COP: &str = "Style/HashEachMethods";
+        let allowed: Vec<String> = self
+            .cfg
+            .param(COP, "AllowedReceivers")
+            .map(crate::config::parse_allowed_list)
+            .unwrap_or_else(|| {
+                DEFAULT_HASH_EACH_METHODS_ALLOWED_RECEIVERS.iter().map(|s| s.to_string()).collect()
+            });
+        if allowed.is_empty() {
+            return false;
+        }
+        let name = hem_receiver_name(self.src, receiver);
+        allowed.iter().any(|a| a.as_bytes() == name.as_slice())
+    }
+
+    /// `register_kv_offense` — `call` is the `.each` call itself (upstream's
+    /// `target`), `inner` its receiver (the `.keys`/`.values` call). Returns
+    /// whether an offense was actually registered (upstream's `and return`
+    /// only short-circuits `on_block` when `register_kv_offense` did — a
+    /// missing `parent_receiver`/an allowed receiver falls through to the
+    /// `each_arguments` check instead of returning early).
+    fn hem_register_kv_offense(&mut self, call: &ruby_prism::CallNode, inner: &ruby_prism::CallNode) -> bool {
+        const COP: &str = "Style/HashEachMethods";
+        let Some(parent_receiver) = inner.receiver() else { return false };
+        if self.hem_allowed_receiver(&parent_receiver) {
+            return false;
+        }
+        let Some(inner_sel) = inner.message_loc() else { return false };
+        let Some(call_sel) = call.message_loc() else { return false };
+        let start = inner_sel.start_offset();
+        let end = call_sel.end_offset();
+        let current = String::from_utf8_lossy(&self.src[start..end]).into_owned();
+        let prefer = hem_prefer_name(inner.name().as_slice());
+        self.push(start, COP, true, format!("Use `{prefer}` instead of `{current}`."));
+
+        // `correct_key_value_each`: replace the WHOLE send (receiver chain
+        // through the `each` selector — NOT `call.location()`, which spans
+        // through the block) with `parent_receiver`'s own source, the SAME
+        // dot/`&.` operator that sat between `.keys`/`.values` and `.each`,
+        // then the new method name.
+        let Some(dot) = call.call_operator_loc() else { return true };
+        let pl = parent_receiver.location();
+        let mut new_src = self.src[pl.start_offset()..pl.end_offset()].to_vec();
+        new_src.extend_from_slice(dot.as_slice());
+        new_src.extend_from_slice(prefer.as_bytes());
+        self.fixes.push((call.location().start_offset(), end, new_src));
+        true
+    }
+
+    /// `register_kv_with_block_pass_offense` — `call` is the
+    /// `.each(&:sym)` call, `inner` its `.keys`/`.values` receiver. Unlike
+    /// the block-node path, the correction only swaps the `keys.each` span
+    /// for the new name IN PLACE (the leading receiver/dot and the trailing
+    /// `(&:sym)` are left untouched), so no `handleable?` gate or `.chop`
+    /// reconstruction is needed here — matches upstream's `on_block_pass`
+    /// skipping `handleable?` entirely.
+    fn hem_register_kv_block_pass_offense(&mut self, call: &ruby_prism::CallNode, inner: &ruby_prism::CallNode) {
+        const COP: &str = "Style/HashEachMethods";
+        let Some(parent_receiver) = inner.receiver() else { return };
+        if self.hem_allowed_receiver(&parent_receiver) {
+            return;
+        }
+        let Some(inner_sel) = inner.message_loc() else { return };
+        let Some(call_sel) = call.message_loc() else { return };
+        let start = inner_sel.start_offset();
+        let end = call_sel.end_offset();
+        let current = String::from_utf8_lossy(&self.src[start..end]).into_owned();
+        let prefer = hem_prefer_name(inner.name().as_slice());
+        self.push(start, COP, true, format!("Use `{prefer}` instead of `{current}`."));
+        self.fixes.push((start, end, prefer.as_bytes().to_vec()));
+    }
+
+    /// `check_unused_block_args` — `call` is the `.each` call (its own
+    /// start offset is the offense anchor: an EMPIRICALLY-verified prism
+    /// `BlockNode#source_range` starts at the receiver chain here, not the
+    /// selector), `body` its block's body, `key`/`value` the two ordered
+    /// block params.
+    fn hem_check_unused_block_args(
+        &mut self,
+        call: &ruby_prism::CallNode,
+        body: &ruby_prism::Node,
+        key: &ruby_prism::Node,
+        value: &ruby_prism::Node,
+    ) {
+        const COP: &str = "Style/HashEachMethods";
+        let mut collector = HemLvarCollector { names: std::collections::HashSet::new() };
+        collector.visit(body);
+        let value_unused = hem_is_unused(&collector.names, value);
+        let key_unused = hem_is_unused(&collector.names, key);
+        if value_unused && key_unused {
+            return;
+        }
+        let (prefer, unused_code, unused_start, unused_end) = if value_unused {
+            (
+                "each_key",
+                self.node_src(value),
+                key.location().end_offset(),
+                value.location().end_offset(),
+            )
+        } else if key_unused {
+            (
+                "each_value",
+                self.node_src(key),
+                key.location().start_offset(),
+                value.location().start_offset(),
+            )
+        } else {
+            return;
+        };
+        let unused_code = String::from_utf8_lossy(unused_code).into_owned();
+        let message = format!(
+            "Use `{prefer}` instead of `each` and remove the unused `{unused_code}` block argument."
+        );
+        self.push(call.location().start_offset(), COP, true, message);
+        if let Some(sel) = call.message_loc() {
+            self.fixes.push((sel.start_offset(), sel.end_offset(), prefer.as_bytes().to_vec()));
+        }
+        self.fixes.push((unused_start, unused_end, Vec::new()));
+    }
+
+    /// Style/HashEachMethods entry point — dispatches on `node.block()`'s
+    /// shape (a real `BlockNode` for `{}`/`do..end`, a `BlockArgumentNode`
+    /// for `&sym`), covering upstream's `on_block`/`on_numblock`/
+    /// `on_itblock`/`on_block_pass` from this one `visit_call_node` hook.
+    pub(crate) fn check_hash_each_methods<'pr>(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        const COP: &str = "Style/HashEachMethods";
+        if !self.on(COP) || node.name().as_slice() != b"each" {
+            return;
+        }
+        let Some(block_child) = node.block() else { return };
+        if let Some(block) = block_child.as_block_node() {
+            if !hem_handleable(self.src, node) {
+                return;
+            }
+            if let Some(inner) = node.receiver().and_then(|r| r.as_call_node()) {
+                if matches!(inner.name().as_slice(), b"keys" | b"values")
+                    && self.hem_register_kv_offense(node, &inner)
+                {
+                    return;
+                }
+            }
+            let Some(body) = block.body() else { return };
+            let Some(params) = block.parameters() else { return };
+            let Some(bp) = params.as_block_parameters_node() else { return };
+            let Some(pp) = bp.parameters() else { return };
+            let Some((key, value)) = hem_two_params(&pp) else { return };
+            self.hem_check_unused_block_args(node, &body, &key, &value);
+        } else if let Some(ba) = block_child.as_block_argument_node() {
+            let Some(expr) = ba.expression() else { return };
+            if expr.as_symbol_node().is_none() {
+                return;
+            }
+            let Some(inner) = node.receiver().and_then(|r| r.as_call_node()) else { return };
+            if matches!(inner.name().as_slice(), b"keys" | b"values") {
+                self.hem_register_kv_block_pass_offense(node, &inner);
+            }
+        }
+    }
+}
