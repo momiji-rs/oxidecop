@@ -88,15 +88,21 @@ fn ruby_shebang(path: &Path) -> bool {
 
 fn is_ruby_file(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // the full AllCops Include list from rubocop's default.yml
     matches!(
         path.extension().and_then(|e| e.to_str()),
-        Some("rb" | "rake" | "gemspec" | "ru" | "builder" | "jbuilder" | "rabl" | "thor" | "gemfile" | "podspec")
+        Some(
+            "rb" | "arb" | "axlsx" | "builder" | "gemfile" | "gemspec" | "jb" | "jbuilder"
+                | "mspec" | "opal" | "pluginspec" | "podspec" | "rabl" | "rake" | "rbw" | "ru"
+                | "ruby" | "schema" | "spec" | "thor"
+        )
     ) || matches!(
         name,
         "Gemfile" | "Rakefile" | "rakefile" | "Guardfile" | "Capfile" | "Berksfile" | "Brewfile"
-            | "Dangerfile" | "Fastfile" | "Podfile" | "Puppetfile" | "Thorfile" | "Vagrantfile"
+            | "Buildfile" | "Dangerfile" | "Deliverfile" | "Jarfile" | "Mavenfile" | "Podfile"
+            | "Puppetfile" | "Schemafile" | "Snapfile" | "Thorfile" | "Vagrantfile"
             | "Appraisals" | "Steepfile" | ".irbrc" | ".pryrc" | ".simplecov" | "buildfile"
-    )
+    ) || name.ends_with("Fastfile")
 }
 
 /// rubocop's TargetRuby non-config sources: .ruby-version, .tool-versions,
