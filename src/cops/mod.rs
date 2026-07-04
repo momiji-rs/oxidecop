@@ -312,7 +312,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
-    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting",
+    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch",
 ];
 
 impl Engine {
@@ -3507,6 +3507,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.check_slicing_with_range(node);
         self.check_empty_lines_around_arguments(node);
+        self.check_format_parameter_mismatch(node);
         // recurse into children (we've overridden the default walk). Push this
         // call's name SPAN so descendants can see it as an ancestor.
         let name_span = node

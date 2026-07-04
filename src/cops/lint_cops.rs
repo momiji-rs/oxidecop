@@ -10254,3 +10254,578 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// Lint/FormatParameterMismatch: mirrors `RuboCop::Cop::Utils::FormatString`
+// (a hand-rolled port of its `SEQUENCE` regex — Rust's `regex` crate rejects
+// duplicate named capture groups across alternation branches and has no
+// lookbehind, both of which the original pattern relies on) plus the cop's
+// own `count_matches`/`offending_node?` bookkeeping. No autocorrector.
+
+/// One match of `RuboCop::Cop::Utils::FormatString::SEQUENCE` — byte offsets
+/// into the format-string's own RAW source slice (quotes/interpolation
+/// markers included, matching Ruby's `node.source`, since dstr nodes must
+/// see their literal `#{...}` text rather than an evaluated/unescaped value).
+struct CfpmSeq {
+    start: usize,
+    end: usize,
+    has_name: bool,
+    is_percent: bool,
+}
+
+fn cfpm_is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `FLAG = /[ #0+-]|(?<arg_number>\d+)\$/` repeated (`FLAG*`), returned as
+/// every prefix-length end position (0 reps first) so callers can backtrack
+/// from the greedy (longest) match down to shorter ones, exactly as Onigmo
+/// would when a longer flags run leads to an overall match failure (e.g.
+/// `%#{padding}s`, where the bare `#` must NOT be swallowed as a flag so the
+/// `#{...}` interpolation can be recognized as a dynamic WIDTH instead).
+fn cfpm_flag_positions(s: &[u8], start: usize) -> Vec<usize> {
+    let mut positions = vec![start];
+    let mut pos = start;
+    loop {
+        if pos < s.len() && matches!(s[pos], b' ' | b'#' | b'0' | b'+' | b'-') {
+            pos += 1;
+            positions.push(pos);
+            continue;
+        }
+        if pos < s.len() && s[pos].is_ascii_digit() {
+            let mut j = pos;
+            while j < s.len() && s[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < s.len() && s[j] == b'$' {
+                pos = j + 1;
+                positions.push(pos);
+                continue;
+            }
+        }
+        break;
+    }
+    positions
+}
+
+/// `NUMBER = /\d+|\*(?:\d+\$)?|\#\{.*?\}/` — used for both WIDTH and (after
+/// the leading `.`) PRECISION.
+fn cfpm_parse_number(s: &[u8], pos: usize) -> Option<usize> {
+    if pos >= s.len() {
+        return None;
+    }
+    if s[pos].is_ascii_digit() {
+        let mut j = pos;
+        while j < s.len() && s[j].is_ascii_digit() {
+            j += 1;
+        }
+        return Some(j);
+    }
+    if s[pos] == b'*' {
+        let mut j = pos + 1;
+        if j < s.len() && s[j].is_ascii_digit() {
+            let mut k = j;
+            while k < s.len() && s[k].is_ascii_digit() {
+                k += 1;
+            }
+            if k < s.len() && s[k] == b'$' {
+                j = k + 1;
+            }
+        }
+        return Some(j);
+    }
+    if s[pos] == b'#' && pos + 1 < s.len() && s[pos + 1] == b'{' {
+        // Non-greedy `.*?` up to the first `}`.
+        return s[pos + 2..].iter().position(|&b| b == b'}').map(|rel| pos + 2 + rel + 1);
+    }
+    None
+}
+
+/// `PRECISION = /\.(?<precision>NUMBER?)/` — the leading `.` is mandatory,
+/// the NUMBER after it is not (`%.d` is a valid, empty-precision sequence).
+fn cfpm_parse_precision(s: &[u8], pos: usize) -> Option<usize> {
+    if pos < s.len() && s[pos] == b'.' {
+        let after = pos + 1;
+        return Some(cfpm_parse_number(s, after).unwrap_or(after));
+    }
+    None
+}
+
+/// `NAME = /<(?<name>\w+)>/` (the annotated `%<name>s` form).
+fn cfpm_parse_name_angle(s: &[u8], pos: usize) -> Option<usize> {
+    if pos < s.len() && s[pos] == b'<' {
+        let mut j = pos + 1;
+        let word_start = j;
+        while j < s.len() && cfpm_is_word_byte(s[j]) {
+            j += 1;
+        }
+        if j > word_start && j < s.len() && s[j] == b'>' {
+            return Some(j + 1);
+        }
+    }
+    None
+}
+
+/// `TEMPLATE_NAME = /(?<!\#)\{(?<name>\w+)\}/` (the `%{name}` form) — the
+/// negative lookbehind keeps a preceding `#{` interpolation opener from
+/// being mistaken for one.
+fn cfpm_parse_template_name(s: &[u8], pos: usize) -> Option<usize> {
+    if pos < s.len() && s[pos] == b'{' {
+        if pos > 0 && s[pos - 1] == b'#' {
+            return None;
+        }
+        let mut j = pos + 1;
+        let word_start = j;
+        while j < s.len() && cfpm_is_word_byte(s[j]) {
+            j += 1;
+        }
+        if j > word_start && j < s.len() && s[j] == b'}' {
+            return Some(j + 1);
+        }
+    }
+    None
+}
+
+/// `TYPE = /(?<type>[bBdiouxXeEfgGaAcps])/`.
+fn cfpm_parse_type(s: &[u8], pos: usize) -> Option<usize> {
+    if pos < s.len()
+        && matches!(
+            s[pos],
+            b'b' | b'B'
+                | b'd'
+                | b'i'
+                | b'o'
+                | b'u'
+                | b'x'
+                | b'X'
+                | b'e'
+                | b'E'
+                | b'f'
+                | b'g'
+                | b'G'
+                | b'a'
+                | b'A'
+                | b'c'
+                | b'p'
+                | b's'
+        )
+    {
+        Some(pos + 1)
+    } else {
+        None
+    }
+}
+
+/// The part of `SEQUENCE` after `% flags` — tries, in the source pattern's
+/// alternation order:
+///   1. `WIDTH? PRECISION? NAME? TYPE` (falling back to no-NAME if consuming
+///      one leaves no valid TYPE, since NAME is optional here and the regex
+///      would backtrack it away)
+///   2. `WIDTH? NAME PRECISION? TYPE`
+///   3. `NAME (more_flags=FLAG*) WIDTH? PRECISION? TYPE`
+///   4. `WIDTH? PRECISION? TEMPLATE_NAME` (the `%{name}` sibling alternative,
+///      which needs no TYPE)
+/// Returns `(end_offset, has_name)`.
+fn cfpm_match_after_flags(s: &[u8], pos: usize) -> Option<(usize, bool)> {
+    {
+        let mut p = pos;
+        if let Some(e) = cfpm_parse_number(s, p) {
+            p = e;
+        }
+        if let Some(e) = cfpm_parse_precision(s, p) {
+            p = e;
+        }
+        let mut with_name = p;
+        let mut has_name = false;
+        if let Some(e) = cfpm_parse_name_angle(s, p) {
+            with_name = e;
+            has_name = true;
+        }
+        if has_name {
+            if let Some(e) = cfpm_parse_type(s, with_name) {
+                return Some((e, true));
+            }
+        }
+        if let Some(e) = cfpm_parse_type(s, p) {
+            return Some((e, false));
+        }
+    }
+    {
+        let mut p = pos;
+        if let Some(e) = cfpm_parse_number(s, p) {
+            p = e;
+        }
+        if let Some(e) = cfpm_parse_name_angle(s, p) {
+            let mut p2 = e;
+            if let Some(e2) = cfpm_parse_precision(s, p2) {
+                p2 = e2;
+            }
+            if let Some(e3) = cfpm_parse_type(s, p2) {
+                return Some((e3, true));
+            }
+        }
+    }
+    if let Some(e) = cfpm_parse_name_angle(s, pos) {
+        for &fe in cfpm_flag_positions(s, e).iter().rev() {
+            let mut p = fe;
+            if let Some(w) = cfpm_parse_number(s, p) {
+                p = w;
+            }
+            if let Some(pr) = cfpm_parse_precision(s, p) {
+                p = pr;
+            }
+            if let Some(t) = cfpm_parse_type(s, p) {
+                return Some((t, true));
+            }
+        }
+    }
+    {
+        let mut p = pos;
+        if let Some(e) = cfpm_parse_number(s, p) {
+            p = e;
+        }
+        if let Some(e) = cfpm_parse_precision(s, p) {
+            p = e;
+        }
+        if let Some(e) = cfpm_parse_template_name(s, p) {
+            return Some((e, true));
+        }
+    }
+    None
+}
+
+/// Tries `SEQUENCE` anchored at `pos` (`s[pos]` must be `%`). Returns
+/// `(end_offset, has_name, is_percent)`.
+fn cfpm_match_sequence_at(s: &[u8], pos: usize) -> Option<(usize, bool, bool)> {
+    if pos + 1 < s.len() && s[pos + 1] == b'%' {
+        return Some((pos + 2, false, true));
+    }
+    for &fe in cfpm_flag_positions(s, pos + 1).iter().rev() {
+        if let Some((end, has_name)) = cfpm_match_after_flags(s, fe) {
+            return Some((end, has_name, false));
+        }
+    }
+    None
+}
+
+/// `@source.scan(SEQUENCE)` — every non-overlapping match, left to right.
+fn cfpm_scan_sequences(s: &[u8]) -> Vec<CfpmSeq> {
+    let mut i = 0;
+    let mut out = Vec::new();
+    while i < s.len() {
+        if s[i] == b'%' {
+            if let Some((end, has_name, is_percent)) = cfpm_match_sequence_at(s, i) {
+                out.push(CfpmSeq { start: i, end, has_name, is_percent });
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `FormatSequence#max_digit_dollar_num`: re-scans the SEQUENCE's own raw
+/// text for `\d+\$` occurrences and returns the max (or `None`, matching
+/// Ruby's `nil` for "no digit-dollar refs in this sequence").
+fn cfpm_seq_max_digit_dollar(s: &[u8], seq: &CfpmSeq) -> Option<u64> {
+    let text = &s[seq.start..seq.end];
+    let mut max_val: Option<u64> = None;
+    let mut i = 0;
+    while i < text.len() {
+        if text[i].is_ascii_digit() {
+            let start = i;
+            while i < text.len() && text[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < text.len() && text[i] == b'$' {
+                if let Ok(v) = std::str::from_utf8(&text[start..i]).unwrap_or("").parse::<u64>() {
+                    max_val = Some(max_val.map_or(v, |m| m.max(v)));
+                }
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    max_val
+}
+
+/// `FormatSequence#arity`: `@source.scan('*').count + 1`.
+fn cfpm_seq_arity(s: &[u8], seq: &CfpmSeq) -> i64 {
+    s[seq.start..seq.end].iter().filter(|&&b| b == b'*').count() as i64 + 1
+}
+
+fn cfpm_is_str_or_dstr(node: &ruby_prism::Node) -> bool {
+    node.as_string_node().is_some() || node.as_interpolated_string_node().is_some()
+}
+
+fn cfpm_is_const(node: &ruby_prism::Node) -> bool {
+    node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some()
+}
+
+fn cfpm_is_kernel_receiver(node: &ruby_prism::Node) -> bool {
+    if let Some(c) = node.as_constant_read_node() {
+        return c.name().as_slice() == b"Kernel";
+    }
+    if let Some(c) = node.as_constant_path_node() {
+        return c.name().is_some_and(|n| n.as_slice() == b"Kernel");
+    }
+    false
+}
+
+fn cfpm_first_argument<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    call.arguments().and_then(|a| a.arguments().iter().next())
+}
+
+/// `called_on_string?`: `{(send {nil? const_type?} _ {str dstr} ...) (send
+/// {str dstr} ...)}` — either the receiver is absent/a constant and the
+/// FIRST ARGUMENT is a string, or the receiver itself is a string.
+fn cfpm_called_on_string(call: &ruby_prism::CallNode) -> bool {
+    let first_is_str = cfpm_first_argument(call).is_some_and(|n| cfpm_is_str_or_dstr(&n));
+    match call.receiver() {
+        None => first_is_str,
+        Some(r) => {
+            if cfpm_is_const(&r) {
+                first_is_str
+            } else {
+                cfpm_is_str_or_dstr(&r)
+            }
+        }
+    }
+}
+
+/// `format_method?`: shared by `format?`/`sprintf?`.
+fn cfpm_format_method_named(call: &ruby_prism::CallNode, name: &[u8]) -> bool {
+    if let Some(r) = call.receiver() {
+        if cfpm_is_const(&r) && !cfpm_is_kernel_receiver(&r) {
+            return false;
+        }
+    }
+    if call.name().as_slice() != name {
+        return false;
+    }
+    let Some(args) = call.arguments() else { return false };
+    let list = args.arguments();
+    if list.iter().count() <= 1 {
+        return false;
+    }
+    let first = list.iter().next().unwrap();
+    cfpm_is_str_or_dstr(&first)
+}
+
+fn cfpm_is_format(call: &ruby_prism::CallNode) -> bool {
+    cfpm_format_method_named(call, b"format")
+}
+
+fn cfpm_is_sprintf(call: &ruby_prism::CallNode) -> bool {
+    cfpm_format_method_named(call, b"sprintf")
+}
+
+/// `heredoc?(node)`: `node.first_argument.source[0, 2] == '<<'` — a plain
+/// string/dstr checks its OPENING token (never `<<` unless it's a real
+/// heredoc); any other node type falls back to its raw source slice (never
+/// heredoc-shaped either, so this is just a defensive fallback).
+fn cfpm_starts_with_shovel(node: &ruby_prism::Node) -> bool {
+    if let Some(s) = node.as_string_node() {
+        return s.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<"));
+    }
+    if let Some(d) = node.as_interpolated_string_node() {
+        return d.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<"));
+    }
+    node.location().as_slice().starts_with(b"<<")
+}
+
+/// `percent?`.
+fn cfpm_is_percent(call: &ruby_prism::CallNode) -> bool {
+    if call.name().as_slice() != b"%" {
+        return false;
+    }
+    let recv = call.receiver();
+    let recv_is_str = recv.as_ref().is_some_and(cfpm_is_str_or_dstr);
+    let first_arg_is_array = cfpm_first_argument(call).is_some_and(|n| n.as_array_node().is_some());
+    if !(recv_is_str || first_arg_is_array) {
+        return false;
+    }
+    if recv_is_str {
+        if let Some(first) = cfpm_first_argument(call) {
+            if cfpm_starts_with_shovel(&first) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn cfpm_method_with_format_args(call: &ruby_prism::CallNode) -> bool {
+    cfpm_is_sprintf(call) || cfpm_is_format(call) || cfpm_is_percent(call)
+}
+
+fn cfpm_format_string_applicable(call: &ruby_prism::CallNode) -> bool {
+    cfpm_called_on_string(call) && cfpm_method_with_format_args(call)
+}
+
+/// `countable_format?`.
+fn cfpm_countable_format(call: &ruby_prism::CallNode) -> bool {
+    (cfpm_is_sprintf(call) || cfpm_is_format(call))
+        && !cfpm_first_argument(call).is_some_and(|n| cfpm_starts_with_shovel(&n))
+}
+
+/// `countable_percent?`.
+fn cfpm_countable_percent(call: &ruby_prism::CallNode) -> bool {
+    cfpm_is_percent(call) && cfpm_first_argument(call).is_some_and(|n| n.as_array_node().is_some())
+}
+
+/// `expected_fields_count`.
+fn cfpm_expected_fields_count(node: &ruby_prism::Node) -> Option<i64> {
+    if !cfpm_is_str_or_dstr(node) {
+        return None;
+    }
+    let src = node.location().as_slice();
+    let seqs = cfpm_scan_sequences(src);
+    if seqs.iter().any(|q| q.has_name) {
+        return Some(1);
+    }
+    if let Some(m) = seqs.iter().filter_map(|q| cfpm_seq_max_digit_dollar(src, q)).max() {
+        if m != 0 {
+            return Some(m as i64);
+        }
+    }
+    Some(seqs.iter().filter(|q| !q.is_percent).map(|q| cfpm_seq_arity(src, q)).sum())
+}
+
+/// `mixed_formats?` (via `FormatString#valid?`/`invalid_format_string?`).
+fn cfpm_mixed_formats(src: &[u8], seqs: &[CfpmSeq]) -> bool {
+    let mut kinds: Vec<u8> = Vec::new();
+    for seq in seqs.iter().filter(|q| !q.is_percent) {
+        let kind = if seq.has_name {
+            0u8
+        } else if cfpm_seq_max_digit_dollar(src, seq).is_some() {
+            1u8
+        } else {
+            2u8
+        };
+        kinds.push(kind);
+    }
+    kinds.sort_unstable();
+    kinds.dedup();
+    kinds.len() > 1
+}
+
+/// `count_matches` — `(num_of_format_args, num_of_expected_fields)`, `None`
+/// standing in for Ruby's `:unknown`.
+fn cfpm_count_matches(call: &ruby_prism::CallNode) -> (Option<i64>, Option<i64>) {
+    if cfpm_countable_format(call) {
+        let args = call.arguments().expect("countable_format implies arguments");
+        let list = args.arguments();
+        let n = list.iter().count() as i64;
+        let first = list.iter().next().expect("countable_format implies a first argument");
+        (Some(n - 1), cfpm_expected_fields_count(&first))
+    } else if cfpm_countable_percent(call) {
+        let first = cfpm_first_argument(call).expect("countable_percent implies a first argument");
+        let arr = first.as_array_node().expect("countable_percent implies an array first argument");
+        let n = arr.elements().iter().count() as i64;
+        let expected = call.receiver().as_ref().and_then(cfpm_expected_fields_count);
+        (Some(n), expected)
+    } else {
+        (None, None)
+    }
+}
+
+/// `splat_args?` — only applies to `format`/`sprintf` (the `%` operator's
+/// own array literal is scanned as-is, splats included, by
+/// `count_percent_matches`).
+fn cfpm_splat_args(call: &ruby_prism::CallNode) -> bool {
+    if cfpm_is_percent(call) {
+        return false;
+    }
+    let Some(args) = call.arguments() else { return false };
+    args.arguments().iter().skip(1).any(|a| a.as_splat_node().is_some())
+}
+
+/// `matched_arguments_count?`.
+fn cfpm_matched_arguments_count(expected: i64, passed: i64) -> bool {
+    if passed.is_negative() {
+        expected < passed.abs()
+    } else {
+        expected != passed
+    }
+}
+
+/// `offending_node?`.
+fn cfpm_offending_node(call: &ruby_prism::CallNode) -> bool {
+    if cfpm_splat_args(call) {
+        return false;
+    }
+    let (num_args_opt, num_fields_opt) = cfpm_count_matches(call);
+    let Some(num_args) = num_args_opt else { return false };
+    let num_fields = num_fields_opt.unwrap_or(0);
+    if num_fields == 0 {
+        if let Some(first) = cfpm_first_argument(call) {
+            if first.as_interpolated_string_node().is_some() || first.as_array_node().is_some() {
+                return false;
+            }
+        }
+    }
+    cfpm_matched_arguments_count(num_fields, num_args)
+}
+
+/// `message`.
+fn cfpm_message_text(call: &ruby_prism::CallNode) -> String {
+    let (num_args, num_fields) = cfpm_count_matches(call);
+    let method_name = if call.name().as_slice() == b"%" {
+        "String#%".to_string()
+    } else {
+        String::from_utf8_lossy(call.name().as_slice()).into_owned()
+    };
+    format!(
+        "Number of arguments ({}) to `{}` doesn't match the number of fields ({}).",
+        num_args.unwrap_or(0),
+        method_name,
+        num_fields.unwrap_or(0)
+    )
+}
+
+impl<'a> Cops<'a> {
+    /// Lint/FormatParameterMismatch: `format`/`sprintf`/`String#%` where the
+    /// number of passed arguments doesn't match the format string's field
+    /// count — or where the format string itself mixes numbered, named and
+    /// unnumbered sequences. No autocorrector.
+    pub(crate) fn check_format_parameter_mismatch(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/FormatParameterMismatch";
+        if !self.on(COP) {
+            return;
+        }
+        // `on_send` never fires for `csend` (`&.`) unless a cop aliases
+        // `on_csend`, which this one doesn't.
+        if node.is_safe_navigation() {
+            return;
+        }
+        if !cfpm_format_string_applicable(node) {
+            return;
+        }
+        let Some(sel) = node.message_loc() else { return };
+
+        let format_node = if cfpm_is_percent(node) {
+            node.receiver().expect("percent? implies a receiver")
+        } else {
+            cfpm_first_argument(node).expect("format?/sprintf? implies a first argument")
+        };
+        let src = format_node.location().as_slice();
+        let seqs = cfpm_scan_sequences(src);
+        if cfpm_mixed_formats(src, &seqs) {
+            self.push(
+                sel.start_offset(),
+                COP,
+                false,
+                "Format string is invalid because formatting sequence types (numbered, named or unnumbered) are mixed.",
+            );
+            return;
+        }
+
+        if !cfpm_offending_node(node) {
+            return;
+        }
+        self.push(sel.start_offset(), COP, false, cfpm_message_text(node));
+    }
+}
