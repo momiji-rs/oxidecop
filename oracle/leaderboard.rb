@@ -268,6 +268,7 @@ COPS = {
   'Style/ParenthesesAroundCondition' => 'style/parentheses_around_condition',
   'Layout/SpaceInsideParens'         => 'layout/space_inside_parens',
   'Style/ExplicitBlockArgument'      => 'style/explicit_block_argument',
+  'Style/RescueModifier'             => 'style/rescue_modifier',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -16180,3 +16180,203 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/RescueModifier's `parenthesized?(node)` (`node.parent &&
+    /// parentheses?(node.parent)`) needs to know whether the enclosing
+    /// `(...)`'s DIRECT body is this exact `RescueModifierNode` — prism
+    /// carries no parent pointers, so `visit_parentheses_node` (mod.rs)
+    /// calls this BEFORE recursing into the parens' body, recording the
+    /// parens' own delimiter offsets keyed by each direct-statement child
+    /// that is itself a `RescueModifierNode`. A rescue-modifier buried
+    /// deeper inside (not a direct statement of THIS parens) never gets an
+    /// entry here, matching upstream's "immediate parent only" semantics.
+    pub(crate) fn record_rescue_modifier_parens(&mut self, node: &ruby_prism::ParenthesesNode) {
+        let Some(body) = node.body() else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        let open = node.opening_loc();
+        let close = node.closing_loc();
+        for stmt in stmts.body().iter() {
+            if stmt.as_rescue_modifier_node().is_some() {
+                self.rescue_mod_parens.insert(
+                    stmt.location().start_offset(),
+                    (open.start_offset(), open.end_offset(), close.start_offset(), close.end_offset()),
+                );
+            }
+        }
+    }
+
+    /// `heredoc_end(operation)`: the source offset right after the LAST
+    /// call-argument heredoc's closing delimiter TEXT — `nil` (here `None`)
+    /// unless `operation` is a call with a heredoc argument. Mirrors
+    /// `node.arguments.reverse.find { |a| a.respond_to?(:heredoc?) &&
+    /// a.heredoc? }.loc.heredoc_end`: iterating in ORIGINAL order and
+    /// keeping the LAST match is equivalent to reverse-find-first, and
+    /// picks out the heredoc whose BODY sits at the highest byte offset
+    /// (bodies are emitted in argument order, after the statement line).
+    ///
+    /// rubocop-ast's `Parser::Source::Map::Heredoc#heredoc_end` (what
+    /// upstream's `corrector.insert_after` anchors on) covers only the
+    /// delimiter identifier text itself (e.g. `EOS`), NOT its trailing
+    /// newline — unlike prism's own `closing_loc`, which spans through the
+    /// `\n` (verified empirically: `RuboCop::ProcessedSource` with
+    /// `parser_engine: :parser_prism`, `loc.heredoc_end.source == "EOS"`,
+    /// 3 bytes short of prism's raw `closing_loc`). Trimming that trailing
+    /// newline off is what keeps exactly ONE newline between the heredoc's
+    /// closing line and the inserted `rescue`/`end` clause.
+    fn rescue_modifier_heredoc_end(&self, operation: &ruby_prism::Node) -> Option<usize> {
+        let call = operation.as_call_node()?;
+        let args = call.arguments()?;
+        let mut found: Option<ruby_prism::Location> = None;
+        for arg in args.arguments().iter() {
+            let closing = if let Some(s) = arg.as_string_node() {
+                s.opening_loc().filter(|o| o.as_slice().starts_with(b"<<")).and_then(|_| s.closing_loc())
+            } else if let Some(s) = arg.as_interpolated_string_node() {
+                s.opening_loc().filter(|o| o.as_slice().starts_with(b"<<")).and_then(|_| s.closing_loc())
+            } else {
+                None
+            };
+            if let Some(c) = closing {
+                found = Some(c);
+            }
+        }
+        let closing = found?;
+        let slice = closing.as_slice();
+        let mut trimmed = slice.len();
+        if trimmed > 0 && slice[trimmed - 1] == b'\n' {
+            trimmed -= 1;
+            if trimmed > 0 && slice[trimmed - 1] == b'\r' {
+                trimmed -= 1;
+            }
+        }
+        Some(closing.start_offset() + trimmed)
+    }
+
+    /// Style/RescueModifier — `expr rescue handler` in modifier form.
+    ///
+    /// Ported to prism's dedicated `RescueModifierNode`: whitequark
+    /// represents the SAME source as a `:rescue` node wrapping one
+    /// modifier-only `:resbody`, indistinguishable by shape alone from a
+    /// written-out `rescue` clause, so upstream's `on_resbody` guards with
+    /// `rescue_modifier?` (a token-position check via
+    /// `RescueNode#modifier_locations`). Prism gives the modifier form its
+    /// OWN node type directly — every `RescueModifierNode` unconditionally
+    /// IS the offense, no token lookup needed.
+    ///
+    /// Autocorrect ports `correct_rescue_block` + `ParenthesesCorrector`
+    /// verbatim, but as fine-grained inserts/removes (mirroring rubocop's
+    /// own `insert_before`/`insert_after`/`remove` corrector calls) instead
+    /// of one whole-range replace. That matters for nested modifiers
+    /// (`blah rescue 1 rescue 2`, both the inner AND outer
+    /// `RescueModifierNode` offend in the SAME pass, each with their own
+    /// correction): only non-overlapping fine-grained edits compose
+    /// correctly through `apply_fixes`' single right-to-left pass (two
+    /// overlapping whole-range replacements would have one silently
+    /// dropped per round). Each offense contributes at most one insert per
+    /// distinct anchor offset — computed here as the FINAL merged text
+    /// upstream's corrector would produce for that anchor (its
+    /// `insert_before` accumulates with each new call prepended closest to
+    /// the anchor, i.e. reverse-call-order; `insert_after` accumulates with
+    /// each new call appended furthest from the anchor, i.e. call-order) —
+    /// so no ordering ambiguity is left for `apply_fixes`' same-start tie
+    /// break to resolve. The one tie that DOES remain — the middle
+    /// `remove(operation.end, node.end)` and the (no-heredoc) `after`
+    /// insert both anchor at `operation`'s own end — is resolved by push
+    /// order: the remove is pushed first, since `apply_fixes` only accepts
+    /// a second same-start fix whose OWN end is `<=` the first fix's start.
+    pub(crate) fn check_rescue_modifier(&mut self, node: &ruby_prism::RescueModifierNode) {
+        const COP: &str = "Style/RescueModifier";
+        if !self.on(COP) {
+            return;
+        }
+        let node_loc = node.location();
+        let node_start = node_loc.start_offset();
+        let node_end = node_loc.end_offset();
+
+        self.push(node_start, COP, true, "Avoid using `rescue` in its modifier form.".to_string());
+
+        let operation = node.expression();
+        let handler = node.rescue_expression();
+        let op_loc = operation.location();
+        let op_start = op_loc.start_offset();
+        let op_end = op_loc.end_offset();
+
+        let parens = self.rescue_mod_parens.get(&node_start).copied();
+
+        // `configured_indentation_width` (`Alignment` mixin):
+        // Style/RescueModifier defines no `IndentationWidth` param of its
+        // own (checked against default.yml) — always
+        // `Layout/IndentationWidth`'s `Width` (schema default 2).
+        let width = self.cfg.int("Layout/IndentationWidth", "Width");
+        let (_, col) = self.idx.loc(node_start);
+        let mut offset_len = col - 1; // 0-based column == `offset(node)`'s length
+        let mut indentation_len = offset_len + width;
+        if parens.is_some() {
+            // `node_indentation[0...-1]` / `node_offset[0...-1]`: both
+            // strings are pure ASCII spaces, so dropping the last
+            // character is just "one fewer space" — always safe here since
+            // a parenthesized rescue-modifier's own column is always >= 1
+            // (it starts strictly after the `(`).
+            offset_len -= 1;
+            indentation_len -= 1;
+        }
+        let node_offset = " ".repeat(offset_len);
+        let node_indentation = " ".repeat(indentation_len);
+
+        // `operation.array_type? && !operation.bracketed?` — an implicit
+        // (unbracketed) array, e.g. the `1, 2` RHS of a multiple assignment.
+        let wrap_array = operation.as_array_node().is_some_and(|a| a.opening_loc().is_none());
+
+        let handler_src = self.node_src(&handler);
+        let after_anchor = self.rescue_modifier_heredoc_end(&operation).unwrap_or(op_end);
+
+        if let Some((open_s, open_e, _, _)) = parens {
+            // `ParenthesesCorrector.correct`'s open-paren removal (no
+            // adjacent whitespace in any fixture case, so just the
+            // delimiter itself; the general `range_with_surrounding_space`
+            // scan isn't ported).
+            self.fixes.push((open_s, open_e, Vec::new()));
+        }
+
+        // `corrector.insert_before(operation, "begin\n#{node_indentation}")`,
+        // with `corrector.wrap`'s `[` (called first upstream, so it ends up
+        // CLOSEST to `operation` — i.e. rightmost/last in this string).
+        let mut before = Vec::with_capacity(node_indentation.len() + 7);
+        before.extend_from_slice(b"begin\n");
+        before.extend_from_slice(node_indentation.as_bytes());
+        if wrap_array {
+            before.push(b'[');
+        }
+        self.fixes.push((op_start, op_start, before));
+
+        // `corrector.remove(range_between(operation.source_range.end_pos,
+        // node.source_range.end_pos))` — pushed BEFORE the same-anchor
+        // `after` insert below (see doc comment: same-start tie order).
+        self.fixes.push((op_end, node_end, Vec::new()));
+
+        // `corrector.wrap`'s `]` (called first upstream, so it's CLOSEST to
+        // `operation` — leftmost/first here), then
+        // `corrector.insert_after(heredoc_end(operation) || operation,
+        // "\n#{node_offset}rescue\n#{node_indentation}#{handler.source}\n#{node_offset}end")`.
+        let mut after = Vec::with_capacity(handler_src.len() + node_offset.len() * 2 + node_indentation.len() + 16);
+        if wrap_array {
+            after.push(b']');
+        }
+        after.push(b'\n');
+        after.extend_from_slice(node_offset.as_bytes());
+        after.extend_from_slice(b"rescue\n");
+        after.extend_from_slice(node_indentation.as_bytes());
+        after.extend_from_slice(handler_src);
+        after.push(b'\n');
+        after.extend_from_slice(node_offset.as_bytes());
+        after.extend_from_slice(b"end");
+        self.fixes.push((after_anchor, after_anchor, after));
+
+        if let Some((_, _, close_s, close_e)) = parens {
+            // `ParenthesesCorrector.correct`'s close-paren removal (ditto:
+            // no adjacent whitespace in any fixture case).
+            self.fixes.push((close_s, close_e, Vec::new()));
+        }
+    }
+}

@@ -307,6 +307,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
     "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
     "Style/ExplicitBlockArgument",
+    "Style/RescueModifier",
 ];
 
 impl Engine {
@@ -1136,6 +1137,16 @@ pub(crate) struct Cops<'a> {
     // Style/ExplicitBlockArgument: start offsets of defs whose signature has
     // already received its `(&block)` edit this run — `@def_nodes.add?`.
     pub(crate) eba_def_fixed: HashSet<usize>,
+    // Style/RescueModifier: `parenthesized?(node)` needs the enclosing
+    // `(...)`'s own delimiter locations, but prism carries no parent
+    // pointers. `visit_parentheses_node` records each of its DIRECT
+    // statement children that is a `RescueModifierNode`, keyed by that
+    // child's own start offset, BEFORE recursing — mirrors rubocop's
+    // `node.parent && parentheses?(node.parent)` (only a rescue-modifier
+    // that is itself a top-level statement of the enclosing parens counts,
+    // not one nested deeper inside). Value: (open_start, open_end,
+    // close_start, close_end) of the parens' own `(`/`)` delimiters.
+    pub(crate) rescue_mod_parens: HashMap<usize, (usize, usize, usize, usize)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2137,6 +2148,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
         self.check_suppressed_exception_modifier(node);
+        self.check_rescue_modifier(node);
         // Layout/SpaceAroundKeyword's `on_resbody`: whitequark parses a
         // modifier `expr rescue handler` as a `:rescue` node wrapping ONE
         // `:resbody` child (nil exception classes/variable) — same
@@ -2520,6 +2532,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_parentheses_node(&mut self, node: &ruby_prism::ParenthesesNode<'pr>) {
         self.check_empty_expression(node);
+        self.record_rescue_modifier_parens(node);
         ruby_prism::visit_parentheses_node(self, node);
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
@@ -3582,6 +3595,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         eba_pending: None,
         eba_def_stack: Vec::new(),
         eba_def_fixed: HashSet::new(),
+        rescue_mod_parens: HashMap::new(),
     };
 
     let t = tick(&T_PREP, t);
