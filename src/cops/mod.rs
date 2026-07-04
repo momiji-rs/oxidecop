@@ -625,6 +625,11 @@ pub(crate) struct Cops<'a> {
     // node, not necessarily the strict AST parent if a non-array node sits
     // between them — not exercised by the fixture.)
     pub(crate) wa_matrix_stack: Vec<bool>,
+    // PercentArray#invalid_percent_array_context?: start offsets of array
+    // literals that are arguments of an UNPARENTHESIZED call carrying a
+    // literal block (`foo ["a", "b"] do ... end`) — converting to %w/%i
+    // there is ambiguous, so the brackets->percent direction never offends.
+    pub(crate) pa_invalid_ctx: HashSet<usize>,
     // Inner `File.dirname` calls claimed by an outer chain (NestedFileDirname).
     pub(crate) dirname_ignore: Vec<usize>,
     // Innermost statement-list span starts — Lint/DuplicateRequire scopes by it.
@@ -3369,6 +3374,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_or_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // PercentArray#invalid_percent_array_context?: mark array-literal
+        // arguments of an unparenthesized call with a literal block BEFORE
+        // descending — see `pa_invalid_ctx`'s doc.
+        if node.opening_loc().is_none()
+            && node.block().is_some_and(|b| b.as_block_node().is_some())
+        {
+            if let Some(args) = node.arguments() {
+                for a in args.arguments().iter() {
+                    if a.as_array_node().is_some() {
+                        self.pa_invalid_ctx.insert(a.location().start_offset());
+                    }
+                }
+            }
+        }
         // Layout/SpaceAroundKeyword's `on_send`: `prefix_not?` — a `not x`
         // call (name `!`, but SPELLED `not`, distinct from `!x`'s bare `!`
         // selector, which this cop never checks).
@@ -3906,6 +3925,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         percent_sym_spans: Vec::new(),
         percent_arr_spans: Vec::new(),
         wa_matrix_stack: Vec::new(),
+        pa_invalid_ctx: HashSet::new(),
         dirname_ignore: Vec::new(),
         stmts_stack: Vec::new(),
         unless_else_spans: Vec::new(),

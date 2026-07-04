@@ -2278,6 +2278,30 @@ impl<'i> MlHeredocEndScanner<'i> {
         if node.as_block_node().is_some() {
             return;
         }
+        // An `elsif` IfNode (and an ElseNode) in prism spans through the
+        // chain's SHARED `end` keyword; the whitequark counterparts stop at
+        // their branch content. Skip them — their children (predicate,
+        // statements, deeper elsifs) are visited normally and cover exactly
+        // the whitequark extent. A standalone `if` still records its own
+        // span (whitequark includes its `end` there too).
+        if node
+            .as_if_node()
+            .is_some_and(|n| n.if_keyword_loc().is_some_and(|k| k.as_slice() == b"elsif"))
+            || node.as_else_node().is_some()
+        {
+            return;
+        }
+        // Same trap as def-with-rescue: prism's implicit BeginNode spans
+        // through the OWNING construct's `end` keyword; whitequark's
+        // rescue/ensure wrappers stop at their content. Record the content
+        // end instead (children still visited normally).
+        if let Some(b) = node.as_begin_node() {
+            let line = self.idx.loc(ml_begin_node_content_end(&b).saturating_sub(1)).0;
+            if line > self.max_line {
+                self.max_line = line;
+            }
+            return;
+        }
         let line = if super::breakable::is_heredoc_node(node) {
             let closing = if let Some(n) = node.as_string_node() {
                 n.closing_loc()

@@ -17862,6 +17862,9 @@ impl<'a> super::Cops<'a> {
             if sa_complex_content(&elements, self.src) {
                 return;
             }
+            if self.pa_invalid_ctx.contains(&node.location().start_offset()) {
+                return; // invalid_percent_array_context?
+            }
             self.check_symbol_array_bracketed(node, &elements, COP);
         } else if opening.as_ref().is_some_and(|o| {
             let s = o.as_slice();
@@ -19899,6 +19902,9 @@ impl<'a> super::Cops<'a> {
             }
             if self.wa_matrix_stack.last() == Some(&true) {
                 return;
+            }
+            if self.pa_invalid_ctx.contains(&node.location().start_offset()) {
+                return; // invalid_percent_array_context?
             }
             self.check_word_array_bracketed(node, &elements, COP);
         } else if opening.as_ref().is_some_and(|o| {
