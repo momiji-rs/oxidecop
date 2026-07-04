@@ -309,7 +309,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/ExplicitBlockArgument",
     "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
     "Style/MethodCallWithoutArgsParentheses", "Style/Alias", "Style/RaiseArgs", "Style/MethodDefParentheses",
-    "Lint/SafeNavigationConsistency",
+    "Lint/SafeNavigationConsistency", "Style/HashTransformKeys",
 ];
 
 impl Engine {
@@ -3241,6 +3241,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_self_assignment_call(node);
         self.check_each_with_object_argument(node);
         self.check_each_with_object(node);
+        self.check_hash_transform_keys(node);
         self.check_trailing_comma_in_attribute_declaration(node);
         self.check_class_variable_set(node);
         self.check_hash_compare_by_identity(node);

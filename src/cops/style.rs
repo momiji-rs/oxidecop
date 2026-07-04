@@ -17327,3 +17327,496 @@ fn md_forced_parentheses(node: &ruby_prism::DefNode) -> bool {
     }
     false
 }
+
+
+/// Style/HashTransformKeys — port of rubocop's shared `HashTransformMethod`
+/// mixin (see `hash_transform_method.rb` + `hash_transform_method/
+/// autocorrection.rb`), specialized for the KEY role. Detects 4 syntactic
+/// shapes that are really just `hash.transform_keys { |k| ... }` in
+/// disguise:
+///   1. `recv.each_with_object({}) { |(k, v), h| h[KEY_EXPR] = v }`
+///   2. `Hash[recv.map { |k, v| [KEY_EXPR, v] }]` (or `.collect`)
+///   3. `recv.map { |k, v| [KEY_EXPR, v] }.to_h`   (or `.collect`)
+///   4. `recv.to_h { |k, v| [KEY_EXPR, v] }`
+/// `recv` must satisfy `hash_receiver?` (`htk_hash_receiver` below) — a
+/// literal hash, or one of a fixed list of hash-producing method names.
+///
+/// `minimum_target_ruby_version 2.5` gates the WHOLE cop (transform_keys is
+/// 2.5+); shape 4 (`to_h` with a block) has an ADDITIONAL `target_ruby_version
+/// < 2.6` guard inside upstream's `on_block` (to_h-with-block itself is a
+/// 2.6+ construct) that shapes 1-3 don't share.
+///
+/// Prism folds a call's trailing block into the SAME `CallNode` (via
+/// `.block()`), unlike whitequark's separate wrapping `:block` node — so all
+/// 4 shapes are examined from one `visit_call_node` hook instead of splitting
+/// across `on_send`/`on_csend`/`on_block` like upstream.
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_hash_transform_keys<'pr>(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        const COP: &str = "Style/HashTransformKeys";
+        if !self.on(COP) || self.cfg.target_ruby() < 2.5 {
+            return;
+        }
+        let name = node.name();
+        // Shape 1: `recv.each_with_object({}) { ... }` — mutually exclusive
+        // with every other shape by name, safe to return unconditionally.
+        if name.as_slice() == b"each_with_object" {
+            if let Some(block) = node.block().and_then(|b| b.as_block_node()) {
+                if let Some(recv) = node.receiver() {
+                    if htk_hash_receiver(&recv) {
+                        if let Some(m) = htk_match_each_with_object(node, &block) {
+                            self.htk_finish(node, "each_with_object", &m, node, HtkStrip::None);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        // Shape 2: `Hash[recv.map { ... }]`.
+        if name.as_slice() == b"[]" && !node.is_safe_navigation() {
+            if let Some(recv) = node.receiver() {
+                if recv.as_constant_read_node().is_some_and(|c| c.name().as_slice() == b"Hash") {
+                    if let Some(args) = node.arguments() {
+                        let arglist: Vec<_> = args.arguments().iter().collect();
+                        if arglist.len() == 1 {
+                            if let Some(inner) = arglist[0].as_call_node() {
+                                if matches!(inner.name().as_slice(), b"map" | b"collect") {
+                                    if let Some(iblock) = inner.block().and_then(|b| b.as_block_node()) {
+                                        if let Some(irecv) = inner.receiver() {
+                                            if htk_hash_receiver(&irecv) {
+                                                if let Some(m) = htk_match_array_block(&iblock) {
+                                                    self.htk_finish(
+                                                        node,
+                                                        "Hash[_.map {...}]",
+                                                        &m,
+                                                        &inner,
+                                                        HtkStrip::HashBrackets(node.as_node().as_call_node().unwrap()),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        // `to_h` covers shapes 3 and 4, tried independently: a `to_h` call is
+        // visited as ONE `CallNode` in prism regardless of whether it ALSO
+        // carries its own trailing block (unlike whitequark, which visits
+        // the call-minus-block and the enclosing block-with-that-call as two
+        // separate nodes) — so a `map {...}.to_h {...}` chain (shape 3, the
+        // dangling blockless `.to_h` in text, matched structurally via its
+        // RECEIVER being a map/collect block) must still be tried even when
+        // THIS call also has its own attached block (which only shape 4, a
+        // hash-receiver `.to_h { ... }`, cares about). They're mutually
+        // exclusive by receiver shape (map/collect names never satisfy
+        // `hash_receiver?`), so trying both is safe.
+        if name.as_slice() != b"to_h" {
+            return;
+        }
+        // Shape 3: `recv.map { ... }.to_h` (or `.collect`).
+        if let Some(recv) = node.receiver() {
+            if let Some(inner) = recv.as_call_node() {
+                if matches!(inner.name().as_slice(), b"map" | b"collect") {
+                    if let Some(iblock) = inner.block().and_then(|b| b.as_block_node()) {
+                        if let Some(irecv) = inner.receiver() {
+                            if htk_hash_receiver(&irecv) {
+                                if let Some(m) = htk_match_array_block(&iblock) {
+                                    self.htk_finish(
+                                        node,
+                                        "map {...}.to_h",
+                                        &m,
+                                        &inner,
+                                        HtkStrip::DanglingToH(node.as_node().as_call_node().unwrap()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Shape 4: `recv.to_h { |k, v| [KEY_EXPR, v] }` — 2.6+ only.
+        if self.cfg.target_ruby() >= 2.6 {
+            if let Some(block) = node.block().and_then(|b| b.as_block_node()) {
+                if let Some(recv) = node.receiver() {
+                    if htk_hash_receiver(&recv) {
+                        if let Some(m) = htk_match_array_block(&block) {
+                            self.htk_finish(node, "to_h {...}", &m, node, HtkStrip::None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Common tail: the 3 semantic heuristics from `HashTransformMethod`
+    /// (`noop_transformation?`, `transformation_uses_both_args?`,
+    /// `use_transformed_argname?`), then the offense + 5 autocorrect edits.
+    ///
+    /// `anchor_node` gives the offense's start offset (rubocop's `add_offense
+    /// (node)` — same start across all 4 shapes: the receiver-chain start,
+    /// since a receiver is always embedded as the first byte of its owner).
+    /// `rename_call` is the call whose OWN selector/args/block get rewritten
+    /// into `transform_keys {...}` (shapes 1/4: `anchor_node` itself; shapes
+    /// 2/3: the inner `map`/`collect` call). `strip` describes any leading/
+    /// trailing text that gets stripped away — mirrors upstream's
+    /// `Autocorrection#strip_prefix_and_suffix` operating on upstream's
+    /// matched top-level node (`Hash[...]`'s own brackets, or the dangling
+    /// `.to_h` after a blockless `map{}.to_h` chain).
+    fn htk_finish<'pr>(
+        &mut self,
+        anchor_node: &ruby_prism::CallNode<'pr>,
+        match_desc: &str,
+        m: &HtkMatch<'pr>,
+        rename_call: &ruby_prism::CallNode<'pr>,
+        strip: HtkStrip<'pr>,
+    ) {
+        const COP: &str = "Style/HashTransformKeys";
+        // noop_transformation?: key expr IS the key arg, unchanged — most
+        // likely a false positive (receiver isn't really a hash).
+        if htk_is_bare_lvar_named(&m.key_body_expr, &m.key_argname) {
+            return;
+        }
+        let Some(val_lvar) = m.val_body_expr.as_local_variable_read_node() else { return };
+        let val_name = val_lvar.name().as_slice().to_vec();
+        // transformation_uses_both_args?: the key transform also reads the
+        // value — can't `transform_keys` without losing that.
+        if htk_contains_lvar_named(&m.key_body_expr, &val_name, false) {
+            return;
+        }
+        // use_transformed_argname?: the key transform must actually use the
+        // key argument somewhere, or there's nothing to represent as
+        // `transform_keys { |k| ... }`.
+        if !htk_contains_lvar_named(&m.key_body_expr, &m.key_argname, false) {
+            return;
+        }
+
+        let start = anchor_node.location().start_offset();
+        self.push(start, COP, true, format!("Prefer `transform_keys` over `{match_desc}`."));
+
+        // strip_prefix_and_suffix: only shapes 2 (`Hash[...]` brackets) and 3
+        // (a dangling blockless `.to_h`) need this; shapes 1/4 pass
+        // `HtkStrip::None` (leading=trailing=0 upstream).
+        match strip {
+            HtkStrip::None => {}
+            HtkStrip::HashBrackets(hash_call) => {
+                // `Hash[` prefix + `]` suffix.
+                if let Some(opening) = hash_call.opening_loc() {
+                    self.fixes.push((hash_call.location().start_offset(), opening.end_offset(), Vec::new()));
+                }
+                if let Some(closing) = hash_call.closing_loc() {
+                    self.fixes.push((closing.start_offset(), closing.end_offset(), Vec::new()));
+                }
+            }
+            HtkStrip::DanglingToH(to_h_call) => {
+                // Strip the dangling `.to_h` after the map/collect block,
+                // UNLESS this `.to_h` carries its own trailing block (then it
+                // stays untouched, chained after the new `transform_keys`).
+                if to_h_call.block().is_none() {
+                    if let Some(recv) = to_h_call.receiver() {
+                        let map_end = recv.location().end_offset();
+                        let to_h_end = to_h_call.location().end_offset();
+                        if to_h_end > map_end {
+                            self.fixes.push((map_end, to_h_end, Vec::new()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // set_new_method_name: rename the selector (+ its own arg-parens, if
+        // any — only `each_with_object({})` has those) to `transform_keys`.
+        let sel = rename_call.message_loc().unwrap_or_else(|| rename_call.location());
+        let name_end = match rename_call.closing_loc() {
+            Some(c) => c.end_offset(),
+            None => sel.end_offset(),
+        };
+        self.fixes.push((sel.start_offset(), name_end, b"transform_keys".to_vec()));
+
+        // set_new_arg_name: `|k, v|`/`|(k, v), h|` -> `|k|`.
+        if let Some(params) = rename_call.block().and_then(|b| b.as_block_node()).and_then(|b| b.parameters()) {
+            let pl = params.location();
+            let mut rep = Vec::with_capacity(m.key_argname.len() + 2);
+            rep.push(b'|');
+            rep.extend_from_slice(&m.key_argname);
+            rep.push(b'|');
+            self.fixes.push((pl.start_offset(), pl.end_offset(), rep));
+        }
+
+        // set_new_body_expression: replace the whole original body (the
+        // `h[...] = v` assignment, or the `[key, v]` array) with just the key
+        // transform's own source — wrapping bare `key: val` in braces if the
+        // key expr is itself an unbraced hash literal (kwargs-shaped).
+        let (bs, be) = m.body_range;
+        let mut body_src = self.src[m.key_body_expr.location().start_offset()..m.key_body_expr.location().end_offset()]
+            .to_vec();
+        // `hash_type? && !braces?` — prism splits whitequark's single
+        // braces?-distinguished `:hash` type into two node kinds: `HashNode`
+        // is always braced, `KeywordHashNode` never is (see
+        // `check_hash_as_last_array_item`'s doc comment for the same split).
+        if m.key_body_expr.as_keyword_hash_node().is_some() {
+            let mut wrapped = b"{ ".to_vec();
+            wrapped.extend_from_slice(&body_src);
+            wrapped.extend_from_slice(b" }");
+            body_src = wrapped;
+        }
+        self.fixes.push((bs, be, body_src));
+    }
+}
+
+/// What (if anything) `htk_finish` strips from the surrounding text before
+/// renaming the map/collect/each_with_object/to_h call in place — mirrors
+/// upstream's `Autocorrection.from_hash_brackets_map`/`from_map_to_h`
+/// (`from_each_with_object`/`from_to_h` pass `leading: 0, trailing: 0`, i.e.
+/// `HtkStrip::None`).
+enum HtkStrip<'pr> {
+    None,
+    /// Shape 2 — the outer `Hash[...]` call; strips its `Hash[` prefix and
+    /// `]` suffix.
+    HashBrackets(ruby_prism::CallNode<'pr>),
+    /// Shape 3 — the (possibly block-attached) `.to_h` call chained after
+    /// the map/collect block; strips the dangling `.to_h` text UNLESS this
+    /// call carries its own trailing block.
+    DanglingToH(ruby_prism::CallNode<'pr>),
+}
+
+/// Captures common to all 4 `HashTransformMethod` shapes:
+/// `(key_argname, key_body_expr, val_body_expr)` — always a 3-tuple in
+/// upstream's `def_node_matcher`s regardless of which shape matched.
+/// `val_body_expr` is ALWAYS structurally just `(lvar val_argname)` (enforced
+/// by every one of the 4 node patterns), so callers can recover the value
+/// arg's name straight from it instead of threading it through separately.
+struct HtkMatch<'pr> {
+    key_argname: Vec<u8>,
+    key_body_expr: ruby_prism::Node<'pr>,
+    val_body_expr: ruby_prism::Node<'pr>,
+    /// Byte range of the block's own body (the `h[...] = v` call, or the
+    /// `[key, v]` array) — what `set_new_body_expression` replaces wholesale.
+    body_range: (usize, usize),
+}
+
+/// `hash_receiver?` — rubocop identifies a hash receiver as: a literal hash;
+/// a plain (non-safe-nav) send named one of a fixed hash-returning-method
+/// list (any args/block allowed); OR a plain send with a trailing block named
+/// one of another fixed list (STRICTLY no args of its own — upstream's
+/// pattern omits the `...` ellipsis there), which for `each_with_object`
+/// additionally requires its sole argument be a literal empty hash `{}`.
+fn htk_hash_receiver(node: &ruby_prism::Node) -> bool {
+    if node.as_hash_node().is_some() {
+        return true;
+    }
+    let Some(call) = node.as_call_node() else { return false };
+    if call.is_safe_navigation() {
+        return false;
+    }
+    if matches!(
+        call.name().as_slice(),
+        b"to_h" | b"to_hash" | b"merge" | b"merge!" | b"update" | b"invert" | b"except" | b"tally"
+    ) {
+        return true;
+    }
+    let has_block = call.block().and_then(|b| b.as_block_node()).is_some();
+    if !has_block {
+        return false;
+    }
+    let has_args = call.arguments().is_some();
+    match call.name().as_slice() {
+        b"group_by" | b"transform_keys" | b"transform_keys!" | b"transform_values" | b"transform_values!"
+            if !has_args =>
+        {
+            true
+        }
+        b"each_with_object" => call.arguments().is_some_and(|args| {
+            let list: Vec<_> = args.arguments().iter().collect();
+            list.len() == 1 && list[0].as_hash_node().is_some_and(|h| h.elements().iter().count() == 0)
+        }),
+        _ => false,
+    }
+}
+
+/// `on_bad_each_with_object`'s pattern:
+/// ```text
+/// (block
+///   (call #hash_receiver? :each_with_object (hash))
+///   (args (mlhs (arg $_) (arg _val)) (arg _memo))
+///   (call (lvar _memo) :[]= $!`_memo $(lvar _val)))
+/// ```
+/// `call` is the `each_with_object` call itself (receiver already validated
+/// by the caller); `block` is its attached block. The `$!`_memo` clause
+/// compiles (verified live against `RuboCop::AST::NodePattern`) to "the key
+/// expr, self-or-descendant, never yields the raw memo-var name" — ported as
+/// `htk_contains_lvar_named(key_expr, memo_name, true)`, negated.
+fn htk_match_each_with_object<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+    block: &ruby_prism::BlockNode<'pr>,
+) -> Option<HtkMatch<'pr>> {
+    let args = call.arguments()?;
+    let arglist: Vec<_> = args.arguments().iter().collect();
+    if arglist.len() != 1 {
+        return None;
+    }
+    if arglist[0].as_hash_node()?.elements().iter().count() != 0 {
+        return None;
+    }
+
+    let pp = block.parameters()?.as_block_parameters_node()?.parameters()?;
+    if !htk_params_exactly(&pp, 2) {
+        return None;
+    }
+    let reqs: Vec<_> = pp.requireds().iter().collect();
+    let mt = reqs[0].as_multi_target_node()?;
+    if mt.rest().is_some() || mt.rights().iter().count() != 0 {
+        return None;
+    }
+    let lefts: Vec<_> = mt.lefts().iter().collect();
+    if lefts.len() != 2 {
+        return None;
+    }
+    let key_argname = lefts[0].as_required_parameter_node()?.name().as_slice().to_vec();
+    let val_argname = lefts[1].as_required_parameter_node()?.name().as_slice().to_vec();
+    let memo_argname = reqs[1].as_required_parameter_node()?.name().as_slice().to_vec();
+
+    let stmts = block.body()?.as_statements_node()?;
+    let stmt_list: Vec<_> = stmts.body().iter().collect();
+    if stmt_list.len() != 1 {
+        return None;
+    }
+    let assign = stmt_list[0].as_call_node()?;
+    if assign.name().as_slice() != b"[]=" {
+        return None;
+    }
+    let assign_recv = assign.receiver()?;
+    let recv_lvar = assign_recv.as_local_variable_read_node()?;
+    if recv_lvar.name().as_slice() != memo_argname.as_slice() {
+        return None;
+    }
+    let assign_args = assign.arguments()?;
+    let mut aa = assign_args.arguments().iter();
+    let key_expr = aa.next()?;
+    let val_expr = aa.next()?;
+    if aa.next().is_some() {
+        return None;
+    }
+    let val_lvar = val_expr.as_local_variable_read_node()?;
+    if val_lvar.name().as_slice() != val_argname.as_slice() {
+        return None;
+    }
+    if htk_contains_lvar_named(&key_expr, &memo_argname, true) {
+        return None;
+    }
+
+    let body_range = (stmt_list[0].location().start_offset(), stmt_list[0].location().end_offset());
+    Some(HtkMatch { key_argname, key_body_expr: key_expr, val_body_expr: val_expr, body_range })
+}
+
+/// Shared by shapes 2/3/4 — `on_bad_hash_brackets_map`/`on_bad_map_to_h`/
+/// `on_bad_to_h`'s common tail:
+/// ```text
+/// (args (arg $_) (arg _val))
+/// (array $_ $(lvar _val))
+/// ```
+/// Exactly 2 plain required block params, and a single-statement body that's
+/// a 2-element array literal whose second element is exactly `(lvar
+/// val_argname)`.
+fn htk_match_array_block<'pr>(block: &ruby_prism::BlockNode<'pr>) -> Option<HtkMatch<'pr>> {
+    let pp = block.parameters()?.as_block_parameters_node()?.parameters()?;
+    if !htk_params_exactly(&pp, 2) {
+        return None;
+    }
+    let reqs: Vec<_> = pp.requireds().iter().collect();
+    let key_argname = reqs[0].as_required_parameter_node()?.name().as_slice().to_vec();
+    let val_argname = reqs[1].as_required_parameter_node()?.name().as_slice().to_vec();
+
+    let stmts = block.body()?.as_statements_node()?;
+    let stmt_list: Vec<_> = stmts.body().iter().collect();
+    if stmt_list.len() != 1 {
+        return None;
+    }
+    let arr = stmt_list[0].as_array_node()?;
+    let mut elems = arr.elements().iter();
+    let key_expr = elems.next()?;
+    let val_expr = elems.next()?;
+    if elems.next().is_some() {
+        return None;
+    }
+    let val_lvar = val_expr.as_local_variable_read_node()?;
+    if val_lvar.name().as_slice() != val_argname.as_slice() {
+        return None;
+    }
+
+    let body_range = (stmt_list[0].location().start_offset(), stmt_list[0].location().end_offset());
+    Some(HtkMatch { key_argname, key_body_expr: key_expr, val_body_expr: val_expr, body_range })
+}
+
+/// Exactly `n` plain required params (no destructuring at THIS level — a
+/// nested `MultiTargetNode` among the requireds is fine, callers check that
+/// themselves), and nothing else (no optionals/rest/posts/keywords/block) —
+/// upstream's `(args (arg $_) (arg _val))` has no trailing `...`, so it's a
+/// strict arity-2 match, not "at least 2".
+fn htk_params_exactly(pp: &ruby_prism::ParametersNode, n: usize) -> bool {
+    pp.requireds().iter().count() == n
+        && pp.optionals().iter().count() == 0
+        && pp.rest().is_none()
+        && pp.posts().iter().count() == 0
+        && pp.keywords().iter().count() == 0
+        && pp.keyword_rest().is_none()
+        && pp.block().is_none()
+}
+
+/// `noop_transformation?`'s self-check: `expr.lvar_type? && expr.children ==
+/// [argname]` — `expr` IS (not merely contains) a bare read of `argname`.
+fn htk_is_bare_lvar_named(expr: &ruby_prism::Node, name: &[u8]) -> bool {
+    expr.as_local_variable_read_node().is_some_and(|l| l.name().as_slice() == name)
+}
+
+/// Ports both `transformation_uses_both_args?`/`use_transformed_argname?`
+/// (`node.descendants.include?(x)` / `node.each_descendant(:lvar).any? {
+/// source == name }` — PROPER descendants only, `include_self: false`) and
+/// the each_with_object pattern's `$!`_memo` unify clause (`NodePattern
+/// .descend` — self-OR-descendant, `include_self: true`). Only local-
+/// variable reads are checked (the realistic carrier of a captured name);
+/// unlike upstream's raw-value `descend`, a same-named bare symbol literal
+/// elsewhere in the expression is not treated as a reference — not
+/// exercised by any fixture example and not a real transform-keys idiom.
+fn htk_contains_lvar_named(node: &ruby_prism::Node, name: &[u8], include_self: bool) -> bool {
+    if include_self && htk_is_bare_lvar_named(node, name) {
+        return true;
+    }
+    struct Finder<'n> {
+        depth: u32,
+        found: bool,
+        name: &'n [u8],
+    }
+    impl<'pr, 'n> ruby_prism::Visit<'pr> for Finder<'n> {
+        fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+            if self.depth > 0 {
+                if let Some(l) = node.as_local_variable_read_node() {
+                    if l.name().as_slice() == self.name {
+                        self.found = true;
+                    }
+                }
+            }
+            self.depth += 1;
+        }
+        fn visit_branch_node_leave(&mut self) {
+            self.depth -= 1;
+        }
+        fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+            if self.depth > 0 {
+                if let Some(l) = node.as_local_variable_read_node() {
+                    if l.name().as_slice() == self.name {
+                        self.found = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut f = Finder { depth: 0, found: false, name };
+    use ruby_prism::Visit;
+    f.visit(node);
+    f.found
+}
