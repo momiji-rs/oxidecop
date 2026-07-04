@@ -14380,3 +14380,223 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/LineEndConcatenation — flags `+`/`<<` string concatenation
+    /// split so the operator sits at the end of one line and its RHS
+    /// string starts on the next line (`'a' +\n  'b'`), suggesting `\`
+    /// line-continuation instead.
+    ///
+    /// Ported from the upstream TOKEN-based cop (`check_token_set`, which
+    /// scans `processed_source.tokens` for `predecessor operator successor`
+    /// triples). Reimplemented over the AST since our engine has no token
+    /// stream. Key equivalences established by reasoning about how prism
+    /// parses (see the helpers below) rather than literal token replay:
+    ///
+    ///   - `eligible_predecessor?` (the last token before the operator is a
+    ///     plain-quoted string) becomes `lec_trailing_plain_string`: the
+    ///     receiver IS a plain string, or is itself a binary-operator call
+    ///     (any operator, not just `+`/`<<`) or a unary prefix-operator call
+    ///     whose own trailing operand/receiver recursively ends in one —
+    ///     this is what makes upstream's `array << 'foo' <<\n'bar'` flag
+    ///     only the SECOND `<<` (that operator's predecessor is `'foo'`, a
+    ///     string; the FIRST `<<`'s predecessor is `array`, not a string).
+    ///   - `eligible_successor?` finds the LEFTMOST leaf of the argument
+    ///     (`lec_next_after_leaf`, descending through receivers that start
+    ///     at the same offset as their call — i.e. the receiver is the
+    ///     call's own first token): if that leaf isn't a plain-quoted
+    ///     string, there's no offense (`array << 'foo' <<\n'bar'`-shaped
+    ///     receivers aside, this also rejects `%(...)`-literal and heredoc
+    ///     successors, and non-string leaves like `__FILE__`).
+    ///   - `eligible_next_successor?` then asks about the token RIGHT AFTER
+    ///     that leaf's own closing quote — which, structurally, is exactly
+    ///     the operator of the CallNode that immediately wraps the leaf as
+    ///     ITS receiver (one level up from the leaf, not necessarily the
+    ///     whole argument — a chain like `'top' + 'foo' + 'bar'` nests
+    ///     several `+`s, but only the INNERMOST one touches `'top'`
+    ///     directly). Upstream excludes only 4 token types
+    ///     (`.`/`**`/`%`/`[` with no space) — empirically (dumping the
+    ///     `parser` gem's own lexer) plain `*` ALSO lexes as `tSTAR2` in
+    ///     this unambiguous post-literal position, so `lec_is_excluding_wrapper`
+    ///     excludes `.`-calls and `*`/`**`/`%`/`[]`-named calls. Critically,
+    ///     `+`/`<<`/`-`/comparisons etc. are NOT in the list — so a chain
+    ///     like `"a" << "b" +\n"c" << "d"` (mixed precedence: `+` binds
+    ///     tighter, so the first `<<`'s argument is really the whole
+    ///     `"b" + "c"` subtree) still flags the first `<<`, because the
+    ///     token immediately after `"b"` is `+`, not one of the 4 — this is
+    ///     the actual behavior of the `expect_offense` "chained ... combined
+    ///     with << calls" example, which upstream flags on EVERY operator.
+    ///     Verified against every `expect_no_offenses` example too: `" " *
+    ///     3` (plain `*`, still excluded), `'gniht'.reverse`, `'%d' %
+    ///     value`, `'abcdefghij'[ix]`, and the nested-interpolation
+    ///     `"...".reverse` case (the outer literal's OWN opening quote is
+    ///     what's checked, regardless of what's inside the interpolation).
+    ///   - a comment sitting anywhere between the operator's end and the
+    ///     argument's start makes upstream's `successor` token land on the
+    ///     `tCOMMENT`/`tNL` instead of the real string token, silently
+    ///     killing the offense (`accepts ... when followed by comment` /
+    ///     `... by a comment line`) — ported directly as `lec_comment_between`
+    ///     scanning `self.comments` for any overlap.
+    ///   - `same_line?(operator, successor)` — skip if the operator and the
+    ///     argument start on the same source line.
+    ///
+    /// Autocorrect (`register_offense`/`autocorrect`): replace the operator
+    /// plus any immediately-following horizontal whitespace (not newlines)
+    /// with a single `\`; if the byte right after that whitespace is
+    /// already `\`, consume it too so we don't leave a double `\\` —
+    /// `range_with_surrounding_space(side: :right, newlines: false)` plus
+    /// the one-more-char double-backslash guard.
+    pub(crate) fn check_line_end_concatenation(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/LineEndConcatenation";
+        if !self.on(COP) {
+            return;
+        }
+        let op = node.name().as_slice();
+        if op != b"+" && op != b"<<" {
+            return;
+        }
+        let Some(receiver) = node.receiver() else { return };
+        let Some(msg_loc) = node.message_loc() else { return };
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.len() != 1 {
+            return;
+        }
+        let arg = &args[0];
+
+        if !lec_trailing_plain_string(&receiver) {
+            return;
+        }
+        if lec_next_after_leaf(arg) != Some(true) {
+            return;
+        }
+
+        let op_start = msg_loc.start_offset();
+        let op_end = msg_loc.end_offset();
+        let arg_start = arg.location().start_offset();
+
+        if self.lec_comment_between(op_end, arg_start) {
+            return;
+        }
+
+        let op_line = self.idx.loc(op_start).0;
+        let arg_line = self.idx.loc(arg_start).0;
+        if op_line == arg_line {
+            return;
+        }
+
+        let op_text = String::from_utf8_lossy(&self.src[op_start..op_end]);
+        let message = format!("Use `\\` instead of `{op_text}` to concatenate multiline strings.");
+        self.push(op_start, COP, true, message);
+
+        // Autocorrect: operator + trailing horizontal whitespace -> `\`,
+        // consuming one more already-there `\` if present (no `\\`).
+        let mut ext_end = op_end;
+        while matches!(self.src.get(ext_end), Some(b' ' | b'\t')) {
+            ext_end += 1;
+        }
+        if self.src.get(ext_end) == Some(&b'\\') {
+            ext_end += 1;
+        }
+        self.fixes.push((op_start, ext_end, b"\\".to_vec()));
+    }
+
+    /// Any comment overlapping the half-open byte range `[start, end)` —
+    /// upstream's `successor`/`token_after_last_string` landing on a
+    /// `tCOMMENT`/`tNL` token instead of the real next string.
+    fn lec_comment_between(&self, start: usize, end: usize) -> bool {
+        self.comments.iter().any(|&(_, cs, ce)| cs < end && ce > start)
+    }
+}
+
+/// Upstream's `standard_string_literal?`: a plain single/double-quoted
+/// string or interpolated string — NOT a `%`-literal, heredoc, or any other
+/// delimiter (checked via the literal's own `opening_loc` bytes, mirroring
+/// the token-based `QUOTE_DELIMITERS.include?(token.text)` check on the
+/// begin/end token). A prism `InterpolatedStringNode` with NO `opening_loc`
+/// of its own is an IMPLICIT adjacent-literal concatenation (`'a' \` +
+/// newline + `'b'` — no single delimiter spans the whole thing; each part
+/// carries its own quotes) rather than one real `"...#{}..."` literal —
+/// upstream's token-based predecessor/successor never draws this
+/// distinction (it just looks at raw tokens), so treat it as "plain" when
+/// every one of its parts is (recursively) itself plain.
+fn lec_is_plain_string(node: &ruby_prism::Node) -> bool {
+    if let Some(s) = node.as_string_node() {
+        return s.opening_loc().is_some_and(|o| matches!(o.as_slice(), b"'" | b"\""));
+    }
+    if let Some(d) = node.as_interpolated_string_node() {
+        return match d.opening_loc() {
+            Some(o) => matches!(o.as_slice(), b"'" | b"\""),
+            None => d.parts().iter().all(|p| lec_is_plain_string(&p)),
+        };
+    }
+    false
+}
+
+/// Upstream's `eligible_successor?` + `eligible_next_successor?`, fused: is
+/// there a plain-quoted-string leaf at the very front of `node` (descending
+/// through receivers that start at the SAME offset as their enclosing call
+/// — i.e. are that call's own first token), and if so, is the token
+/// directly after that leaf's closing quote (the immediate wrapping call,
+/// one level up from the leaf — NOT `node` itself, if `node` nests deeper)
+/// something other than a `.`-call / `*`/`**`/`%`/`[]`-named call? `None` —
+/// no such leaf (not a string at all, or a `%`/heredoc-delimited one) —
+/// means no offense, same as `Some(false)` (blocked by the immediate
+/// wrapper); only `Some(true)` clears the check.
+fn lec_next_after_leaf(node: &ruby_prism::Node) -> Option<bool> {
+    if lec_is_plain_string(node) {
+        return Some(true);
+    }
+    let call = node.as_call_node()?;
+    let recv = call.receiver()?;
+    if recv.location().start_offset() != node.location().start_offset() {
+        return None;
+    }
+    if lec_is_plain_string(&recv) {
+        Some(!lec_is_excluding_wrapper(&call))
+    } else {
+        lec_next_after_leaf(&recv)
+    }
+}
+
+/// Is `call`'s own operator one of the 4 upstream excludes
+/// (`tDOT`/`tSTAR2`/`tPERCENT`/`tLBRACK2`)? A real `.`/`&.` method call, or
+/// a call named `*`, `**`, `%`, or `[]` (index) — empirically (the `parser`
+/// gem's own lexer), an unambiguous `*` right after a string literal ALWAYS
+/// lexes as `tSTAR2` regardless of whether the source spells one star or
+/// two, so both `Style::*`-named calls are excluded uniformly.
+fn lec_is_excluding_wrapper(call: &ruby_prism::CallNode) -> bool {
+    if call.call_operator_loc().is_some() {
+        return true;
+    }
+    matches!(call.name().as_slice(), b"*" | b"**" | b"%" | b"[]")
+}
+
+/// Upstream's `eligible_predecessor?`: is the very LAST TOKEN of `node`'s
+/// source a plain-quoted string's closing token? We have no token stream,
+/// so this recurses over the AST shapes whose last token is determined by
+/// a tail position: the node itself is a plain string; or a call with
+/// explicit arguments (`recv OP arg`, including binary operators), whose
+/// last token is its last argument's last token; or a receiver-only call
+/// with no arguments at all whose message sits BEFORE the receiver (a
+/// prefix/unary operator: `-recv`, `!recv`, `~recv`), whose last token is
+/// then the receiver's own last token.
+fn lec_trailing_plain_string(node: &ruby_prism::Node) -> bool {
+    if lec_is_plain_string(node) {
+        return true;
+    }
+    let Some(call) = node.as_call_node() else { return false };
+    if call.block().is_some() {
+        return false;
+    }
+    if let Some(args) = call.arguments() {
+        let list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        return list.last().is_some_and(lec_trailing_plain_string);
+    }
+    if let (Some(recv), Some(msg)) = (call.receiver(), call.message_loc()) {
+        if msg.start_offset() < recv.location().start_offset() {
+            return lec_trailing_plain_string(&recv);
+        }
+    }
+    false
+}

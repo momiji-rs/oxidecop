@@ -242,7 +242,7 @@ const IMPLEMENTED: &[&str] = &[
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
-    "Lint/MissingSuper",
+    "Lint/MissingSuper", "Style/LineEndConcatenation",
 ];
 
 impl Engine {
@@ -2671,6 +2671,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_self(node);
         self.check_binary_operator_with_identical_operands(node);
         self.check_float_comparison(node);
+        self.check_line_end_concatenation(node);
         if self.ll_active {
             let (count, info) = breakable::call_break_facts(node);
             let l = node.location();
