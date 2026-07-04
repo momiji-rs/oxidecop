@@ -16161,12 +16161,13 @@ fn dm_const_last_name(node: &ruby_prism::Node) -> Option<Vec<u8>> {
 }
 
 /// `smart_path`'s effective behavior for this port: the oracle always stages
-/// each example in its OWN fresh temp directory (never under this process's
-/// cwd), so upstream's "relative to project root, else absolute" reduces to
-/// "just the basename" for every representable example — matching the
-/// `rsplit('/')` idiom already used by `Naming/FileName`/`Bundler/GemFilename`.
-fn dm_basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+/// upstream's `smart_path` — relative to the working directory when the
+/// file sits under it, else the path as given. The engine's `rel_path` is
+/// already the CLI-supplied (cwd-relative during corpus runs) path, so this
+/// only trims a cosmetic leading "./"; the oracle harness normalizes its
+/// absolute temp paths back to `(string)` itself.
+fn dm_smart_path(path: &str) -> &str {
+    path.strip_prefix("./").unwrap_or(path)
 }
 
 /// `humanize_scope`: `scope.sub(/(?:(?<name>.*)::)#<Class:\k<name>>|
@@ -16749,7 +16750,7 @@ impl<'a> super::Cops<'a> {
             }
             let prev_line = self.idx.loc(prev_anchor).0;
             let cur_line = self.idx.loc(anchor).0;
-            let base = dm_basename(self.rel_path);
+            let base = dm_smart_path(self.rel_path);
             let msg = format!("Method `{display_name}` is defined at both {base}:{prev_line} and {base}:{cur_line}.");
             self.push(anchor, COP, false, msg);
         } else {

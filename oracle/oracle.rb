@@ -949,7 +949,13 @@ def run_poc(poc, src, cfg, filename = nil)
         # ... but ONLY for the generic ex.rb staging: Bundler/Gemspec depts
         # stage a SEMANTIC name (Gemfile/ex.gemspec) their cops legitimately
         # embed (Bundler/OrderedGems says "of the Gemfile").
-        msg = msg.gsub(rb, '(string)').gsub('ex.rb', '(string)') if filename.nil? && File.basename(rb) == 'ex.rb'
+        if filename.nil? && File.basename(rb) == 'ex.rb'
+          msg = msg.gsub(rb, '(string)').gsub('ex.rb', '(string)')
+        elsif filename
+          # an explicit filename IS the RSpec buffer name — strip the temp
+          # staging prefix so path-embedding messages compare faithfully
+          msg = msg.gsub(rb, filename)
+        end
         [line_no, col_no, msg]
       end
     end
