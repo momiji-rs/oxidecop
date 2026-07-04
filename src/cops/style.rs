@@ -13227,10 +13227,69 @@ fn cli_deparen(mut node: ruby_prism::Node) -> ruby_prism::Node {
 /// Approximates upstream's structural `AST::Node#==` (ignores source
 /// location) via raw byte-source comparison of the two nodes' own spans —
 /// see the doc comment on `check_case_like_if` for the fidelity caveat.
+///
+/// Heredocs are the one shape where the span alone LIES about the value:
+/// a heredoc expression's span covers only the `<<~MSG` marker while its
+/// body lives on later lines, so two markers with entirely different
+/// bodies compare byte-identical. Upstream's whitequark `Node#==` sees the
+/// body (it's the str/dstr node's children), so after the span check every
+/// heredoc BODY inside each subtree is compared too, in traversal order.
 fn cli_node_eq(a: &ruby_prism::Node, b: &ruby_prism::Node, src: &[u8]) -> bool {
     let al = a.location();
     let bl = b.location();
-    src[al.start_offset()..al.end_offset()] == src[bl.start_offset()..bl.end_offset()]
+    if src[al.start_offset()..al.end_offset()] != src[bl.start_offset()..bl.end_offset()] {
+        return false;
+    }
+    cli_heredoc_bodies(a, src) == cli_heredoc_bodies(b, src)
+}
+
+/// Collects the raw body bytes (content start through the line before the
+/// terminator) of every heredoc string/xstring anywhere inside `n`'s
+/// subtree, in traversal order.
+fn cli_heredoc_bodies<'pr>(n: &ruby_prism::Node<'pr>, src: &'pr [u8]) -> Vec<&'pr [u8]> {
+    struct Collector<'s> {
+        src: &'s [u8],
+        out: Vec<&'s [u8]>,
+    }
+    impl<'s> Collector<'s> {
+        fn heredoc_body(
+            &mut self,
+            opening: Option<ruby_prism::Location>,
+            closing: Option<ruby_prism::Location>,
+            content_start: Option<usize>,
+        ) {
+            let Some(op) = opening else { return };
+            if !op.as_slice().starts_with(b"<<") {
+                return;
+            }
+            let Some(cl) = closing else { return };
+            let start = content_start.unwrap_or(cl.start_offset());
+            self.out.push(&self.src[start.min(cl.start_offset())..cl.start_offset()]);
+        }
+    }
+    impl<'s> ruby_prism::Visit<'s> for Collector<'s> {
+        fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'s>) {
+            self.heredoc_body(node.opening_loc(), node.closing_loc(), Some(node.content_loc().start_offset()));
+            ruby_prism::visit_string_node(self, node);
+        }
+        fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'s>) {
+            let first = node.parts().iter().next().map(|p| p.location().start_offset());
+            self.heredoc_body(node.opening_loc(), node.closing_loc(), first);
+            ruby_prism::visit_interpolated_string_node(self, node);
+        }
+        fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'s>) {
+            self.heredoc_body(Some(node.opening_loc()), Some(node.closing_loc()), Some(node.content_loc().start_offset()));
+            ruby_prism::visit_x_string_node(self, node);
+        }
+        fn visit_interpolated_x_string_node(&mut self, node: &ruby_prism::InterpolatedXStringNode<'s>) {
+            let first = node.parts().iter().next().map(|p| p.location().start_offset());
+            self.heredoc_body(Some(node.opening_loc()), Some(node.closing_loc()), first);
+            ruby_prism::visit_interpolated_x_string_node(self, node);
+        }
+    }
+    let mut c = Collector { src, out: Vec::new() };
+    c.visit(n);
+    c.out
 }
 
 fn cli_is_regexp(node: &ruby_prism::Node) -> bool {
