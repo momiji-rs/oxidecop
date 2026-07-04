@@ -9657,3 +9657,295 @@ pub(crate) fn ic_is_class_constructor_call(call: &ruby_prism::CallNode, src: &[u
         _ => false,
     }
 }
+
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/ArgumentAlignment — checks that the arguments of a multi-line
+    /// method CALL (as opposed to Layout/ParameterAlignment's method
+    /// *definition*) are aligned: to the first argument's own column
+    /// (`EnforcedStyle: with_first_argument`, the default), or to the
+    /// call's own selector line's indentation plus one configured
+    /// indentation step (`with_fixed_indentation`). Ports rubocop's
+    /// `ArgumentAlignment` cop + the shared `Alignment` mixin's
+    /// `check_alignment`/`each_bad_alignment`/`register_offense`, and the
+    /// `AlignmentCorrector` autocorrector — see `check_parameter_alignment`
+    /// and `check_array_alignment` above for the same shared mixin ported
+    /// for the sibling cops.
+    ///
+    /// `on_send` (prism unifies `on_send`/`alias on_csend` into one
+    /// `CallNode` hook — the only place `csend`-ness matters here is the
+    /// `[]=` exclusion below) bails out when: (a) `multiple_arguments?` is
+    /// false (fewer than 2 raw arguments, UNLESS the sole argument is a
+    /// braceless keyword hash with >= 2 pairs — prism's `KeywordHashNode`,
+    /// distinct from an explicit `{...}` `HashNode`, which never flattens);
+    /// (b) this is a plain (non-safe-nav) `[]=` indexed-assignment send
+    /// (`a[b] = c`, rewritten by prism into an ordinary `CallNode` named
+    /// `:[]=` with no `call_operator_loc` of its own — safe navigation
+    /// earlier in the receiver chain, e.g. `Test&.config[x] = y`, doesn't
+    /// change THIS call's own operator, so it's excluded exactly the same);
+    /// or (c) `with_first_argument_style? && enforce_hash_argument_with_
+    /// separator?` (autocorrect_incompatible_with_other_cops?` — the
+    /// default `key`/`key` HashAlignment styles never satisfy this, so it's
+    /// only reachable with an explicit user config the fixture never sets).
+    ///
+    /// `flattened_arguments`: rubocop's `node.arguments` also has an
+    /// explicit `&block` block-pass as its own trailing element (prism
+    /// keeps it out of `ArgumentsNode` entirely, as `node.block` instead —
+    /// `argalign_call_items` below re-appends it when present, mirroring
+    /// that). Under `with_fixed_indentation`, only the LAST raw argument is
+    /// flattened into its own individual pairs when it's a braceless hash
+    /// (`arguments_with_last_arg_pairs`); otherwise (the default style),
+    /// only the FIRST raw argument is flattened the same way
+    /// (`arguments_or_first_arg_pairs`) — a trailing braceless hash after
+    /// other positional args counts as a single item for that style
+    /// (matching the fixture's `func2(do_something, foo: ..., bar: ...)`
+    /// case, where only ONE offense fires, anchored at the hash's own
+    /// start, yet the autocorrect still reindents every line inside the
+    /// hash's own range — see `argalign_correct`'s per-line loop).
+    ///
+    /// `each_bad_alignment`'s core loop: walking the items in order, only
+    /// one that (a) starts a NEW source line relative to the previous
+    /// item's line, and (b) is the first non-whitespace token on that line
+    /// (`begins_its_line?`) is a candidate; its bad-alignment
+    /// `column_delta` is `base - display_column(item)` (the Unicode
+    /// East-Asian-Width-aware column). A zero delta is fine; otherwise it's
+    /// an offense anchored at the item's own start.
+    ///
+    /// `Alignment#check_alignment`'s `@current_offenses` overlap guard IS
+    /// ported here (via `argalign_registered_ranges`, this cop's own
+    /// separate cop-instance-wide accumulator — see its field doc) because
+    /// the fixture's "doesn't crash and burn when there are nested issues"
+    /// regression test exercises it directly: a `build(:house, :rooms =>
+    /// [...])` call whose bracketed array value contains further
+    /// misaligned nested `build(...)` calls, each getting its own `on_send`
+    /// investigation. Without the guard, the outer call's own correction
+    /// (reindenting every line in its multi-line hash-pair item, including
+    /// all the nested calls' lines) and the inner calls' own corrections
+    /// would both target overlapping byte ranges; upstream avoids the
+    /// collision by still registering the inner offense but skipping its
+    /// correction (`register_offense(expr, nil)`), which is safe because a
+    /// LATER pass (this engine reruns the whole lint after applying
+    /// non-overlapping fixes) picks it up again once the outer rewrite has
+    /// already resolved that region. NOT ported: `AlignmentCorrector`'s
+    /// non-heredoc "multi-line quoted string interior" taboo case and
+    /// `block_comment_within?` — neither is exercised by the fixture (the
+    /// one heredoc example, `class_eval(<<-EOS, __FILE__, __LINE__ + 1)`,
+    /// has all three arguments on ITS OWN single source line, so it never
+    /// even reaches `each_bad_alignment`'s "begins a new line" branch).
+    pub(crate) fn check_argument_alignment(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/ArgumentAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let items_base = argalign_call_items(node);
+        if !argalign_multiple_arguments(&items_base) {
+            return;
+        }
+        // `node.call_type? && node.method?(:[]=)`: only THIS call's own
+        // operator matters, not any safe navigation earlier in the
+        // receiver chain (`is_safe_navigation()` mirrors `csend_type?`).
+        if !node.is_safe_navigation() && node.name().as_slice() == b"[]=" {
+            return;
+        }
+        let fixed_indentation = self.cfg.enforced_style(COP) == "with_fixed_indentation";
+        if !fixed_indentation && self.argalign_hash_separator_style() {
+            return;
+        }
+
+        let items: Vec<ruby_prism::Node> = if fixed_indentation {
+            argalign_with_last_arg_pairs(items_base)
+        } else {
+            argalign_or_first_arg_pairs(items_base)
+        };
+        let Some(first) = items.first() else { return };
+
+        let base = if fixed_indentation {
+            // `target_method_lineno`: `node.loc.selector` (prism's
+            // `message_loc` — present for every named call AND for a bare
+            // `[]`/`[]=` bracket call alike, absent only for the
+            // `.()`-shorthand `Proc#call`), else the opening-paren's line.
+            let lineno_offset = node
+                .message_loc()
+                .map(|l| l.start_offset())
+                .or_else(|| node.opening_loc().map(|l| l.start_offset()))
+                .unwrap_or_else(|| node.location().start_offset());
+            let (line, _) = self.idx.loc(lineno_offset);
+            let line_start = self.idx.starts[line - 1];
+            let mut p = line_start;
+            while p < self.src.len() && self.src[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            let indentation_of_line = p - line_start;
+            indentation_of_line + self.argalign_indentation_width(COP)
+        } else {
+            self.display_column(first.location().start_offset())
+        };
+
+        let mut prev_line: Option<usize> = None;
+        for item in &items {
+            let start = item.location().start_offset();
+            let (line, _) = self.idx.loc(start);
+            let starts_new_line = prev_line.map_or(true, |p| line > p);
+            if starts_new_line {
+                let line_start = self.idx.starts[line - 1];
+                let begins_its_line = self.src[line_start..start].iter().all(u8::is_ascii_whitespace);
+                if begins_its_line {
+                    let actual = self.display_column(start);
+                    if actual != base {
+                        let delta = base as isize - actual as isize;
+                        let end = item.location().end_offset();
+                        let msg = if fixed_indentation {
+                            "Use one level of indentation for arguments following the first line of a multi-line method call."
+                        } else {
+                            "Align the arguments of a method call if they span more than one line."
+                        };
+                        let within_prior = self
+                            .argalign_registered_ranges
+                            .iter()
+                            .any(|&(rs, re)| start >= rs && end <= re);
+                        self.push(start, COP, !within_prior, msg);
+                        if !within_prior {
+                            self.argalign_correct(start, end, delta);
+                        }
+                        self.argalign_registered_ranges.push((start, end));
+                    }
+                }
+            }
+            prev_line = Some(line);
+        }
+    }
+
+    /// `Alignment#configured_indentation_width`: the cop's own
+    /// `IndentationWidth` (no schema default — meaningful only when a user
+    /// sets it directly on this cop), else `Layout/IndentationWidth`'s
+    /// `Width` (schema default 2) — identical fallback chain to
+    /// `parameter_alignment_indentation_width`/`aa_indentation_width`.
+    fn argalign_indentation_width(&self, cop: &'static str) -> usize {
+        self.cfg
+            .get(cop, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+
+    /// `autocorrect_incompatible_with_other_cops?`'s `enforce_hash_argument_
+    /// with_separator?`: true when `Layout/HashAlignment` is itself enabled
+    /// (`for_enabled_cop`) and EITHER of its two separator-style params
+    /// (`EnforcedColonStyle`/`EnforcedHashRocketStyle`) is set to (or, for
+    /// `AllowMultipleStyles`'s array form, includes) `'separator'`. The
+    /// schema default for both is the plain string `'key'`, so this is
+    /// unreachable unless a config explicitly opts in.
+    fn argalign_hash_separator_style(&self) -> bool {
+        if !self.cfg.cop_config_enabled("Layout/HashAlignment") {
+            return false;
+        }
+        ["EnforcedColonStyle", "EnforcedHashRocketStyle"]
+            .iter()
+            .any(|&style| self.cfg.get("Layout/HashAlignment", style).unwrap_or("key").contains("separator"))
+    }
+
+    /// `AlignmentCorrector.correct`, ported for the single misaligned
+    /// argument/pair node — see `array_alignment_correct`'s doc for the
+    /// full per-line walk this is copied from verbatim (widen/narrow logic,
+    /// the `using_tabs?` global disable, and the heredoc taboo-range
+    /// guard).
+    fn argalign_correct(&mut self, start: usize, end: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            return;
+        }
+        let mut line_begin = start;
+        loop {
+            let (line_no, _) = self.idx.loc(line_begin);
+            let taboo = self.heredoc_lines.iter().any(|&(hs, he, _, _)| line_no >= hs && line_no <= he + 1);
+            if !taboo {
+                if delta > 0 {
+                    if self.src.get(line_begin) != Some(&b'\n') {
+                        self.fixes.push((line_begin, line_begin, vec![b' '; delta as usize]));
+                    }
+                } else {
+                    let n = (-delta) as usize;
+                    let starts_with_space = self.src.get(line_begin) == Some(&b' ');
+                    let (rs, re) = if starts_with_space {
+                        (line_begin, line_begin + n)
+                    } else {
+                        (line_begin.saturating_sub(n), line_begin)
+                    };
+                    if re <= self.src.len()
+                        && rs < re
+                        && self.src[rs..re].iter().all(|&b| b == b' ' || b == b'\t')
+                    {
+                        self.fixes.push((rs, re, Vec::new()));
+                    }
+                }
+            }
+            // Advance to the next physical line within [start, end), if any.
+            let mut p = line_begin;
+            while p < end && self.src[p] != b'\n' {
+                p += 1;
+            }
+            if p >= end {
+                break;
+            }
+            line_begin = p + 1;
+        }
+    }
+}
+
+/// The raw list rubocop's `node.arguments` produces for a `CallNode`: every
+/// element of prism's own `ArgumentsNode` (positional, splat, keyword-hash,
+/// block-splat alike — one item per top-level argument), PLUS an explicit
+/// `&block` block-pass appended at the end when present (prism keeps that
+/// out of `ArgumentsNode` entirely, as the call's separate `block` field —
+/// a `do...end`/`{}` block literal there is a DIFFERENT prism node kind,
+/// `BlockNode`, and is correctly never appended: rubocop's own AST keeps
+/// block literals out of `node.arguments` too, wrapping the whole send in a
+/// separate `:block` node instead).
+fn argalign_call_items<'pr>(node: &ruby_prism::CallNode<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    let mut items: Vec<ruby_prism::Node> = match node.arguments() {
+        Some(a) => a.arguments().iter().collect(),
+        None => Vec::new(),
+    };
+    if let Some(b) = node.block() {
+        if b.as_block_argument_node().is_some() {
+            items.push(b);
+        }
+    }
+    items
+}
+
+/// `multiple_arguments?`: at least 2 raw items, or exactly 1 that's itself
+/// a braceless keyword hash (prism's `KeywordHashNode`) with >= 2 pairs.
+fn argalign_multiple_arguments(items: &[ruby_prism::Node]) -> bool {
+    if items.len() >= 2 {
+        return true;
+    }
+    items.first().and_then(|f| f.as_keyword_hash_node()).is_some_and(|kw| kw.elements().len() >= 2)
+}
+
+/// `arguments_or_first_arg_pairs`: if the FIRST item is a braceless keyword
+/// hash, flatten it into its own individual pair nodes (`AssocNode`/
+/// `AssocSplatNode`); otherwise the raw item list is used as-is (an
+/// explicit `{...}` `HashNode` — prism's distinct node kind for a braced
+/// hash literal — is never flattened, matching `!braces?`).
+fn argalign_or_first_arg_pairs<'pr>(items: Vec<ruby_prism::Node<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+    if let Some(kw) = items.first().and_then(|f| f.as_keyword_hash_node()) {
+        return kw.elements().iter().collect();
+    }
+    items
+}
+
+/// `arguments_with_last_arg_pairs`: the raw items minus the last, plus
+/// either the LAST item's own pairs (if it's a braceless keyword hash) or
+/// the last item itself unchanged.
+fn argalign_with_last_arg_pairs<'pr>(mut items: Vec<ruby_prism::Node<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+    let Some(last) = items.pop() else { return items };
+    match last.as_keyword_hash_node() {
+        Some(kw) => items.extend(kw.elements().iter()),
+        None => items.push(last),
+    }
+    items
+}
