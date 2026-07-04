@@ -1126,12 +1126,27 @@ impl<'a> super::Cops<'a> {
             return;
         }
         let Some(reference) = node.reference() else { return };
-        // Only a plain local-variable target has a rubocop-AST `#name` — a
-        // writer-method reference (`rescue => storage.exception`) doesn't
-        // (`respond_to?(:name)` is false there), so it's silently skipped,
-        // same as upstream's `variable_name`.
-        let Some(target) = reference.as_local_variable_target_node() else { return };
-        let offending = target.name();
+        // Anything with a rubocop-AST `#name` offends — lvasgn, but also
+        // ivasgn/cvasgn/gvasgn/casgn (`rescue => @error`), whose prism
+        // names carry their sigils, matching upstream's message text. A
+        // writer-method reference (`rescue => storage.exception`) has no
+        // `#name` (`respond_to?(:name)` is false) and is silently skipped.
+        // Only LOCAL targets get body-reference renames below: upstream's
+        // `correct_node` walks `lvar`/`lvasgn`/`masgn` nodes exclusively.
+        let (offending, target_loc, is_local) =
+            if let Some(t) = reference.as_local_variable_target_node() {
+                (t.name(), t.location(), true)
+            } else if let Some(t) = reference.as_instance_variable_target_node() {
+                (t.name(), t.location(), false)
+            } else if let Some(t) = reference.as_class_variable_target_node() {
+                (t.name(), t.location(), false)
+            } else if let Some(t) = reference.as_global_variable_target_node() {
+                (t.name(), t.location(), false)
+            } else if let Some(t) = reference.as_constant_target_node() {
+                (t.name(), t.location(), false)
+            } else {
+                return;
+            };
         let offending = offending.as_slice();
 
         let base_preferred = self.cfg.get(COP, "PreferredName").unwrap_or("e");
@@ -1152,7 +1167,7 @@ impl<'a> super::Cops<'a> {
             return;
         }
 
-        let range = target.location();
+        let range = target_loc;
         let msg = format!(
             "Use `{preferred}` instead of `{}`.",
             String::from_utf8_lossy(offending)
@@ -1161,6 +1176,11 @@ impl<'a> super::Cops<'a> {
 
         // --- autocorrect ---
         self.fixes.push((range.start_offset(), range.end_offset(), preferred.clone().into_bytes()));
+        if !is_local {
+            // upstream's correct_node/right-sibling walk only ever matches
+            // lvar-family nodes; for a sigiled target nothing else renames.
+            return;
+        }
         if let Some(body) = node.statements() {
             correct_rescue_refs(&body.as_node(), offending, preferred.as_bytes(), &mut self.fixes);
         }
