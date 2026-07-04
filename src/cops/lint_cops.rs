@@ -9660,3 +9660,314 @@ fn snc_is_builtin_nil_method(name: &[u8]) -> bool {
     METHODS.iter().any(|&m| m == name)
 }
 
+
+/// Finds (or lazily creates) `key`'s slot in an ordered `names` map mirroring
+/// rubocop's `Hash.new(0)` (`CommentConfig#extra_enabled_comments`'
+/// `disable_count`). A cop-specific key (has a `/`) that is `Enabled: false`
+/// in the effective config is seeded at count 1 — mirroring
+/// `registry.disabled(config).each { |cop| disable_count[cop.cop_name] += 1
+/// }`, which runs BEFORE any directive is read. A bare department key (no
+/// `/`) is never config-pre-disabled this way in real rubocop (that hash is
+/// built from actual Cop classes, never department names), so it always
+/// starts at 0. Reuses `mced_cop_enabled` (defined above for
+/// `Lint/MissingCopEnableDirective`) for the same "ignore the oracle
+/// harness's injected `AllCops: DisabledByDefault`" reasoning documented
+/// there.
+fn rce_slot(names: &mut Vec<(String, i32)>, cfg: &crate::config::Config, key: &str) -> usize {
+    if let Some(i) = names.iter().position(|(k, _)| k == key) {
+        return i;
+    }
+    let seed = if key.contains('/') && !mced_cop_enabled(cfg, key) { 1 } else { 0 };
+    names.push((key.to_string(), seed));
+    names.len() - 1
+}
+
+/// `DirectiveComment#cop_name_indention`'s Rust equivalent:
+/// `comment.text.index(/#{Regexp.escape(name)}(?!\w)/)`. Finds the first
+/// occurrence of `name` in `text` that isn't immediately followed by a
+/// word character — so a shorter name isn't matched inside a longer one
+/// that shares its PREFIX (`Layout/EmptyLines` inside
+/// `Layout/EmptyLinesAfterModuleInclusion`). No leading-boundary check is
+/// made, matching upstream (a name that's a SUFFIX of another isn't
+/// guarded against either — not exercised by the fixture).
+fn rce_find_name(text: &[u8], name: &str) -> Option<usize> {
+    let needle = name.as_bytes();
+    if needle.is_empty() {
+        return None;
+    }
+    (0..=text.len().saturating_sub(needle.len())).find(|&i| {
+        &text[i..i + needle.len()] == needle
+            && !text.get(i + needle.len()).is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+    })
+}
+
+/// `SurroundingSpace#reposition`/`RangeHelp#range_with_comma`'s comma-aware
+/// removal range for ONE redundant name inside a multi-name directive
+/// (`register_offense`'s `range_with_comma` branch, reached when
+/// `directive.match?(cop_names)` is false — i.e. some OTHER name in the same
+/// comment is still necessary). Widens `name`'s own span over adjacent
+/// spaces/tabs (never newlines) in both directions, then removes through
+/// whichever comma sits on either side of that widened span — trimming the
+/// leading space too UNLESS the list has no space after that comma (so a
+/// single separating space survives either way). Returns byte offsets
+/// relative to `text` (the comment's own source slice, offset 0 == its `#`).
+fn rce_remove_with_comma(text: &[u8], name: &str) -> Option<(usize, usize)> {
+    let mut begin_pos = rce_find_name(text, name)?;
+    let mut end_pos = begin_pos + name.len();
+    while begin_pos > 0 && matches!(text[begin_pos - 1], b' ' | b'\t') {
+        begin_pos -= 1;
+    }
+    while end_pos < text.len() && matches!(text[end_pos], b' ' | b'\t') {
+        end_pos += 1;
+    }
+    if begin_pos > 0 && text[begin_pos - 1] == b',' {
+        // `range_with_comma_before`: comma through the (trimmed) name end.
+        Some((begin_pos - 1, end_pos))
+    } else if end_pos < text.len() && text[end_pos] == b',' {
+        // `range_with_comma_after`: (trimmed) name start through the comma,
+        // keeping the leading space when there's no space after the comma
+        // either (so exactly one separating space survives either way).
+        let mut bp = begin_pos;
+        if !matches!(text.get(end_pos + 1), Some(b' ')) {
+            bp += 1;
+        }
+        Some((bp, end_pos + 1))
+    } else {
+        // `range_between(start, comment.source_range.end_pos)`: no comma
+        // neighbor at all, i.e. `name` had no other item alongside it in
+        // the directive's OWN written text. Removes only the comment's own
+        // text (not the trailing newline) — reached for a bare department
+        // token that's the directive's sole written item but ISN'T fully
+        // redundant once a same-department specific cop (never repeated in
+        // this directive) is still legitimately open (see `full_match`'s
+        // department-sibling check above), leaving a blank line behind.
+        Some((0, text.len()))
+    }
+}
+
+/// `SurroundingSpace#range_with_surrounding_space(directive.range, side:
+/// :right)`: the whole-directive removal used when EVERY name in the
+/// comment is redundant (`directive.match?(cop_names)`). `directive.range`
+/// is approximated as the whole comment span (true whenever the comment is
+/// nothing but the directive itself, as in every fixture example — no
+/// trailing `-- reason` prose). Expands rightward over spaces/tabs, then
+/// over ALL consecutive newlines (upstream's `final_pos` loops one `\n` at
+/// a time but doesn't stop after the first).
+fn rce_remove_whole(src: &[u8], start: usize, end: usize) -> (usize, usize) {
+    let mut e = end;
+    while e < src.len() && matches!(src[e], b' ' | b'\t') {
+        e += 1;
+    }
+    while e < src.len() && src[e] == b'\n' {
+        e += 1;
+    }
+    (start, e)
+}
+
+impl<'a> Cops<'a> {
+    /// Lint/RedundantCopEnableDirective — a `# rubocop:enable` naming a cop
+    /// (or department, or `all`) that ISN'T currently disabled at that point
+    /// is dead text. Ported from `CommentConfig#extra_enabled_comments`
+    /// (`handle_switch`/`handle_enable_all`) + the cop's own
+    /// `register_offense`/`range_of_offense`/`range_with_comma`.
+    ///
+    /// Unlike `Lint/MissingCopEnableDirective` above, this check is
+    /// independent of the push/pop stack machinery entirely — upstream's
+    /// `extra_enabled_comments` walks `each_directive` with a single flat
+    /// `names` counter, skipping `push`/`pop` outright.
+    ///
+    /// Deliberate simplification (same category as `MissingEnableAnalysis`'s
+    /// department handling above, and just as observably invisible): a bare
+    /// department name (`# rubocop:disable Layout`) is tracked as ONE
+    /// pseudo-entry keyed by the department name itself, instead of being
+    /// expanded into every individual cop in that department (this engine
+    /// doesn't carry the full ~500-cop registry needed to do that). This is
+    /// observably IDENTICAL for every case the fixture exercises: whenever
+    /// upstream's per-cop expansion would flag SOME (not all) of a
+    /// department's cops as extra, EVERY one of those offenses collapses via
+    /// `register_offense`'s `department?`-triggered shortening (`name =
+    /// name.split('/').first`) to the SAME message at the SAME location
+    /// (the literal department text in the comment) — and `Cop::Base
+    /// #add_offense`'s location dedup then collapses them to the one offense
+    /// our coarser model reports directly. The one scenario this can't
+    /// reproduce (not in the fixture): a department fully covered by
+    /// disabling EVERY individual cop in it one-by-one (rather than via one
+    /// bare `# rubocop:disable Layout`) would upstream-correctly treat a
+    /// later `# rubocop:enable Layout` as non-redundant; this simplified
+    /// model, never having set the bare "Layout" key, would flag it as
+    /// redundant. (The mirror-image interaction — a bare-department enable
+    /// where ONE specific same-department cop is still legitimately open —
+    /// IS handled: see the `full_match` department-sibling check below,
+    /// needed because it changes which CORRECTION range applies even though
+    /// the reported offense itself is identical either way.)
+    ///
+    /// `# rubocop:disable all` / `# rubocop:todo all` are also not tracked
+    /// (upstream expands `all` into literally every registry cop even for a
+    /// *disable*, via `directive.cop_names`, which isn't reproducible here).
+    /// This can only under-report (missing a "was genuinely still open"
+    /// case for a later specific-cop enable) — not exercised by the fixture,
+    /// which never disables via bare `all`.
+    pub(crate) fn check_redundant_cop_enable_directive(&mut self) {
+        const COP: &str = "Lint/RedundantCopEnableDirective";
+        if !self.on(COP) {
+            return;
+        }
+        // `!processed_source.raw_source.include?('enable')` fast-path.
+        if !self.src.windows(6).any(|w| w == b"enable") {
+            return;
+        }
+
+        static RE: OnceLock<regex::Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| {
+            regex::Regex::new(r"^#\s*rubocop\s*:\s*(disable|todo|enable|push|pop)\b\s*(.*)$")
+                .unwrap()
+        });
+
+        // `Hash.new(0)`, insertion-ordered (only a handful of entries ever
+        // exist, so a linear-scan-backed vec is plenty — same idiom as
+        // `MissingEnableAnalysis`'s `analyses` above).
+        let mut names: Vec<(String, i32)> = Vec::new();
+
+        // One record per comment that ends up with at least one redundant
+        // name: its own span, every name it lists (written order, for the
+        // `directive.match?` all-redundant check), and the subset that's
+        // redundant (written order).
+        struct Rec {
+            start: usize,
+            end: usize,
+            extra: Vec<String>,
+            full_match: bool,
+        }
+        let mut recs: Vec<Rec> = Vec::new();
+
+        for &(line, start, end) in self.comments {
+            let text = String::from_utf8_lossy(&self.src[start..end]);
+            let Some(caps) = re.captures(&text) else { continue };
+            let mode = caps.get(1).unwrap().as_str();
+            if mode == "push" || mode == "pop" {
+                continue;
+            }
+            // `comment_only_line?`: nothing but whitespace precedes the `#`
+            // on this physical line — a directive sharing its line with
+            // real code doesn't participate in this check at all (unlike
+            // `Lint/MissingCopEnableDirective`, which still tracks a
+            // trailing single-line disable).
+            let standalone =
+                self.src[self.idx.starts[line - 1]..start].iter().all(u8::is_ascii_whitespace);
+            if !standalone {
+                continue;
+            }
+            let rest = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+            // a ` -- reason` trailer is prose, not part of the cop list
+            let cops_part = rest.split(" -- ").next().unwrap_or(rest).trim();
+            let disabling = mode == "disable" || mode == "todo";
+
+            if cops_part == "all" {
+                if disabling {
+                    // `disable all`/`todo all` — see doc comment: not tracked.
+                    continue;
+                }
+                // `handle_enable_all`: close every currently-open name;
+                // redundant only if NONE were open.
+                let mut enabled_cops = 0;
+                for (_, count) in names.iter_mut() {
+                    if *count > 0 {
+                        *count -= 1;
+                        enabled_cops += 1;
+                    }
+                }
+                if enabled_cops == 0 {
+                    // `directive.match?(["all"])`: `parsed_cop_names` for an
+                    // `all` directive is `["all"]` too (`"all"` isn't itself
+                    // a registered department) — always a full match.
+                    recs.push(Rec { start, end, extra: vec!["all".to_string()], full_match: true });
+                }
+                continue;
+            }
+
+            let raw_tokens: Vec<String> = cops_part
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if disabling {
+                for tok in &raw_tokens {
+                    let i = rce_slot(&mut names, self.cfg, tok);
+                    names[i].1 += 1;
+                }
+            } else {
+                let mut extra = Vec::new();
+                for tok in &raw_tokens {
+                    let i = rce_slot(&mut names, self.cfg, tok);
+                    if names[i].1 > 0 {
+                        names[i].1 -= 1;
+                    } else {
+                        extra.push(tok.clone());
+                    }
+                }
+                if !extra.is_empty() {
+                    // `directive.match?(cop_names)`: true only when EVERY
+                    // cop the directive really covers (after upstream's
+                    // department expansion, which this engine's coarser
+                    // per-token model doesn't replicate) ended up extra. A
+                    // bare department token collapses ~90 individual cops
+                    // into one pseudo-entry (see the doc comment above) —
+                    // but if some OTHER already-tracked specific cop in that
+                    // same department is STILL currently disabled (its own
+                    // count > 0, meaning upstream's expansion would have
+                    // silently consumed it as the one legitimately-needed
+                    // enable), the directive only PARTIALLY matches even
+                    // though this token's own pseudo-entry looks fully
+                    // redundant — downgrade to the per-name removal path.
+                    let mut a = raw_tokens.clone();
+                    a.sort();
+                    a.dedup();
+                    let mut b = extra.clone();
+                    b.sort();
+                    b.dedup();
+                    let mut full_match = a == b;
+                    if full_match {
+                        for tok in &raw_tokens {
+                            if tok.contains('/') {
+                                continue;
+                            }
+                            let prefix = format!("{tok}/");
+                            if names.iter().any(|(k, c)| *c > 0 && k.starts_with(&prefix)) {
+                                full_match = false;
+                                break;
+                            }
+                        }
+                    }
+                    recs.push(Rec { start, end, extra, full_match });
+                }
+            }
+        }
+
+        // `Cop::Base#add_offense`'s `current_offense_locations.add?` dedup.
+        let mut emitted: HashSet<usize> = HashSet::new();
+        for rec in &recs {
+            let comment_text = &self.src[rec.start..rec.end];
+            for name in &rec.extra {
+                let Some(rel) = rce_find_name(comment_text, name) else { continue };
+                let abs_start = rec.start + rel;
+                if !emitted.insert(abs_start) {
+                    continue;
+                }
+                let display = if name == "all" { "all cops".to_string() } else { name.clone() };
+                self.push(abs_start, COP, true, format!("Unnecessary enabling of {display}."));
+            }
+
+            if rec.full_match {
+                let (fstart, fend) = rce_remove_whole(self.src, rec.start, rec.end);
+                self.fixes.push((fstart, fend, Vec::new()));
+            } else {
+                for name in &rec.extra {
+                    if let Some((rs, re_)) = rce_remove_with_comma(comment_text, name) {
+                        self.fixes.push((rec.start + rs, rec.start + re_, Vec::new()));
+                    }
+                }
+            }
+        }
+    }
+}
