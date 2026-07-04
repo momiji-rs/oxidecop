@@ -13842,3 +13842,531 @@ fn void_expand_left_ws_and_newlines(src: &[u8], mut start: usize) -> usize {
     }
     start
 }
+
+
+// Lint/UnusedBlockArgument ---------------------------------------------------
+//
+// Upstream (`UnusedBlockArgument` including the shared `UnusedArgument`
+// mixin) rides `VariableForce`'s `after_leaving_scope`: for every parameter
+// (or explicit `;shadow` block-local) declared in a BLOCK's or LAMBDA's own
+// parameter list, offend at the name's own location unless it's already
+// `_`-prefixed, has at least one explicit reference, or is exempted by
+// `allowed_block?` (not actually a block/lambda parameter, or an empty
+// block body under `IgnoreEmptyBlocks`), `allowed_keyword_argument?`
+// (`AllowUnusedKeywordArguments`), or (`;shadow` locals only)
+// `used_block_local?` — reassigned at least once, regardless of whether
+// it's ever READ.
+//
+// Ported as a standalone scope-tracking walk, the same shape as
+// `Lint/UnderscorePrefixedVariableName`'s `UpvCollector` above (see its
+// module comment for the full argument for why a single flat frame stack,
+// indexed by prism's own `depth` field, is sufficient — a `def`/`class`/
+// `module`/`sclass` boundary can never be crossed by a `depth`). The
+// difference here: only BLOCK/LAMBDA frames ever declare a trackable name
+// (their own parameters/shadow-locals, since this cop only ever cares about
+// `block_argument?` variables); `Def`/`Other` frames are still pushed
+// (empty) purely to keep the depth arithmetic correct for reads that occur
+// after they close.
+//
+// Two upstream `VariableForce` special cases matter here (unlike
+// `UnderscorePrefixedVariableName`, which only ever cares about EXPLICIT
+// references): a bare, argument-less `binding` call (`process_send` — note
+// upstream never actually checks for an absent receiver, just the method
+// name and zero args) marks every variable in `VariableTable
+// #accessible_variables` as referenced: the current scope's own vars, then
+// each enclosing scope's own vars in turn AS LONG AS the scope just
+// finished is itself block/lambda-typed, stopping right after the first
+// non-block one is included. Zero-arity `super` (`process_zero_arity_
+// super`) is a documented no-op for this cop: it only ever marks `method_
+// argument?` variables (a `def`'s own params), never `block_argument?`
+// ones, so it needs no handling at all.
+impl<'a> super::Cops<'a> {
+    /// `after_leaving_scope` + `check_argument`/`message`/`autocorrect`: runs
+    /// the whole-file scope walk once (from `visit_program_node` in mod.rs),
+    /// then re-derives each unused parameter's message/correction exactly as
+    /// `UnusedArgument#check_argument` + `UnusedBlockArgument#message` +
+    /// `UnusedArgCorrector.correct` would.
+    pub(crate) fn check_unused_block_argument(&mut self, node: &ruby_prism::ProgramNode) {
+        const COP: &str = "Lint/UnusedBlockArgument";
+        if !self.on(COP) {
+            return;
+        }
+        let ignore_empty_blocks = self.cfg.get(COP, "IgnoreEmptyBlocks") == Some("true");
+        let allow_unused_kwargs = self.cfg.get(COP, "AllowUnusedKeywordArguments") == Some("true");
+
+        let mut c = UbaCollector {
+            frames: vec![UbaFrame { is_block: false, scope_idx: None, names: HashMap::new() }],
+            vars: Vec::new(),
+            scopes: Vec::new(),
+        };
+        use ruby_prism::Visit;
+        c.visit(&node.as_node());
+
+        for scope in &c.scopes {
+            // `allowed_block?`'s `ignore_empty_blocks? && empty_block?`
+            // disjunct — applies uniformly to every variable in the scope
+            // (shadow-locals included, since `block_argument?` is true for
+            // those too).
+            if scope.is_empty && ignore_empty_blocks {
+                continue;
+            }
+            let all_referenced_none = scope.var_indices.iter().all(|&i| !c.vars[i].referenced);
+            let arg_count = scope.var_indices.len();
+            for &i in &scope.var_indices {
+                let v = &c.vars[i];
+                if v.kind == UbaKind::ShadowArg {
+                    // `used_block_local?`: reassigned at least once is
+                    // allowed outright, regardless of read status.
+                    if v.assigned {
+                        continue;
+                    }
+                    if v.name.starts_with(b"_") || v.referenced {
+                        continue;
+                    }
+                    let msg =
+                        format!("Unused block local variable - `{}`.", String::from_utf8_lossy(&v.name));
+                    self.push(v.name_start, COP, true, msg);
+                    let mut repl = Vec::with_capacity(v.name.len() + 1);
+                    repl.push(b'_');
+                    repl.extend_from_slice(&v.name);
+                    self.fixes.push((v.name_start, v.name_start + v.name.len(), repl));
+                    continue;
+                }
+                let is_kw = matches!(v.kind, UbaKind::ReqKwArg | UbaKind::OptKwArg);
+                if is_kw && allow_unused_kwargs {
+                    continue;
+                }
+                if v.name.starts_with(b"_") || v.referenced {
+                    continue;
+                }
+                let base = format!("Unused block argument - `{}`.", String::from_utf8_lossy(&v.name));
+                let augmentation = if scope.is_lambda {
+                    let mut m = uba_underscore_message(&v.name);
+                    if all_referenced_none {
+                        m.push_str(
+                            " Also consider using a proc without arguments instead of a lambda \
+                             if you want it to accept any arguments but don't care about them.",
+                        );
+                    }
+                    m
+                } else if all_referenced_none && !scope.is_define_method {
+                    if arg_count > 1 {
+                        "You can omit all the arguments if you don't care about them.".to_string()
+                    } else {
+                        "You can omit the argument if you don't care about it.".to_string()
+                    }
+                } else {
+                    uba_underscore_message(&v.name)
+                };
+                let msg = format!("{base} {augmentation}");
+                // `UnusedArgCorrector.correct`: `kwarg`/`kwoptarg` never get
+                // a correction block's worth of actual edits (RuboCop still
+                // reports them, just not as `[Correctable]`).
+                let correctable = !is_kw;
+                self.push(v.name_start, COP, correctable, msg);
+                if correctable {
+                    if v.kind == UbaKind::BlockArg {
+                        let (start, end) = uba_blockarg_removal_range(self.src, v.full_start, v.full_end);
+                        self.fixes.push((start, end, Vec::new()));
+                    } else {
+                        let mut repl = Vec::with_capacity(v.name.len() + 1);
+                        repl.push(b'_');
+                        repl.extend_from_slice(&v.name);
+                        self.fixes.push((v.name_start, v.name_start + v.name.len(), repl));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `message_for_underscore_prefix`: shared by both the lambda and
+/// normal-block augmentation paths.
+fn uba_underscore_message(name: &[u8]) -> String {
+    format!(
+        "If it's necessary, use `_` or `_{}` as an argument name to indicate that it won't be used.",
+        String::from_utf8_lossy(name)
+    )
+}
+
+/// `UnusedArgCorrector.correct_for_blockarg_type`: an unused `&block`
+/// parameter is REMOVED entirely (never `_`-prefixed) — `range_with_
+/// surrounding_space(side: :left)` (eat trailing `[ \t]*`, then `\n*`) then
+/// `range_with_surrounding_comma(:left)` (eat one further preceding `,`).
+fn uba_blockarg_removal_range(src: &[u8], mut start: usize, end: usize) -> (usize, usize) {
+    while start > 0 && matches!(src[start - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    while start > 0 && src[start - 1] == b'\n' {
+        start -= 1;
+    }
+    while start > 0 && src[start - 1] == b',' {
+        start -= 1;
+    }
+    (start, end)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum UbaKind {
+    Arg,
+    OptArg,
+    RestArg,
+    ReqKwArg,
+    OptKwArg,
+    KwRestArg,
+    BlockArg,
+    ShadowArg,
+}
+
+/// One declared block/lambda parameter (or `;shadow` block-local). `name_start`
+/// is the anchor for both the offense and (for every kind but `BlockArg`) the
+/// autocorrect rename range (`name_start .. name_start + name.len()`).
+/// `full_start`/`full_end` are the declaring node's OWN full span — only
+/// consulted for `BlockArg` (the whole `&block` gets removed, not renamed).
+struct UbaVar {
+    name: Vec<u8>,
+    name_start: usize,
+    full_start: usize,
+    full_end: usize,
+    kind: UbaKind,
+    referenced: bool,
+    assigned: bool,
+}
+
+/// Upstream's `all_arguments = scope.variables.each_value.select(&:block_
+/// argument?)` plus the two `scope.node`-level predicates `message_for_
+/// normal_block`/`message_for_lambda` need: `lambda?` (was this block's own
+/// call named `lambda`, or a `->(){}` literal) and `define_method_call?`
+/// (was it `define_method`). `is_empty` is `empty_block?` (a `do...end`/`{}`
+/// with no body at all).
+struct UbaScope {
+    var_indices: Vec<usize>,
+    is_lambda: bool,
+    is_define_method: bool,
+    is_empty: bool,
+}
+
+struct UbaFrame {
+    /// Block/lambda scopes are "soft": a `binding` call's implicit
+    /// reference walk continues on outward through them (see `mark_
+    /// binding`); `def`/`class`/`module`/`sclass` are hard stops.
+    is_block: bool,
+    /// `Some` (indexing into the collector's `scopes`) iff `is_block` — the
+    /// only kind of frame that ever declares a trackable name.
+    scope_idx: Option<usize>,
+    names: HashMap<Vec<u8>, usize>,
+}
+
+/// The scope-tracking visitor described in the module comment above
+/// `check_unused_block_argument`.
+struct UbaCollector {
+    frames: Vec<UbaFrame>,
+    vars: Vec<UbaVar>,
+    scopes: Vec<UbaScope>,
+}
+
+impl UbaCollector {
+    fn frame_for_depth(&self, depth: u32) -> usize {
+        self.frames.len().saturating_sub(1).saturating_sub(depth as usize)
+    }
+
+    fn declare_here(&mut self, name: &[u8], name_start: usize, full_start: usize, full_end: usize, kind: UbaKind) {
+        let fi = self.frames.len() - 1;
+        if self.frames[fi].names.contains_key(name) {
+            return;
+        }
+        let idx = self.vars.len();
+        self.vars.push(UbaVar {
+            name: name.to_vec(),
+            name_start,
+            full_start,
+            full_end,
+            kind,
+            referenced: false,
+            assigned: false,
+        });
+        self.frames[fi].names.insert(name.to_vec(), idx);
+        if let Some(si) = self.frames[fi].scope_idx {
+            self.scopes[si].var_indices.push(idx);
+        }
+    }
+
+    fn reference(&mut self, name: &[u8], depth: u32) {
+        let fi = self.frame_for_depth(depth);
+        if let Some(&idx) = self.frames[fi].names.get(name) {
+            self.vars[idx].referenced = true;
+        }
+    }
+
+    fn assign(&mut self, name: &[u8], depth: u32) {
+        let fi = self.frame_for_depth(depth);
+        if let Some(&idx) = self.frames[fi].names.get(name) {
+            self.vars[idx].assigned = true;
+        }
+    }
+
+    /// `VariableTable#accessible_variables`: the current (innermost) scope's
+    /// own vars, then each enclosing scope's own vars in turn as long as the
+    /// scope just included was itself block/lambda-typed.
+    fn mark_binding(&mut self) {
+        let mut i = self.frames.len();
+        while i > 0 {
+            i -= 1;
+            let is_block = self.frames[i].is_block;
+            let idxs: Vec<usize> = self.frames[i].names.values().copied().collect();
+            for idx in idxs {
+                self.vars[idx].referenced = true;
+            }
+            if !is_block {
+                break;
+            }
+        }
+    }
+
+    fn enter_block_scope(&mut self, is_lambda: bool, is_define_method: bool, has_body: bool) {
+        let scope_idx = self.scopes.len();
+        self.scopes.push(UbaScope { var_indices: Vec::new(), is_lambda, is_define_method, is_empty: !has_body });
+        self.frames.push(UbaFrame { is_block: true, scope_idx: Some(scope_idx), names: HashMap::new() });
+    }
+
+    fn exit_block_scope(&mut self) {
+        self.frames.pop();
+    }
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for UbaCollector {
+    // `def`/`class`/`module`/`sclass` are hard scope boundaries: parts
+    // evaluated in the ENCLOSING scope (a `defs` receiver, a class's
+    // superclass/constant path, `class << expr`'s `expr`) are visited
+    // BEFORE the new (empty, non-block) frame is pushed.
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        if let Some(recv) = node.receiver() {
+            self.visit(&recv);
+        }
+        self.frames.push(UbaFrame { is_block: false, scope_idx: None, names: HashMap::new() });
+        if let Some(params) = node.parameters() {
+            self.visit_parameters_node(&params);
+        }
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.frames.pop();
+    }
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        self.visit(&node.constant_path());
+        if let Some(sup) = node.superclass() {
+            self.visit(&sup);
+        }
+        self.frames.push(UbaFrame { is_block: false, scope_idx: None, names: HashMap::new() });
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.frames.pop();
+    }
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        self.visit(&node.constant_path());
+        self.frames.push(UbaFrame { is_block: false, scope_idx: None, names: HashMap::new() });
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.frames.pop();
+    }
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        self.visit(&node.expression());
+        self.frames.push(UbaFrame { is_block: false, scope_idx: None, names: HashMap::new() });
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.frames.pop();
+    }
+    // A `do...end`/`{}` block attached to this call: `lambda?`/`define_
+    // method_call?` are both keyed off the CALL's own method name (upstream
+    // never checks for an absent receiver on either), never the block node
+    // itself — so both are computed right here, before descending into the
+    // block's own params/body as a fresh scope. `&:sym`/bare `&var` block-
+    // PASS arguments (`BlockArgumentNode`) aren't block nodes at all and are
+    // just visited generically.
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if let Some(recv) = node.receiver() {
+            self.visit(&recv);
+        }
+        if let Some(args) = node.arguments() {
+            self.visit_arguments_node(&args);
+        }
+        let name = node.name();
+        let name = name.as_slice();
+        // `process_send`: a bare, argument-less `binding` call (receiver
+        // irrelevant) marks every currently-accessible variable referenced.
+        if name == b"binding" && node.arguments().is_none_or(|a| a.arguments().is_empty()) {
+            self.mark_binding();
+        }
+        if let Some(block) = node.block() {
+            if let Some(bn) = block.as_block_node() {
+                let is_lambda = name == b"lambda";
+                let is_define_method = name == b"define_method";
+                self.enter_block_scope(is_lambda, is_define_method, bn.body().is_some());
+                if let Some(params) = bn.parameters() {
+                    self.visit(&params);
+                }
+                if let Some(body) = bn.body() {
+                    self.visit(&body);
+                }
+                self.exit_block_scope();
+            } else {
+                self.visit(&block);
+            }
+        }
+    }
+    // `super(...) { }` (explicit args) / bare `super { }` (`zsuper`, all
+    // args implicitly forwarded) can each carry their own block too — never
+    // a lambda, never `define_method`.
+    fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+        if let Some(args) = node.arguments() {
+            self.visit_arguments_node(&args);
+        }
+        if let Some(block) = node.block() {
+            if let Some(bn) = block.as_block_node() {
+                self.enter_block_scope(false, false, bn.body().is_some());
+                if let Some(params) = bn.parameters() {
+                    self.visit(&params);
+                }
+                if let Some(body) = bn.body() {
+                    self.visit(&body);
+                }
+                self.exit_block_scope();
+            } else {
+                self.visit(&block);
+            }
+        }
+    }
+    fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+        if let Some(bn) = node.block() {
+            self.enter_block_scope(false, false, bn.body().is_some());
+            if let Some(params) = bn.parameters() {
+                self.visit(&params);
+            }
+            if let Some(body) = bn.body() {
+                self.visit(&body);
+            }
+            self.exit_block_scope();
+        }
+    }
+    // `->(){}` literal: always a lambda, never attached via `CallNode::
+    // block()`.
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.enter_block_scope(true, false, node.body().is_some());
+        if let Some(params) = node.parameters() {
+            self.visit(&params);
+        }
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.exit_block_scope();
+    }
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.reference(node.name().as_slice(), node.depth());
+    }
+    // Plain `x = value` never references `x` itself (only assigns it) —
+    // `process_variable_assignment` processes the RHS BEFORE recording the
+    // assignment, so `x = x + 1` still counts as a genuine prior read.
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.visit(&node.value());
+        self.assign(node.name().as_slice(), node.depth());
+    }
+    // A masgn (`a, b = ...`)/pattern-match target: a write, never a read —
+    // matches `process_variable_assignment`'s non-referencing behavior
+    // exactly (any read of the same name in the whole masgn's RHS or a
+    // sibling target is a SEPARATE `LocalVariableReadNode`, picked up on its
+    // own).
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        self.assign(node.name().as_slice(), node.depth());
+    }
+    // `+=`/`-=`/etc: `process_variable_operator_assignment` ALWAYS
+    // references the variable's old value before evaluating the RHS, then
+    // assigns — regardless of whether the old value's read is used to
+    // suppress an offense downstream, this exactly matches upstream's
+    // unconditional `variable_table.reference_variable(name, node)`.
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        self.reference(node.name().as_slice(), node.depth());
+        self.visit(&node.value());
+        self.assign(node.name().as_slice(), node.depth());
+    }
+    // `&&=`/`||=`: upstream treats `and_asgn`/`or_asgn` identically to
+    // `op_asgn` in `OPERATOR_ASSIGNMENT_TYPES` — always references first.
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        self.reference(node.name().as_slice(), node.depth());
+        self.visit(&node.value());
+        self.assign(node.name().as_slice(), node.depth());
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        self.reference(node.name().as_slice(), node.depth());
+        self.visit(&node.value());
+        self.assign(node.name().as_slice(), node.depth());
+    }
+    fn visit_required_parameter_node(&mut self, node: &ruby_prism::RequiredParameterNode<'pr>) {
+        let loc = node.location();
+        self.declare_here(node.name().as_slice(), loc.start_offset(), loc.start_offset(), loc.end_offset(), UbaKind::Arg);
+    }
+    fn visit_optional_parameter_node(&mut self, node: &ruby_prism::OptionalParameterNode<'pr>) {
+        let nloc = node.name_loc();
+        let floc = node.location();
+        self.declare_here(
+            node.name().as_slice(),
+            nloc.start_offset(),
+            floc.start_offset(),
+            floc.end_offset(),
+            UbaKind::OptArg,
+        );
+        self.visit(&node.value());
+    }
+    // Anonymous `*` (no name) declares nothing trackable — matches upstream
+    // `process_variable_declaration`'s `return unless variable_name`.
+    fn visit_rest_parameter_node(&mut self, node: &ruby_prism::RestParameterNode<'pr>) {
+        if let (Some(name), Some(nloc)) = (node.name(), node.name_loc()) {
+            let floc = node.location();
+            self.declare_here(name.as_slice(), nloc.start_offset(), floc.start_offset(), floc.end_offset(), UbaKind::RestArg);
+        }
+    }
+    fn visit_required_keyword_parameter_node(&mut self, node: &ruby_prism::RequiredKeywordParameterNode<'pr>) {
+        let nloc = node.name_loc();
+        let floc = node.location();
+        self.declare_here(
+            node.name().as_slice(),
+            nloc.start_offset(),
+            floc.start_offset(),
+            floc.end_offset(),
+            UbaKind::ReqKwArg,
+        );
+    }
+    fn visit_optional_keyword_parameter_node(&mut self, node: &ruby_prism::OptionalKeywordParameterNode<'pr>) {
+        let nloc = node.name_loc();
+        let floc = node.location();
+        self.declare_here(
+            node.name().as_slice(),
+            nloc.start_offset(),
+            floc.start_offset(),
+            floc.end_offset(),
+            UbaKind::OptKwArg,
+        );
+        self.visit(&node.value());
+    }
+    fn visit_keyword_rest_parameter_node(&mut self, node: &ruby_prism::KeywordRestParameterNode<'pr>) {
+        if let (Some(name), Some(nloc)) = (node.name(), node.name_loc()) {
+            let floc = node.location();
+            self.declare_here(name.as_slice(), nloc.start_offset(), floc.start_offset(), floc.end_offset(), UbaKind::KwRestArg);
+        }
+    }
+    // `&block` — a method/block's block-PASS parameter, not a block node.
+    // Anonymous `&` (no name) declares nothing trackable.
+    fn visit_block_parameter_node(&mut self, node: &ruby_prism::BlockParameterNode<'pr>) {
+        if let (Some(name), Some(nloc)) = (node.name(), node.name_loc()) {
+            let floc = node.location();
+            self.declare_here(name.as_slice(), nloc.start_offset(), floc.start_offset(), floc.end_offset(), UbaKind::BlockArg);
+        }
+    }
+    // `shadowarg` — a block-local variable (`obj.each { |arg; this| }`).
+    fn visit_block_local_variable_node(&mut self, node: &ruby_prism::BlockLocalVariableNode<'pr>) {
+        let loc = node.location();
+        self.declare_here(node.name().as_slice(), loc.start_offset(), loc.start_offset(), loc.end_offset(), UbaKind::ShadowArg);
+    }
+}
