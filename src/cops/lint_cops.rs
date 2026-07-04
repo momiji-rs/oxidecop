@@ -18789,8 +18789,17 @@ impl<'a> Cops<'a> {
             }
             return true;
         }
-        let mut errors = result.errors().peekable();
-        if errors.peek().is_none() {
+        // `Prism::Translation::Parser` parses with `partial_script: true`,
+        // which disables exactly two checks (parse_yield, parse_block_exit):
+        // top-level `yield` and `break`/`next`/`redo` outside a loop/block.
+        // Those errors never exist on the RuboCop side.
+        let errors: Vec<_> = result
+            .errors()
+            .filter(|e| {
+                !matches!(e.message(), "Invalid yield" | "Invalid break" | "Invalid next" | "Invalid redo")
+            })
+            .collect();
+        if errors.is_empty() {
             return false;
         }
         if !self.on(COP) {
