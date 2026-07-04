@@ -8748,6 +8748,14 @@ impl<'a> Cops<'a> {
                     i += 1;
                     continue;
                 }
+                // a LINE-CONTINUATION backslash isn't a lexer token upstream
+                // — the token stream simply ends at the preceding token and
+                // resumes on the next line (cross-line pairs are never
+                // checked), so spacing before it is invisible (rails:
+                // '"..." \'-aligned string continuations).
+                if b == b'\\' && self.src[i + 1..code_end].iter().all(u8::is_ascii_whitespace) {
+                    break;
+                }
                 let tok_end = i + self.es_token_len(i).max(1);
                 if let Some(pe) = prev_end {
                     let is_assign = force_eq_align && assign_map.get(&line) == Some(&(i, tok_end));
@@ -9637,26 +9645,6 @@ impl<'a> super::Cops<'a> {
     }
 }
 
-/// Layout/IndentationConsistency: `class_constructor?`'s `any_block` branch,
-/// checked directly on a `CallNode` (from `visit_call_node`, before its
-/// `block` is visited): a call to `new` on a bare/`::`-qualified
-/// `Class`/`Module`/`Struct` constant, or `define` on `Data`, matching
-/// `global_const?`'s `(const {nil? cbase} %1)` — a plain top-level constant
-/// reference or one with a leading `::`, never a deeper-namespaced one
-/// (`Foo::Struct.new` doesn't match).
-pub(crate) fn ic_is_class_constructor_call(call: &ruby_prism::CallNode, src: &[u8]) -> bool {
-    if call.is_safe_navigation() {
-        return false;
-    }
-    let Some(r) = call.receiver() else { return false };
-    let l = r.location();
-    let recv = &src[l.start_offset()..l.end_offset()];
-    match call.name().as_slice() {
-        b"new" => matches!(recv, b"Class" | b"::Class" | b"Module" | b"::Module" | b"Struct" | b"::Struct"),
-        b"define" => matches!(recv, b"Data" | b"::Data"),
-        _ => false,
-    }
-}
 
 
 

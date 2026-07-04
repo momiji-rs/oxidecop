@@ -3212,6 +3212,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.mcwap_assign_stack.pop();
     }
     fn visit_call_and_write_node(&mut self, node: &ruby_prism::CallAndWriteNode<'pr>) {
+        // Layout/IndentationWidth: CheckAssignment also fires for
+        // compound writes on index/attribute targets (rails:
+        // `@responses[k] ||= if ...`).
+        self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         self.check_self_assignment_reader_write(
             node.location().start_offset(),
             node.receiver(),
@@ -3221,7 +3225,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         );
         ruby_prism::visit_call_and_write_node(self, node);
     }
+    fn visit_call_operator_write_node(&mut self, node: &ruby_prism::CallOperatorWriteNode<'pr>) {
+        // Layout/IndentationWidth: CheckAssignment also fires for compound
+        // writes on attribute-call targets (`foo.bar += if ...`).
+        self.check_indentation_width_assignment(node.location().start_offset(), node.value());
+        ruby_prism::visit_call_operator_write_node(self, node);
+    }
     fn visit_call_or_write_node(&mut self, node: &ruby_prism::CallOrWriteNode<'pr>) {
+        // Layout/IndentationWidth: CheckAssignment also fires for
+        // compound writes on index/attribute targets (rails:
+        // `@responses[k] ||= if ...`).
+        self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         self.check_self_assignment_reader_write(
             node.location().start_offset(),
             node.receiver(),
@@ -3233,6 +3247,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_call_or_write_node(self, node);
     }
     fn visit_index_and_write_node(&mut self, node: &ruby_prism::IndexAndWriteNode<'pr>) {
+        // Layout/IndentationWidth: CheckAssignment also fires for
+        // compound writes on index/attribute targets (rails:
+        // `@responses[k] ||= if ...`).
+        self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         let key_args: Vec<ruby_prism::Node> =
             node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
         self.check_self_assignment_reader_write(
@@ -3251,6 +3269,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_index_and_write_node(self, node);
     }
     fn visit_index_or_write_node(&mut self, node: &ruby_prism::IndexOrWriteNode<'pr>) {
+        // Layout/IndentationWidth: CheckAssignment also fires for
+        // compound writes on index/attribute targets (rails:
+        // `@responses[k] ||= if ...`).
+        self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         let key_args: Vec<ruby_prism::Node> =
             node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
         self.check_self_assignment_reader_write(
@@ -3270,6 +3292,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_index_or_write_node(self, node);
     }
     fn visit_index_operator_write_node(&mut self, node: &ruby_prism::IndexOperatorWriteNode<'pr>) {
+        // Layout/IndentationWidth: CheckAssignment also fires for
+        // compound writes on index/attribute targets (rails:
+        // `@responses[k] ||= if ...`).
+        self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         self.check_space_inside_reference_brackets_write(
             node.receiver(),
             node.opening_loc(),
@@ -5151,16 +5177,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
-        // Layout/IndentationConsistency: `class_constructor?`'s `any_block`
-        // branch — a `Class.new`/`Module.new`/`Struct.new`/`Data.define
-        // do...end` block's own body is a macro scope, exactly like a real
-        // `class`/`module` body — see `ic_parent_of_body`'s doc.
-        if layout::ic_is_class_constructor_call(node, self.src) {
-            if let Some(blk) = node.block().and_then(|b| b.as_block_node()) {
-                if let Some(body) = blk.body() {
-                    self.ic_parent_of_body
-                        .insert(body.location().start_offset(), blk.location().start_offset());
-                }
+        // Layout/IndentationConsistency: rubocop-ast's `macro?` treats a
+        // bare send in ANY block body as macro-scoped (`class_methods do`,
+        // `concerning ... do`, plain DSL blocks — rails corpus), not just
+        // `class_constructor?` blocks — every call-attached block body
+        // registers as a macro-scope container, exactly like a real
+        // `class`/`module` body. See `ic_parent_of_body`'s doc.
+        if let Some(blk) = node.block().and_then(|b| b.as_block_node()) {
+            if let Some(body) = blk.body() {
+                self.ic_parent_of_body
+                    .insert(body.location().start_offset(), blk.location().start_offset());
             }
         }
         // Style/RegexpLiteral: mark a receiver/argument regexp literal as a
