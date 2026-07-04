@@ -241,7 +241,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
-    "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment",
+    "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems",
 ];
 
 impl Engine {
@@ -3173,6 +3173,10 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     // `add_dependency`-family call, then compare consecutive pairs) rather
     // than a per-node hook — see gemspec.rs's doc comment.
     cops.check_ordered_dependencies(&result.node());
+    // Bundler/OrderedGems: same whole-file-scan shape (see gemspec.rs's
+    // check_ordered_dependencies doc comment) — collect every `gem 'name'`
+    // declaration, then compare consecutive pairs.
+    cops.check_ordered_gems(&result.node());
     // needs the breakable nominations the walk collected
     cops.check_line_length();
     cops.check_semicolon_lines();

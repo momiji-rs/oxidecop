@@ -1,6 +1,6 @@
 //! Bundler department.
 use super::Cops;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 impl<'a> Cops<'a> {
     /// Bundler/InsecureProtocolSource — `source :gemcutter`/`:rubygems`/
@@ -356,4 +356,208 @@ impl<'a> Cops<'a> {
             self.push(0, COP, false, message);
         }
     }
+}
+
+
+/// One `gem 'name'` declaration matching rubocop's node pattern `(:send
+/// nil? :gem str ...)` — a bare `gem` call (no receiver) whose FIRST
+/// argument is literally a string node (any further args/trailing block are
+/// irrelevant to the match). Since the pattern already requires the first
+/// argument to be a `str` node, `OrderedGemNode#find_gem_name`'s recursive
+/// "peel through `.receiver()` chains" branch is dead code here (it only
+/// matters for cops like Gemspec/OrderedDependencies whose pattern doesn't
+/// pin the argument's node type) — the string's own content is always what
+/// gets used.
+struct GemDecl {
+    // The call node's own span (`gem` through its last argument) — rubocop's
+    // `node.source_range`: both the offense anchor and the "own line" bound
+    // `declaration_with_comment` swaps up to.
+    start: usize,
+    first_line: usize,
+    last_line: usize,
+    name: Vec<u8>,
+}
+
+/// Collects every `gem_declarations` match in the whole file, in source
+/// order — rubocop's `def_node_search` walks the full tree (including
+/// inside `group do ... end` blocks), and for this narrow, non-nesting node
+/// shape, preorder traversal order is the same as source order.
+struct GemDeclCollector<'a> {
+    idx: &'a super::LineIndex,
+    decls: Vec<GemDecl>,
+}
+impl<'pr, 'a> ruby_prism::Visit<'pr> for GemDeclCollector<'a> {
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if node.receiver().is_none() && node.name().as_slice() == b"gem" {
+            if let Some(first) = node.arguments().and_then(|a| a.arguments().iter().next()) {
+                if let Some(s) = first.as_string_node() {
+                    let l = node.location();
+                    let start = l.start_offset();
+                    let end = l.end_offset();
+                    self.decls.push(GemDecl {
+                        start,
+                        first_line: self.idx.loc(start).0,
+                        last_line: self.idx.loc(end.saturating_sub(1).max(start)).0,
+                        name: s.unescaped().to_vec(),
+                    });
+                }
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+}
+
+impl<'a> Cops<'a> {
+    /// Bundler/OrderedGems — `gem` declarations must be alphabetically
+    /// sorted within their "section" (a maximal run of declarations on
+    /// consecutive lines, where a leading comment block directly touching a
+    /// declaration counts as part of it unless `TreatCommentsAsGroupSeparators`
+    /// says otherwise).
+    ///
+    /// Ported from `RuboCop::Cop::Bundler::OrderedGems` +
+    /// `OrderedGemNode` (mixin) + `OrderedGemCorrector` — the very same
+    /// mixin/corrector `Gemspec::OrderedDependencies` uses (see
+    /// `check_ordered_dependencies` in gemspec.rs, whose structure this
+    /// mirrors closely). Two differences from that port: (1) there's only
+    /// ONE method name (`gem`), so no grouping-by-method-name step exists;
+    /// (2) the node pattern here pins the first argument to `str` directly,
+    /// so `gem_name` never needs the receiver-chain-peeling fallback.
+    ///
+    /// Run once over the whole parsed tree (like `check_ordered_dependencies`),
+    /// not from a `visit_*` hook — the upstream check is fundamentally a
+    /// whole-file `def_node_search` + `each_cons(2)`, not a single-node
+    /// predicate. This cop's per-cop `Include` (`**/*.gemfile`, `**/Gemfile`,
+    /// `**/gems.rb`) is handled by the engine's DEFAULT_COP_INCLUDES
+    /// machinery upstream of this function, per the task brief — no gating
+    /// here.
+    pub(crate) fn check_ordered_gems(&mut self, root: &ruby_prism::Node) {
+        const COP: &str = "Bundler/OrderedGems";
+        if !self.on(COP) {
+            return;
+        }
+        let mut collector = GemDeclCollector { idx: self.idx, decls: Vec::new() };
+        ruby_prism::Visit::visit(&mut collector, root);
+        let decls = collector.decls;
+        if decls.len() < 2 {
+            return;
+        }
+
+        // TreatCommentsAsGroupSeparators default true, ConsiderPunctuation
+        // default false — both ARRAY-absent-from-schema-safe here since
+        // they're plain booleans, but honor the same self.cfg.get +
+        // schema-default-fallback idiom as the sibling port for consistency.
+        let treat_as_sep = self.cfg.get(COP, "TreatCommentsAsGroupSeparators") != Some("false");
+        let consider_punct = self.cfg.get(COP, "ConsiderPunctuation") == Some("true");
+
+        // Lines whose ENTIRE content (up to the `#`) is whitespace — a
+        // "leading comment" line eligible to be swapped along with the
+        // declaration under it (rubocop's `Parser::Source::Comment::
+        // Associator`: a same-line TRAILING comment never counts as a
+        // preceding one).
+        let mut own_line_comment: HashSet<usize> = HashSet::new();
+        for &(line, start, _end) in self.comments {
+            let ls = self.idx.starts[line - 1];
+            if self.src[ls..start].iter().all(u8::is_ascii_whitespace) {
+                own_line_comment.insert(line);
+            }
+        }
+        // Whole-line-is-whitespace check (blank line).
+        let blank_line = |line: usize| -> bool {
+            let ls = self.idx.starts[line - 1];
+            let le = self.idx.starts.get(line).copied().unwrap_or(self.src.len());
+            self.src[ls..le].iter().all(u8::is_ascii_whitespace)
+        };
+        // The EARLIEST comment `Parser::Source::Comment::Associator` attaches
+        // to a node starting on `first_line` — `get_source_range`'s
+        // `ast_with_comments[node].first`. Walk upward through blank and
+        // comment-only lines; the topmost comment-only line seen is the
+        // first attached comment.
+        let leading_top = |first_line: usize| -> Option<usize> {
+            let mut top = None;
+            let mut line = first_line;
+            while line > 1 {
+                let above = line - 1;
+                if own_line_comment.contains(&above) {
+                    top = Some(above);
+                } else if !blank_line(above) {
+                    break;
+                }
+                line = above;
+            }
+            top
+        };
+        // `get_source_range(node, treat_as_sep).first_line`: with
+        // TreatCommentsAsGroupSeparators, comments are never folded in.
+        let source_range_first_line =
+            |first_line: usize| if treat_as_sep { first_line } else { leading_top(first_line).unwrap_or(first_line) };
+
+        let canon = |name: &[u8]| -> Vec<u8> {
+            let mut v: Vec<u8> = if consider_punct {
+                name.to_vec()
+            } else {
+                name.iter().copied().filter(|&b| b != b'-' && b != b'_').collect()
+            };
+            v.make_ascii_lowercase();
+            v
+        };
+
+        // Byte ranges already claimed by an earlier swap THIS pass — when a
+        // declaration is the `current` of one offense and the `previous` of
+        // the next (`c, b, a`), the second `corrector.swap` clobbers the
+        // first; rubocop drops the whole clobbering corrector (Parser::
+        // ClobberingError suppression) and re-converges over autocorrect
+        // passes. Both halves of a swap must stay atomic — applying one half
+        // alone would corrupt the source.
+        let mut claimed: Vec<(usize, usize)> = Vec::new();
+
+        for w in decls.windows(2) {
+            let (prev, curr) = (&w[0], &w[1]);
+            // consecutive_lines?
+            let curr_top = source_range_first_line(curr.first_line);
+            if prev.last_line != curr_top.saturating_sub(1) {
+                continue;
+            }
+            // case_insensitive_out_of_order?(gem_name(current), gem_name(previous))
+            if canon(&curr.name) >= canon(&prev.name) {
+                continue;
+            }
+
+            let prev_name = String::from_utf8_lossy(&prev.name).into_owned();
+            let curr_name = String::from_utf8_lossy(&curr.name).into_owned();
+            let msg = format!(
+                "Gems should be sorted in an alphabetical order within their section of the Gemfile. Gem `{curr_name}` should appear before `{prev_name}`."
+            );
+            self.push(curr.start, COP, true, msg);
+
+            // OrderedGemCorrector#declaration_with_comment for each side:
+            // begin = start of the topmost attached-comment line (or the
+            // node's own line when there's none / comments are separators);
+            // end = end of the node's OWN last line, newline included.
+            let prev_top = source_range_first_line(prev.first_line);
+            let curr_range = (self.idx.starts[curr_top - 1], og_line_end_incl_nl(self.idx, self.src, curr.last_line));
+            let prev_range = (self.idx.starts[prev_top - 1], og_line_end_incl_nl(self.idx, self.src, prev.last_line));
+
+            let overlaps = |a: (usize, usize), b: &(usize, usize)| a.0 < b.1 && b.0 < a.1;
+            if claimed.iter().any(|c| overlaps(curr_range, c) || overlaps(prev_range, c)) {
+                continue; // offense stands; the clobbering correction is dropped
+            }
+            claimed.push(curr_range);
+            claimed.push(prev_range);
+
+            let curr_text = self.src[curr_range.0..curr_range.1].to_vec();
+            let prev_text = self.src[prev_range.0..prev_range.1].to_vec();
+            // corrector.swap(current_range, previous_range)
+            self.fixes.push((curr_range.0, curr_range.1, prev_text));
+            self.fixes.push((prev_range.0, prev_range.1, curr_text));
+        }
+    }
+}
+
+/// End offset of `line`, including its trailing newline — the start of the
+/// next line, or end-of-buffer for the last line. (Free function, not a
+/// `Cops` method, to avoid an inherent-method name collision with
+/// gemspec.rs's identically-shaped `line_end_incl_nl` helper — inherent
+/// impls share one method namespace per type across the whole crate.)
+fn og_line_end_incl_nl(idx: &super::LineIndex, src: &[u8], line: usize) -> usize {
+    idx.starts.get(line).copied().unwrap_or(src.len())
 }

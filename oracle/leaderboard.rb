@@ -254,6 +254,7 @@ COPS = {
   'Layout/IndentationStyle'          => 'layout/indentation_style',
   'Layout/ParameterAlignment'        => 'layout/parameter_alignment',
   'Style/RedundantAssignment'        => 'style/redundant_assignment',
+  'Bundler/OrderedGems'              => 'bundler/ordered_gems',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
