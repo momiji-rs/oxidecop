@@ -2296,11 +2296,16 @@ impl<'i> MlHeredocEndScanner<'i> {
         // rescue/ensure wrappers stop at their content. Record the content
         // end instead (children still visited normally).
         if let Some(b) = node.as_begin_node() {
-            let line = self.idx.loc(ml_begin_node_content_end(&b).saturating_sub(1)).0;
-            if line > self.max_line {
-                self.max_line = line;
+            // Only the IMPLICIT wrapper (no `begin` keyword) needs the
+            // content-end treatment; an explicit kwbegin spans through its
+            // own `end` in whitequark too.
+            if b.begin_keyword_loc().is_none() {
+                let line = self.idx.loc(ml_begin_node_content_end(&b).saturating_sub(1)).0;
+                if line > self.max_line {
+                    self.max_line = line;
+                }
+                return;
             }
-            return;
         }
         let line = if super::breakable::is_heredoc_node(node) {
             let closing = if let Some(n) = node.as_string_node() {
