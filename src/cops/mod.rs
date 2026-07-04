@@ -313,7 +313,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef",
 ];
 
 impl Engine {
@@ -1337,6 +1337,16 @@ pub(crate) struct Cops<'a> {
     // node's own start/end offsets, outer-literal brace eligibility) — see
     // `visit_embedded_statements_node`'s doc.
     pub(crate) sgv_climb: HashMap<usize, (usize, usize, bool)>,
+    // Lint/OutOfRangeRegexpRef: capture-count "the most recently seen
+    // regexp gives `$1..$9` this many valid refs" state — mirrors
+    // upstream's `@valid_ref` ivar. `Some(0)` at the start of every file
+    // (matching `on_new_investigation`'s `@valid_ref = 0`, NOT `None` —
+    // `$1` before any regexp at all is still a confident "0 captures"
+    // verdict, not an unknown one). Becomes `None` whenever a
+    // `RESTRICT_ON_SEND` call is seen that doesn't pan out (no regexp
+    // literal receiver/argument) or an interpolated regexp is checked —
+    // `None` means "never offend" (upstream's `return if @valid_ref.nil?`).
+    pub(crate) oorr_valid_ref: Option<u32>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2092,6 +2102,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_numbered_reference_read_node(&mut self, node: &ruby_prism::NumberedReferenceReadNode<'pr>) {
         self.check_perl_backrefs_numbered(node);
+        self.check_out_of_range_regexp_ref_nth_ref(node);
     }
     fn visit_back_reference_read_node(&mut self, node: &ruby_prism::BackReferenceReadNode<'pr>) {
         self.check_perl_backrefs_back_ref(node);
@@ -2324,12 +2335,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_multiline_when_then(node);
         let kw = node.keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"when");
+        // Lint/OutOfRangeRegexpRef's `on_when`: must run BEFORE descending
+        // into the clause's conditions/body so nth-refs inside see the
+        // updated state (mirrors upstream's node-enter callback timing).
+        self.check_out_of_range_regexp_ref_when(node);
         ruby_prism::visit_when_node(self, node);
     }
     fn visit_in_node(&mut self, node: &ruby_prism::InNode<'pr>) {
         self.check_redundant_self_in_pattern(node);
         let kw = node.in_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"in");
+        // Lint/OutOfRangeRegexpRef's `on_in_pattern`: node-enter timing,
+        // same as `on_when` above — must run before the pattern/statements
+        // are visited.
+        self.check_out_of_range_regexp_ref_in_pattern(node);
         // Inlines `ruby_prism::visit_in_node`'s own default body (visit
         // pattern, then statements) so only the PATTERN half runs under
         // `pattern_depth` — see that field's doc comment on `Cops`.
@@ -3774,6 +3793,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.bare_arg_frames.pop();
             }
         }
+        // Lint/OutOfRangeRegexpRef's `after_send`/`after_csend`: fires after
+        // the receiver and arguments are visited but BEFORE any attached
+        // block — see that function's doc comment for why this exact spot
+        // matters (mirrors whitequark's node shape, where a block's body is
+        // never a child of the `:send` node itself).
+        self.check_out_of_range_regexp_ref_after_send(node);
         if let Some(b) = node.block() {
             if let Some(bn) = b.as_block_node() {
                 self.check_empty_block_parameter(&bn);
@@ -4072,6 +4097,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         aa_masgn_rhs: HashSet::new(),
         aa_unbracketed_rhs_parent: HashMap::new(),
         aa_registered_ranges: Vec::new(),
+        oorr_valid_ref: Some(0),
     };
 
     let t = tick(&T_PREP, t);

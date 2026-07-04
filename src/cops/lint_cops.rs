@@ -10829,3 +10829,376 @@ impl<'a> Cops<'a> {
         self.push(sel.start_offset(), COP, false, cfpm_message_text(node));
     }
 }
+
+
+// ---- Lint/OutOfRangeRegexpRef ---------------------------------------------
+//
+// Upstream tracks a single `@valid_ref` ivar (here: `Cops::oorr_valid_ref`,
+// `Option<u32>` — `None` standing in for whitequark's `nil`) that gets
+// updated every time a regexp literal is "matched" against something, and
+// consulted every time a `$1`..`$9` numbered-backref read (prism's
+// `NumberedReferenceReadNode`) is encountered. Node-processing ORDER is
+// everything here — see the doc comments on each hook below for exactly
+// when in the traversal it must fire, mirroring upstream's
+// `on_send`/`after_send`/`on_when`/`on_in_pattern`/`on_nth_ref` callback
+// timing (a "pre" callback fires at node-enter, before children are
+// visited; an "after" callback fires once the node's own children have
+// been fully visited).
+//
+// `on_match_with_lvasgn` (upstream's callback for `/regex/ =~ str` where
+// `regex` has a named capture — whitequark elides the `=~` into a
+// dedicated `match_with_lvasgn` node with NO nested `:send` node at all)
+// has no dedicated hook here: prism instead wraps an ordinary `CallNode`
+// (name `=~`, receiver the regexp) in a `MatchWriteNode`, and
+// `ruby_prism::visit_match_write_node`'s default body dispatches straight
+// into `visit_call_node` — so the `after_send`-equivalent hook below
+// reproduces `check_regexp(node.children.first)` for free, calling
+// `check_regexp` on the exact same regexp node upstream would.
+
+const OORR_REGEXP_RECEIVER_METHODS: &[&[u8]] = &[b"=~", b"===", b"match"];
+const OORR_REGEXP_ARGUMENT_METHODS: &[&[u8]] = &[
+    b"=~",
+    b"match",
+    b"grep",
+    b"gsub",
+    b"gsub!",
+    b"sub",
+    b"sub!",
+    b"[]",
+    b"slice",
+    b"slice!",
+    b"index",
+    b"rindex",
+    b"scan",
+    b"partition",
+    b"rpartition",
+    b"start_with?",
+    b"end_with?",
+];
+// RESTRICT_ON_SEND: the union of the two method sets above — every such
+// call resets `@valid_ref`, whether or not a regexp literal is actually
+// involved.
+const OORR_RESTRICT_ON_SEND: &[&[u8]] = &[
+    b"=~",
+    b"===",
+    b"match",
+    b"grep",
+    b"gsub",
+    b"gsub!",
+    b"sub",
+    b"sub!",
+    b"[]",
+    b"slice",
+    b"slice!",
+    b"index",
+    b"rindex",
+    b"scan",
+    b"partition",
+    b"rpartition",
+    b"start_with?",
+    b"end_with?",
+];
+
+fn oorr_is_regexp_node(node: &ruby_prism::Node) -> bool {
+    node.as_regular_expression_node().is_some() || node.as_interpolated_regular_expression_node().is_some()
+}
+
+/// `pattern.each_descendant(:regexp).to_a` — every regexp literal anywhere
+/// in `node`'s subtree (array/hash/alternative/pin `case/in` patterns can
+/// nest a regexp arbitrarily deep), regardless of depth. Both prism regexp
+/// node types stand in for whitequark's single `:regexp` node type (see the
+/// module doc above for why `Lint/OutOfRangeRegexpRef` needs both).
+fn oorr_regexp_descendants<'pr>(node: &ruby_prism::Node<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    struct Finder<'pr> {
+        found: Vec<ruby_prism::Node<'pr>>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder<'pr> {
+        fn visit_regular_expression_node(&mut self, node: &ruby_prism::RegularExpressionNode<'pr>) {
+            self.found.push(node.as_node());
+            ruby_prism::visit_regular_expression_node(self, node);
+        }
+        fn visit_interpolated_regular_expression_node(
+            &mut self,
+            node: &ruby_prism::InterpolatedRegularExpressionNode<'pr>,
+        ) {
+            self.found.push(node.as_node());
+            ruby_prism::visit_interpolated_regular_expression_node(self, node);
+        }
+    }
+    let mut f = Finder { found: Vec::new() };
+    use ruby_prism::Visit;
+    f.visit(node);
+    f.found
+}
+
+/// Counts named vs. plain numbered capturing groups in a regexp pattern's
+/// raw source bytes, mirroring the presence-scanning algorithm documented
+/// on `scan_regexp_captures` above (`Lint/MixedRegexpCaptureTypes`) but
+/// tallying group COUNTS rather than a mere presence bit — `check_regexp`
+/// needs the exact number of named captures, since Onigmo semantics say
+/// that once ANY named group exists in a pattern, the plain numbered groups
+/// no longer participate in `$1`.."$9"` numbering at all (the named groups
+/// alone are numbered, in order of appearance). A malformed/unbalanced
+/// pattern (real rubocop's `regexp_parser` backend fails to parse it, so
+/// `each_capture` yields nothing for either kind) reports `(0, 0)`, same as
+/// `scan_regexp_captures`'s `(false, false)`.
+fn oorr_count_captures(src: &[u8], extended: bool) -> (u32, u32) {
+    let mut named_count: u32 = 0;
+    let mut numbered_count: u32 = 0;
+    let n = src.len();
+    let mut i = 0usize;
+    let mut class_depth: u32 = 0;
+    let mut depth: i64 = 0;
+
+    while i < n {
+        let b = src[i];
+
+        if b == b'\\' {
+            i += 2;
+            continue;
+        }
+
+        if class_depth > 0 {
+            if b == b'[' && i + 1 < n && matches!(src[i + 1], b':' | b'.' | b'=') {
+                let closer = [src[i + 1], b']'];
+                match find_bytes(&src[i + 2..], &closer) {
+                    Some(rel) => i += 2 + rel + 2,
+                    None => i += 2,
+                }
+                continue;
+            }
+            if b == b'[' {
+                class_depth += 1;
+                i += 1;
+                continue;
+            }
+            if b == b']' {
+                class_depth -= 1;
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'[' {
+            class_depth = 1;
+            i += 1;
+            if i < n && src[i] == b'^' {
+                i += 1;
+            }
+            if i < n && src[i] == b']' {
+                i += 1;
+            }
+            continue;
+        }
+
+        if extended && b == b'#' {
+            while i < n && src[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        if b == b')' {
+            if depth == 0 {
+                return (0, 0);
+            }
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+
+        if b != b'(' {
+            i += 1;
+            continue;
+        }
+
+        if i + 1 >= n || src[i + 1] != b'?' {
+            numbered_count += 1;
+            depth += 1;
+            i += 1;
+            continue;
+        }
+
+        let j = i + 2;
+        if j >= n {
+            i = j;
+            continue;
+        }
+        match src[j] {
+            b'#' => {
+                i = match find_bytes(&src[j + 1..], b")") {
+                    Some(rel) => j + 1 + rel + 1,
+                    None => n,
+                };
+            }
+            b'<' if j + 1 < n && matches!(src[j + 1], b'=' | b'!') => {
+                depth += 1;
+                i = j + 2;
+            }
+            b'<' => {
+                named_count += 1;
+                depth += 1;
+                i = match find_bytes(&src[j + 1..], b">") {
+                    Some(rel) => j + 1 + rel + 1,
+                    None => n,
+                };
+            }
+            b'\'' => {
+                named_count += 1;
+                depth += 1;
+                i = match find_bytes(&src[j + 1..], b"'") {
+                    Some(rel) => j + 1 + rel + 1,
+                    None => n,
+                };
+            }
+            b':' | b'=' | b'!' | b'>' | b'~' => {
+                depth += 1;
+                i = j + 1;
+            }
+            _ => {
+                let mut k = j;
+                while k < n && src[k] != b':' && src[k] != b')' {
+                    k += 1;
+                }
+                if k < n && src[k] == b':' {
+                    depth += 1;
+                    i = k + 1;
+                } else if k < n {
+                    i = k + 1;
+                } else {
+                    i = n;
+                }
+            }
+        }
+    }
+
+    if depth != 0 || class_depth != 0 {
+        return (0, 0);
+    }
+
+    (named_count, numbered_count)
+}
+
+impl<'a> super::Cops<'a> {
+    /// `check_regexp`: `Some(count)` for a non-interpolated regexp literal
+    /// (the named-capture count if positive, else the numbered-capture
+    /// count), `None` for an interpolated one (`return if node.interpolation?`
+    /// upstream — a `None` here always gets ASSIGNED into `@valid_ref`
+    /// as-is by every caller, same as upstream leaving `@valid_ref` at
+    /// whatever `check_regexp`'s early `return` (i.e. `nil`) produced).
+    fn oorr_capture_count(&self, node: &ruby_prism::Node) -> Option<u32> {
+        if node.as_interpolated_regular_expression_node().is_some() {
+            return None;
+        }
+        let regex = node.as_regular_expression_node()?;
+        let content_loc = regex.content_loc();
+        let src = &self.src[content_loc.start_offset()..content_loc.end_offset()];
+        let (named, numbered) = oorr_count_captures(src, regex.is_extended());
+        Some(if named > 0 { named } else { numbered })
+    }
+
+    /// `after_send`/`after_csend` (aliased in upstream to the same method):
+    /// fires for every `RESTRICT_ON_SEND` call (the union of
+    /// `OORR_REGEXP_RECEIVER_METHODS` and `OORR_REGEXP_ARGUMENT_METHODS|)
+    /// REGARDLESS of whether it turns out to touch a regexp literal —
+    /// `@valid_ref` is unconditionally reset to `None` first, so an
+    /// intervening non-regexp call (e.g. `foo.match(some_regexp_variable)`)
+    /// invalidates any earlier regexp's capture count, then re-derived from
+    /// THIS call's own regexp-literal first-argument/receiver if it has
+    /// one (first-argument takes priority, matching upstream's
+    /// `if regexp_first_argument? ... elsif regexp_receiver?`).
+    ///
+    /// Must be called from `visit_call_node` AFTER the receiver and
+    /// arguments have been visited but BEFORE any attached block — see the
+    /// call site's own comment for why.
+    pub(crate) fn check_out_of_range_regexp_ref_after_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/OutOfRangeRegexpRef";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !OORR_RESTRICT_ON_SEND.contains(&name) {
+            return;
+        }
+        self.oorr_valid_ref = None;
+        let first_argument = node.arguments().and_then(|a| a.arguments().iter().next());
+        if let Some(arg) = &first_argument {
+            if OORR_REGEXP_ARGUMENT_METHODS.contains(&name) && oorr_is_regexp_node(arg) {
+                self.oorr_valid_ref = self.oorr_capture_count(arg);
+                return;
+            }
+        }
+        if let Some(recv) = node.receiver() {
+            if OORR_REGEXP_RECEIVER_METHODS.contains(&name) && oorr_is_regexp_node(&recv) {
+                self.oorr_valid_ref = self.oorr_capture_count(&recv);
+            }
+        }
+    }
+
+    /// `on_when`: the max capture-count across every REGEXP-LITERAL
+    /// condition of a `when` clause (non-regexp conditions, e.g. a plain
+    /// variable, are ignored entirely — they don't even reset the state).
+    /// Must run BEFORE the clause's conditions/body are visited. An
+    /// interpolated regexp condition contributes nothing (`oorr_capture_count`
+    /// returns `None`, filtered out); if NO condition ends up contributing
+    /// (including "there were no regexp conditions at all"), `@valid_ref`
+    /// becomes `None` (an empty iterator's `.max()` is `None`) — NOT `0`.
+    pub(crate) fn check_out_of_range_regexp_ref_when(&mut self, node: &ruby_prism::WhenNode) {
+        const COP: &str = "Lint/OutOfRangeRegexpRef";
+        if !self.on(COP) {
+            return;
+        }
+        let conditions: Vec<ruby_prism::Node> = node.conditions().iter().collect();
+        let max_count = conditions
+            .iter()
+            .filter(|c| oorr_is_regexp_node(c))
+            .filter_map(|c| self.oorr_capture_count(c))
+            .max();
+        self.oorr_valid_ref = max_count;
+    }
+
+    /// `on_in_pattern`: same "max across contributing regexps" shape as
+    /// `on_when`, but the regexp(s) come from `regexp_patterns` — either the
+    /// `in` pattern itself (if it's a bare regexp literal) or every regexp
+    /// anywhere in its subtree (array/hash/alternative/pin patterns etc.).
+    /// Must run BEFORE the pattern/statements are visited.
+    pub(crate) fn check_out_of_range_regexp_ref_in_pattern(&mut self, node: &ruby_prism::InNode) {
+        const COP: &str = "Lint/OutOfRangeRegexpRef";
+        if !self.on(COP) {
+            return;
+        }
+        let pattern = node.pattern();
+        let patterns: Vec<ruby_prism::Node> = if oorr_is_regexp_node(&pattern) {
+            vec![pattern]
+        } else {
+            oorr_regexp_descendants(&pattern)
+        };
+        let max_count = patterns.iter().filter_map(|p| self.oorr_capture_count(p)).max();
+        self.oorr_valid_ref = max_count;
+    }
+
+    /// `on_nth_ref`: `$1`..`$9` (and beyond) read against the capture count
+    /// left by the most recently seen regexp. `None` means "no verdict —
+    /// never offend" (upstream's `return if @valid_ref.nil?`); otherwise
+    /// offend only if the backref number EXCEEDS the valid count (`$1`
+    /// against a 1-capture regexp is fine; `$2` against it is not).
+    pub(crate) fn check_out_of_range_regexp_ref_nth_ref(&mut self, node: &ruby_prism::NumberedReferenceReadNode) {
+        const COP: &str = "Lint/OutOfRangeRegexpRef";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(valid) = self.oorr_valid_ref else {
+            return;
+        };
+        let backref = node.number();
+        if backref <= valid {
+            return;
+        }
+        let count = if valid == 0 { "no".to_string() } else { valid.to_string() };
+        let group = if valid == 1 { "group" } else { "groups" };
+        let msg = format!("${backref} is out of range ({count} regexp capture {group} detected).");
+        self.push(node.location().start_offset(), COP, false, msg);
+    }
+}
