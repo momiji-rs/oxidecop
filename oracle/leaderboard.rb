@@ -265,6 +265,7 @@ COPS = {
   'Layout/SpaceAroundKeyword'        => 'layout/space_around_keyword',
   'Style/MixinGrouping'              => 'style/mixin_grouping',
   'Style/ClassEqualityComparison'    => 'style/class_equality_comparison',
+  'Style/ParenthesesAroundCondition' => 'style/parentheses_around_condition',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

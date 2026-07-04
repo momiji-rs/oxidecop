@@ -15566,3 +15566,236 @@ impl<'a> super::Cops<'a> {
         out
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/ParenthesesAroundCondition — a superfluous `(...)` wrapped
+    /// around an `if`/`elsif`/`unless`/`while`/`until` condition. Ported from
+    /// `on_if` (also covers `elsif`, which prism visits as a nested
+    /// `IfNode` reached through `subsequent` — same hook, no special-casing
+    /// needed) and `on_while`/`on_until` (aliased upstream, split back out
+    /// here into two call sites since prism gives them distinct node
+    /// types). `unless` gets its own prism `UnlessNode` even though
+    /// whitequark folds it into `:if`, so it needs an explicit call site
+    /// too (upstream never defines `on_unless` — it doesn't have to).
+    ///
+    /// `keyword` is the literal keyword text driving the message
+    /// (`"if"`/`"elsif"`/`"unless"`/`"while"`/`"until"` — upstream reads
+    /// `node.parent.keyword`, which is just this); `is_while_or_until` gates
+    /// `require_parentheses?`'s block-condition exemption. Callers must
+    /// never invoke this for a ternary (`if_keyword_loc().is_none()`, no
+    /// call site here can produce one for `if`) or for the `begin...end
+    /// while/until` post-condition-loop shape (a distinct whitequark node
+    /// type `on_while` is never invoked for at all — mirrored here by the
+    /// `while`/`until` call sites skipping `is_begin_modifier()` nodes
+    /// before ever calling in).
+    pub(crate) fn check_parens_around_condition(
+        &mut self,
+        keyword: &'static str,
+        is_while_or_until: bool,
+        predicate: &ruby_prism::Node,
+    ) {
+        const COP: &str = "Style/ParenthesesAroundCondition";
+        if !self.on(COP) {
+            return;
+        }
+        // `control_op_condition`: `(begin $first_child $...rest)` — the
+        // condition must literally be a parenthesized group (prism's
+        // `ParenthesesNode`, upstream's `:begin`); anything else (a bare
+        // `x > 10`, a `(1..2).include?(x)` call chain, ...) doesn't match
+        // and is left alone.
+        let Some(paren) = predicate.as_parentheses_node() else { return };
+
+        // An empty `()` condition has no children at all — the pattern
+        // simply fails to match (`$_` requires at least one), so it's inert
+        // rather than an offense.
+        let children: Vec<ruby_prism::Node> = paren
+            .body()
+            .and_then(|b| b.as_statements_node())
+            .map(|s| s.body().iter().collect())
+            .unwrap_or_default();
+        let Some(first_child) = children.first() else { return };
+
+        // `require_parentheses?`: a `while`/`until` condition that's a
+        // method call with a `do`...`end` block keeps its parens — without
+        // them the `do` would misparse as binding to `while`/`until`
+        // itself rather than to the call (`{`...`}` has no such ambiguity,
+        // so it's NOT exempted).
+        if is_while_or_until && pac_block_requires_do_end_parens(first_child) {
+            return;
+        }
+
+        // `semicolon_separated_expressions?`: `(foo; bar)` — a literal `;`
+        // sits between the first and second statement.
+        if let Some(second) = children.get(1) {
+            let between = &self.src[first_child.location().end_offset()..second.location().start_offset()];
+            if between.contains(&b';') {
+                return;
+            }
+        }
+
+        // `modifier_op?`: the sole statement is itself a modifier
+        // if/unless/while/until or a `rescue` modifier — its own keyword
+        // makes stripping the outer parens ambiguous/unsafe, so upstream
+        // leaves them alone. (A `?:` ternary is explicitly carved back OUT
+        // of this upstream; unreachable here since no call site ever passes
+        // one, but mirrored for fidelity in `pac_is_modifier_op`.)
+        if pac_is_modifier_op(first_child) {
+            return;
+        }
+
+        // `parens_allowed?`, disjunct 1 (`Parentheses#parens_required?`):
+        // no space between the keyword/next-token and the parens — e.g.
+        // `if(x > 5)` — would merge into `ifx` if the parens were stripped
+        // bare, so they're left in place.
+        let open = paren.opening_loc();
+        let close = paren.closing_loc();
+        let before = open.start_offset().checked_sub(1).map(|i| self.src[i]);
+        let after = self.src.get(close.end_offset()).copied();
+        if before.is_some_and(|b| b.is_ascii_lowercase()) || after.is_some_and(|b| b.is_ascii_lowercase()) {
+            return;
+        }
+
+        // `parens_allowed?`, disjunct 2: `AllowSafeAssignment` (default
+        // true) — a SOLE assignment/setter-call statement, wrapped in
+        // parens on purpose to say "yes, I meant `=` here".
+        let allow_safe = self.cfg.get(COP, "AllowSafeAssignment") != Some("false");
+        if allow_safe && children.len() == 1 && pac_is_safe_assignment(first_child) {
+            return;
+        }
+
+        // `parens_allowed?`, disjunct 3: `AllowInMultilineConditions`
+        // (default false) — the parens themselves (not just the body) span
+        // more than one source line.
+        let allow_multiline = self.cfg.get(COP, "AllowInMultilineConditions") == Some("true");
+        if allow_multiline {
+            let (start_line, _) = self.idx.loc(open.start_offset());
+            let (end_line, _) = self.idx.loc(close.end_offset() - 1);
+            if start_line != end_line {
+                return;
+            }
+        }
+
+        let article = if keyword == "while" { "a" } else { "an" };
+        self.push(
+            paren.location().start_offset(),
+            COP,
+            true,
+            format!("Don't use parentheses around the condition of {article} `{keyword}`."),
+        );
+        self.pac_autocorrect(&paren);
+    }
+
+    /// `ParenthesesCorrector.correct`, minus the ternary-space-insertion and
+    /// orphaned-comma branches — both are for OTHER cops sharing the same
+    /// corrector (a ternary's own condition never reaches here: `on_if`
+    /// never calls in for one; a condition is never followed by a comma,
+    /// so `only_closing_paren_before_comma?` can't trigger either).
+    ///
+    /// Step 1 removes `(` together with ALL following whitespace (spaces,
+    /// tabs, newlines) up to the next non-whitespace byte — upstream's
+    /// `range_with_surrounding_space(side: :right, whitespace: true)`
+    /// defaults `newlines: true` too, and combined those two flags simply
+    /// consume every whitespace byte in one pass (see `pac_right_ext`'s doc
+    /// comment for the step-by-step equivalence).
+    ///
+    /// Step 2 removes `)` together with same-line leading spaces/tabs, then
+    /// (upstream's `remove_close_paren`, `newlines: true` in the common
+    /// case — we don't replicate the rare comment-above-`)`-swallows-a-
+    /// chained-call exception that flips it to `false`) any further
+    /// contiguous newlines before THAT — but no further indentation beyond
+    /// those newlines, matching `whitespace: false` there.
+    fn pac_autocorrect(&mut self, paren: &ruby_prism::ParenthesesNode) {
+        let open = paren.opening_loc();
+        let close = paren.closing_loc();
+        let right_end = pac_right_ext(self.src, open.end_offset());
+        self.fixes.push((open.start_offset(), right_end, Vec::new()));
+        let left_start = pac_left_ext(self.src, close.start_offset());
+        self.fixes.push((left_start, close.end_offset(), Vec::new()));
+    }
+}
+
+/// See `pac_autocorrect`'s doc comment: upstream's `final_pos` runs, in
+/// order, (1) same-line spaces/tabs unconditionally, (2) backslash-newline
+/// continuations (never requested here), (3) newlines (requested here), (4)
+/// any remaining `\s` (requested here). Since (4) alone already consumes
+/// every whitespace byte contiguously (spaces, tabs, AND newlines), steps
+/// (1) and (3) never change the outcome — they just get there first. So
+/// this is exactly steps 1+3+4 collapsed: walk `\s` forward from `pos`.
+fn pac_right_ext(src: &[u8], pos: usize) -> usize {
+    let mut p = pos;
+    while p < src.len() && matches!(src[p], b' ' | b'\t' | b'\n') {
+        p += 1;
+    }
+    p
+}
+
+/// See `pac_autocorrect`'s doc comment: upstream's `final_pos` here only
+/// requests steps (1) same-line spaces/tabs, then (3) newlines — step (4)
+/// (`whitespace`) is off, so indentation on an EARLIER line (before those
+/// newlines) is never swept up. Walk backward: spaces/tabs first, then
+/// contiguous newlines.
+fn pac_left_ext(src: &[u8], pos: usize) -> usize {
+    let mut p = pos;
+    while p > 0 && matches!(src[p - 1], b' ' | b'\t') {
+        p -= 1;
+    }
+    while p > 0 && src[p - 1] == b'\n' {
+        p -= 1;
+    }
+    p
+}
+
+/// `require_parentheses?`'s block check: the sole condition statement is a
+/// call with an attached `do`...`end` block (a `{`...`}` block is NOT
+/// exempted — only `do`...`end` is syntactically ambiguous with the
+/// `while`/`until` keyword once the parens are gone).
+fn pac_block_requires_do_end_parens(node: &ruby_prism::Node) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return false };
+    block.closing_loc().as_slice() == b"end"
+}
+
+/// `modifier_op?`: is `node` itself a modifier if/unless/while/until, or a
+/// `rescue` modifier (`x rescue y`)? A `?:` ternary is explicitly excluded
+/// upstream (unreachable here, but mirrored). `unless`'s modifier form gets
+/// its own prism `UnlessNode` branch since it isn't folded into `IfNode`
+/// the way whitequark folds it into `:if`. `while`/`until`'s `begin...end`
+/// post-condition-loop shape (`is_begin_modifier`) is excluded — it's a
+/// distinct whitequark node type (`:while_post`) that `basic_conditional?`
+/// never matches, so upstream never treats it as a modifier form here.
+fn pac_is_modifier_op(node: &ruby_prism::Node) -> bool {
+    if let Some(iff) = node.as_if_node() {
+        let Some(kw) = iff.if_keyword_loc() else { return false }; // ternary
+        return kw.as_slice() == b"if" && iff.end_keyword_loc().is_none();
+    }
+    if let Some(unl) = node.as_unless_node() {
+        return unl.end_keyword_loc().is_none();
+    }
+    if node.as_rescue_modifier_node().is_some() {
+        return true;
+    }
+    if let Some(w) = node.as_while_node() {
+        return !w.is_begin_modifier() && w.closing_loc().is_none();
+    }
+    if let Some(u) = node.as_until_node() {
+        return !u.is_begin_modifier() && u.closing_loc().is_none();
+    }
+    false
+}
+
+/// `SafeAssignment#safe_assignment?`'s inner test, given the sole statement
+/// already isolated by the caller: a plain `=` write (`equals_asgn?`) or a
+/// setter call (`test[0] = 10`'s `[]=`, `self.test = 10`'s `test=` — any
+/// call node that IS itself an assignment, i.e. has an `=` operator
+/// location).
+fn pac_is_safe_assignment(node: &ruby_prism::Node) -> bool {
+    node.as_local_variable_write_node().is_some()
+        || node.as_instance_variable_write_node().is_some()
+        || node.as_class_variable_write_node().is_some()
+        || node.as_global_variable_write_node().is_some()
+        || node.as_constant_write_node().is_some()
+        || node.as_constant_path_write_node().is_some()
+        || node.as_multi_write_node().is_some()
+        || node.as_call_node().is_some_and(|c| c.equal_loc().is_some())
+}

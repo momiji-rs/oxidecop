@@ -244,7 +244,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
     "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops", "Style/SlicingWithRange",
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
-    "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison",
+    "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition",
 ];
 
 impl Engine {
@@ -1552,6 +1552,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                     node.statements().map(|s| s.location().start_offset()),
                     kw_text,
                 );
+                self.check_parens_around_condition(kw_text, false, &node.predicate());
                 // ternaries have no keyword; modifiers have no end keyword
                 if node.end_keyword_loc().is_some() {
                     self.check_condition_position(kw.as_slice(), kw.start_offset(), &node.predicate());
@@ -1608,6 +1609,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Prism DOES give `unless` its own `UnlessNode`, so it needs its own
         // hook here to match.
         self.check_assignment_in_condition(&node.predicate());
+        self.check_parens_around_condition("unless", false, &node.predicate());
         self.check_redundant_conditional_unless(node);
         self.check_safe_navigation_with_empty(&node.predicate());
         self.check_negated_unless(node);
@@ -2255,6 +2257,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         );
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_assignment_in_condition(&node.predicate());
+        // `on_while` is never invoked upstream for the `begin...end while`
+        // post-condition-loop shape (a distinct whitequark node type), so
+        // skip it here too.
+        if !node.is_begin_modifier() {
+            self.check_parens_around_condition("while", true, &node.predicate());
+        }
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
         if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
             self.check_condition_position(b"while", node.keyword_loc().start_offset(), &node.predicate());
@@ -2307,6 +2315,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         );
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_assignment_in_condition(&node.predicate());
+        // `on_until` (aliased to `on_while` upstream) is never invoked for
+        // the `begin...end until` post-condition-loop shape either.
+        if !node.is_begin_modifier() {
+            self.check_parens_around_condition("until", true, &node.predicate());
+        }
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
         if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
             self.check_condition_position(b"until", node.keyword_loc().start_offset(), &node.predicate());
