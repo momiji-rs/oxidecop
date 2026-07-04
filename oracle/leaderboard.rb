@@ -356,6 +356,7 @@ COPS = {
   'Layout/ClosingParenthesisIndentation' => 'layout/closing_parenthesis_indentation',
   'Layout/IndentationConsistency'    => 'layout/indentation_consistency',
   'Layout/ArgumentAlignment'         => 'layout/argument_alignment',
+  'Layout/MultilineBlockLayout'      => 'layout/multiline_block_layout',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

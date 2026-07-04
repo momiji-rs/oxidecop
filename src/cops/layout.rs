@@ -9949,3 +9949,291 @@ fn argalign_with_last_arg_pairs<'pr>(mut items: Vec<ruby_prism::Node<'pr>>) -> V
     }
     items
 }
+
+
+impl<'a> Cops<'a> {
+    /// Layout/MultilineBlockLayout — ported from `on_block` (aliased to
+    /// `on_numblock`/`on_itblock`; all three collapse to prism's single
+    /// `BlockNode` — see `check_multiline_block_layout_block`) plus a stabby
+    /// lambda's `LambdaNode` (RuboCop's translation treats `-> (x) { }` as a
+    /// `:block` node too — `BlockNode#lambda?` is `send_node.method?
+    /// (:lambda)` — so `on_block` fires for it exactly the same way; see
+    /// `check_multiline_block_layout_lambda`).
+    ///
+    /// Two known traps this leans on:
+    ///   - `node.source_range` (used for `needed_length_for_args`'s column/
+    ///     first-line math AND `autocorrect_body`'s indent width) is
+    ///     receiver-chain-inclusive for a do/end-or-brace block — i.e. it's
+    ///     the OWNING CALL's own range (`foo.bar do...end` starts at `foo`),
+    ///     never prism's own `BlockNode::location()` (which starts at `do`/
+    ///     `{`, per the "block ranges start at the selector" trap). The
+    ///     owning call's start is recovered from `rp_ancestors` (see
+    ///     `mbl_outer_start`). A stabby lambda has no owning call — prism's
+    ///     `LambdaNode::location()` already spans the whole literal from
+    ///     `->`, so it needs no lookup at all.
+    ///   - a def-with-rescue/ensure-shaped block body is an implicit prism
+    ///     `BeginNode` spanning from the first statement THROUGH the block's
+    ///     own `end` — never use ITS location as "the body's start"; drill
+    ///     into `.statements()` first (same fix as `dn_compute_def_last_child`
+    ///     elsewhere in this file).
+    ///
+    /// Offense anchors only ever need a START offset (the oracle grades on
+    /// the first `^` position, not the full underlined range), so unlike
+    /// upstream's `range_between(expr.begin_pos, expr.end_pos)` this never
+    /// bothers constructing an end position for detection purposes.
+    fn check_multiline_block_layout(
+        &mut self,
+        opening: ruby_prism::Location<'_>,
+        closing: ruby_prism::Location<'_>,
+        parameters: Option<ruby_prism::Node<'_>>,
+        body: Option<ruby_prism::Node<'_>>,
+        outer_start: usize,
+    ) {
+        const COP: &str = "Layout/MultilineBlockLayout";
+        const ARG_MSG: &str = "Block argument expression is not on the same line as the block start.";
+        const MSG: &str = "Block body expression is on the same line as the block start.";
+        if !self.on(COP) {
+            return;
+        }
+        let begin_off = opening.start_offset();
+        let begin_end = opening.end_offset();
+        let begin_line = self.idx.loc(begin_off).0;
+        // `single_line?`: `loc.begin.line == loc.end.line` — the block's OWN
+        // opening/closing delimiters, never the (possibly receiver-chain-
+        // inclusive) outer range.
+        if begin_line == self.idx.loc(closing.start_offset()).0 {
+            return;
+        }
+
+        // `node.arguments?`/`node.arguments`: only an explicit `|...|` (or
+        // stabby-lambda `(...)`) parameter list counts — a numbered (`_1`)
+        // or `it` param block has none (upstream's `arguments` returns `[]`
+        // for those block types).
+        let args = parameters.as_ref().and_then(|p| p.as_block_parameters_node());
+
+        let args_on_beginning_line = match &args {
+            None => true,
+            Some(a) => begin_line == self.idx.loc(a.location().end_offset().saturating_sub(1)).0,
+        };
+
+        let mut arg_offense = false;
+        if !args_on_beginning_line {
+            let a = args.as_ref().unwrap();
+            let needs_break = self
+                .mbl_max_line_length()
+                .is_some_and(|max| self.mbl_needed_length_for_args(outer_start, a) > max);
+            if !needs_break {
+                self.push(a.location().start_offset(), COP, true, ARG_MSG);
+                arg_offense = true;
+            }
+        }
+
+        // `node.body`: prism always wraps a non-empty body in a
+        // `StatementsNode`, unwrapping (or not) never changes the START
+        // offset used here (a `StatementsNode`'s own location always starts
+        // exactly where its first child starts) — so there is no need to
+        // replicate whitequark's single-statement unwrap at all, only the
+        // def-with-rescue `BeginNode` trap.
+        let body_start = body.as_ref().map(|b| self.mbl_body_start(b));
+
+        let mut body_offense = false;
+        if let Some(bstart) = body_start {
+            if self.idx.loc(bstart).0 == begin_line {
+                self.push(bstart, COP, true, MSG);
+                body_offense = true;
+            }
+        }
+
+        if !arg_offense && !body_offense {
+            return;
+        }
+
+        // ---- autocorrect (upstream's `autocorrect`, run unconditionally
+        // once either offense fires — the two conditions are mutually
+        // exclusive in practice: multi-line args always push the body past
+        // `begin_line`, so both never fire on the same node at once, but the
+        // body-move side effect below can still trigger off an ARG_MSG-only
+        // offense) ----
+        let mut expr_before_body: Option<usize> = None;
+        if !args_on_beginning_line {
+            let a = args.as_ref().unwrap();
+            self.mbl_autocorrect_arguments(begin_end, a);
+            expr_before_body = Some(a.location().end_offset());
+        }
+        if let Some(bstart) = body_start {
+            let anchor = expr_before_body.unwrap_or(begin_off);
+            if self.idx.loc(anchor).0 == self.idx.loc(bstart).0 {
+                let block_start_col = self.idx.loc(outer_start).1 - 1;
+                let indent = format!("\n  {}", " ".repeat(block_start_col));
+                self.fixes.push((bstart, bstart, indent.into_bytes()));
+            }
+        }
+    }
+
+    /// Hook for a `do...end`/`{}` call block. `outer_start` is the OWNING
+    /// CALL's own prism start offset (receiver-chain-inclusive), recovered
+    /// from the ancestor frame `visit_branch_node_enter` just pushed for it
+    /// — see the trap note on `check_multiline_block_layout`.
+    pub(crate) fn check_multiline_block_layout_block(&mut self, node: &ruby_prism::BlockNode<'_>) {
+        let fallback = node.location().start_offset();
+        let outer_start = self.mbl_owning_call_start(fallback);
+        self.check_multiline_block_layout(node.opening_loc(), node.closing_loc(), node.parameters(), node.body(), outer_start);
+    }
+
+    /// Hook for a stabby lambda. Its own prism `location()` already spans
+    /// the whole `-> ... end`/`-> { }` literal from the `->` operator, which
+    /// is exactly upstream's (receiver-less) `node.source_range` here.
+    pub(crate) fn check_multiline_block_layout_lambda(&mut self, node: &ruby_prism::LambdaNode<'_>) {
+        let outer_start = node.location().start_offset();
+        self.check_multiline_block_layout(node.opening_loc(), node.closing_loc(), node.parameters(), node.body(), outer_start);
+    }
+
+    /// Nearest enclosing `Call` ancestor's own start offset — `rp_ancestors`
+    /// always has THIS block's own just-pushed frame on top, so skip it,
+    /// same as `style::Cops::rp_parent` (private to that module; reimplemented
+    /// here directly off the shared `rp_ancestors` field rather than reaching
+    /// across module boundaries for a one-off lookup).
+    fn mbl_owning_call_start(&self, fallback: usize) -> usize {
+        let len = self.rp_ancestors.len();
+        self.rp_ancestors[..len.saturating_sub(1)]
+            .iter()
+            .rev()
+            .find_map(|f| f.as_ref())
+            .filter(|k| k.tag == super::style::RpTag::Call)
+            .map(|k| k.start)
+            .unwrap_or(fallback)
+    }
+
+    /// `node.body`'s real start offset, peeling the implicit rescue/ensure
+    /// `BeginNode` wrapper the same way `dn_compute_def_last_child` does for
+    /// `def` bodies (its location spans from here through the block's own
+    /// `end`, never usable directly).
+    fn mbl_body_start(&self, body: &ruby_prism::Node<'_>) -> usize {
+        if let Some(b) = body.as_begin_node() {
+            if let Some(stmts) = b.statements() {
+                return stmts.location().start_offset();
+            }
+        }
+        body.location().start_offset()
+    }
+
+    fn mbl_max_line_length(&self) -> Option<i64> {
+        if self.cfg.param("Layout/LineLength", "Enabled") == Some("false") {
+            return None; // `max_line_length` returns nil -> falsy
+        }
+        Some(self.cfg.get("Layout/LineLength", "Max").and_then(|v| v.parse::<i64>().ok()).unwrap_or(120))
+    }
+
+    /// `needed_length_for_args`: how long the line would be if the (still
+    /// multi-line) block header were joined onto one line.
+    fn mbl_needed_length_for_args(&self, outer_start: usize, args: &ruby_prism::BlockParametersNode<'_>) -> i64 {
+        let col = (self.idx.loc(outer_start).1 - 1) as i64;
+        let rest = &self.src[outer_start..];
+        let first_line_end = rest.iter().position(|&b| b == b'\n').map(|n| outer_start + n).unwrap_or(self.src.len());
+        let first_line = &self.src[outer_start..first_line_end];
+        // `characters_needed_for_space_and_pipes`: the opening pipe already
+        // trails the first line (`lambda do |\n...`) needs only the closing
+        // pipe; otherwise both pipes AND the joining space are still needed.
+        let chars_needed: i64 = if first_line.ends_with(b"|") { 1 } else { 3 };
+        col + chars_needed + mbl_char_count(first_line) as i64 + mbl_char_count(self.mbl_block_arg_string(args).as_bytes()) as i64
+    }
+
+    /// `autocorrect_arguments`: replace everything from right after the
+    /// opening delimiter through the closing pipe (plus any trailing
+    /// spaces/tabs before a newline — `range_with_surrounding_space(side:
+    /// :right, newlines: false)`) with the joined `" |args|"`.
+    fn mbl_autocorrect_arguments(&mut self, begin_end: usize, args: &ruby_prism::BlockParametersNode<'_>) {
+        let args_end = args.location().end_offset();
+        let mut end_pos = args_end;
+        while end_pos < self.src.len() && matches!(self.src[end_pos], b' ' | b'\t') {
+            end_pos += 1;
+        }
+        let replacement = format!(" |{}|", self.mbl_block_arg_string(args));
+        self.fixes.push((begin_end, end_pos, replacement.into_bytes()));
+    }
+
+    /// `block_arg_string`: the flattened, comma-joined parameter list —
+    /// `sabp_flatten_args` already gives the exact source-ordered child list
+    /// upstream's whitequark `args.children` would (regular params in
+    /// Ruby's fixed grammar order, then any `; shadow` locals, bare trailing
+    /// commas excluded).
+    fn mbl_block_arg_string(&self, args: &ruby_prism::BlockParametersNode<'_>) -> String {
+        let children = sabp_flatten_args(args);
+        self.mbl_join_children(args, &children)
+    }
+
+    fn mbl_join_children(&self, top: &ruby_prism::BlockParametersNode<'_>, children: &[ruby_prism::Node<'_>]) -> String {
+        let parts: Vec<String> = children.iter().map(|arg| self.mbl_arg_text(top, arg)).collect();
+        let mut s = parts.join(", ");
+        if self.mbl_include_trailing_comma(top) {
+            s.push(',');
+        }
+        s
+    }
+
+    fn mbl_arg_text(&self, top: &ruby_prism::BlockParametersNode<'_>, arg: &ruby_prism::Node<'_>) -> String {
+        if let Some(mt) = arg.as_multi_target_node() {
+            let mut inner: Vec<ruby_prism::Node> = Vec::new();
+            inner.extend(mt.lefts().iter());
+            if let Some(r) = mt.rest() {
+                if r.as_implicit_rest_node().is_none() {
+                    inner.push(r);
+                }
+            }
+            inner.extend(mt.rights().iter());
+            format!("({})", self.mbl_join_children(top, &inner))
+        } else {
+            let loc = arg.location();
+            String::from_utf8_lossy(&self.src[loc.start_offset()..loc.end_offset()]).into_owned()
+        }
+    }
+
+    /// `include_trailing_comma?`: exactly one plain required param anywhere
+    /// in the WHOLE tree (top-level or nested inside a destructured group)
+    /// AND the raw pipe-to-pipe source contains a comma.
+    fn mbl_include_trailing_comma(&self, top: &ruby_prism::BlockParametersNode<'_>) -> bool {
+        let count = top.parameters().map(|p| self.mbl_count_required_list(&p)).unwrap_or(0);
+        if count != 1 {
+            return false;
+        }
+        let loc = top.location();
+        self.src[loc.start_offset()..loc.end_offset()].contains(&b',')
+    }
+
+    fn mbl_count_required_list(&self, params: &ruby_prism::ParametersNode<'_>) -> usize {
+        let mut c = 0;
+        for n in params.requireds().iter() {
+            c += self.mbl_count_required(&n);
+        }
+        for n in params.posts().iter() {
+            c += self.mbl_count_required(&n);
+        }
+        c
+    }
+
+    fn mbl_count_required(&self, node: &ruby_prism::Node<'_>) -> usize {
+        if node.as_required_parameter_node().is_some() {
+            return 1;
+        }
+        if let Some(mt) = node.as_multi_target_node() {
+            let mut c = 0;
+            for n in mt.lefts().iter() {
+                c += self.mbl_count_required(&n);
+            }
+            for n in mt.rights().iter() {
+                c += self.mbl_count_required(&n);
+            }
+            return c;
+        }
+        0
+    }
+}
+
+/// ASCII fast path, same convention as `Layout/LineLength`'s own char count.
+fn mbl_char_count(bytes: &[u8]) -> usize {
+    if bytes.is_ascii() {
+        bytes.len()
+    } else {
+        String::from_utf8_lossy(bytes).chars().count()
+    }
+}

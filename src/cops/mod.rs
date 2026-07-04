@@ -387,7 +387,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
-    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment",
+    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout",
 ];
 
 impl Engine {
@@ -3737,6 +3737,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_block_end_newline(node);
         self.check_access_modifier_indentation_block(node);
         self.check_space_around_block_parameters(node);
+        self.check_multiline_block_layout_block(node);
         // Layout/SpaceAroundKeyword: `do`/`end` — a numbered-param (`_1`) or
         // `it`-param block is still a plain `BlockNode` in prism (same as an
         // ordinary block), so this one hook covers `on_block`/`on_numblock`/
@@ -4794,6 +4795,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_space_before_block_braces(&node.opening_loc(), &node.closing_loc());
         self.check_block_end_newline_lambda(node);
         self.check_space_around_block_parameters_lambda(node);
+        self.check_multiline_block_layout_lambda(node);
         self.check_space_in_lambda_literal(node);
         self.check_empty_block_lambda(node);
         self.check_nil_lambda_stabby(node);
