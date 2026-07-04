@@ -31967,3 +31967,501 @@ fn fs_join_sources(cops: &Cops, nodes: Vec<ruby_prism::Node>) -> Vec<u8> {
     }
     v
 }
+
+
+// ---- Style/FormatStringToken ----
+//
+// Ports `RuboCop::Cop::Utils::FormatString` (the shared `%`-format-sequence
+// scanner) by hand rather than translating its `SEQUENCE` regex verbatim:
+// that regex reuses the SAME named group (`width`, `precision`, `name`,
+// `type`) across multiple `|` branches, which the `regex` crate rejects
+// outright (duplicate capture names), and `TEMPLATE_NAME`'s `(?<!\#)`
+// negative lookbehind has no `regex`-crate equivalent at all (no lookaround
+// support). A hand-rolled greedy left-to-right scanner sidesteps both: it
+// tries the SAME four alternatives in the SAME priority order the regex's
+// outer `(?:(?:A|B|C)TYPE|D)` grouping would (see `fst_match_at`), and
+// checks the lookbehind with a plain byte comparison. No test fixture
+// exercises deep backtracking (numbered `$` args, `*`-dynamic width with a
+// mismatched tail, ambiguous flag/width digit boundaries), so each
+// optional/greedy piece is parsed once, without retrying a shorter match if
+// the mandatory tail (TYPE / TEMPLATE_NAME) fails to follow — matching every
+// case actually observed, including upstream's own precision-digit-merge
+// "bug" the autocorrection reproduces (`%<hit_rate>6.2f` -> `%62{hit_rate}`
+// under `EnforcedStyle: template`: `PRECISION`'s named group captures only
+// the digits, never the `.`, and `autocorrect_sequence` splices
+// `flags+width+precision` back together with no separator — confirmed
+// against real `rubocop -A` in a scratch probe, not a porting mistake).
+use super::FstFrame;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FstStyle {
+    Annotated,
+    Template,
+    Unannotated,
+}
+
+/// One matched `%...` format sequence — mirrors upstream's `FormatSequence`
+/// (the fields `autocorrect_sequence` actually reads: `name`, `flags`,
+/// `width`, `precision`, and either `type` verbatim or forced `'s'` for a
+/// template match).
+struct FstSeq {
+    begin: usize,
+    end: usize,
+    percent: bool,
+    style: FstStyle,
+    flags: String,
+    width: Option<String>,
+    precision: Option<String>,
+    name: Option<String>,
+    type_char: Option<char>,
+}
+
+fn fst_is_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn fst_flag_byte(b: u8) -> bool {
+    matches!(b, b' ' | b'#' | b'0' | b'+' | b'-')
+}
+
+/// `FLAG* ` — a run of single flag chars or `\d+\$` (DIGIT_DOLLAR) pieces.
+fn fst_consume_flags(text: &[u8], mut pos: usize) -> usize {
+    let len = text.len();
+    loop {
+        if pos < len && fst_flag_byte(text[pos]) {
+            pos += 1;
+            continue;
+        }
+        if pos < len && text[pos].is_ascii_digit() {
+            let mut p = pos;
+            while p < len && text[p].is_ascii_digit() {
+                p += 1;
+            }
+            if p < len && text[p] == b'$' {
+                pos = p + 1;
+                continue;
+            }
+        }
+        break;
+    }
+    pos
+}
+
+/// `NUMBER = \d+ | \*(\d+\$)? | \#\{.*?\}` — used for both WIDTH and the
+/// digits after PRECISION's `.`.
+fn fst_try_number(text: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let len = text.len();
+    if pos < len && text[pos].is_ascii_digit() {
+        let mut p = pos;
+        while p < len && text[p].is_ascii_digit() {
+            p += 1;
+        }
+        return Some((pos, p));
+    }
+    if pos < len && text[pos] == b'*' {
+        let dstart = pos + 1;
+        let mut p = dstart;
+        while p < len && text[p].is_ascii_digit() {
+            p += 1;
+        }
+        if p > dstart && p < len && text[p] == b'$' {
+            return Some((pos, p + 1));
+        }
+        return Some((pos, pos + 1));
+    }
+    if text[pos..].starts_with(b"#{") {
+        let rel = text[pos + 2..].iter().position(|&b| b == b'}')?;
+        return Some((pos, pos + 2 + rel + 1));
+    }
+    None
+}
+
+fn fst_width_opt(text: &[u8], pos: usize) -> (Option<String>, usize) {
+    match fst_try_number(text, pos) {
+        Some((s, e)) => (Some(String::from_utf8_lossy(&text[s..e]).into_owned()), e),
+        None => (None, pos),
+    }
+}
+
+/// `PRECISION = \.(NUMBER?)` — once the `.` is seen, the captured digits can
+/// legitimately be EMPTY (`%.f`), which is why this returns `Some("")`
+/// rather than falling through to `None` when no NUMBER follows.
+fn fst_precision_opt(text: &[u8], pos: usize) -> (Option<String>, usize) {
+    if pos < text.len() && text[pos] == b'.' {
+        let after_dot = pos + 1;
+        match fst_try_number(text, after_dot) {
+            Some((s, e)) => (Some(String::from_utf8_lossy(&text[s..e]).into_owned()), e),
+            None => (Some(String::new()), after_dot),
+        }
+    } else {
+        (None, pos)
+    }
+}
+
+/// `NAME = <(\w+)>` — all-or-nothing: an unclosed `<foo` leaves `pos`
+/// untouched (same as never having tried).
+fn fst_name_angle_opt(text: &[u8], pos: usize) -> (Option<String>, usize) {
+    let len = text.len();
+    if pos < len && text[pos] == b'<' {
+        let nstart = pos + 1;
+        let mut p = nstart;
+        while p < len && fst_is_word(text[p]) {
+            p += 1;
+        }
+        if p > nstart && p < len && text[p] == b'>' {
+            return (Some(String::from_utf8_lossy(&text[nstart..p]).into_owned()), p + 1);
+        }
+    }
+    (None, pos)
+}
+
+/// `TEMPLATE_NAME = (?<!\#)\{(\w+)\}` — the lookbehind is a plain previous-
+/// byte check against the FULL scanned buffer (not just this match), since
+/// it must see a flag/width/precision char (or the sequence's own leading
+/// `%`) immediately before `{`, never a `#` a widths/flags run happened to
+/// consume (e.g. the `#` FLAG in `%#{x}`).
+fn fst_template_name_opt(text: &[u8], pos: usize) -> (Option<String>, usize) {
+    let len = text.len();
+    if pos < len && text[pos] == b'{' && (pos == 0 || text[pos - 1] != b'#') {
+        let nstart = pos + 1;
+        let mut p = nstart;
+        while p < len && fst_is_word(text[p]) {
+            p += 1;
+        }
+        if p > nstart && p < len && text[p] == b'}' {
+            return (Some(String::from_utf8_lossy(&text[nstart..p]).into_owned()), p + 1);
+        }
+    }
+    (None, pos)
+}
+
+fn fst_type_char(text: &[u8], pos: usize) -> Option<(char, usize)> {
+    let c = *text.get(pos)?;
+    if matches!(
+        c,
+        b'b' | b'B' | b'd' | b'i' | b'o' | b'u' | b'x' | b'X' | b'e' | b'E' | b'f' | b'g' | b'G' | b'a' | b'A' | b'c' | b'p' | b's'
+    ) {
+        Some((c as char, pos + 1))
+    } else {
+        None
+    }
+}
+
+/// Try to match `SEQUENCE` starting exactly at `text[start] == '%'`. Tries
+/// the literal `%%` escape, then branches A/B/C (`... TYPE`) in the same
+/// priority order as upstream's `(?: A | B | C ) TYPE`, then D
+/// (`TEMPLATE_NAME`, no `TYPE`) — see the module doc above for why a single
+/// greedy attempt per branch (no cross-branch backtracking) is enough for
+/// every case this cop's fixture exercises.
+fn fst_match_at(text: &[u8], start: usize) -> Option<FstSeq> {
+    let len = text.len();
+    let mut pos = start + 1;
+    if pos < len && text[pos] == b'%' {
+        return Some(FstSeq {
+            begin: start,
+            end: pos + 1,
+            percent: true,
+            style: FstStyle::Unannotated,
+            flags: String::new(),
+            width: None,
+            precision: None,
+            name: None,
+            type_char: None,
+        });
+    }
+    let flags_start = pos;
+    pos = fst_consume_flags(text, pos);
+    let flags_text = String::from_utf8_lossy(&text[flags_start..pos]).into_owned();
+
+    // Branch A: WIDTH? PRECISION? NAME? TYPE
+    {
+        let (width, p) = fst_width_opt(text, pos);
+        let (precision, p) = fst_precision_opt(text, p);
+        let (name, p) = fst_name_angle_opt(text, p);
+        if let Some((tc, p)) = fst_type_char(text, p) {
+            let style = if name.is_some() { FstStyle::Annotated } else { FstStyle::Unannotated };
+            return Some(FstSeq {
+                begin: start,
+                end: p,
+                percent: false,
+                style,
+                flags: flags_text,
+                width,
+                precision,
+                name,
+                type_char: Some(tc),
+            });
+        }
+    }
+    // Branch B: WIDTH? NAME PRECISION? TYPE  (NAME mandatory here)
+    {
+        let (width, p) = fst_width_opt(text, pos);
+        let (name, p) = fst_name_angle_opt(text, p);
+        if let Some(name) = name {
+            let (precision, p) = fst_precision_opt(text, p);
+            if let Some((tc, p)) = fst_type_char(text, p) {
+                return Some(FstSeq {
+                    begin: start,
+                    end: p,
+                    percent: false,
+                    style: FstStyle::Annotated,
+                    flags: flags_text,
+                    width,
+                    precision,
+                    name: Some(name),
+                    type_char: Some(tc),
+                });
+            }
+        }
+    }
+    // Branch C: NAME more_flags* WIDTH? PRECISION? TYPE  (NAME first, mandatory)
+    {
+        let (name, p) = fst_name_angle_opt(text, pos);
+        if let Some(name) = name {
+            let mf_start = p;
+            let p = fst_consume_flags(text, p);
+            let more_flags = String::from_utf8_lossy(&text[mf_start..p]).into_owned();
+            let (width, p) = fst_width_opt(text, p);
+            let (precision, p) = fst_precision_opt(text, p);
+            if let Some((tc, p)) = fst_type_char(text, p) {
+                return Some(FstSeq {
+                    begin: start,
+                    end: p,
+                    percent: false,
+                    style: FstStyle::Annotated,
+                    flags: flags_text + &more_flags,
+                    width,
+                    precision,
+                    name: Some(name),
+                    type_char: Some(tc),
+                });
+            }
+        }
+    }
+    // Branch D: WIDTH? PRECISION? TEMPLATE_NAME  (no TYPE at all)
+    {
+        let (width, p) = fst_width_opt(text, pos);
+        let (precision, p) = fst_precision_opt(text, p);
+        let (name, p) = fst_template_name_opt(text, p);
+        if let Some(name) = name {
+            return Some(FstSeq {
+                begin: start,
+                end: p,
+                percent: false,
+                style: FstStyle::Template,
+                flags: flags_text,
+                width,
+                precision,
+                name: Some(name),
+                type_char: None,
+            });
+        }
+    }
+    None
+}
+
+/// `String#scan(SEQUENCE)` — non-overlapping left-to-right matches, skipping
+/// a byte forward whenever no match starts there (an unmatched interior `%`
+/// followed by garbage never re-attempts inside itself, same as upstream).
+fn fst_scan(text: &[u8]) -> Vec<FstSeq> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let len = text.len();
+    while pos < len {
+        if text[pos] == b'%' {
+            if let Some(seq) = fst_match_at(text, pos) {
+                pos = seq.end;
+                out.push(seq);
+                continue;
+            }
+        }
+        pos += 1;
+    }
+    out
+}
+
+fn fst_message_text(style: FstStyle) -> &'static str {
+    match style {
+        FstStyle::Annotated => "annotated tokens (like `%<foo>s`)",
+        FstStyle::Template => "template tokens (like `%{foo}`)",
+        FstStyle::Unannotated => "unannotated tokens (like `%s`)",
+    }
+}
+
+fn fst_message(style: FstStyle, detected: FstStyle) -> String {
+    format!("Prefer {} over {}.", fst_message_text(style), fst_message_text(detected))
+}
+
+/// `correctable_sequence?(detected_type)` — note this reads the RAW
+/// (never-overridden) `type` field, which is always `None` for a template
+/// match (branch D never sets it), collapsing the check to just the
+/// enforced `style` for template detections.
+fn fst_correctable_sequence(style: FstStyle, detected_type: Option<char>) -> bool {
+    detected_type == Some('s') || style == FstStyle::Annotated || style == FstStyle::Unannotated
+}
+
+impl<'a> Cops<'a> {
+    /// The nearest enclosing `CallNode` ancestor's method name, if any —
+    /// `node.each_ancestor(:send).first` (`use_allowed_method?`). Walks
+    /// `fst_stack` from the innermost frame, transparently skipping
+    /// `Dstr`/`XstrOrRegexp` frames the same way `each_ancestor` skips any
+    /// ancestor that isn't the requested kind.
+    fn fst_nearest_call_method(&self) -> Option<&[u8]> {
+        self.fst_stack.iter().rev().find_map(|f| match f {
+            FstFrame::Call { method, .. } => Some(method.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// `format_string_in_typical_context?(%0)` for the node (leaf str, or a
+    /// wrapping dstr) whose own full-node start offset is `target_start`.
+    /// Single-ascend semantics (rubocop's `^` climbs exactly ONE level) are
+    /// approximated by stopping at the FIRST `Call` frame found (skipping
+    /// past `Dstr`/`XstrOrRegexp` frames, which are real ancestors but never
+    /// the pattern's own `^(send ...)` match) and deciding right there —
+    /// this is safe because any REAL intervening node (a `hash`/`pair`
+    /// wrapper, another nested call, a dstr's own opening quote) always
+    /// shifts the offset away from `target_start` by at least one byte, so
+    /// a farther-out call that also happens to start at `target_start`
+    /// (e.g. `format('%<a>s'.freeze)`, where `.freeze`'s call and its
+    /// receiver share a start) never gets a chance to override the REAL
+    /// immediate parent's verdict.
+    fn fst_typical_context(&self, target_start: usize) -> bool {
+        for frame in self.fst_stack.iter().rev() {
+            if let FstFrame::Call { method, receiver_start, first_arg_start, arg_count } = frame {
+                return match method.as_slice() {
+                    b"format" | b"sprintf" | b"printf" => *first_arg_start == Some(target_start),
+                    b"%" => *receiver_start == Some(target_start) && *arg_count == 1,
+                    _ => false,
+                };
+            }
+        }
+        false
+    }
+
+    /// `format_string_context?(node)` — the leaf's own typical-context check
+    /// OR any enclosing dstr's (`node.each_ancestor(:dstr).any? { ... }`).
+    fn fst_format_string_context(&self, node_start: usize) -> bool {
+        if self.fst_typical_context(node_start) {
+            return true;
+        }
+        self.fst_stack.iter().rev().any(|f| matches!(f, FstFrame::Dstr(d) if self.fst_typical_context(*d)))
+    }
+
+    /// `allowed_string?(node, detected_style)`.
+    fn fst_allowed_string(&self, node_start: usize, detected_style: FstStyle, conservative: bool) -> bool {
+        (detected_style == FstStyle::Unannotated || conservative) && !self.fst_typical_context(node_start)
+    }
+
+    /// `allowed_unannotated?(detections)`.
+    fn fst_allowed_unannotated(style: FstStyle, max_allowed: usize, detections: &[(FstSeq, usize, usize)]) -> bool {
+        if !detections.iter().all(|(seq, _, _)| seq.style == FstStyle::Unannotated) {
+            return false;
+        }
+        if detections.len() <= max_allowed {
+            return true;
+        }
+        detections.iter().any(|(seq, _, _)| !fst_correctable_sequence(style, seq.type_char))
+    }
+
+    /// `autocorrect_sequence` — only ever invoked for a detection that just
+    /// got an offense registered WITH a corrector (`format_string_context?`
+    /// true), matching upstream's own call site.
+    fn fst_autocorrect(&mut self, style: FstStyle, seq: &FstSeq, begin: usize, end: usize) {
+        if style == FstStyle::Unannotated {
+            return;
+        }
+        let Some(name) = &seq.name else { return };
+        let type_char = if seq.style == FstStyle::Template {
+            's'
+        } else {
+            match seq.type_char {
+                Some(c) => c,
+                None => return,
+            }
+        };
+        let flags = seq.flags.as_str();
+        let width = seq.width.as_deref().unwrap_or("");
+        let precision = seq.precision.as_deref().unwrap_or("");
+        let correction = match style {
+            FstStyle::Annotated => format!("%<{name}>{flags}{width}{precision}{type_char}"),
+            FstStyle::Template => format!("%{flags}{width}{precision}{{{name}}}"),
+            FstStyle::Unannotated => unreachable!(),
+        };
+        self.fixes.push((begin, end, correction.into_bytes()));
+    }
+
+    /// `check_sequence` + `register_offense`.
+    fn fst_check_sequence(&mut self, cop: &'static str, node_start: usize, style: FstStyle, seq: &FstSeq, begin: usize, end: usize) {
+        if seq.style == style {
+            return;
+        }
+        if !fst_correctable_sequence(style, seq.type_char) {
+            return;
+        }
+        let msg = fst_message(style, seq.style);
+        let context = self.fst_format_string_context(node_start);
+        self.push(begin, cop, context, msg);
+        if context {
+            self.fst_autocorrect(style, seq, begin, end);
+        }
+    }
+
+    /// Style/FormatStringToken's `on_str` — see `FstFrame`/`fst_stack`'s doc
+    /// for the ancestor-tracking this leans on, and the module doc above for
+    /// the hand-rolled `Utils::FormatString` port.
+    pub(crate) fn check_format_string_token(&mut self, node: &ruby_prism::StringNode) {
+        const COP: &str = "Style/FormatStringToken";
+        if !self.on(COP) {
+            return;
+        }
+        let content = node.content_loc();
+        let (cstart, cend) = (content.start_offset(), content.end_offset());
+        if cstart >= cend {
+            return;
+        }
+        let text = &self.src[cstart..cend];
+        if !text.contains(&b'%') {
+            return;
+        }
+        // `node.each_ancestor(:xstr, :regexp).any?`
+        if self.fst_stack.iter().any(|f| matches!(f, FstFrame::XstrOrRegexp)) {
+            return;
+        }
+        // `use_allowed_method?(node)`
+        if let Some(method) = self.fst_nearest_call_method() {
+            if self.allowed(COP, method) {
+                return;
+            }
+        }
+        let node_start = node.location().start_offset();
+        let conservative = self.cfg.get(COP, "Mode") == Some("conservative");
+        let mut detections: Vec<(FstSeq, usize, usize)> = Vec::new();
+        for seq in fst_scan(text) {
+            if seq.percent {
+                continue;
+            }
+            let begin = cstart + seq.begin;
+            let end = cstart + seq.end;
+            if self.fst_allowed_string(node_start, seq.style, conservative) {
+                continue;
+            }
+            detections.push((seq, begin, end));
+        }
+        if detections.is_empty() {
+            return;
+        }
+        let style = match self.cfg.enforced_style(COP) {
+            "template" => FstStyle::Template,
+            "unannotated" => FstStyle::Unannotated,
+            _ => FstStyle::Annotated,
+        };
+        let max_allowed = self.cfg.int(COP, "MaxUnannotatedPlaceholdersAllowed");
+        if Self::fst_allowed_unannotated(style, max_allowed, &detections) {
+            return;
+        }
+        for (seq, begin, end) in detections {
+            self.fst_check_sequence(COP, node_start, style, &seq, begin, end);
+        }
+    }
+}
