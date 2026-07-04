@@ -309,7 +309,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/ExplicitBlockArgument",
     "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
     "Style/MethodCallWithoutArgsParentheses", "Style/Alias", "Style/RaiseArgs", "Style/MethodDefParentheses",
-    "Lint/SafeNavigationConsistency", "Style/HashTransformKeys",
+    "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray",
 ];
 
 impl Engine {
@@ -2681,6 +2681,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_nested_percent_literal(node);
         self.check_percent_symbol_array(node);
         self.check_percent_string_array(node);
+        self.check_symbol_array(node);
         self.check_min_max_array(node);
         self.check_space_inside_percent_literal_delimiters_array(node);
         if self.ll_active {

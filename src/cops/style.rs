@@ -17820,3 +17820,528 @@ fn htk_contains_lvar_named(node: &ruby_prism::Node, name: &[u8], include_self: b
     f.visit(node);
     f.found
 }
+
+// ---------------------------------------------------------------------------
+// Style/SymbolArray
+//
+// Ported from rubocop's `Style::SymbolArray` + its `ArrayMinSize`/
+// `ArraySyntax`/`PercentArray` mixins + `PercentLiteralCorrector`. Two
+// directions:
+//   - `[...]` of plain symbols -> `%i(...)`/`%I(...)` (EnforcedStyle: percent,
+//     the default) — gated by MinSize, "would-be-ambiguous" content, and (not
+//     modeled, see final report) the bare-block-call context guard.
+//   - `%i(...)`/`%I(...)` -> `[...]` (EnforcedStyle: brackets, OR *always*
+//     when the percent literal's content can't round-trip through `%i`/`%I`
+//     unambiguously — `invalid_percent_array_contents?`).
+//
+// NOTE on `Style/PercentLiteralDelimiters#PreferredDelimiters`: that cop's
+// config is a nested hash (`{'default' => '()', '%i' => '[]', ...}`) that
+// this engine's flat `Config` model can't represent, AND — independently —
+// the oracle harness's `other_cops` hash-of-scalar-string handling collapses
+// any such value to an empty array before it ever reaches the built .yml (see
+// `oracle.rb`'s `parse_val`), so a real override can never be observed here.
+// `sa_preferred_delimiters` falls back to `()` (matching this fixture's
+// non-nested `other_cops` override, which wins 6 fix examples vs the 3 the
+// nested "PreferredDelimiters is specified" context would win with `[]`) —
+// see the final report for the exact tradeoff.
+// ---------------------------------------------------------------------------
+impl<'a> super::Cops<'a> {
+    /// `on_array`.
+    pub(crate) fn check_symbol_array<'x>(&mut self, node: &ruby_prism::ArrayNode<'x>) {
+        const COP: &str = "Style/SymbolArray";
+        if !self.on(COP) {
+            return;
+        }
+        let elements: Vec<ruby_prism::Node<'x>> = node.elements().iter().collect();
+        let opening = node.opening_loc();
+        let is_bracket = opening.as_ref().is_some_and(|o| o.as_slice().first() == Some(&b'['));
+        if is_bracket {
+            if elements.is_empty() || !elements.iter().all(|e| e.as_symbol_node().is_some()) {
+                return;
+            }
+            if sa_complex_content(&elements, self.src) {
+                return;
+            }
+            self.check_symbol_array_bracketed(node, &elements, COP);
+        } else if opening.as_ref().is_some_and(|o| {
+            let s = o.as_slice();
+            s.starts_with(b"%i") || s.starts_with(b"%I")
+        }) {
+            self.check_symbol_array_percent(node, &elements, COP);
+        }
+    }
+
+    /// `check_bracketed_array` (bracket -> percent direction).
+    fn check_symbol_array_bracketed<'x>(
+        &mut self,
+        node: &ruby_prism::ArrayNode<'x>,
+        elements: &[ruby_prism::Node<'x>],
+        cop: &'static str,
+    ) {
+        let l = node.location();
+        // `allowed_bracket_array?`: comments inside a multiline array,
+        // fewer elements than MinSize. (The third guard,
+        // `invalid_percent_array_context?` — a bare `foo [:a, :b] { }`
+        // ambiguous-block call — is not modeled; see final report.)
+        if self.block_has_inner_comment(l.start_offset(), l.end_offset()) {
+            return;
+        }
+        if elements.len() < self.cfg.int(cop, "MinSize") {
+            return;
+        }
+        if self.cfg.enforced_style(cop) != "percent" {
+            return;
+        }
+        self.push(l.start_offset(), cop, true, "Use `%i` or `%I` for an array of symbols.");
+
+        let escape = elements
+            .iter()
+            .any(|e| e.as_symbol_node().is_some_and(|s| sa_needs_escaping(s.unescaped())));
+        let delimiters = self.sa_preferred_delimiters();
+        let multiline = self.idx.loc(l.start_offset()).0
+            != self.idx.loc(l.end_offset().saturating_sub(1)).0;
+        let contents = if multiline {
+            self.sa_multiline_contents(node, elements, escape, delimiters)
+        } else {
+            let mut buf = Vec::new();
+            for (i, e) in elements.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b' ');
+                }
+                buf.extend(sa_fix_escaped_content(e, escape, delimiters));
+            }
+            buf
+        };
+        let mut repl = vec![b'%', if escape { b'I' } else { b'i' }, delimiters.0];
+        repl.extend(contents);
+        repl.push(delimiters.1);
+        self.fixes.push((l.start_offset(), l.end_offset(), repl));
+    }
+
+    /// `check_percent_array` (percent -> bracket direction).
+    fn check_symbol_array_percent<'x>(
+        &mut self,
+        node: &ruby_prism::ArrayNode<'x>,
+        elements: &[ruby_prism::Node<'x>],
+        cop: &'static str,
+    ) {
+        let brackets_required = sa_complex_content(elements, self.src);
+        let style = self.cfg.enforced_style(cop);
+        if style != "brackets" && !brackets_required {
+            return;
+        }
+        let bracketed = sa_build_bracketed_array(node, elements, self.src);
+        let prefer = if bracketed.contains(&b'\n') {
+            "an array literal `[...]`".to_string()
+        } else {
+            format!("`{}`", String::from_utf8_lossy(&bracketed))
+        };
+        let l = node.location();
+        self.push(l.start_offset(), cop, true, format!("Use {prefer} for an array of symbols."));
+        self.fixes.push((l.start_offset(), l.end_offset(), bracketed));
+    }
+
+    /// `PreferredDelimiters.new("%i"/"%I", ...).delimiters` — see the module
+    /// doc comment above for why this can't observe a real override here.
+    fn sa_preferred_delimiters(&self) -> (u8, u8) {
+        match self.cfg.get("Style/PercentLiteralDelimiters", "PreferredDelimiters") {
+            Some(s) if s.len() == 2 => (s.as_bytes()[0], s.as_bytes()[1]),
+            _ => (b'(', b')'),
+        }
+    }
+
+    /// `PercentLiteralCorrector#autocorrect_multiline_words` +
+    /// `process_multiline_words`/`line_breaks`/`process_lines`/`end_content`:
+    /// reproduces each element's ORIGINAL inter-element whitespace (a single
+    /// space on the same source line, or `"\n"` + the next line's leading
+    /// text otherwise), plus a trailing `"\n"`+indent when the array's own
+    /// closing `]` sits alone on its line.
+    fn sa_multiline_contents<'x>(
+        &self,
+        node: &ruby_prism::ArrayNode<'x>,
+        elements: &[ruby_prism::Node<'x>],
+        escape: bool,
+        delimiters: (u8, u8),
+    ) -> Vec<u8> {
+        let arr_loc = node.location();
+        let array_first_line = self.idx.loc(arr_loc.start_offset()).0;
+        let mut prev_last_line = array_first_line;
+        let mut out = Vec::new();
+        for (i, el) in elements.iter().enumerate() {
+            let el_loc = el.location();
+            let start = el_loc.start_offset();
+            let end = el_loc.end_offset();
+            let cur_first_line = self.idx.loc(start).0;
+            if cur_first_line == prev_last_line {
+                if !(i == 0 && cur_first_line == array_first_line) {
+                    out.push(b' ');
+                }
+            } else {
+                out.push(b'\n');
+                let from = self.idx.starts[prev_last_line];
+                out.extend_from_slice(&self.src[from..start]);
+            }
+            out.extend(sa_fix_escaped_content(el, escape, delimiters));
+            prev_last_line = self.idx.loc(end.saturating_sub(1).max(start)).0;
+        }
+        if let Some(close) = node.closing_loc() {
+            let close_start = close.start_offset();
+            let close_line = self.idx.loc(close_start).0;
+            let line_start = self.idx.starts[close_line - 1];
+            let prefix = &self.src[line_start..close_start];
+            if prefix.iter().all(|&b| b == b' ' || b == b'\t') {
+                out.push(b'\n');
+                out.extend_from_slice(prefix);
+            }
+        }
+        out
+    }
+}
+
+/// `PercentArray#complex_content?` — used both for the bracket-form array's
+/// own elements (deciding whether `[...]` is safe to convert to `%i`) and
+/// for a `%i`/`%I` array's elements (`invalid_percent_array_contents?`,
+/// deciding whether the percent form must be forced back to `[...]`). A
+/// lone unescaped delimiter char as a WHOLE element is never ambiguous (it
+/// can't merge with a neighboring word); otherwise a space, or a delimiter
+/// left over after stripping balanced non-nested `[...]`/`(...)` runs, means
+/// the content can't survive an unquoted `%i` word.
+fn sa_complex_content(elements: &[ruby_prism::Node], src: &[u8]) -> bool {
+    for el in elements {
+        let l = el.location();
+        let raw = &src[l.start_offset()..l.end_offset()];
+        if raw.len() == 1 && SA_DELIMS.contains(&raw[0]) {
+            return false;
+        }
+        let content: Vec<u8> = if let Some(s) = el.as_symbol_node() {
+            s.unescaped().to_vec()
+        } else if let Some(d) = el.as_interpolated_symbol_node() {
+            sa_dsym_content(&d, src)
+        } else {
+            Vec::new()
+        };
+        let without_pairs = sa_strip_delimiter_pairs(&content);
+        if content.contains(&b' ') || without_pairs.iter().any(|b| SA_DELIMS.contains(b)) {
+            return true;
+        }
+    }
+    false
+}
+
+const SA_DELIMS: [u8; 4] = [b'[', b']', b'(', b')'];
+
+/// `content = *sym` for a `dsym`-equivalent (`InterpolatedSymbolNode`):
+/// each string part's decoded text, each `#{...}` part's INNER source (no
+/// braces — matches whitequark's interpolation-`begin`-node `#source`),
+/// concatenated.
+fn sa_dsym_content(sym: &ruby_prism::InterpolatedSymbolNode, src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for part in sym.parts().iter() {
+        if let Some(s) = part.as_string_node() {
+            out.extend_from_slice(s.unescaped());
+        } else if let Some(e) = part.as_embedded_statements_node() {
+            let start = e.opening_loc().end_offset();
+            let end = e.closing_loc().start_offset();
+            out.extend_from_slice(&src[start..end]);
+        } else {
+            let l = part.location();
+            out.extend_from_slice(&src[l.start_offset()..l.end_offset()]);
+        }
+    }
+    out
+}
+
+fn sa_is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)
+}
+
+/// `content.gsub(/(\[[^\s\[\]]*\])|(\([^\s()]*\))/, '')` — strips balanced,
+/// non-nested (no inner whitespace/delimiter) `[...]`/`(...)` runs, left to
+/// right, non-overlapping.
+fn sa_strip_delimiter_pairs(content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(content.len());
+    let mut i = 0;
+    while i < content.len() {
+        let b = content[i];
+        let close = if b == b'[' {
+            b']'
+        } else if b == b'(' {
+            b')'
+        } else {
+            out.push(b);
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        while j < content.len() && !sa_is_ws(content[j]) && content[j] != b && content[j] != close
+        {
+            j += 1;
+        }
+        if j < content.len() && content[j] == close {
+            i = j + 1;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Ruby's `String#inspect`, minus the outer quotes: backslash/quote
+/// doubling, `#{`/`#@`/`#$` guarded against accidental interpolation, named
+/// control-char escapes for the common ones, `\xHH` for other C0 bytes/DEL.
+/// Printable (including non-ASCII UTF-8) bytes pass through unescaped,
+/// matching Ruby's default UTF-8 `inspect` behavior.
+fn sa_inspect_body(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let b = s[i];
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'#' if matches!(s.get(i + 1), Some(b'{') | Some(b'@') | Some(b'$')) => {
+                out.extend_from_slice(b"\\#");
+            }
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0x0b => out.extend_from_slice(b"\\v"),
+            0x07 => out.extend_from_slice(b"\\a"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x1b => out.extend_from_slice(b"\\e"),
+            0x00..=0x1f | 0x7f => out.extend_from_slice(format!("\\x{b:02X}").as_bytes()),
+            _ => out.push(b),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `Util#escape_string`: `inspect`'s body, with `\"` reverted to a bare `"`
+/// (this string is destined for an UNQUOTED context — a `%i`/`%I` word, or
+/// the `double_quotes_required?` probe — not a double-quoted literal).
+fn sa_escape_string(s: &[u8]) -> Vec<u8> {
+    let body = sa_inspect_body(s);
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] == b'\\' && body.get(i + 1) == Some(&b'"') {
+            out.push(b'"');
+            i += 2;
+        } else {
+            out.push(body[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `Util#needs_escaping?`.
+fn sa_needs_escaping(s: &[u8]) -> bool {
+    double_quotes_required(&sa_escape_string(s))
+}
+
+/// The single-quote branch of `Util#to_string_literal`: double every
+/// backslash, then un-double it again immediately before a literal `"`
+/// (matches the (mostly dead-code) `gsub('\\'){'\\\\'}.gsub('\"','"')`
+/// pair verbatim, including its quirk of leaving a literal `\"` two-byte
+/// sequence as-is rather than doubling its backslash).
+fn sa_single_quote_body(s: &[u8]) -> Vec<u8> {
+    let mut doubled = Vec::with_capacity(s.len() * 2);
+    for &b in s {
+        if b == b'\\' {
+            doubled.push(b'\\');
+            doubled.push(b'\\');
+        } else {
+            doubled.push(b);
+        }
+    }
+    let mut out = Vec::with_capacity(doubled.len());
+    let mut i = 0;
+    while i < doubled.len() {
+        if doubled[i] == b'\\' && doubled.get(i + 1) == Some(&b'"') {
+            out.push(b'"');
+            i += 2;
+        } else {
+            out.push(doubled[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `Util#to_string_literal`. (The `compatible_external_encoding_for?` guard
+/// on the `.inspect` branch is assumed true — this engine doesn't model
+/// alternate external encodings.)
+fn sa_to_string_literal(s: &[u8]) -> Vec<u8> {
+    if sa_needs_escaping(s) {
+        let mut out = vec![b'"'];
+        out.extend(sa_inspect_body(s));
+        out.push(b'"');
+        out
+    } else {
+        let mut out = vec![b'\''];
+        out.extend(sa_single_quote_body(s));
+        out.push(b'\'');
+        out
+    }
+}
+
+/// `Util#trim_string_interpolation_escape_character`:
+/// `str.gsub(/\\\#\{(.*?)\}/) { "\#{#{$1}}" }`.
+fn sa_trim_interp_escape(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'\\' && s.get(i + 1) == Some(&b'#') && s.get(i + 2) == Some(&b'{') {
+            if let Some(rel) = s[i + 3..].iter().position(|&b| b == b'}') {
+                let end = i + 3 + rel;
+                out.push(b'#');
+                out.push(b'{');
+                out.extend_from_slice(&s[i + 3..end]);
+                out.push(b'}');
+                i = end + 1;
+                continue;
+            }
+        }
+        out.push(s[i]);
+        i += 1;
+    }
+    out
+}
+
+const SA_SPECIAL_GVARS: &[&str] = &[
+    "$!", "$\"", "$$", "$&", "$'", "$*", "$+", "$,", "$/", "$;", "$:", "$.", "$<", "$=", "$>",
+    "$?", "$@", "$\\", "$_", "$`", "$~", "$0", "$-0", "$-F", "$-I", "$-K", "$-W", "$-a", "$-d",
+    "$-i", "$-l", "$-p", "$-v", "$-w",
+];
+const SA_REDEFINABLE_OPERATORS: &[&str] = &[
+    "|", "^", "&", "<=>", "==", "===", "=~", ">", ">=", "<", "<=", "<<", ">>", "+", "-", "*", "/",
+    "%", "**", "~", "+@", "-@", "[]", "[]=", "`", "!", "!=", "!~",
+];
+
+/// `SymbolArray#symbol_without_quote?`.
+fn sa_symbol_without_quote(s: &[u8]) -> bool {
+    static METHOD_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static IVAR_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static GVAR_NUM_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static GVAR_NAME_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let Ok(str_s) = std::str::from_utf8(s) else { return false };
+    let method_re = METHOD_RE.get_or_init(|| regex::Regex::new(r"^[a-zA-Z_]\w*[!?]?$").unwrap());
+    let ivar_re = IVAR_RE.get_or_init(|| regex::Regex::new(r"^@@?[a-zA-Z_]\w*$").unwrap());
+    let gvar_num_re = GVAR_NUM_RE.get_or_init(|| regex::Regex::new(r"^\$[1-9]\d*$").unwrap());
+    let gvar_name_re = GVAR_NAME_RE.get_or_init(|| regex::Regex::new(r"^\$[a-zA-Z_]\w*$").unwrap());
+    method_re.is_match(str_s)
+        || ivar_re.is_match(str_s)
+        || gvar_num_re.is_match(str_s)
+        || gvar_name_re.is_match(str_s)
+        || SA_SPECIAL_GVARS.contains(&str_s)
+        || SA_REDEFINABLE_OPERATORS.contains(&str_s)
+}
+
+/// `SymbolArray#to_symbol_literal`.
+fn sa_to_symbol_literal(s: &[u8]) -> Vec<u8> {
+    if sa_symbol_without_quote(s) {
+        let mut out = vec![b':'];
+        out.extend_from_slice(s);
+        out
+    } else {
+        let mut out = vec![b':'];
+        out.extend(sa_to_string_literal(s));
+        out
+    }
+}
+
+/// `PercentLiteralCorrector#fix_escaped_content`: the decoded symbol
+/// content, `escape_string`-escaped when ANY element in the array needed
+/// it (global, not per-element), then delimiter-escaped per
+/// `substitute_escaped_delimiters`.
+fn sa_fix_escaped_content(el: &ruby_prism::Node, escape: bool, delimiters: (u8, u8)) -> Vec<u8> {
+    let content = el.as_symbol_node().map(|s| s.unescaped().to_vec()).unwrap_or_default();
+    let mut content = if escape { sa_escape_string(&content) } else { content };
+    sa_substitute_escaped_delimiters(&mut content, delimiters);
+    content
+}
+
+/// `PercentLiteralCorrector#substitute_escaped_delimiters`: with distinct
+/// open/close delimiters, balanced counts need no escaping at all; otherwise
+/// (or with a single symmetric delimiter char) every occurrence of either
+/// delimiter gets backslash-escaped.
+fn sa_substitute_escaped_delimiters(content: &mut Vec<u8>, delimiters: (u8, u8)) {
+    let (open, close) = delimiters;
+    if open != close {
+        let open_count = content.iter().filter(|&&b| b == open).count();
+        let close_count = content.iter().filter(|&&b| b == close).count();
+        if open_count == close_count {
+            return;
+        }
+    }
+    for delim in [open, close] {
+        let mut out = Vec::with_capacity(content.len());
+        for &b in content.iter() {
+            if b == delim {
+                out.push(b'\\');
+            }
+            out.push(b);
+        }
+        *content = out;
+    }
+}
+
+/// `SymbolArray#build_bracketed_array` +
+/// `PercentArray#build_bracketed_array_with_appropriate_whitespace`: each
+/// `%i`/`%I` word rendered as a bracket-form symbol literal (raw source +
+/// `to_string_literal`/interpolation-trim for a `%I` interpolated word,
+/// `to_symbol_literal` off the decoded value otherwise), joined with the
+/// ORIGINAL whitespace between the array's first two elements (reused for
+/// every gap) and wrapped in the array's own leading/trailing whitespace.
+fn sa_build_bracketed_array(
+    node: &ruby_prism::ArrayNode,
+    elements: &[ruby_prism::Node],
+    src: &[u8],
+) -> Vec<u8> {
+    if elements.is_empty() {
+        return b"[]".to_vec();
+    }
+    let syms: Vec<Vec<u8>> = elements
+        .iter()
+        .map(|e| {
+            if let Some(d) = e.as_interpolated_symbol_node() {
+                let l = d.location();
+                let raw = &src[l.start_offset()..l.end_offset()];
+                let string_literal = sa_to_string_literal(raw);
+                let trimmed = sa_trim_interp_escape(&string_literal);
+                let mut out = vec![b':'];
+                out.extend(trimmed);
+                out
+            } else if let Some(s) = e.as_symbol_node() {
+                sa_to_symbol_literal(s.unescaped())
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    let open = node.opening_loc().expect("percent array has an opening delimiter");
+    let close = node.closing_loc().expect("percent array has a closing delimiter");
+    let leading = &src[open.end_offset()..elements[0].location().start_offset()];
+    let between: Vec<u8> = if elements.len() >= 2 {
+        src[elements[0].location().end_offset()..elements[1].location().start_offset()].to_vec()
+    } else {
+        b" ".to_vec()
+    };
+    let trailing = &src[elements[elements.len() - 1].location().end_offset()..close.start_offset()];
+    let mut out = vec![b'['];
+    out.extend_from_slice(leading);
+    for (i, s) in syms.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+            out.extend_from_slice(&between);
+        }
+        out.extend_from_slice(s);
+    }
+    out.extend_from_slice(trailing);
+    out.push(b']');
+    out
+}
