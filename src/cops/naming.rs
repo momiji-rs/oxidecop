@@ -1562,6 +1562,7 @@ impl<'a> super::Cops<'a> {
         // prism-vs-whitequark trap. Anything else is a lone non-Statements
         // node — prism's shape for a single-statement body — and is itself
         // the sole top-level "statement".
+        let body_is_stmts = body_node.as_statements_node().is_some();
         let stmts: Vec<ruby_prism::Node> = if let Some(sn) = body_node.as_statements_node() {
             sn.body().iter().collect()
         } else if let Some(bn) = body_node.as_begin_node() {
@@ -1581,6 +1582,22 @@ impl<'a> super::Cops<'a> {
         // `memoized?`: `@ivar ||= ...` as the sole/last top-level statement.
         if let Some(orw) = last.as_instance_variable_or_write_node() {
             self.mivn_check_or_asgn(style, method_name, &orw);
+        } else if body_is_stmts && stmts.len() == 1 {
+            // upstream accepts `body.children.last == node` too: when the
+            // def body is a SINGLE statement, whitequark's `body` IS that
+            // statement, and its own last child — a wrapping block's body
+            // (`@mutex.synchronize do @x ||= ... end`), an if/case `else`
+            // branch, an `unless` primary body, a while/until body, or an
+            // explicit begin's last statement — is still "the end of the
+            // method" (rails corpus: server_timing.rb, route_set.rb,
+            // finder_methods.rb, cache/entry.rb). A MULTI-statement body is
+            // whitequark's `:begin`, whose children.last is the last
+            // top-level statement — the branch above.
+            if let Some(inner) = mivn_children_last(&stmts[0]) {
+                if let Some(orw) = inner.as_instance_variable_or_write_node() {
+                    self.mivn_check_or_asgn(style, method_name, &orw);
+                }
+            }
         }
 
         // `defined_memoized?`: `(begin (if (defined (ivar %1)) (return (ivar
@@ -1684,6 +1701,68 @@ pub(crate) fn mivn_dynamic_define_name(call: &ruby_prism::CallNode) -> Option<Ve
 /// EXACTLY a bare `return @ivar` (nothing else), and both ivars name the
 /// same variable. Returns the `defined?(...)`'s ivar and the `return`'s
 /// ivar (both offense anchors) once matched.
+/// whitequark's `node.children.last` for the single-statement-def-body
+/// shapes that can hold a memoization as their last child. Returns the
+/// child only when whitequark would see the NODE itself there — i.e. a
+/// single-statement branch/body (a multi-statement one is a `:begin` node,
+/// which can never equal the `or_asgn`); explicit `begin`/parens are
+/// themselves the statement group, so their last statement qualifies at any
+/// count.
+fn mivn_children_last<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    fn sole<'pr>(stmts: Option<ruby_prism::StatementsNode<'pr>>) -> Option<ruby_prism::Node<'pr>> {
+        let list: Vec<ruby_prism::Node<'pr>> = stmts?.body().iter().collect();
+        if list.len() == 1 { list.into_iter().next() } else { None }
+    }
+    if let Some(call) = n.as_call_node() {
+        // (block (send ...) (args) BODY) — children.last is the block body.
+        // EXCEPT when the block is itself a literal-name `define_method`/
+        // `define_singleton_method`: upstream's `find_definition` climb
+        // stops there first (it IS a method definition), so its memoization
+        // belongs to THAT name — handled by `check_memoized_ivar_block` at
+        // the owning call site, never by the enclosing def.
+        if mivn_dynamic_define_name(&call).is_some() {
+            return None;
+        }
+        let block = call.block()?.as_block_node()?;
+        return sole(block.body()?.as_statements_node());
+    }
+    if let Some(i) = n.as_if_node() {
+        // (if cond then-branch ELSE-BRANCH) — an elsif chain in the else
+        // slot is its own `if` node, never the or_asgn.
+        return sole(i.subsequent()?.as_else_node()?.statements());
+    }
+    if let Some(u) = n.as_unless_node() {
+        // whitequark folds `unless` into (if cond else-clause BODY) — the
+        // primary body sits in the LAST (else) slot.
+        return sole(u.statements());
+    }
+    if let Some(c) = n.as_case_node() {
+        return sole(c.else_clause()?.statements());
+    }
+    if let Some(c) = n.as_case_match_node() {
+        return sole(c.else_clause()?.statements());
+    }
+    if let Some(w) = n.as_while_node() {
+        return sole(w.statements());
+    }
+    if let Some(w) = n.as_until_node() {
+        return sole(w.statements());
+    }
+    if let Some(b) = n.as_begin_node() {
+        // explicit `begin ... end` without rescue/else/ensure is
+        // whitequark's `kwbegin`, whose children ARE the statements; any
+        // clause turns children.last into the rescue/ensure node instead.
+        if b.rescue_clause().is_none() && b.else_clause().is_none() && b.ensure_clause().is_none() {
+            return b.statements()?.body().iter().last();
+        }
+        return None;
+    }
+    if let Some(p) = n.as_parentheses_node() {
+        return p.body()?.as_statements_node()?.body().iter().last();
+    }
+    None
+}
+
 fn mivn_defined_shape<'pr>(
     if_node: &ruby_prism::IfNode<'pr>,
 ) -> Option<(ruby_prism::InstanceVariableReadNode<'pr>, ruby_prism::InstanceVariableReadNode<'pr>)> {
