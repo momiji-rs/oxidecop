@@ -11821,3 +11821,140 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/CommentedKeyword — flags a trailing `#` comment sharing a
+    /// physical line with `begin`/`class`/`def`/`end`/`module`. Ported
+    /// verbatim from rubocop's `on_new_investigation`, which scans
+    /// `processed_source.comments` directly (no AST node involved), hence
+    /// the standalone (non-visit) hook call in `lint()` rather than a
+    /// `visit_*` override.
+    ///
+    /// `offensive?` gates on three checks, in this exact order (rubocop
+    /// short-circuits on the first two):
+    ///   1. `rbs_inline_annotation?` — allowed on a `class X < Y` subclass
+    ///      header (`#[...]`, requiring the closing bracket — an
+    ///      unterminated `#[String` or a bare `#String]` is NOT exempt) or
+    ///      on any `def`/`end` line (a bare `#:` prefix — RBS::Inline's
+    ///      method-type annotation; note the classification is by LINE TEXT
+    ///      shape only, so `end #: String` is exempt whether that `end`
+    ///      closes a `def`, `class`, `module`, or `begin`).
+    ///   2. `steep_annotation?` — `# steep:ignore` (a literal single space
+    ///      between `#` and `steep`), optionally followed by more text as
+    ///      long as a whitespace character (or end of comment) immediately
+    ///      follows `ignore` itself (`#steep:ignore` with no leading space,
+    ///      or `# steep:ignoreFoo` with no separator, are NOT valid).
+    ///   3. `KEYWORD_REGEXES` (one of the five keywords, anchored at the
+    ///      start of the line with a trailing space) must match, AND
+    ///      `ALLOWED_COMMENT_REGEXES` (`:nodoc:`, `:yields:`, or a
+    ///      `# rubocop:disable/enable/todo/push/pop` directive) must NOT.
+    ///
+    /// The reported `keyword` (and the correction's "hoist above the line"
+    /// decision) comes from a separate regex — upstream's
+    /// `/(?<keyword>\S+).*#/`, the line's first whitespace-delimited token —
+    /// which happens to always coincide with whichever KEYWORD_REGEXES
+    /// matched here (both anchor on the same leading run of non-space
+    /// characters).
+    ///
+    /// Autocorrect (unsafe, like upstream): removes the comment plus
+    /// surrounding horizontal whitespace only (spaces/tabs — rubocop's
+    /// `range_with_surrounding_space(newlines: false)` never crosses a
+    /// newline), and unless the matched keyword is literally `end`,
+    /// re-inserts the original comment text as its own line directly above
+    /// — at column 0 of the physical line, ignoring that line's own
+    /// indentation (rubocop's `insert_before(buffer.line_range(...), ...)`).
+    pub(crate) fn check_commented_keyword(&mut self) {
+        const COP: &str = "Style/CommentedKeyword";
+        if !self.on(COP) {
+            return;
+        }
+        static KEYWORD_RES: OnceLock<[regex::Regex; 5]> = OnceLock::new();
+        let keyword_res = KEYWORD_RES.get_or_init(|| {
+            [
+                regex::Regex::new(r"^\s*begin\s").unwrap(),
+                regex::Regex::new(r"^\s*class\s").unwrap(),
+                regex::Regex::new(r"^\s*def\s").unwrap(),
+                regex::Regex::new(r"^\s*end\s").unwrap(),
+                regex::Regex::new(r"^\s*module\s").unwrap(),
+            ]
+        });
+        static NODOC_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let nodoc_re = NODOC_RE.get_or_init(|| regex::Regex::new(r"#\s*:nodoc:").unwrap());
+        static YIELDS_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let yields_re = YIELDS_RE.get_or_init(|| regex::Regex::new(r"#\s*:yields:").unwrap());
+        static DIRECTIVE_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let directive_re = DIRECTIVE_RE.get_or_init(|| {
+            regex::Regex::new(r"#\s*rubocop\s*:\s*(?:disable|enable|todo|push|pop)\b").unwrap()
+        });
+        static SUBCLASS_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let subclass_re = SUBCLASS_RE
+            .get_or_init(|| regex::Regex::new(r"^\s*class\s+(?:\w|::)+\s*<\s*(?:\w|::)+").unwrap());
+        static METHOD_OR_END_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let method_or_end_re =
+            METHOD_OR_END_RE.get_or_init(|| regex::Regex::new(r"^\s*(?:def\s|end)").unwrap());
+        static RBS_BRACKET_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let rbs_bracket_re = RBS_BRACKET_RE.get_or_init(|| regex::Regex::new(r"^#\[.+\]").unwrap());
+        static STEEP_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let steep_re =
+            STEEP_RE.get_or_init(|| regex::Regex::new(r"#\ssteep:ignore(?:\s|\z)").unwrap());
+        static EXTRACT_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let extract_re = EXTRACT_RE.get_or_init(|| regex::Regex::new(r"^\s*(\S+).*#").unwrap());
+
+        for &(line, start, end) in self.comments {
+            let line_start = self.idx.starts[line - 1];
+            let line_end =
+                if line < self.idx.starts.len() { self.idx.starts[line] - 1 } else { self.src.len() };
+            let line_text = String::from_utf8_lossy(&self.src[line_start..line_end]);
+            let comment_bytes = &self.src[start..end];
+            let comment_str = String::from_utf8_lossy(comment_bytes);
+
+            // rbs_inline_annotation?
+            let rbs = if subclass_re.is_match(&line_text) {
+                rbs_bracket_re.is_match(&comment_str)
+            } else if method_or_end_re.is_match(&line_text) {
+                comment_str.starts_with("#:")
+            } else {
+                false
+            };
+            if rbs || steep_re.is_match(&comment_str) {
+                continue;
+            }
+            if !keyword_res.iter().any(|r| r.is_match(&line_text)) {
+                continue;
+            }
+            if nodoc_re.is_match(&line_text)
+                || yields_re.is_match(&line_text)
+                || directive_re.is_match(&line_text)
+            {
+                continue;
+            }
+            let Some(caps) = extract_re.captures(&line_text) else { continue };
+            let keyword = caps.get(1).unwrap().as_str().to_string();
+
+            self.push(
+                start,
+                COP,
+                true,
+                format!("Do not place comments on the same line as the `{keyword}` keyword."),
+            );
+
+            // Autocorrect: remove the comment plus surrounding horizontal
+            // whitespace (never crossing the newline either side).
+            let mut remove_start = start;
+            while remove_start > line_start && matches!(self.src[remove_start - 1], b' ' | b'\t') {
+                remove_start -= 1;
+            }
+            let mut remove_end = end;
+            while remove_end < self.src.len() && matches!(self.src[remove_end], b' ' | b'\t') {
+                remove_end += 1;
+            }
+            self.fixes.push((remove_start, remove_end, Vec::new()));
+
+            if keyword != "end" {
+                let mut ins = comment_bytes.to_vec();
+                ins.push(b'\n');
+                self.fixes.push((line_start, line_start, ins));
+            }
+        }
+    }
+}

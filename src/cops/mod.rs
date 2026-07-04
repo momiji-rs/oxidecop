@@ -231,7 +231,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException",
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
-    "Style/MultilineTernaryOperator",
+    "Style/MultilineTernaryOperator", "Style/CommentedKeyword",
 ];
 
 impl Engine {
@@ -2861,6 +2861,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     cops.check_space_after_semicolon();
     cops.check_double_cop_disable_directive();
     cops.check_missing_cop_enable_directive();
+    cops.check_commented_keyword();
     let t = tick(&T_VISIT, t);
 
     let mut offenses = cops.offenses;
