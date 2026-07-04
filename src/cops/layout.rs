@@ -7482,3 +7482,330 @@ impl<'a> Cops<'a> {
         self.sirb_check(opening, closing, has_args, start, end);
     }
 }
+
+
+
+/// Layout/SpaceInsideBlockBraces — port of `on_block`/`on_numblock`/
+/// `on_itblock` (all aliased to the same method upstream) plus its private
+/// helpers (`check_inside`/`adjacent_braces`/`braces_with_contents_inside`/
+/// `check_left_brace`/`check_right_brace`/`(no_)?space_inside_(left|right)
+/// _brace`/`pipe?`/`no_space`/`space`/`offense`/`style_for_empty_braces`).
+/// Prism gives every brace-delimited block (plain, `_1`-numbered, `it`) the
+/// SAME `BlockNode` shape, so — exactly like upstream's alias trio — one
+/// hook handles all three; only `node.parameters()` distinguishes them (a
+/// `BlockParametersNode` for the pipe form, `NumberedParametersNode`/
+/// `ItParametersNode` — or nothing — otherwise).
+///
+/// `chain_start` is the byte offset of upstream's `node.source_range.column`
+/// — used only by the multiline right-brace alignment check
+/// (`aligned_braces?`). Upstream's whitequark `block` node's own expression
+/// spans the FULL receiver chain (`foo.bar.baz { ... }`'s block node starts
+/// at `foo`, column 0), which is exactly prism's raw owning-call-or-`super`
+/// node's `location()` (that node's span already includes any receiver —
+/// confirmed empirically against real rubocop, not the bare "starts at the
+/// selector" raw-prism `BlockNode#location` shape). The caller passes the
+/// `rp_ancestors` entry directly below our own (the block's one and only
+/// possible owner — see `dm_owning_call_start`'s doc for why that lookup is
+/// always correct).
+impl<'a> Cops<'a> {
+    const SIBB_COP: &'static str = "Layout/SpaceInsideBlockBraces";
+
+    /// Ruby's `/\s/` character class (used for the `\A\S`/`\S$`/`\S`
+    /// membership tests on `inner`, and the offense corrector's `/\s/`
+    /// case arm) — space, tab, CR, LF, FF, VT.
+    fn sibb_is_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x0b)
+    }
+
+    /// Forward twin of `range_with_surrounding_space(..., side: :right)`
+    /// (defaults `newlines: true, whitespace: false, continuations: false`):
+    /// skip a run of spaces/tabs, THEN (from wherever that stops) a run of
+    /// newlines — sequential, not a combined scan. Mirrors
+    /// `check_space_before_block_braces`'s backward twin (see its doc).
+    fn sibb_skip_fwd(src: &[u8], mut pos: usize) -> usize {
+        while pos < src.len() && matches!(src[pos], b' ' | b'\t') {
+            pos += 1;
+        }
+        while pos < src.len() && src[pos] == b'\n' {
+            pos += 1;
+        }
+        pos
+    }
+
+    /// Backward twin, for `side: :left`. Also reports whether any `\n` byte
+    /// was skipped — upstream's `brace_with_space.source.match?(/\R/)`; the
+    /// only newlines that CAN land in that range come from here, since the
+    /// range's other edge is the brace's own (non-newline) character.
+    fn sibb_skip_back(src: &[u8], mut pos: usize) -> (usize, bool) {
+        while pos > 0 && matches!(src[pos - 1], b' ' | b'\t') {
+            pos -= 1;
+        }
+        let mut crossed_nl = false;
+        while pos > 0 && src[pos - 1] == b'\n' {
+            crossed_nl = true;
+            pos -= 1;
+        }
+        (pos, crossed_nl)
+    }
+
+    /// `inner_last_space_count`: `inner.split("\n").last.count(' ')`.
+    /// Ruby's default `String#split` drops ALL trailing empty pieces (not
+    /// just one) — so a `}` sitting alone at column 0 (inner ends with a
+    /// bare `\n`, nothing after) resolves to the line BEFORE that blank
+    /// tail, not `""`. Strip trailing `\n`s first, then take the tail after
+    /// the last remaining `\n` (or the whole thing if none remain).
+    fn sibb_inner_last_space_count(inner: &[u8]) -> usize {
+        let mut end = inner.len();
+        while end > 0 && inner[end - 1] == b'\n' {
+            end -= 1;
+        }
+        let stripped = &inner[..end];
+        let start = stripped.iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        stripped[start..].iter().filter(|&&b| b == b' ').count()
+    }
+
+    /// `style_for_empty_braces`: `Some(true)` => `:space`, `Some(false)` =>
+    /// `:no_space`, `None` => upstream's `raise 'Unknown
+    /// EnforcedStyleForEmptyBraces selected!'` (an invalid config value —
+    /// see `check_space_inside_block_braces`'s callers for how that's
+    /// handled: treated as a no-op rather than aborting the process).
+    fn sibb_style_for_empty_braces(&self) -> Option<bool> {
+        match self.cfg.get(Self::SIBB_COP, "EnforcedStyleForEmptyBraces") {
+            Some("space") => Some(true),
+            Some("no_space") => Some(false),
+            _ => None,
+        }
+    }
+
+    fn sibb_style_no_space(&self) -> bool {
+        self.cfg.get(Self::SIBB_COP, "EnforcedStyle") == Some("no_space")
+    }
+
+    fn sibb_space_before_params(&self) -> bool {
+        self.cfg.get(Self::SIBB_COP, "SpaceBeforeBlockParameters") == Some("true")
+    }
+
+    /// `offense`: registers at `[begin, end)` (already guarded by callers to
+    /// have `begin <= end`, but check anyway to mirror upstream's own
+    /// `return if begin_pos > end_pos`) and dispatches the autocorrection
+    /// exactly like upstream's `case range.source`.
+    fn sibb_offense(&mut self, begin: usize, end: usize, msg: &'static str) {
+        if begin > end {
+            return;
+        }
+        self.push(begin, Self::SIBB_COP, true, msg);
+        let range_src = &self.src[begin..end];
+        if range_src.iter().any(|&b| Self::sibb_is_ws(b)) {
+            self.fixes.push((begin, end, Vec::new()));
+        } else if range_src == b"{}" {
+            self.fixes.push((begin, end, b"{ }".to_vec()));
+        } else if range_src == b"{|" {
+            self.fixes.push((begin, end, b"{ |".to_vec()));
+        } else {
+            // `insert_before`: a zero-width insert right before `begin`;
+            // `[begin, end)` itself is left untouched.
+            self.fixes.push((begin, begin, b" ".to_vec()));
+        }
+    }
+
+    /// `no_space`: upstream only offends when the configured style is
+    /// `:space` (otherwise the "no space" state is already what the style
+    /// wants — `correct_style_detected`, a no-op for us).
+    fn sibb_no_space(&mut self, begin: usize, end: usize, msg: &'static str) {
+        if !self.sibb_style_no_space() {
+            self.sibb_offense(begin, end, msg);
+        }
+    }
+
+    /// `space`: the mirror image — offends only under `:no_space`.
+    fn sibb_space(&mut self, begin: usize, end: usize, msg: &'static str) {
+        if self.sibb_style_no_space() {
+            self.sibb_offense(begin, end, msg);
+        }
+    }
+
+    pub(crate) fn check_space_inside_block_braces(&mut self, node: &ruby_prism::BlockNode, chain_start: usize) {
+        if !self.on(Self::SIBB_COP) {
+            return;
+        }
+        let opening = node.opening_loc();
+        // `node.keywords?`: `do`...`end` blocks are Layout/SpaceAroundKeyword
+        // turf, not ours — only the `{`-opened form is in scope here.
+        if opening.as_slice() != b"{" {
+            return;
+        }
+        let closing = node.closing_loc();
+        let left_brace_start = opening.start_offset();
+        let left_brace_end = opening.end_offset();
+        let right_brace_start = closing.start_offset();
+        let right_brace_end = closing.end_offset();
+
+        let open_line = self.idx.loc(left_brace_start).0;
+        let close_line = self.idx.loc(right_brace_start).0;
+        // Multi-line EMPTY braces are exempt entirely — registering (and
+        // autocorrecting) here would collapse them to single-line empty
+        // braces, fighting this very cop's own next pass (upstream's
+        // comment references rubocop/rubocop#7363).
+        if node.body().is_none() && open_line != close_line {
+            return;
+        }
+
+        if left_brace_end == right_brace_start {
+            // `adjacent_braces`: literally `{}`, nothing between.
+            if self.sibb_style_for_empty_braces() == Some(true) {
+                self.sibb_offense(left_brace_start, right_brace_end, "Space missing inside empty braces.");
+            }
+            return;
+        }
+
+        let src = self.src;
+        let inner = &src[left_brace_end..right_brace_start];
+        if inner.iter().any(|&b| !Self::sibb_is_ws(b)) {
+            self.sibb_braces_with_contents(
+                node,
+                inner,
+                left_brace_start,
+                left_brace_end,
+                right_brace_start,
+                right_brace_end,
+                chain_start,
+            );
+        } else if self.sibb_style_for_empty_braces() == Some(false) {
+            self.sibb_offense(left_brace_end, right_brace_start, "Space inside empty braces detected.");
+        }
+    }
+
+    /// `braces_with_contents_inside` + `check_left_brace`/`check_right_brace`
+    /// dispatch (folded into one to avoid threading 7 positional args
+    /// through an extra layer).
+    fn sibb_braces_with_contents(
+        &mut self,
+        node: &ruby_prism::BlockNode,
+        inner: &[u8],
+        left_brace_start: usize,
+        left_brace_end: usize,
+        right_brace_start: usize,
+        right_brace_end: usize,
+        chain_start: usize,
+    ) {
+        // `node.arguments.loc.begin if node.block_type?`: the pipe location,
+        // present only for an ordinary (non-numbered, non-`it`) block that
+        // actually declares `|...|` — `NumberedParametersNode`/
+        // `ItParametersNode` (or no parameters at all) both yield `None`
+        // here, matching upstream's `nil` in either case.
+        let args_delim = node
+            .parameters()
+            .and_then(|p| p.as_block_parameters_node())
+            .and_then(|bp| bp.opening_loc())
+            .map(|l| (l.start_offset(), l.end_offset()));
+
+        self.sibb_check_left_brace(inner, left_brace_start, left_brace_end, args_delim);
+
+        let single_line = self.idx.loc(left_brace_start).0 == self.idx.loc(right_brace_start).0;
+        self.sibb_check_right_brace(
+            inner,
+            left_brace_start,
+            right_brace_start,
+            right_brace_end,
+            single_line,
+            chain_start,
+        );
+    }
+
+    fn sibb_check_left_brace(
+        &mut self,
+        inner: &[u8],
+        left_brace_start: usize,
+        left_brace_end: usize,
+        args_delim: Option<(usize, usize)>,
+    ) {
+        let starts_non_ws = inner.first().is_some_and(|&b| !Self::sibb_is_ws(b));
+        if starts_non_ws {
+            // `no_space_inside_left_brace`
+            match args_delim {
+                Some((d_begin, d_end)) => {
+                    if left_brace_end == d_begin && self.sibb_space_before_params() {
+                        self.sibb_offense(left_brace_start, d_end, "Space between { and | missing.");
+                    }
+                    // else: `correct_style_detected` — no offense.
+                }
+                None => {
+                    // We indicate the position after the left brace, matching
+                    // upstream's comment on distinguishing left- vs
+                    // right-side missing space during autocorrect.
+                    self.sibb_no_space(left_brace_end, left_brace_end + 1, "Space missing inside {.");
+                }
+            }
+        } else {
+            // `space_inside_left_brace`
+            match args_delim {
+                Some((d_begin, _)) => {
+                    if !self.sibb_space_before_params() {
+                        self.sibb_offense(left_brace_end, d_begin, "Space between { and | detected.");
+                    }
+                    // else: `correct_style_detected` — no offense.
+                }
+                None => {
+                    let end = Self::sibb_skip_fwd(self.src, left_brace_end);
+                    self.sibb_space(left_brace_end, end, "Space inside { detected.");
+                }
+            }
+        }
+    }
+
+    fn sibb_check_right_brace(
+        &mut self,
+        inner: &[u8],
+        left_brace_start: usize,
+        right_brace_start: usize,
+        right_brace_end: usize,
+        single_line: bool,
+        chain_start: usize,
+    ) {
+        let ends_non_ws = inner.last().is_some_and(|&b| !Self::sibb_is_ws(b));
+        if single_line && ends_non_ws {
+            self.sibb_no_space(right_brace_start, right_brace_end, "Space missing inside }.");
+            return;
+        }
+
+        let column = self.idx.loc(chain_start).1 - 1;
+        let right_column = self.idx.loc(right_brace_start).1 - 1;
+        let left_line = self.idx.loc(left_brace_start).0;
+        let right_line = self.idx.loc(right_brace_start).0;
+        let multiline_block = left_line != right_line;
+        if multiline_block {
+            let aligned = right_column == column || Self::sibb_inner_last_space_count(inner) == column;
+            if aligned {
+                return;
+            }
+        }
+
+        self.sibb_space_inside_right_brace(inner, right_brace_start, right_brace_end, right_column, column);
+    }
+
+    fn sibb_space_inside_right_brace(
+        &mut self,
+        inner: &[u8],
+        right_brace_start: usize,
+        right_brace_end: usize,
+        right_column: usize,
+        column: usize,
+    ) {
+        let (back_pos, crossed_nl) = Self::sibb_skip_back(self.src, right_brace_start);
+        let mut begin_pos = back_pos;
+        let mut end_pos = right_brace_end - 1;
+
+        if crossed_nl {
+            let diff = right_column as isize - column as isize;
+            begin_pos = (end_pos as isize - diff).max(0) as usize;
+        }
+
+        if inner.last() == Some(&b']') {
+            end_pos -= 1;
+            let diff = Self::sibb_inner_last_space_count(inner) as isize - column as isize;
+            begin_pos = (end_pos as isize - diff).max(0) as usize;
+        }
+
+        self.sibb_space(begin_pos, end_pos, "Space inside } detected.");
+    }
+}
