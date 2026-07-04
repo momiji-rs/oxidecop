@@ -233,7 +233,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
-    "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument",
+    "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem",
 ];
 
 impl Engine {
@@ -2154,6 +2154,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_parentheses_node(self, node);
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+        self.check_hash_as_last_array_item(node);
         self.check_multiline_array_brace_layout(node);
         self.check_nested_percent_literal(node);
         self.check_percent_symbol_array(node);

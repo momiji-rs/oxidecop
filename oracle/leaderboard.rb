@@ -241,6 +241,7 @@ COPS = {
   'Style/EmptyMethod'                => 'style/empty_method',
   'Lint/RedundantRequireStatement'   => 'lint/redundant_require_statement',
   'Lint/SendWithMixinArgument'       => 'lint/send_with_mixin_argument',
+  'Style/HashAsLastArrayItem'        => 'style/hash_as_last_array_item',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -14074,3 +14074,158 @@ fn em_ordered_params<'pr>(params: &ruby_prism::ParametersNode<'pr>) -> Vec<ruby_
     }
     out
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/HashAsLastArrayItem — hooked from `visit_array_node` rather than
+    /// mirroring upstream's `on_hash` (which walks EVERY hash node and asks
+    /// "am I the containing array's last value?" via a `parent` back-link).
+    /// Prism nodes carry no parent pointer, but the cop only ever fires on
+    /// the array's OWN last element, so starting from the array and looking
+    /// at `elements().last()` is behaviorally identical and needs no
+    /// back-link at all.
+    ///
+    /// A second structural split: whitequark's parser gives both `{ a: 1 }`
+    /// and a braceless `a: 1` the SAME `:hash` node type, distinguished only
+    /// by `#braces?`. Prism instead uses two distinct node kinds —
+    /// `HashNode` (always braced: `opening_loc`/`closing_loc` are
+    /// non-optional fields) and `KeywordHashNode` (always braceless, no
+    /// brace locations at all) — so `hali_braced` below stands in for
+    /// upstream's `braces?` test across both.
+    pub(crate) fn check_hash_as_last_array_item(&mut self, array: &ruby_prism::ArrayNode) {
+        const COP: &str = "Style/HashAsLastArrayItem";
+        if !self.on(COP) {
+            return;
+        }
+
+        let elements: Vec<ruby_prism::Node> = array.elements().iter().collect();
+        let Some(last) = elements.last() else { return };
+
+        // Only a hash-like (braced or braceless) last element is ever in
+        // play — anything else can't be an offense site.
+        let Some(last_braced) = hali_braced(last) else { return };
+
+        // `return if node.children.first&.kwsplat_type?` — a lone `**splat`
+        // (or a `**splat` written first among pairs) is exempt regardless of
+        // style, e.g. `[1, **options]`.
+        let last_elements: Vec<ruby_prism::Node> = hali_elements(last);
+        if last_elements.first().is_some_and(|e| e.as_assoc_splat_node().is_some()) {
+            return;
+        }
+
+        // `explicit_array?` — an implicit array (e.g. the right-hand side of
+        // a multiple assignment) can never have an "unbraced" hash flagged.
+        if array.opening_loc().is_none() {
+            return;
+        }
+
+        let braces_style = self.cfg.enforced_style(COP) != "no_braces";
+
+        // `expected_braced_last_array_item?`: bail if the array is made ENTIRELY
+        // of hashes already matching the enforced style (the cop's "ignore
+        // arrays where multiple items are all hashes" note), or if the
+        // second-to-last item is itself hash-like (only a non-hash
+        // second-to-last item allows the last one to be judged at all).
+        let all_already_conforming =
+            elements.iter().all(|e| hali_braced(e).is_some_and(|b| b == braces_style));
+        if all_already_conforming {
+            return;
+        }
+        let n = elements.len();
+        let second_last_is_hash = n >= 2 && hali_braced(&elements[n - 2]).is_some();
+        if second_last_is_hash {
+            return;
+        }
+        // `array.values.last.equal?(node)` is trivially true here since
+        // `last` — by construction — IS `elements.last()`.
+
+        let loc = last.location();
+        let start = loc.start_offset();
+        let end = loc.end_offset();
+
+        if braces_style {
+            if last_braced {
+                return; // `return if node.braces?`
+            }
+            self.push(start, COP, true, "Wrap hash in `{` and `}`.");
+
+            // `node.single_line? || same_line?(node, node.parent)`
+            let last_char = if end > start { end - 1 } else { start };
+            let single_line = self.idx.loc(start).0 == self.idx.loc(last_char).0;
+            let same_line_as_array =
+                self.idx.loc(start).0 == self.idx.loc(array.location().start_offset()).0;
+
+            if single_line || same_line_as_array {
+                self.fixes.push((start, start, b"{".to_vec()));
+                self.fixes.push((end, end, b"}".to_vec()));
+            } else {
+                // `indent(node)` = `' ' * node.loc.column` (0-based).
+                let col = self.idx.loc(start).1 - 1;
+                let indent = " ".repeat(col);
+                let mut open = b"{\n".to_vec();
+                open.extend_from_slice(indent.as_bytes());
+                let mut close = b"\n".to_vec();
+                close.extend_from_slice(indent.as_bytes());
+                close.push(b'}');
+                self.fixes.push((start, start, open));
+                self.fixes.push((end, end, close));
+            }
+        } else {
+            if !last_braced {
+                return; // `return unless node.braces?`
+            }
+            if last_elements.is_empty() {
+                return; // "Empty hash cannot be unbraced"
+            }
+            self.push(start, COP, true, "Omit the braces around the hash.");
+
+            // `remove_last_element_trailing_comma`: from the end of the hash
+            // (== the array's last element), skip horizontal whitespace then
+            // any run of newlines (`range_with_surrounding_space(...,
+            // side: :right)`'s default `newlines: true`), and remove the
+            // single byte landed on if it's a comma.
+            let mut pos = end;
+            while matches!(self.src.get(pos), Some(b' ' | b'\t')) {
+                pos += 1;
+            }
+            while matches!(self.src.get(pos), Some(b'\n')) {
+                pos += 1;
+            }
+            if self.src.get(pos) == Some(&b',') {
+                self.fixes.push((pos, pos + 1, Vec::new()));
+            }
+
+            let hash_node = last.as_hash_node().expect("last_braced implies HashNode");
+            let open = hash_node.opening_loc();
+            let close = hash_node.closing_loc();
+            self.fixes.push((open.start_offset(), open.end_offset(), Vec::new()));
+            self.fixes.push((close.start_offset(), close.end_offset(), Vec::new()));
+        }
+    }
+}
+
+/// `node.hash_type? && braces?`-equivalent: `Some(true)` for an explicit
+/// `{...}` `HashNode`, `Some(false)` for a braceless `KeywordHashNode`,
+/// `None` for anything else.
+fn hali_braced(node: &ruby_prism::Node) -> Option<bool> {
+    if node.as_hash_node().is_some() {
+        Some(true)
+    } else if node.as_keyword_hash_node().is_some() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The hash-like node's own pairs, uniformly across `HashNode` and
+/// `KeywordHashNode` — empty (not a panic) for anything else, since callers
+/// only ever invoke this after `hali_braced` already confirmed the kind.
+fn hali_elements<'pr>(node: &ruby_prism::Node<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    if let Some(h) = node.as_hash_node() {
+        h.elements().iter().collect()
+    } else if let Some(h) = node.as_keyword_hash_node() {
+        h.elements().iter().collect()
+    } else {
+        Vec::new()
+    }
+}
