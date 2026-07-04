@@ -14270,3 +14270,514 @@ pub(crate) fn rea_masgn_lhs_end(node: &ruby_prism::MultiWriteNode) -> usize {
     }
     end
 }
+
+
+// ============================================================================
+// Layout/FirstArrayElementIndentation
+//
+// Ported from rubocop's `FirstArrayElementIndentation` cop plus the mixins it
+// includes: `Alignment` (`configured_indentation_width`, plus the
+// `AlignmentCorrector`-style multi-line shift already established by
+// `check_array_alignment`'s own `array_alignment_correct` above — `brace_
+// alignment_style` is fixed to `:align_brackets` for this cop), `Configurable
+// EnforcedStyle` (the 3-way `EnforcedStyle`), and `MultilineElementIndentation`
+// (`each_argument_node`, `check_first`/`check_right_bracket`, `indent_base`).
+//
+// Three `EnforcedStyle`s: `special_inside_parentheses` (default — an array
+// literal argument whose own `[` sits on the same source line as the call's
+// `(` indents relative to the first column after that `(`), `consistent`
+// (always relative to the start of the line the `[` is on), `align_brackets`
+// (always relative to the `[`'s own column).
+//
+// `on_array`/`on_send` (`alias on_csend on_send`) both short-circuit when
+// `Layout/ArrayAlignment` is itself enabled and configured `with_fixed_
+// indentation` (`enforce_first_argument_with_fixed_indentation?`) UNLESS this
+// cop's own style is `consistent`.
+//
+// `each_argument_node`'s `on_node(:array, arg, :send)` recursive search
+// (`FaeiArgWalker` below) needs no cross-node parent map — unlike `Layout/
+// FirstArgumentIndentation`'s `special_inner_call_indentation?`/autocorrect
+// chain-climbing, everything this cop needs is reachable DOWNWARD from the
+// call being checked (walk into its own top-level arguments looking for
+// nested array literals) or downward from a hash/keyword-hash literal into
+// its own pairs (`faei_register_hash_pairs`, run from `visit_hash_node`/
+// `visit_keyword_hash_node` before their children are visited) — no need to
+// reconstruct prism's missing parent pointers at all.
+//
+// `hash_pair_where_value_beginning_with`'s `first.parent.loc.begin ==
+// left_brace` guard is ALWAYS true when reached from `check_first`/`check_
+// right_bracket` (both call it with `first` = `array_node.values.first`, so
+// `first.parent` is always `array_node` itself, whose own `loc.begin` is
+// exactly the `left_brace` passed alongside it) — so it collapses to just
+// "does a first element exist", ported as the `has_first_elem: bool` param.
+// ============================================================================
+
+/// `MultilineElementIndentation#hash_pair_where_value_beginning_with`'s
+/// per-array cache entry — see `Cops::faei_hash_pair`'s field doc for how and
+/// when it's populated.
+#[derive(Clone, Copy)]
+pub(crate) struct FaeiPairInfo {
+    /// The enclosing pair's own start offset — identical to its key's start
+    /// offset, since a prism `AssocNode`'s range always begins exactly at
+    /// its key (mirrors `pair.loc.column`/`pair.key`'s shared start).
+    pair_start: usize,
+    /// The following sibling ELEMENT's (pair or kwsplat) own start line
+    /// within the same hash/keyword-hash, if any — `pair.right_sibling`'s
+    /// `first_line`. `None` when this pair is the last element.
+    right_sibling_key_line: Option<usize>,
+}
+
+/// Whole-file, one-time pre-pass (run alongside `HeredocFinder` in `lint()`)
+/// building `faei_hash_pair` up front. A "just in time" population from the
+/// main traversal's own `visit_hash_node`/`visit_keyword_hash_node` (parent
+/// visited before its children) is NOT enough here: `check_first_array_
+/// element_indentation_send`'s own `FaeiArgWalker` search runs EAGERLY and
+/// synchronously from within `visit_call_node`, entirely BEFORE the main
+/// traversal ever descends into that same call's own arguments — i.e.
+/// before it would otherwise reach the `KeywordHashNode`/`HashNode` pair
+/// wrapping one of THIS call's own array-literal arguments. A true up-front
+/// pre-pass sidesteps the ordering problem entirely.
+pub(crate) fn faei_build_hash_pairs<'pr>(root: &ruby_prism::Node<'pr>, idx: &super::LineIndex) -> std::collections::HashMap<(usize, usize), FaeiPairInfo> {
+    use ruby_prism::Visit;
+    struct FaeiHashPairPrepass<'a> {
+        idx: &'a super::LineIndex,
+        pairs: std::collections::HashMap<(usize, usize), FaeiPairInfo>,
+    }
+    impl<'pr, 'a> ruby_prism::Visit<'pr> for FaeiHashPairPrepass<'a> {
+        fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
+            self.register(&node.elements().iter().collect::<Vec<_>>());
+            ruby_prism::visit_hash_node(self, node);
+        }
+        fn visit_keyword_hash_node(&mut self, node: &ruby_prism::KeywordHashNode<'pr>) {
+            self.register(&node.elements().iter().collect::<Vec<_>>());
+            ruby_prism::visit_keyword_hash_node(self, node);
+        }
+    }
+    impl<'a> FaeiHashPairPrepass<'a> {
+        /// Registers every `AssocNode` element of one hash/keyword-hash
+        /// whose own `value` is directly an array literal.
+        fn register(&mut self, elements: &[ruby_prism::Node]) {
+            for i in 0..elements.len() {
+                let Some(assoc) = elements[i].as_assoc_node() else { continue };
+                let Some(arr) = assoc.value().as_array_node() else { continue };
+                let pair_start = assoc.location().start_offset();
+                let arr_loc = arr.location();
+                let key = (arr_loc.start_offset(), arr_loc.end_offset());
+                let right_sibling_key_line = elements.get(i + 1).map(|n| self.idx.loc(n.location().start_offset()).0);
+                self.pairs.insert(key, FaeiPairInfo { pair_start, right_sibling_key_line });
+            }
+        }
+    }
+    let mut p = FaeiHashPairPrepass { idx, pairs: std::collections::HashMap::new() };
+    p.visit(root);
+    p.pairs
+}
+
+/// One array literal found by `FaeiArgWalker`'s subtree search — its shape,
+/// captured while the node is still in hand (the walker itself has no access
+/// to `Cops`, so nothing is checked until after the whole walk completes).
+struct FaeiHit {
+    array_start: usize,
+    array_end: usize,
+    open_start: usize,
+    close_start: usize,
+    close_end: usize,
+    first_elem: Option<(usize, usize)>,
+}
+
+/// `MultilineElementIndentation#each_argument_node`'s `on_node(:array, arg,
+/// :send)` recursive search: starting from one top-level ARGUMENT of a
+/// parenthesized call, find every array literal reachable WITHOUT crossing
+/// into another plain (non-safe-navigation) method call's own children —
+/// such a nested call gets its own independent `on_send`/`on_csend`
+/// investigation (using ITS OWN left parenthesis) when the main traversal
+/// reaches it directly, so it must not be searched through here. This
+/// mirrors whitequark `on_node`'s `excludes = :send` — a SINGLE-symbol
+/// exclude list that quietly does NOT also exclude `:csend`: a safe-
+/// navigation call's own children (and a bracket index call/write's —
+/// whitequark's distinct, never-excluded `:index`/`:indexasgn` types) ARE
+/// still searched through from an outer call's investigation, an upstream
+/// quirk reproduced faithfully via `is_true_send` below. Every array literal
+/// along the way is recorded regardless of whether it matches (`on_node`
+/// yields THEN keeps recursing unless excluded), so nested arrays (e.g.
+/// `func([[1, 2]])`) are all found independently, each checked against the
+/// SAME (outer) left parenthesis.
+struct FaeiArgWalker {
+    /// The `[line_start, line_end)` byte span of the physical line the
+    /// call's own left parenthesis sits on — computed once per call, since
+    /// it never changes across the whole walk (replaces repeated
+    /// `same_line?` calls).
+    line_start: usize,
+    line_end: usize,
+    hits: Vec<FaeiHit>,
+}
+impl<'pr> ruby_prism::Visit<'pr> for FaeiArgWalker {
+    fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+        if let Some(open) = node.opening_loc() {
+            let open_start = open.start_offset();
+            if open_start >= self.line_start && open_start < self.line_end {
+                if let Some(close) = node.closing_loc() {
+                    let l = node.location();
+                    let first_elem = node.elements().iter().next().map(|e| {
+                        let el = e.location();
+                        (el.start_offset(), el.end_offset())
+                    });
+                    self.hits.push(FaeiHit {
+                        array_start: l.start_offset(),
+                        array_end: l.end_offset(),
+                        open_start,
+                        close_start: close.start_offset(),
+                        close_end: close.end_offset(),
+                        first_elem,
+                    });
+                }
+            }
+        }
+        ruby_prism::visit_array_node(self, node);
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // Stop descending into a plain `:send`-shaped call's own children
+        // (receiver/arguments/block) — it gets its own independent
+        // investigation. A safe-navigation call (`:csend`) and a bracket
+        // index call/write (`recv[...]`/`recv[...] = x`, whitequark's
+        // distinct `:index`/`:indexasgn` types) are NOT `:send`, so both are
+        // searched through normally (the default recursive behavior below).
+        let is_bracket = node.call_operator_loc().is_none() && matches!(node.name().as_slice(), b"[]" | b"[]=");
+        let is_true_send = !node.is_safe_navigation() && !is_bracket;
+        if is_true_send {
+            return;
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+}
+
+/// `base_description(indent_base_type)`.
+fn faei_base_description(base_type: &str) -> &'static str {
+    match base_type {
+        "left_brace_or_bracket" => "the position of the opening bracket",
+        "first_column_after_left_parenthesis" => "the first position after the preceding left parenthesis",
+        "parent_hash_key" => "the parent hash key",
+        _ => "the start of the line where the left square bracket is",
+    }
+}
+
+/// `message_for_right_bracket(indent_base_type)`. Upstream's own source has
+/// a dangling `\` continuation before the `else` in this `case` (a harmless
+/// no-op verified live: `ruby -e 'case ...; when :parent_hash_key; "C" \
+/// else; "D"; end'` still returns exactly `"C"`), so the 4 branches below are
+/// exactly what each style produces.
+fn faei_message_for_right_bracket(base_type: &str) -> &'static str {
+    match base_type {
+        "left_brace_or_bracket" => "Indent the right bracket the same as the left bracket.",
+        "first_column_after_left_parenthesis" => {
+            "Indent the right bracket the same as the first position after the preceding left parenthesis."
+        }
+        "parent_hash_key" => "Indent the right bracket the same as the parent hash key.",
+        _ => "Indent the right bracket the same as the start of the line where the left bracket is.",
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// `on_array`.
+    pub(crate) fn check_first_array_element_indentation_array(&mut self, node: &ruby_prism::ArrayNode) {
+        const COP: &str = "Layout/FirstArrayElementIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        if style != "consistent" && self.faei_enforce_fixed() {
+            return;
+        }
+        // `check(node, nil) if node.loc.begin` — an implicit (bracketless)
+        // array, e.g. a mass-assignment's bare RHS list, is never checked.
+        let Some(open) = node.opening_loc() else { return };
+        let Some(close) = node.closing_loc() else { return };
+        let loc = node.location();
+        let first_elem = node.elements().iter().next().map(|e| {
+            let el = e.location();
+            (el.start_offset(), el.end_offset())
+        });
+        self.faei_check(
+            loc.start_offset(),
+            loc.end_offset(),
+            open.start_offset(),
+            close.start_offset(),
+            close.end_offset(),
+            first_elem,
+            None,
+            style,
+        );
+    }
+
+    /// `on_send` / `alias on_csend on_send` — prism's `is_safe_navigation()`
+    /// unifies both into one `CallNode` hook.
+    pub(crate) fn check_first_array_element_indentation_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/FirstArrayElementIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        if style != "consistent" && self.faei_enforce_fixed() {
+            return;
+        }
+        // whitequark's `on_send`/`on_csend` only ever fire for a genuine
+        // `:send`/`:csend` node — a bracket index call/write (`recv[...]`/
+        // `recv[...] = x`) is its own distinct `:index`/`:indexasgn` type
+        // there and never reaches either hook, even though prism unifies all
+        // four shapes into one `CallNode`.
+        if node.call_operator_loc().is_none() && matches!(node.name().as_slice(), b"[]" | b"[]=") {
+            return;
+        }
+        // `left_parenthesis = node.loc.begin; return unless left_parenthesis`
+        // — a paren-less call's arguments are only ever reached via `on_array`.
+        let Some(open) = node.opening_loc() else { return };
+        if open.as_slice() != b"(" {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let left_paren_start = open.start_offset();
+        let paren_line = self.idx.loc(left_paren_start).0;
+        let line_start = self.idx.starts[paren_line - 1];
+        let line_end = self.idx.starts.get(paren_line).copied().unwrap_or(self.src.len());
+        let mut hits: Vec<FaeiHit> = Vec::new();
+        {
+            use ruby_prism::Visit;
+            for arg in args.arguments().iter() {
+                let mut walker = FaeiArgWalker { line_start, line_end, hits: Vec::new() };
+                walker.visit(&arg);
+                hits.append(&mut walker.hits);
+            }
+        }
+        for hit in hits {
+            if self.faei_ignored.contains(&hit.array_start) {
+                continue;
+            }
+            self.faei_check(
+                hit.array_start,
+                hit.array_end,
+                hit.open_start,
+                hit.close_start,
+                hit.close_end,
+                hit.first_elem,
+                Some(left_paren_start),
+                style,
+            );
+            self.faei_ignored.insert(hit.array_start);
+        }
+    }
+
+    /// `enforce_first_argument_with_fixed_indentation?`: `config.
+    /// for_enabled_cop('Layout/ArrayAlignment')['EnforcedStyle'] ==
+    /// 'with_fixed_indentation'` — `for_enabled_cop` returns an empty hash
+    /// (so the comparison is always false) when `Layout/ArrayAlignment`
+    /// itself is disabled.
+    fn faei_enforce_fixed(&self) -> bool {
+        self.on("Layout/ArrayAlignment") && self.cfg.enforced_style("Layout/ArrayAlignment") == "with_fixed_indentation"
+    }
+
+    /// `FirstArrayElementIndentation#check`.
+    fn faei_check(
+        &mut self,
+        array_start: usize,
+        array_end: usize,
+        open_start: usize,
+        close_start: usize,
+        close_end: usize,
+        first_elem: Option<(usize, usize)>,
+        left_paren: Option<usize>,
+        style: &str,
+    ) {
+        const COP: &str = "Layout/FirstArrayElementIndentation";
+        if self.faei_ignored.contains(&array_start) {
+            return;
+        }
+        if let Some(fe) = first_elem {
+            let open_line = self.idx.loc(open_start).0;
+            let fe_line = self.idx.loc(fe.0).0;
+            if fe_line == open_line {
+                // `return if same_line?(first_elem, left_bracket)` — bails
+                // out of the WHOLE method, right bracket included.
+                return;
+            }
+            self.faei_check_first(COP, style, fe, open_start, left_paren, array_start, array_end);
+        }
+        self.faei_check_right_bracket(
+            COP,
+            style,
+            close_start,
+            close_end,
+            first_elem.is_some(),
+            open_start,
+            left_paren,
+            array_start,
+            array_end,
+        );
+    }
+
+    /// `MultilineElementIndentation#check_first` (with `offset` always `0`
+    /// for an array's own first element).
+    fn faei_check_first(
+        &mut self,
+        cop: &'static str,
+        style: &str,
+        fe: (usize, usize),
+        open_start: usize,
+        left_paren: Option<usize>,
+        array_start: usize,
+        array_end: usize,
+    ) {
+        let (base_col, base_type) = self.faei_indent_base(style, open_start, true, left_paren, array_start, array_end);
+        let width = self.faei_indentation_width(cop);
+        let expected = base_col + width;
+        let actual = self.faei_col(fe.0);
+        if expected == actual {
+            return;
+        }
+        let msg = format!(
+            "Use {} spaces for indentation in an array, relative to {}.",
+            width,
+            faei_base_description(base_type)
+        );
+        self.push(fe.0, cop, true, msg);
+        let delta = expected as isize - actual as isize;
+        self.faei_alignment_correct(fe.0, fe.1, delta);
+    }
+
+    /// `MultilineElementIndentation#check_right_bracket`.
+    #[allow(clippy::too_many_arguments)]
+    fn faei_check_right_bracket(
+        &mut self,
+        cop: &'static str,
+        style: &str,
+        close_start: usize,
+        close_end: usize,
+        has_first_elem: bool,
+        open_start: usize,
+        left_paren: Option<usize>,
+        array_start: usize,
+        array_end: usize,
+    ) {
+        // "if the right bracket is on the same line as the last value, accept".
+        let line = self.idx.loc(close_start).0;
+        let line_start = self.idx.starts[line - 1];
+        if self.src[line_start..close_start].iter().any(|b| !b.is_ascii_whitespace()) {
+            return;
+        }
+        let (base_col, base_type) = self.faei_indent_base(style, open_start, has_first_elem, left_paren, array_start, array_end);
+        let actual = self.faei_col(close_start);
+        if base_col == actual {
+            return;
+        }
+        self.push(close_start, cop, true, faei_message_for_right_bracket(base_type).to_string());
+        let delta = base_col as isize - actual as isize;
+        self.faei_alignment_correct(close_start, close_end, delta);
+    }
+
+    /// `MultilineElementIndentation#indent_base`.
+    fn faei_indent_base(
+        &self,
+        style: &str,
+        open_start: usize,
+        has_first_elem: bool,
+        left_paren: Option<usize>,
+        array_start: usize,
+        array_end: usize,
+    ) -> (usize, &'static str) {
+        if style == "align_brackets" {
+            return (self.faei_col(open_start), "left_brace_or_bracket");
+        }
+        if has_first_elem {
+            if let Some(pair) = self.faei_hash_pair.get(&(array_start, array_end)) {
+                let key_line = self.idx.loc(pair.pair_start).0;
+                let value_line = self.idx.loc(array_start).0;
+                if key_line == value_line {
+                    if let Some(sib_line) = pair.right_sibling_key_line {
+                        let last_line = self.idx.loc(array_end.saturating_sub(1)).0;
+                        if last_line < sib_line {
+                            return (self.faei_col(pair.pair_start), "parent_hash_key");
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(lp) = left_paren {
+            if style == "special_inside_parentheses" {
+                return (self.faei_col(lp) + 1, "first_column_after_left_parenthesis");
+            }
+        }
+        (self.faei_first_non_ws_col(open_start), "start_of_line")
+    }
+
+    /// A plain byte column (0-based) — this cop's whole `indent_base`/
+    /// `actual_column` computation is byte-column based (`Parser::Source::
+    /// Range#column`), never the Unicode-display-width `display_column`
+    /// the `Alignment` mixin's OWN `check_alignment` uses elsewhere.
+    fn faei_col(&self, offset: usize) -> usize {
+        self.idx.loc(offset).1 - 1
+    }
+
+    /// `left_brace.source_line =~ /\S/`.
+    fn faei_first_non_ws_col(&self, offset: usize) -> usize {
+        let line = self.idx.loc(offset).0;
+        let line_start = self.idx.starts[line - 1];
+        let mut p = line_start;
+        while p < self.src.len() && self.src[p] != b'\n' && self.src[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        p - line_start
+    }
+
+    /// `Alignment#configured_indentation_width`: this cop's own
+    /// `IndentationWidth` (no schema default — meaningful only when a user
+    /// sets it directly), else `Layout/IndentationWidth`'s `Width` (schema
+    /// default 2).
+    fn faei_indentation_width(&self, cop: &'static str) -> usize {
+        self.cfg
+            .get(cop, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+
+    /// `AlignmentCorrector.correct(corrector, processed_source, node,
+    /// @column_delta)`, ported for a possibly multi-line `node` (either the
+    /// flagged first element, which can itself span many lines, or the
+    /// single-line right bracket) — identical per-line shifting logic to
+    /// `array_alignment_correct` above (including its `using_tabs?` guard and
+    /// heredoc taboo-range skip).
+    fn faei_alignment_correct(&mut self, start: usize, end: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            return;
+        }
+        let mut line_begin = start;
+        loop {
+            let (line_no, _) = self.idx.loc(line_begin);
+            let taboo = self.heredoc_lines.iter().any(|&(hs, he, _, _)| line_no >= hs && line_no <= he + 1);
+            if !taboo {
+                if delta > 0 {
+                    if self.src.get(line_begin) != Some(&b'\n') {
+                        self.fixes.push((line_begin, line_begin, vec![b' '; delta as usize]));
+                    }
+                } else {
+                    let n = (-delta) as usize;
+                    let starts_with_space = self.src.get(line_begin) == Some(&b' ');
+                    let (rs, re) = if starts_with_space { (line_begin, line_begin + n) } else { (line_begin.saturating_sub(n), line_begin) };
+                    if re <= self.src.len() && rs < re && self.src[rs..re].iter().all(|&b| b == b' ' || b == b'\t') {
+                        self.fixes.push((rs, re, Vec::new()));
+                    }
+                }
+            }
+            let mut p = line_begin;
+            while p < end && self.src[p] != b'\n' {
+                p += 1;
+            }
+            if p >= end {
+                break;
+            }
+            line_begin = p + 1;
+        }
+    }
+}
