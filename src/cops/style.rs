@@ -23115,3 +23115,205 @@ fn icb_lhs_source<'pr>(n: &ruby_prism::Node<'pr>, src: &'pr [u8]) -> &'pr [u8] {
     }
     icb_node_bytes(n, src)
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/YodaCondition — flags (and reverses) comparisons where the
+    /// "constant-like" operand sits on the wrong side per `EnforcedStyle`
+    /// (`ConfigurableEnforcedStyle`, `include RangeHelp`, `extend
+    /// AutoCorrector`). rubocop restricts `on_send` to `RESTRICT_ON_SEND =
+    /// RuboCop::AST::Node::COMPARISON_OPERATORS` (`== === != <= >= > <` —
+    /// note `<=>` is NOT in that set, so it never reaches this cop at all),
+    /// then immediately rejects `===` via `noncommutative_operator?`. Net
+    /// effective operator set: `== != <= >= > <`.
+    pub(crate) fn check_yoda_condition(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/YodaCondition";
+        if !self.on(COP) {
+            return;
+        }
+        let op = node.name();
+        let op = op.as_slice();
+        if !matches!(op, b"==" | b"!=" | b"<=" | b">=" | b">" | b"<") {
+            return;
+        }
+        let Some(lhs) = node.receiver() else { return };
+        // `valid_yoda?`: `return true unless (rhs = node.first_argument)` —
+        // e.g. `foo.==` (no first argument) is always accepted.
+        let Some(rhs) = node.arguments().and_then(|a| a.arguments().iter().next()) else {
+            return;
+        };
+
+        // `file_constant_equal_program_name?`:
+        // `(send #source_file_path_constant? {:== :!=} (gvar #program_name?))`
+        // — `__FILE__ == $0` / `__FILE__ == $PROGRAM_NAME` (and `!=`) are
+        // always accepted regardless of style. `source_file_path_constant?`
+        // is textual (`node.source == '__FILE__'`), so compare source bytes
+        // directly rather than the node type.
+        if matches!(op, b"==" | b"!=") && self.node_src(&lhs) == b"__FILE__" {
+            if let Some(gvar) = rhs.as_global_variable_read_node() {
+                if matches!(gvar.name().as_slice(), b"$0" | b"$PROGRAM_NAME") {
+                    return;
+                }
+            }
+        }
+
+        let style = self.cfg.enforced_style(COP);
+        let equality_only = matches!(
+            style,
+            "forbid_for_equality_operators_only" | "require_for_equality_operators_only"
+        );
+        // `equality_only? && non_equality_operator?(node)` — `< > <= >=`
+        // are never checked under the equality-only styles.
+        if equality_only && !matches!(op, b"==" | b"!=") {
+            return;
+        }
+        let enforce_yoda = matches!(
+            style,
+            "require_for_all_comparison_operators" | "require_for_equality_operators_only"
+        );
+
+        let lhs_const = yc_constant_portion(&lhs);
+        let rhs_const = yc_constant_portion(&rhs);
+        // `valid_yoda?`, verbatim: both sides constant, both sides
+        // non-constant, LHS interpolated, or (per style) the "correct" side
+        // is the constant one.
+        let valid = (lhs_const && rhs_const)
+            || (!lhs_const && !rhs_const)
+            || yc_interpolation(&lhs)
+            || if enforce_yoda { lhs_const } else { rhs_const };
+        if valid {
+            return;
+        }
+
+        let loc = node.location();
+        let (start, end) = (loc.start_offset(), loc.end_offset());
+        let source = String::from_utf8_lossy(&self.src[start..end]);
+        self.push(start, COP, true, format!("Reverse the order of the operands `{source}`."));
+
+        // `REVERSE_COMPARISON.fetch(operator.to_s, operator)` — `==`/`!=`
+        // have no entry, so `reverse_comparison` returns them unchanged.
+        let reversed_op: &[u8] = match op {
+            b"<" => b">",
+            b"<=" => b">=",
+            b">" => b"<",
+            b">=" => b"<=",
+            other => other,
+        };
+        let lhs_src = self.node_src(&lhs);
+        let rhs_src = self.node_src(&rhs);
+        let mut corrected = Vec::with_capacity(lhs_src.len() + rhs_src.len() + reversed_op.len() + 2);
+        corrected.extend_from_slice(rhs_src);
+        corrected.push(b' ');
+        corrected.extend_from_slice(reversed_op);
+        corrected.push(b' ');
+        corrected.extend_from_slice(lhs_src);
+        self.fixes.push((start, end, corrected));
+    }
+}
+
+/// `constant_portion?`: `node.recursive_literal? || node.const_type?`.
+fn yc_constant_portion(n: &ruby_prism::Node) -> bool {
+    yc_recursive_literal(n) || n.as_constant_read_node().is_some() || n.as_constant_path_node().is_some()
+}
+
+/// `interpolation?`: `node.dstr_type? || (node.regexp_type? &&
+/// node.interpolation?)`. Whitequark's `:regexp` type covers both plain and
+/// interpolated regexes (distinguished by whether a child is `:begin`-typed);
+/// prism splits them into two node kinds, and `InterpolatedRegularExpressionNode`
+/// only ever exists when the source actually has an embedded expression.
+fn yc_interpolation(n: &ruby_prism::Node) -> bool {
+    n.as_interpolated_string_node().is_some() || n.as_interpolated_regular_expression_node().is_some()
+}
+
+/// `Node#recursive_literal?` (rubocop-ast), verbatim:
+/// - `send` nodes: only `== === != <= >= > < * ! <=>` recurse, and only if
+///   both the receiver and every argument are themselves recursively
+///   literal.
+/// - `and`/`or` (whitequark's `OPERATOR_KEYWORDS`) and the composite literal
+///   types (`dstr xstr dsym array hash irange erange regexp`), plus `begin`
+///   (prism: `ParenthesesNode`) and `pair` (prism: `AssocNode`): recurse into
+///   every child.
+/// - Everything else: plain `literal?` (a fixed list of literal node types).
+fn yc_recursive_literal(n: &ruby_prism::Node) -> bool {
+    // Basic (non-composite) literals — `literal?` is true and there are no
+    // children to recurse into.
+    if n.as_integer_node().is_some()
+        || n.as_float_node().is_some()
+        || n.as_rational_node().is_some()
+        || n.as_imaginary_node().is_some()
+        || n.as_symbol_node().is_some()
+        || n.as_string_node().is_some()
+        || n.as_true_node().is_some()
+        || n.as_false_node().is_some()
+        || n.as_nil_node().is_some()
+        || n.as_x_string_node().is_some()
+        || n.as_regular_expression_node().is_some()
+    {
+        return true;
+    }
+    // Composite literals — recurse into children.
+    if let Some(s) = n.as_interpolated_string_node() {
+        return s.parts().iter().all(|p| yc_recursive_literal(&p));
+    }
+    if let Some(s) = n.as_interpolated_x_string_node() {
+        return s.parts().iter().all(|p| yc_recursive_literal(&p));
+    }
+    if let Some(s) = n.as_interpolated_symbol_node() {
+        return s.parts().iter().all(|p| yc_recursive_literal(&p));
+    }
+    if let Some(r) = n.as_interpolated_regular_expression_node() {
+        return r.parts().iter().all(|p| yc_recursive_literal(&p));
+    }
+    if let Some(a) = n.as_array_node() {
+        return a.elements().iter().all(|e| yc_recursive_literal(&e));
+    }
+    if let Some(h) = n.as_hash_node() {
+        return h.elements().iter().all(|e| yc_recursive_literal(&e));
+    }
+    if let Some(r) = n.as_range_node() {
+        let left_ok = r.left().is_none_or(|l| yc_recursive_literal(&l));
+        let right_ok = r.right().is_none_or(|rr| yc_recursive_literal(&rr));
+        return left_ok && right_ok;
+    }
+    // `pair` (hash key/value entry).
+    if let Some(p) = n.as_assoc_node() {
+        return yc_recursive_literal(&p.key()) && yc_recursive_literal(&p.value());
+    }
+    if n.as_assoc_splat_node().is_some() {
+        return false;
+    }
+    // `begin` (parenthesized expression(s)).
+    if let Some(p) = n.as_parentheses_node() {
+        return match p.body() {
+            None => true,
+            Some(b) => match b.as_statements_node() {
+                Some(st) => st.body().iter().all(|c| yc_recursive_literal(&c)),
+                None => yc_recursive_literal(&b),
+            },
+        };
+    }
+    // `and` / `or` keyword operators.
+    if let Some(a) = n.as_and_node() {
+        return yc_recursive_literal(&a.left()) && yc_recursive_literal(&a.right());
+    }
+    if let Some(o) = n.as_or_node() {
+        return yc_recursive_literal(&o.left()) && yc_recursive_literal(&o.right());
+    }
+    // `send` — only the literal-preserving operator methods recurse.
+    if let Some(c) = n.as_call_node() {
+        let name = c.name();
+        if matches!(
+            name.as_slice(),
+            b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<" | b"*" | b"!" | b"<=>"
+        ) {
+            let Some(recv) = c.receiver() else { return false };
+            if !yc_recursive_literal(&recv) {
+                return false;
+            }
+            let args: Vec<ruby_prism::Node> =
+                c.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            return args.iter().all(yc_recursive_literal);
+        }
+    }
+    false
+}

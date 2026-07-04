@@ -369,6 +369,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
+    "Style/YodaCondition",
 ];
 
 impl Engine {
@@ -3872,6 +3873,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_next_without_accumulator(node);
         self.check_multiple_comparison(node);
         self.check_identity_comparison(node);
+        self.check_yoda_condition(node);
         self.check_class_check(node);
         self.check_class_equality_comparison(node);
         self.check_redundant_file_extension_in_require(node);
