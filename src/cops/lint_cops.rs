@@ -12690,3 +12690,673 @@ fn lac_sub_first(haystack: &[u8], needle: &[u8], repl: &[u8]) -> Vec<u8> {
 fn lac_msg(src: &[u8]) -> String {
     format!("Literal `{}` appeared as a condition.", String::from_utf8_lossy(src))
 }
+
+
+/// Lint/ShadowedArgument. Upstream builds this on `VariableForce` (a full
+/// variable-lifecycle tracker: scopes, `Variable`/`Assignment`/`Reference`
+/// objects, and a `Branch`/`Branchable` system for reasoning about which
+/// conditional arm an assignment/reference sits in). We hand-roll a
+/// deliberately narrower model that's sufficient for `ShadowedArgument`'s own
+/// algorithm (`check_argument`/`shadowing_assignment`/
+/// `assignment_without_argument_usage`/`conditional_assignment?` in
+/// `rubocop/cop/lint/shadowed_argument.rb`), leaning hard on two facts:
+///
+/// 1. Prism already resolves local-variable scoping for us: every
+///    `LocalVariable{Read,Write,Target,Operator/Or/AndWrite}Node` carries a
+///    `depth` (how many enclosing lexical scopes to walk up), computed by
+///    prism using the exact same rules `VariableTable#find_variable`
+///    manually re-derives upstream (blocks/lambdas are "soft" scopes a name
+///    can resolve through; `def`/`class`/`module`/`sclass` are hard resets).
+///    So `SaCollector` just keeps a flat stack of frames (one per lexical
+///    scope, pushed for EVERY def/class/module/sclass/block/lambda) and
+///    indexes `frames[frames.len() - 1 - depth]` — no re-implementation of
+///    scope resolution needed.
+/// 2. `check_argument` only ever cares about variables declared as method or
+///    block PARAMETERS (`argument.method_argument? || argument.block_argument?`,
+///    and `explicit_block_local_variable?` — a `;shadow` block-local — bails
+///    out immediately). So `SaCollector` only ever creates a tracked `SaVar`
+///    for a real parameter declaration; plain local writes, and any
+///    `;shadow`/pattern-match/`case/in` capture bindings, are simply never
+///    registered as trackable names at all (mirroring
+///    `process_pattern_match_variable`'s declare-but-never-assign-or-
+///    reference behavior for `case/in`, and `explicit_block_local_variable?`
+///    for `;shadow` locals) — a write/read that resolves (via depth) to an
+///    untracked name is silently a no-op for us, exactly as it is a no-op
+///    for this cop upstream.
+///
+/// What upstream's `Branch`/`Branchable` machinery is used for, replicated
+/// more narrowly here:
+///  - `conditional_assignment?` (is an assignment inside an `if`/`while`/
+///    `until`(pre-condition only)/`case`/`case_match`/`block`/`lambda`/
+///    `rescue`-region relative to the variable's OWN scope node): tracked via
+///    `counters`, a stack parallel to `frames` where EVERY currently-open
+///    frame's counter gets incremented while visiting one of those
+///    constructs (decremented on exit). A variable's assignment records
+///    `counters[owning_frame] > 0` at the moment it's visited — exactly
+///    "is there such a construct between here and that scope's own node",
+///    without needing real ancestor pointers.
+///  - The `argument_references`/`assignment.references` backward-marking
+///    used to exclude "this reference is really evaluating a LATER
+///    reassignment's value, not a genuine use of the original argument" is
+///    approximated (see `sa_check_argument`) as: an explicit (non-`super`/
+///    `binding`) reference only counts as "used before shadowing" if no
+///    assignment to the variable happened before it — i.e. it's reading the
+///    variable's very first (original-argument) value. This is exact for
+///    every fixture example and any straight-line code; it can only diverge
+///    from upstream's fuller branch-aware bookkeeping in contrived
+///    multi-branch/loop reassignment interleavings not exercised here (see
+///    the residual-risk note in the final report).
+///
+/// Not modeled at all (upstream's `process_pattern_match_variable`/regexp
+/// named captures never produce an assignment or reference either, so this
+/// is a no-op both ways): `case/in` pattern captures, `/(?<name>)/ =~ str`
+/// named captures. `for`-loop index variables get minimal best-effort
+/// handling (rare for a `for`-variable to coincide with a pre-existing
+/// argument name, since `for` doesn't open its own scope).
+impl<'a> Cops<'a> {
+    pub(crate) fn check_shadowed_argument(&mut self, node: &ruby_prism::ProgramNode) {
+        const COP: &str = "Lint/ShadowedArgument";
+        if !self.on(COP) {
+            return;
+        }
+        let ignore_implicit = self.cfg.get(COP, "IgnoreImplicitReferences") == Some("true");
+        let mut c = SaCollector {
+            frames: vec![SaFrame { kind: SaKind::Other, names: HashMap::new() }],
+            counters: vec![0],
+            vars: Vec::new(),
+        };
+        use ruby_prism::Visit;
+        c.visit(&node.as_node());
+        for v in &mut c.vars {
+            v.assignments.sort_by_key(|a| a.node_start);
+            v.references.sort_by_key(|r| r.pos);
+        }
+        let mut offenses: Vec<(usize, Vec<u8>)> = Vec::new();
+        for v in &c.vars {
+            if let Some(start) = sa_check_argument(v, ignore_implicit) {
+                offenses.push((start, v.name.clone()));
+            }
+        }
+        offenses.sort_by_key(|(start, _)| *start);
+        for (start, name) in offenses {
+            let msg = format!(
+                "Argument `{}` was shadowed by a local variable before it was used.",
+                String::from_utf8_lossy(&name)
+            );
+            self.push(start, COP, false, msg);
+        }
+    }
+}
+
+/// One tracked method/block-parameter variable. `decl_start` is the
+/// parameter's own name-span start offset — used as the offense anchor when
+/// `check_argument` can't pin down a precise reassignment location
+/// (`argument.declaration_node` upstream).
+struct SaVar {
+    name: Vec<u8>,
+    decl_start: usize,
+    assignments: Vec<SaAssignment>,
+    references: Vec<SaReference>,
+}
+
+/// One assignment to a tracked variable. `node_start` is the assignment's
+/// OWN node's start offset (never the `meta_assignment_node`'s — matches
+/// `assignment.node.source_range.begin_pos`, e.g. for a masgn splat target
+/// this is just `items`'s own span, not `*items, ... = ...`'s). `shorthand`
+/// is true for `||=`/`&&=`/`+=`-shaped writes (upstream's
+/// `assignment_node.shorthand_asgn?` — always skipped, never a shadowing
+/// candidate, since they inherently read the old value). `uses_var` is
+/// upstream's `uses_var?` def_node_search: does this assignment's effective
+/// node (its RHS value, for a masgn also every sibling target/the RHS)
+/// contain a read of this same variable NAME (purely syntactic, exactly
+/// like upstream's `def_node_search` — not scope-aware). `conditional` is
+/// `conditional_assignment?`: was there an `if`/`while`/`until`/`case`/
+/// `case_match`/block/lambda/rescue-region ancestor between this assignment
+/// and the variable's own scope node.
+struct SaAssignment {
+    node_start: usize,
+    shorthand: bool,
+    uses_var: bool,
+    conditional: bool,
+}
+
+/// One reference (read) of a tracked variable. `explicit` is false only for
+/// the two implicit-reference sources upstream recognizes: a zero-arity
+/// `super` (references the nearest enclosing `def`'s own parameters only)
+/// and a bare, argument-less `binding` call (references every parameter
+/// reachable from its own scope, walking outward through block/lambda
+/// scopes).
+struct SaReference {
+    pos: usize,
+    explicit: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SaKind {
+    /// A `def`/`defs` scope — the only kind whose vars are ever
+    /// `method_argument?` (relevant to zero-arity `super`'s implicit
+    /// reference, which only ever touches a `def`'s own parameters).
+    Def,
+    /// A `block`/`lambda` scope — "soft": zero-arity `super` and `binding`
+    /// both walk straight through it to reach an enclosing scope; entering
+    /// one also increments every OPEN frame's conditional counter (it's a
+    /// `:block`-type ancestor for anything outside it).
+    Block,
+    /// `class`/`module`/`sclass`, or the file's top level: a hard scope
+    /// boundary that owns no trackable parameters, but still needs its own
+    /// frame so nested defs/blocks compute the right depth-relative index,
+    /// and still stops an outward `super`/`binding` walk once reached.
+    Other,
+}
+
+struct SaFrame {
+    kind: SaKind,
+    /// Declared parameter name -> index into the collector's flat `vars`.
+    names: HashMap<Vec<u8>, usize>,
+}
+
+/// The scope-tracking visitor described in the module comment above
+/// `check_shadowed_argument`.
+struct SaCollector {
+    frames: Vec<SaFrame>,
+    /// Parallel to `frames`: `counters[i]` counts how many currently-open
+    /// `if`/`while`/`until`/`case`/`case_match`/block/lambda/rescue-region
+    /// constructs sit between the CURRENT traversal position and
+    /// `frames[i]`'s own scope node — i.e. exactly `conditional_assignment?`
+    /// for a variable owned by frame `i`, without needing ancestor pointers.
+    counters: Vec<u32>,
+    vars: Vec<SaVar>,
+}
+
+impl SaCollector {
+    fn resolve(&self, name: &[u8], depth: u32) -> Option<(usize, usize)> {
+        let top = self.frames.len().checked_sub(1)?;
+        let f = top.checked_sub(depth as usize)?;
+        self.frames[f].names.get(name).map(|&idx| (idx, f))
+    }
+
+    fn declare_arg(&mut self, name: &[u8], decl_start: usize) {
+        let frame = self.frames.last_mut().unwrap();
+        if frame.names.contains_key(name) {
+            return;
+        }
+        let idx = self.vars.len();
+        self.vars.push(SaVar { name: name.to_vec(), decl_start, assignments: Vec::new(), references: Vec::new() });
+        self.frames.last_mut().unwrap().names.insert(name.to_vec(), idx);
+    }
+
+    fn record_write(&mut self, name: &[u8], depth: u32, pos: usize, shorthand: bool, uses_var: bool) {
+        if let Some((idx, f)) = self.resolve(name, depth) {
+            let conditional = self.counters[f] > 0;
+            self.vars[idx].assignments.push(SaAssignment { node_start: pos, shorthand, uses_var, conditional });
+        }
+    }
+
+    fn record_reference(&mut self, name: &[u8], depth: u32, pos: usize, explicit: bool) {
+        if let Some((idx, _)) = self.resolve(name, depth) {
+            self.vars[idx].references.push(SaReference { pos, explicit });
+        }
+    }
+
+    fn enter_conditional(&mut self) {
+        for c in &mut self.counters {
+            *c += 1;
+        }
+    }
+    fn exit_conditional(&mut self) {
+        for c in &mut self.counters {
+            *c -= 1;
+        }
+    }
+    fn enter_frame(&mut self, kind: SaKind) {
+        self.frames.push(SaFrame { kind, names: HashMap::new() });
+        self.counters.push(0);
+    }
+    fn exit_frame(&mut self) {
+        self.frames.pop();
+        self.counters.pop();
+    }
+    fn enter_block_frame(&mut self) {
+        self.enter_conditional();
+        self.enter_frame(SaKind::Block);
+    }
+    fn exit_block_frame(&mut self) {
+        self.exit_frame();
+        self.exit_conditional();
+    }
+
+    /// Zero-arity `super`: `process_zero_arity_super` — walks from the
+    /// CURRENT scope outward, referencing a `Def` frame's own vars (the only
+    /// kind that's ever `method_argument?`) and STOPPING there; a `Block`
+    /// frame contributes nothing (its vars are `block_argument?`, filtered
+    /// out upstream too) but doesn't stop the walk; any other (hard,
+    /// non-`Def`) frame stops the walk without marking anything.
+    fn mark_zsuper(&mut self, pos: usize) {
+        for i in (0..self.frames.len()).rev() {
+            match self.frames[i].kind {
+                SaKind::Def => {
+                    let idxs: Vec<usize> = self.frames[i].names.values().copied().collect();
+                    for idx in idxs {
+                        self.vars[idx].references.push(SaReference { pos, explicit: false });
+                    }
+                    break;
+                }
+                SaKind::Block => continue,
+                SaKind::Other => break,
+            }
+        }
+    }
+
+    /// Bare `binding` call: `VariableTable#accessible_variables` — marks the
+    /// current scope's own vars, and keeps walking (and marking) outward
+    /// through `Block` frames, stopping right after including the first
+    /// non-`Block` frame.
+    fn mark_binding(&mut self, pos: usize) {
+        let mut i = self.frames.len();
+        while i > 0 {
+            i -= 1;
+            let is_block = self.frames[i].kind == SaKind::Block;
+            let idxs: Vec<usize> = self.frames[i].names.values().copied().collect();
+            for idx in idxs {
+                self.vars[idx].references.push(SaReference { pos, explicit: false });
+            }
+            if !is_block {
+                break;
+            }
+        }
+    }
+
+    /// `Assignment#meta_assignment_node`'s `multiple_assignment_node`/
+    /// `rest_assignment_node` case, recursively: a masgn target is either a
+    /// splat (unwrap one level), a nested `(a, b)` sub-mlhs (flatten into its
+    /// own lefts/rest/rights), a local-variable target (record the write —
+    /// `uses_var?`'s `def_node_search` is purely syntactic over the WHOLE
+    /// masgn node, so e.g. `x, arr[x] = 1, 2` counts as a use of `x` even
+    /// though that read sits in a sibling target, not the RHS `value`), or
+    /// anything else (index/attr/ivar/etc targets — just visit normally so
+    /// nested reads inside e.g. `arr[i]` still get picked up).
+    fn process_masgn_target<'pr>(&mut self, t: &ruby_prism::Node<'pr>, whole: &ruby_prism::Node<'pr>)
+    where
+        Self: ruby_prism::Visit<'pr>,
+    {
+        use ruby_prism::Visit;
+        if let Some(splat) = t.as_splat_node() {
+            if let Some(expr) = splat.expression() {
+                self.process_masgn_target(&expr, whole);
+            }
+            return;
+        }
+        if let Some(mt) = t.as_multi_target_node() {
+            let mut inner: Vec<ruby_prism::Node<'pr>> = mt.lefts().iter().collect();
+            if let Some(r) = mt.rest() {
+                inner.push(r);
+            }
+            inner.extend(mt.rights().iter());
+            for it in &inner {
+                self.process_masgn_target(it, whole);
+            }
+            return;
+        }
+        if let Some(lvt) = t.as_local_variable_target_node() {
+            let name = lvt.name();
+            let name = name.as_slice();
+            let uses_var = sa_contains_lvar_read(whole, name);
+            self.record_write(name, lvt.depth(), lvt.location().start_offset(), false, uses_var);
+            return;
+        }
+        self.visit(t);
+    }
+}
+
+/// `def_node_search :uses_var?, '(lvar %)'` — a purely syntactic (NOT
+/// scope-aware) search for any `lvar`-equivalent read of `name` anywhere in
+/// `node`'s subtree, matching upstream's naive `def_node_search` exactly
+/// (including nested blocks/scopes, which upstream's search doesn't skip
+/// either).
+fn sa_contains_lvar_read(node: &ruby_prism::Node, name: &[u8]) -> bool {
+    struct Search<'n> {
+        name: &'n [u8],
+        found: bool,
+    }
+    impl<'pr, 'n> ruby_prism::Visit<'pr> for Search<'n> {
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            if node.name().as_slice() == self.name {
+                self.found = true;
+            }
+        }
+    }
+    let mut s = Search { name, found: false };
+    use ruby_prism::Visit;
+    s.visit(node);
+    s.found
+}
+
+/// Port of `ShadowedArgument#check_argument` /
+/// `#shadowing_assignment` / `#assignment_without_argument_usage`. Returns
+/// the offense anchor (byte offset) if `v` is shadowed.
+fn sa_check_argument(v: &SaVar, ignore_implicit: bool) -> Option<usize> {
+    // `return unless argument.referenced?`
+    if v.references.is_empty() {
+        return None;
+    }
+
+    // `assignment_without_argument_usage`: find the first assignment that
+    // doesn't reference the variable's own old value, skipping (and
+    // propagating `location_known = false` for) ones that are themselves
+    // shorthand (`||=` etc, always "use" their argument) or inside a
+    // conditional/block/rescue region (their execution isn't guaranteed, so
+    // the precise shadowing location becomes undecidable even once a later,
+    // unconditional overwrite is found).
+    let mut location_known = true;
+    let mut found: Option<&SaAssignment> = None;
+    for a in &v.assignments {
+        if a.shorthand {
+            location_known = false;
+            continue;
+        }
+        if !a.uses_var {
+            if a.conditional {
+                location_known = false;
+                continue;
+            }
+            found = Some(a);
+            break;
+        }
+        // uses its own old value: not a shadowing candidate, but doesn't
+        // affect `location_known` either — keep scanning.
+    }
+    let assignment = found?;
+    let threshold = assignment.node_start;
+
+    // `shadowing_assignment`: was the variable genuinely used (its ORIGINAL
+    // argument value read) at or before the shadowing assignment? An
+    // explicit reference only counts if no assignment preceded it — once any
+    // assignment has happened, a later explicit read reflects the
+    // REASSIGNED value, not the original argument (upstream's
+    // `argument_references` excludes exactly these via `assignment.
+    // references`' backward marking). An implicit (`super`/`binding`)
+    // reference is never excluded this way, and additionally short-circuits
+    // entirely when `IgnoreImplicitReferences` is on, regardless of
+    // position.
+    let first_assignment_pos = v.assignments.first().map(|a| a.node_start);
+    for r in &v.references {
+        if !r.explicit {
+            if ignore_implicit {
+                return None;
+            }
+            if r.pos <= threshold {
+                return None;
+            }
+            continue;
+        }
+        let excluded_as_post_reassignment_read = first_assignment_pos.is_some_and(|p| p < r.pos);
+        if excluded_as_post_reassignment_read {
+            continue;
+        }
+        if r.pos <= threshold {
+            return None;
+        }
+    }
+
+    Some(if location_known { assignment.node_start } else { v.decl_start })
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for SaCollector {
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        if let Some(recv) = node.receiver() {
+            self.visit(&recv);
+        }
+        self.enter_frame(SaKind::Def);
+        if let Some(params) = node.parameters() {
+            self.visit_parameters_node(&params);
+        }
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.exit_frame();
+    }
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        self.visit(&node.constant_path());
+        if let Some(sup) = node.superclass() {
+            self.visit(&sup);
+        }
+        self.enter_frame(SaKind::Other);
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.exit_frame();
+    }
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        self.visit(&node.constant_path());
+        self.enter_frame(SaKind::Other);
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.exit_frame();
+    }
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        self.visit(&node.expression());
+        self.enter_frame(SaKind::Other);
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.exit_frame();
+    }
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        self.enter_block_frame();
+        ruby_prism::visit_block_node(self, node);
+        self.exit_block_frame();
+    }
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.enter_block_frame();
+        ruby_prism::visit_lambda_node(self, node);
+        self.exit_block_frame();
+    }
+    fn visit_required_parameter_node(&mut self, node: &ruby_prism::RequiredParameterNode<'pr>) {
+        self.declare_arg(node.name().as_slice(), node.location().start_offset());
+    }
+    fn visit_optional_parameter_node(&mut self, node: &ruby_prism::OptionalParameterNode<'pr>) {
+        self.declare_arg(node.name().as_slice(), node.name_loc().start_offset());
+        self.visit(&node.value());
+    }
+    fn visit_rest_parameter_node(&mut self, node: &ruby_prism::RestParameterNode<'pr>) {
+        if let (Some(name), Some(loc)) = (node.name(), node.name_loc()) {
+            self.declare_arg(name.as_slice(), loc.start_offset());
+        }
+    }
+    fn visit_required_keyword_parameter_node(&mut self, node: &ruby_prism::RequiredKeywordParameterNode<'pr>) {
+        self.declare_arg(node.name().as_slice(), node.name_loc().start_offset());
+    }
+    fn visit_optional_keyword_parameter_node(&mut self, node: &ruby_prism::OptionalKeywordParameterNode<'pr>) {
+        self.declare_arg(node.name().as_slice(), node.name_loc().start_offset());
+        self.visit(&node.value());
+    }
+    fn visit_keyword_rest_parameter_node(&mut self, node: &ruby_prism::KeywordRestParameterNode<'pr>) {
+        if let (Some(name), Some(loc)) = (node.name(), node.name_loc()) {
+            self.declare_arg(name.as_slice(), loc.start_offset());
+        }
+    }
+    fn visit_block_parameter_node(&mut self, node: &ruby_prism::BlockParameterNode<'pr>) {
+        if let (Some(name), Some(loc)) = (node.name(), node.name_loc()) {
+            self.declare_arg(name.as_slice(), loc.start_offset());
+        }
+    }
+    // `;shadow` block-locals (`explicit_block_local_variable?`) are
+    // deliberately never registered — see the module doc comment.
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        let name = node.name();
+        let name = name.as_slice();
+        let uses_var = sa_contains_lvar_read(&node.value(), name);
+        self.record_write(name, node.depth(), node.location().start_offset(), false, uses_var);
+        self.visit(&node.value());
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        let name = node.name();
+        let name = name.as_slice();
+        let pos = node.location().start_offset();
+        self.record_reference(name, node.depth(), pos, true);
+        self.record_write(name, node.depth(), pos, true, true);
+        self.visit(&node.value());
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        let name = node.name();
+        let name = name.as_slice();
+        let pos = node.location().start_offset();
+        self.record_reference(name, node.depth(), pos, true);
+        self.record_write(name, node.depth(), pos, true, true);
+        self.visit(&node.value());
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        let name = node.name();
+        let name = name.as_slice();
+        let pos = node.location().start_offset();
+        self.record_reference(name, node.depth(), pos, true);
+        self.record_write(name, node.depth(), pos, true, true);
+        self.visit(&node.value());
+    }
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        let name = node.name();
+        self.record_reference(name.as_slice(), node.depth(), node.location().start_offset(), true);
+    }
+    fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        let whole = node.as_node();
+        let mut targets: Vec<ruby_prism::Node> = node.lefts().iter().collect();
+        if let Some(r) = node.rest() {
+            targets.push(r);
+        }
+        targets.extend(node.rights().iter());
+        for t in &targets {
+            self.process_masgn_target(t, &whole);
+        }
+        self.visit(&node.value());
+    }
+    fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
+        self.visit(&node.collection());
+        let idx = node.index();
+        if let Some(lvt) = idx.as_local_variable_target_node() {
+            let name = lvt.name();
+            let name = name.as_slice();
+            // `for_assignment_node`'s meta node is the WHOLE `ForNode`
+            // (index + collection + body): `uses_var?`'s `def_node_search`
+            // therefore also sees reads inside the loop BODY, not just the
+            // collection expression — almost always true for a real `for`
+            // loop, which is why reassigning a `for`'s own iteration
+            // variable essentially never registers as a shadowing
+            // candidate in practice.
+            let uses_var = sa_contains_lvar_read(&node.collection(), name)
+                || node.statements().is_some_and(|st| sa_contains_lvar_read(&st.as_node(), name));
+            self.record_write(name, lvt.depth(), lvt.location().start_offset(), false, uses_var);
+        } else {
+            self.visit(&idx);
+        }
+        if let Some(st) = node.statements() {
+            self.visit(&st.as_node());
+        }
+    }
+    fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+        self.mark_zsuper(node.location().start_offset());
+        if let Some(block) = node.block() {
+            self.visit_block_node(&block);
+        }
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if node.name().as_slice() == b"binding" {
+            let empty_args =
+                node.arguments().map(|a| a.arguments().iter().next().is_none()).unwrap_or(true);
+            if empty_args {
+                self.mark_binding(node.location().start_offset());
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+    fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        self.enter_conditional();
+        ruby_prism::visit_if_node(self, node);
+        self.exit_conditional();
+    }
+    fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        self.enter_conditional();
+        ruby_prism::visit_unless_node(self, node);
+        self.exit_conditional();
+    }
+    fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
+        self.enter_conditional();
+        ruby_prism::visit_case_node(self, node);
+        self.exit_conditional();
+    }
+    fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
+        self.enter_conditional();
+        ruby_prism::visit_case_match_node(self, node);
+        self.exit_conditional();
+    }
+    fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        if node.is_begin_modifier() {
+            ruby_prism::visit_while_node(self, node);
+        } else {
+            self.enter_conditional();
+            ruby_prism::visit_while_node(self, node);
+            self.exit_conditional();
+        }
+    }
+    fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        if node.is_begin_modifier() {
+            ruby_prism::visit_until_node(self, node);
+        } else {
+            self.enter_conditional();
+            ruby_prism::visit_until_node(self, node);
+            self.exit_conditional();
+        }
+    }
+    fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
+        self.enter_conditional();
+        self.visit(&node.expression());
+        self.visit(&node.rescue_expression());
+        self.exit_conditional();
+    }
+    // `begin ... rescue ... else ... ensure ... end` — upstream's SINGLE
+    // `:rescue` node type (spanning main body + rescue clauses + else body,
+    // but NOT the separate `:ensure` wrapper) maps to prism's `BeginNode`
+    // only when `rescue_clause` is present; the main body, every chained
+    // `rescue_clause`, and the `else_clause` all sit "inside" it (ancestor-
+    // wise) for `conditional_assignment?`'s purposes, but `ensure_clause`
+    // does not (`type?(:block, :rescue)` never matches `:ensure`).
+    fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
+        if node.rescue_clause().is_some() {
+            self.enter_conditional();
+            if let Some(st) = node.statements() {
+                self.visit(&st.as_node());
+            }
+            if let Some(rc) = node.rescue_clause() {
+                self.visit_rescue_node(&rc);
+            }
+            if let Some(ec) = node.else_clause() {
+                self.visit(&ec.as_node());
+            }
+            self.exit_conditional();
+        } else if let Some(st) = node.statements() {
+            self.visit(&st.as_node());
+        }
+        if let Some(en) = node.ensure_clause() {
+            self.visit(&en.as_node());
+        }
+    }
+    fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
+        for exc in node.exceptions().iter() {
+            self.visit(&exc);
+        }
+        if let Some(reference) = node.reference() {
+            if let Some(lvt) = reference.as_local_variable_target_node() {
+                let name = lvt.name();
+                self.record_write(name.as_slice(), lvt.depth(), lvt.location().start_offset(), false, false);
+            } else {
+                self.visit(&reference);
+            }
+        }
+        if let Some(st) = node.statements() {
+            self.visit(&st.as_node());
+        }
+        if let Some(sub) = node.subsequent() {
+            self.visit(&sub.as_node());
+        }
+    }
+}
