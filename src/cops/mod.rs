@@ -244,6 +244,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
     "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops", "Style/SlicingWithRange",
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
+    "Layout/SpaceAroundKeyword",
 ];
 
 impl Engine {
@@ -1042,6 +1043,20 @@ pub(crate) struct Cops<'a> {
     // reached through a call's `.block()`), which always pushes `None`
     // directly instead.
     pub(crate) ms_pending_block: Option<bool>,
+    // Layout/SpaceAroundKeyword: ancestor-kind stack maintained by
+    // `visit_branch_node_enter`/`_leave` for EVERY branch node in the tree
+    // (rubocop's `preceded_by_operator?` needs the real ancestor chain, and
+    // prism gives no parent pointers) — see `Cops::sak_classify` in
+    // layout.rs for the encoding. The TOP entry is always the node currently
+    // being visited (pushed on entry), so a lookup climbs from index
+    // `len - 2` downward.
+    pub(crate) sak_ancestors: Vec<u8>,
+    // Layout/SpaceAroundKeyword: start offsets of `end` keywords already
+    // checked — an `elsif` chain's nested `IfNode`s (and `UnlessNode`'s
+    // `else_clause` chain) all report the SAME `end_keyword_loc` in prism;
+    // rubocop's `Base#add_offense` collapses those onto one offense via
+    // range-identity, which this reproduces explicitly.
+    pub(crate) sak_end_seen: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1539,6 +1554,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        // Layout/SpaceAroundKeyword's `on_if`: `keyword` (`if`/`elsif` — a
+        // whitequark `:if` node covers both, and prism's nested `subsequent`
+        // `IfNode` chain mirrors that), `then` (`begin_keyword`), `end`, and
+        // the trailing `else` (when `subsequent` resolves to an `ElseNode`
+        // rather than another `elsif` `IfNode`).
+        if let Some(kw) = node.if_keyword_loc() {
+            self.sak_check(kw.start_offset(), kw.end_offset(), kw.as_slice());
+        }
+        if let Some(then_kw) = node.then_keyword_loc() {
+            if then_kw.as_slice() == b"then" {
+                self.sak_check(then_kw.start_offset(), then_kw.end_offset(), b"then");
+            }
+        }
+        if let Some(end_kw) = node.end_keyword_loc() {
+            self.sak_check_end(end_kw.start_offset(), b"end");
+        }
+        if let Some(else_node) = node.subsequent().and_then(|s| s.as_else_node()) {
+            let e = else_node.else_keyword_loc();
+            self.sak_check(e.start_offset(), e.end_offset(), b"else");
+        }
         // pre-order (before recursion): a nested modifier chain
         // (`body if inner if outer`) needs the OUTER node checked first, so
         // it claims the shared start offset before the inner one is visited
@@ -1587,6 +1622,25 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         );
         if node.end_keyword_loc().is_some() {
             self.check_condition_position(b"unless", node.keyword_loc().start_offset(), &node.predicate());
+        }
+        // Layout/SpaceAroundKeyword: whitequark folds `unless` into an `:if`
+        // node too (same reasoning as the comment above), so on_if's
+        // keyword/then/end/else checks apply here verbatim.
+        {
+            let kw = node.keyword_loc();
+            self.sak_check(kw.start_offset(), kw.end_offset(), b"unless");
+        }
+        if let Some(then_kw) = node.then_keyword_loc() {
+            if then_kw.as_slice() == b"then" {
+                self.sak_check(then_kw.start_offset(), then_kw.end_offset(), b"then");
+            }
+        }
+        if let Some(end_kw) = node.end_keyword_loc() {
+            self.sak_check_end(end_kw.start_offset(), b"end");
+        }
+        if let Some(else_node) = node.else_clause() {
+            let e = else_node.else_keyword_loc();
+            self.sak_check(e.start_offset(), e.end_offset(), b"else");
         }
         // pre-order: nested modifiers dedup via multiline_if_mod_seen.
         if node.end_keyword_loc().is_none() {
@@ -1843,12 +1897,28 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_else_case(node);
         self.check_hash_like_case(node);
         self.check_empty_case_condition(node);
+        {
+            let kw = node.case_keyword_loc();
+            self.sak_check(kw.start_offset(), kw.end_offset(), b"case");
+        }
+        if let Some(else_node) = node.else_clause() {
+            let e = else_node.else_keyword_loc();
+            self.sak_check(e.start_offset(), e.end_offset(), b"else");
+        }
         self.cond_depth += 1;
         ruby_prism::visit_case_node(self, node);
         self.cond_depth -= 1;
     }
     fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
         self.check_case_match_indentation(node);
+        {
+            let kw = node.case_keyword_loc();
+            self.sak_check(kw.start_offset(), kw.end_offset(), b"case");
+        }
+        if let Some(else_node) = node.else_clause() {
+            let e = else_node.else_keyword_loc();
+            self.sak_check(e.start_offset(), e.end_offset(), b"else");
+        }
         self.cond_depth += 1;
         ruby_prism::visit_case_match_node(self, node);
         self.cond_depth -= 1;
@@ -1856,10 +1926,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_when_node(&mut self, node: &ruby_prism::WhenNode<'pr>) {
         self.check_when_then(node);
         self.check_multiline_when_then(node);
+        let kw = node.keyword_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"when");
         ruby_prism::visit_when_node(self, node);
     }
     fn visit_in_node(&mut self, node: &ruby_prism::InNode<'pr>) {
         self.check_redundant_self_in_pattern(node);
+        let kw = node.in_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"in");
         // Inlines `ruby_prism::visit_in_node`'s own default body (visit
         // pattern, then statements) so only the PATTERN half runs under
         // `pattern_depth` — see that field's doc comment on `Cops`.
@@ -1873,6 +1947,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_match_required_node(&mut self, node: &ruby_prism::MatchRequiredNode<'pr>) {
         // `expr => pattern` (rightward assignment) — same pattern-binding
         // shape as `case/in`, so the same `pattern_depth` exemption applies.
+        // rubocop's `on_match_pattern` (which would check the `=>` operator)
+        // only fires when `target_ruby_version < 3.0`; oxidecop always
+        // targets >= 3.0, so this is unconditionally unchecked (matches the
+        // fixture's unconditional 'accepts before/after `=>`' examples).
         self.visit(&node.value());
         self.pattern_depth += 1;
         self.visit(&node.pattern());
@@ -1880,6 +1958,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_match_predicate_node(&mut self, node: &ruby_prism::MatchPredicateNode<'pr>) {
         // `expr in pattern` (boolean pattern match) — same as above.
+        let op = node.operator_loc();
+        self.sak_check(op.start_offset(), op.end_offset(), b"in");
         self.visit(&node.value());
         self.pattern_depth += 1;
         self.visit(&node.pattern());
@@ -1916,6 +1996,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_top_level_return_with_argument(node);
         self.check_non_local_exit_from_iterator(node);
         self.ecc_mark_not_supported_parent(node.arguments());
+        let kw = node.keyword_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"return");
         // Style/MultilineTernaryOperator: `return cond ? a : b` — a single
         // return value that's a ternary corrects to single-line, mirroring
         // upstream's `SINGLE_LINE_TYPES` including `:return`.
@@ -1931,16 +2013,24 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_break_node(&mut self, node: &ruby_prism::BreakNode<'pr>) {
         self.ecc_mark_not_supported_parent(node.arguments());
+        let kw = node.keyword_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"break");
         ruby_prism::visit_break_node(self, node);
     }
     fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
         self.ecc_mark_not_supported_parent(node.arguments());
+        let kw = node.keyword_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"next");
         ruby_prism::visit_next_node(self, node);
     }
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
         self.check_rescue_exception(node);
         self.check_rescue_type(node);
         self.check_suppressed_exception(node);
+        {
+            let kw = node.keyword_loc();
+            self.sak_check(kw.start_offset(), kw.end_offset(), b"rescue");
+        }
         self.check_rescued_exceptions_variable_name(node);
         // Hand-rolled (rather than a plain `ruby_prism::visit_rescue_node`
         // call) ONLY so `renv_resbody_depth` can bracket exactly the
@@ -1966,6 +2056,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
         self.check_suppressed_exception_modifier(node);
+        // Layout/SpaceAroundKeyword's `on_resbody`: whitequark parses a
+        // modifier `expr rescue handler` as a `:rescue` node wrapping ONE
+        // `:resbody` child (nil exception classes/variable) — same
+        // `on_resbody` hook prism's dedicated `RescueModifierNode` maps to.
+        let kw = node.keyword_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"rescue");
         ruby_prism::visit_rescue_modifier_node(self, node);
     }
     fn visit_flip_flop_node(&mut self, node: &ruby_prism::FlipFlopNode<'pr>) {
@@ -2041,6 +2137,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_space_before_block_braces(&node.opening_loc(), &node.closing_loc());
         self.check_block_end_newline(node);
         self.check_access_modifier_indentation_block(node);
+        // Layout/SpaceAroundKeyword: `do`/`end` — a numbered-param (`_1`) or
+        // `it`-param block is still a plain `BlockNode` in prism (same as an
+        // ordinary block), so this one hook covers `on_block`/`on_numblock`/
+        // `on_itblock` alike. `{`/`}` delimiters aren't checked here at all
+        // (that's Layout/SpaceBeforeBlockBraces/SpaceInsideBlockBraces turf).
+        let opening = node.opening_loc();
+        let is_do = opening.as_slice() == b"do";
+        if is_do {
+            self.sak_check(opening.start_offset(), opening.end_offset(), b"do");
+        }
+        if is_do {
+            let closing = node.closing_loc();
+            self.sak_check_end(closing.start_offset(), b"end");
+        }
         // Style/RedundantSelf: a block CONTINUES (shares) the enclosing
         // scope's name set when one is active — a real Ruby closure sees
         // outer locals, and upstream's `add_scope(node,
@@ -2165,6 +2275,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.closing_loc(),
             "while",
         );
+        self.sak_check(node.keyword_loc().start_offset(), node.keyword_loc().end_offset(), b"while");
+        if let Some(do_kw) = node.do_keyword_loc() {
+            self.sak_check(do_kw.start_offset(), do_kw.end_offset(), b"do");
+        }
+        if let Some(closing) = node.closing_loc() {
+            if node.do_keyword_loc().is_some() {
+                self.sak_check_end(closing.start_offset(), b"end");
+            }
+        }
         self.cond_depth += 1;
         ruby_prism::visit_while_node(self, node);
         self.cond_depth -= 1;
@@ -2205,6 +2324,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.closing_loc(),
             "until",
         );
+        self.sak_check(node.keyword_loc().start_offset(), node.keyword_loc().end_offset(), b"until");
+        if let Some(do_kw) = node.do_keyword_loc() {
+            self.sak_check(do_kw.start_offset(), do_kw.end_offset(), b"do");
+        }
+        if let Some(closing) = node.closing_loc() {
+            if node.do_keyword_loc().is_some() {
+                self.sak_check_end(closing.start_offset(), b"end");
+            }
+        }
         self.cond_depth += 1;
         ruby_prism::visit_until_node(self, node);
         self.cond_depth -= 1;
@@ -2212,6 +2340,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
         self.check_for(node);
         self.check_unreachable_loop_for(node);
+        if let Some(do_kw) = node.do_keyword_loc() {
+            self.sak_check(do_kw.start_offset(), do_kw.end_offset(), b"do");
+            self.sak_check_end(node.end_keyword_loc().start_offset(), b"end");
+        }
         ruby_prism::visit_for_node(self, node);
     }
     fn visit_pre_execution_node(&mut self, node: &ruby_prism::PreExecutionNode<'pr>) {
@@ -2219,6 +2351,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.push(node.keyword_loc().start_offset(), "Style/BeginBlock", false,
                 "Avoid the use of `BEGIN` blocks.");
         }
+        let kw = node.keyword_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"BEGIN");
         ruby_prism::visit_pre_execution_node(self, node);
     }
     fn visit_post_execution_node(&mut self, node: &ruby_prism::PostExecutionNode<'pr>) {
@@ -2228,6 +2362,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 "Avoid the use of `END` blocks. Use `Kernel#at_exit` instead.");
             self.fixes.push((kw.start_offset(), kw.end_offset(), b"at_exit".to_vec()));
         }
+        let kw = node.keyword_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"END");
         ruby_prism::visit_post_execution_node(self, node);
     }
     fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
@@ -2237,6 +2373,23 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_lines_around_exception_handling_keywords_kwbegin(node);
         self.check_begin_end_alignment(node);
         let kwbegin = node.begin_keyword_loc().is_some();
+        // Layout/SpaceAroundKeyword: `on_kwbegin`'s `begin`/`end` (explicit
+        // `begin...end` only — the IMPLICIT BeginNode wrapping a def's
+        // rescue/ensure body has no `begin_keyword_loc` and isn't checked)
+        // plus `on_rescue`'s `else` (the `else` after a rescue clause, which
+        // DOES apply to both the explicit-kwbegin and implicit-def shapes).
+        if let Some(begin_kw) = node.begin_keyword_loc() {
+            self.sak_check(begin_kw.start_offset(), begin_kw.end_offset(), b"begin");
+        }
+        if let Some(end_kw) = node.end_keyword_loc() {
+            if kwbegin {
+                self.sak_check_end(end_kw.start_offset(), b"end");
+            }
+        }
+        if let Some(else_node) = node.else_clause() {
+            let e = else_node.else_keyword_loc();
+            self.sak_check(e.start_offset(), e.end_offset(), b"else");
+        }
         if kwbegin {
             self.usage_block_depth += 1;
             // Lint/SuppressedException's ancestor search: an explicit
@@ -2264,6 +2417,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_ensure_node(&mut self, node: &ruby_prism::EnsureNode<'pr>) {
         self.check_empty_ensure(node);
         self.check_ensure_return(node);
+        let kw = node.ensure_keyword_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"ensure");
         ruby_prism::visit_ensure_node(self, node);
     }
     fn visit_parentheses_node(&mut self, node: &ruby_prism::ParenthesesNode<'pr>) {
@@ -2601,6 +2756,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.usage_block_depth -= 1;
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+        {
+            let kw = node.keyword_loc();
+            self.sak_check(kw.start_offset(), kw.end_offset(), b"super");
+        }
         let framed = node.lparen_loc().is_none() && self.hot.empty_literal && node.arguments().is_some();
         if framed {
             let spans: Vec<(usize, usize)> = node
@@ -2637,6 +2796,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+        {
+            // `ForwardingSuperNode` (bare `super`, no parens/args) has no
+            // dedicated `keyword_loc` — its OWN `location()` spans through a
+            // trailing block (`super {}`'s location is `"super {}"`), so the
+            // keyword itself is always exactly the first 5 bytes (`super`
+            // is a fixed literal for this node — there's no other spelling).
+            let start = node.location().start_offset();
+            self.sak_check(start, start + 5, b"super");
+        }
         if let Some(b) = node.block() {
             self.check_empty_block_parameter(&b);
             self.check_block_parameter_name(&b);
@@ -2686,15 +2854,31 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_and_with_identical_operands(node);
         let op = node.operator_loc();
         self.redundant_sort_logical_left.insert(node.left().location().start_offset(), (op.start_offset(), op.end_offset()));
+        if op.as_slice() == b"and" {
+            self.sak_check(op.start_offset(), op.end_offset(), b"and");
+        }
         ruby_prism::visit_and_node(self, node);
     }
     fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
         self.check_or_with_identical_operands(node);
         let op = node.operator_loc();
         self.redundant_sort_logical_left.insert(node.left().location().start_offset(), (op.start_offset(), op.end_offset()));
+        if op.as_slice() == b"or" {
+            self.sak_check(op.start_offset(), op.end_offset(), b"or");
+        }
         ruby_prism::visit_or_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // Layout/SpaceAroundKeyword's `on_send`: `prefix_not?` — a `not x`
+        // call (name `!`, but SPELLED `not`, distinct from `!x`'s bare `!`
+        // selector, which this cop never checks).
+        if node.name().as_slice() == b"!" {
+            if let Some(sel) = node.message_loc() {
+                if sel.as_slice() == b"not" {
+                    self.sak_check(sel.start_offset(), sel.end_offset(), b"not");
+                }
+            }
+        }
         // Lint/UselessMethodDefinition: register def-arguments of generic
         // macro calls (anything but a receiver-less access modifier).
         if let Some(args) = node.arguments() {
@@ -3086,6 +3270,35 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.call_stack.pop();
         self.ll_exit_collection();
     }
+    fn visit_yield_node(&mut self, node: &ruby_prism::YieldNode<'pr>) {
+        let kw = node.keyword_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"yield");
+        ruby_prism::visit_yield_node(self, node);
+    }
+    fn visit_defined_node(&mut self, node: &ruby_prism::DefinedNode<'pr>) {
+        let kw = node.keyword_loc();
+        self.sak_check(kw.start_offset(), kw.end_offset(), b"defined?");
+        ruby_prism::visit_defined_node(self, node);
+    }
+    // Layout/SpaceAroundKeyword's `preceded_by_operator?` needs a real
+    // ancestor chain, which prism doesn't provide (no parent pointers).
+    // `visit()`'s generated dispatcher (see the `Visit` trait) calls these
+    // around EVERY node — branch or leaf — regardless of which concrete
+    // `visit_xxx_node` override (if any) handles it, so this is the one hook
+    // guaranteed to see every ancestor level. See `Cops::sak_classify` /
+    // `Cops::sak_preceded_by_operator` in layout.rs.
+    fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+        self.sak_ancestors.push(Self::sak_classify(&node));
+    }
+    fn visit_branch_node_leave(&mut self) {
+        self.sak_ancestors.pop();
+    }
+    fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+        self.sak_ancestors.push(Self::sak_classify(&node));
+    }
+    fn visit_leaf_node_leave(&mut self) {
+        self.sak_ancestors.pop();
+    }
 }
 
 /// Lint one file: run the text-based cops and the AST visitor, return sorted
@@ -3247,6 +3460,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         ms_class_stack: Vec::new(),
         ms_block_stack: Vec::new(),
         ms_pending_block: None,
+        sak_ancestors: Vec::new(),
+        sak_end_seen: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);

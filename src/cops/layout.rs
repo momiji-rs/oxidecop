@@ -5727,3 +5727,153 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+/// Layout/SpaceAroundKeyword — every hook lives in `mod.rs`'s `visit_*`
+/// overrides (one per keyword-bearing node type rubocop's cop dispatches
+/// on: `on_and`/`on_or`/`on_if`(+`unless`)/`on_case`(+`case_match`)/
+/// `on_when`/`on_in_pattern`/`on_match_pattern_p`/`on_ensure`/`on_for`/
+/// `on_kwbegin`/`on_block`(+numblock/itblock)/`on_break`/`on_next`/
+/// `on_return`/`on_yield`/`on_super`/`on_zsuper`/`on_defined?`/`on_send`
+/// (`not`)/`on_resbody`/`on_rescue`/`on_postexe`/`on_preexe`/`on_while`/
+/// `on_until`); this impl holds the actual `check`/`check_keyword`/
+/// `check_begin`/`check_end`/`space_before_missing?`/`space_after_missing?`/
+/// `preceded_by_operator?` port.
+impl<'a> Cops<'a> {
+    const SAK_COP: &'static str = "Layout/SpaceAroundKeyword";
+
+    const SAK_ACCEPT_LEFT_PAREN: [&'static [u8]; 6] =
+        [b"break", b"defined?", b"next", b"not", b"rescue", b"super"];
+    const SAK_ACCEPT_LEFT_BRACKET: [&'static [u8]; 2] = [b"super", b"yield"];
+
+    /// rubocop-ast's `MethodIdentifierPredicates::OPERATOR_METHODS`.
+    fn sak_is_operator_method(name: &[u8]) -> bool {
+        matches!(
+            name,
+            b"|" | b"^" | b"&" | b"<=>" | b"==" | b"===" | b"=~" | b">" | b">=" | b"<" | b"<="
+                | b"<<" | b">>" | b"+" | b"-" | b"*" | b"/" | b"%" | b"**" | b"~" | b"+@" | b"-@"
+                | b"!@" | b"~@" | b"[]" | b"[]=" | b"!" | b"!=" | b"!~" | b"`"
+        )
+    }
+
+    /// Classifies a node for `sak_preceded_by_operator`'s ancestor climb —
+    /// rubocop's `preceded_by_operator?`:
+    /// ```ruby
+    /// node.each_ancestor do |ancestor|
+    ///   return true if ancestor.operator_keyword? || ancestor.range_type?
+    ///   return false unless ancestor.send_type?
+    ///   return true if ancestor.operator_method?
+    /// end
+    /// false
+    /// ```
+    /// 1 = `and`/`or` (`operator_keyword?` — true for the TYPE regardless of
+    /// `&&`/`and` spelling) or a range literal (`range_type?`) — climb
+    /// ACCEPTS. 2 = a `send`/`csend` whose method IS an operator method —
+    /// also ACCEPTS. 3 = any other `send`/`csend` — "regular dotted method
+    /// calls bind more tightly than operators", so the climb continues PAST
+    /// it. 0 = anything else — the first non-send ancestor REJECTS outright.
+    pub(crate) fn sak_classify(node: &ruby_prism::Node) -> u8 {
+        if node.as_and_node().is_some() || node.as_or_node().is_some() || node.as_range_node().is_some() {
+            return 1;
+        }
+        if let Some(call) = node.as_call_node() {
+            return if Self::sak_is_operator_method(call.name().as_slice()) { 2 } else { 3 };
+        }
+        0
+    }
+
+    /// The climb starts at the checked node's PARENT — `sak_ancestors`'
+    /// TOP entry is the node currently being visited (pushed on entry by
+    /// `visit_branch_node_enter`/`visit_leaf_node_enter`), so skip it first.
+    fn sak_preceded_by_operator(&self) -> bool {
+        let mut it = self.sak_ancestors.iter().rev();
+        it.next();
+        for &k in it {
+            match k {
+                1 | 2 => return true,
+                3 => continue,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// rubocop's `space_before_missing?`: the byte immediately before the
+    /// keyword's start isn't one of `[\s(|{\[;,*=]`.
+    fn sak_space_before_missing(&self, start: usize) -> bool {
+        if start == 0 {
+            return false;
+        }
+        !matches!(
+            self.src[start - 1],
+            b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c | b'(' | b'|' | b'{' | b'[' | b';' | b',' | b'*' | b'='
+        )
+    }
+
+    /// rubocop's `space_after_missing?`: EOF is treated as accepted
+    /// (`accepted_opening_delimiter?` returns true when `char` is nil), then
+    /// the `[`/`(` opening-delimiter exceptions (`ACCEPT_LEFT_SQUARE_BRACKET`
+    /// / `ACCEPT_LEFT_PAREN`, keyed off the exact keyword text), then the
+    /// unconditional `&.` safe-navigation and (for `super` only) `::`
+    /// namespace-operator exceptions, then the general
+    /// `[\s;,#\\)}\].]` allowlist.
+    fn sak_space_after_missing(&self, end: usize, kw: &[u8]) -> bool {
+        let Some(&ch) = self.src.get(end) else { return false };
+        if Self::SAK_ACCEPT_LEFT_BRACKET.contains(&kw) && ch == b'[' {
+            return false;
+        }
+        if Self::SAK_ACCEPT_LEFT_PAREN.contains(&kw) && ch == b'(' {
+            return false;
+        }
+        if ch == b'&' && self.src.get(end + 1) == Some(&b'.') {
+            return false;
+        }
+        if kw == b"super" && ch == b':' && self.src.get(end + 1) == Some(&b':') {
+            return false;
+        }
+        !matches!(
+            ch,
+            b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c | b';' | b',' | b'#' | b'\\' | b')' | b'}' | b']' | b'.'
+        )
+    }
+
+    /// rubocop's `check_keyword`: full before+after check for a keyword or
+    /// operator range. `kw` is the range's exact source text — the message
+    /// interpolates it verbatim (`range.source`), and it's also the lookup
+    /// key for the paren/bracket/namespace-operator exceptions.
+    pub(crate) fn sak_check(&mut self, start: usize, end: usize, kw: &[u8]) {
+        if !self.on(Self::SAK_COP) {
+            return;
+        }
+        let kw_str = String::from_utf8_lossy(kw);
+        if self.sak_space_before_missing(start) && !self.sak_preceded_by_operator() {
+            self.push(start, Self::SAK_COP, true, format!("Space before keyword `{kw_str}` is missing."));
+            self.fixes.push((start, start, b" ".to_vec()));
+        }
+        if self.sak_space_after_missing(end, kw) {
+            self.push(start, Self::SAK_COP, true, format!("Space after keyword `{kw_str}` is missing."));
+            self.fixes.push((end, end, b" ".to_vec()));
+        }
+    }
+
+    /// rubocop's `check_end`: before-ONLY (no after-check, and no
+    /// `preceded_by_operator?` guard either — `check_end` never calls it).
+    /// Deduped by offset: an `elsif` chain's nested `IfNode`s (and an
+    /// `UnlessNode`'s `else_clause`-less `end`) all report the outer `if`'s
+    /// SAME `end_keyword_loc` in prism; rubocop's own `Base#add_offense`
+    /// collapses the repeat visits onto one offense via range-identity —
+    /// `sak_end_seen` reproduces that explicitly since we have no such
+    /// range-dedup layer.
+    pub(crate) fn sak_check_end(&mut self, start: usize, kw: &[u8]) {
+        if !self.on(Self::SAK_COP) {
+            return;
+        }
+        if !self.sak_end_seen.insert(start) {
+            return;
+        }
+        if self.sak_space_before_missing(start) {
+            self.push(start, Self::SAK_COP, true, format!("Space before keyword `{}` is missing.", String::from_utf8_lossy(kw)));
+            self.fixes.push((start, start, b" ".to_vec()));
+        }
+    }
+}
