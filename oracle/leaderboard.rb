@@ -261,6 +261,7 @@ COPS = {
   'Style/CombinableLoops'            => 'style/combinable_loops',
   'Style/SlicingWithRange'           => 'style/slicing_with_range',
   'Style/RedundantInterpolation'     => 'style/redundant_interpolation',
+  'Style/BisectedAttrAccessor'       => 'style/bisected_attr_accessor',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

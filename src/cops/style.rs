@@ -15106,3 +15106,185 @@ fn ri_is_operator_method(name: &[u8]) -> bool {
             | b"`"
     )
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/BisectedAttrAccessor — flags `attr_reader`/`attr_writer` (or
+    /// `attr`) direct statements in a class/module/sclass body that name the
+    /// SAME attribute across a reader and a writer within the SAME
+    /// visibility scope, and merges them into `attr_accessor`.
+    ///
+    /// Ported from `find_macros`/`find_bisection`/`Macro` (upstream's
+    /// `Macro.new(node).attrs` keys on `arg.source`, so a splat like
+    /// `*ATTRIBUTES` participates by its whole source text, not just plain
+    /// symbols) plus `VisibilityHelp#node_visibility_from_visibility_block`:
+    /// visibility is the nearest PRECEDING sibling statement that's a bare
+    /// `private`/`protected`/`public` call (no receiver, no args/block-pass,
+    /// no `do...end` block) — NOT lexical nesting, and unaffected by
+    /// intervening non-modifier statements (including other macros).
+    ///
+    /// Each macro gets at most one correction: `corrector.insert_before(node,
+    /// attr_accessor_line) + corrector.replace(node, shrunk_macro)` collapses
+    /// to a single replace over the macro's own range here (the inserted
+    /// text lands exactly at the replace's start, so concatenating them is
+    /// byte-identical and avoids the harness's separate-edit overlap check);
+    /// a fully-bisected macro instead replaces (reader) or removes (writer)
+    /// its WHOLE source line, `indent(node) = ' ' * node.loc.column` spaces.
+    pub(crate) fn check_bisected_attr_accessor(&mut self, body: Option<ruby_prism::Node>) {
+        const COP: &str = "Style/BisectedAttrAccessor";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = body else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        let items: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+
+        struct BaMacro {
+            start: usize,
+            end: usize,
+            col0: usize,
+            is_reader: bool,
+            // (arg source text, arg's own start offset) in original order.
+            attrs: Vec<(Vec<u8>, usize)>,
+            visibility: &'static str,
+        }
+        let mut macros: Vec<BaMacro> = Vec::new();
+
+        for (i, item) in items.iter().enumerate() {
+            let Some(call) = item.as_call_node() else { continue };
+            let is_reader = match call.name().as_slice() {
+                b"attr_reader" | b"attr" => true,
+                b"attr_writer" => false,
+                _ => continue,
+            };
+            let attrs: Vec<(Vec<u8>, usize)> = call
+                .arguments()
+                .map(|a| {
+                    a.arguments()
+                        .iter()
+                        .map(|arg| {
+                            let l = arg.location();
+                            (self.src[l.start_offset()..l.end_offset()].to_vec(), l.start_offset())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut visibility: &'static str = "public";
+            for j in (0..i).rev() {
+                let Some(c2) = items[j].as_call_node() else { continue };
+                if c2.receiver().is_some() || c2.arguments().is_some() || c2.block().is_some() {
+                    continue;
+                }
+                match c2.name().as_slice() {
+                    b"private" => {
+                        visibility = "private";
+                        break;
+                    }
+                    b"protected" => {
+                        visibility = "protected";
+                        break;
+                    }
+                    b"public" => {
+                        visibility = "public";
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            let l = call.location();
+            let col0 = self.idx.loc(l.start_offset()).1 - 1;
+            macros.push(BaMacro { start: l.start_offset(), end: l.end_offset(), col0, is_reader, attrs, visibility });
+        }
+
+        // Group macro indices by visibility — order across groups doesn't
+        // affect output since every offense/fix is independent per macro.
+        let mut groups: Vec<(&'static str, Vec<usize>)> = Vec::new();
+        for (idx, m) in macros.iter().enumerate() {
+            if let Some(g) = groups.iter_mut().find(|(v, _)| *v == m.visibility) {
+                g.1.push(idx);
+            } else {
+                groups.push((m.visibility, vec![idx]));
+            }
+        }
+
+        for (_, idxs) in &groups {
+            let mut writer_names: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+            for &i in idxs {
+                if !macros[i].is_reader {
+                    for (k, _) in &macros[i].attrs {
+                        writer_names.insert(k.as_slice());
+                    }
+                }
+            }
+            // `readers.flat_map(&:attr_names) & writers.flat_map(&:attr_names)`
+            // — readers' own order, filtered to names also written, deduped.
+            let mut bisected: Vec<Vec<u8>> = Vec::new();
+            for &i in idxs {
+                if macros[i].is_reader {
+                    for (k, _) in &macros[i].attrs {
+                        if writer_names.contains(k.as_slice()) && !bisected.iter().any(|b| b == k) {
+                            bisected.push(k.clone());
+                        }
+                    }
+                }
+            }
+            if bisected.is_empty() {
+                continue;
+            }
+
+            for &i in idxs {
+                let m = &macros[i];
+                // This macro's own bisected subset, in the GLOBAL order above
+                // (`Hash#slice(*bisected)` orders by the ARGUMENT list, not
+                // the receiver hash's own order).
+                let my_bisected: Vec<&(Vec<u8>, usize)> =
+                    bisected.iter().filter_map(|name| m.attrs.iter().find(|(k, _)| k == name)).collect();
+                if my_bisected.is_empty() {
+                    continue;
+                }
+                for (name, off) in &my_bisected {
+                    let msg =
+                        format!("Combine both accessors into `attr_accessor {}`.", String::from_utf8_lossy(name));
+                    self.push(*off, COP, true, msg);
+                }
+                // `attr_names - bisected_names` — this macro's own attrs NOT
+                // bisected, in ITS OWN original order.
+                let rest: Vec<&[u8]> = m
+                    .attrs
+                    .iter()
+                    .filter(|(k, _)| !my_bisected.iter().any(|(bk, _)| bk == k))
+                    .map(|(k, _)| k.as_slice())
+                    .collect();
+                let all_bisected = rest.is_empty();
+                let indent = " ".repeat(m.col0);
+
+                if m.is_reader {
+                    let names_joined = my_bisected
+                        .iter()
+                        .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if all_bisected {
+                        let (line_start, _, line_end_incl) = ewo_line_bounds(self.src, m.start, m.end);
+                        let replacement = format!("{indent}attr_accessor {names_joined}\n");
+                        self.fixes.push((line_start, line_end_incl, replacement.into_bytes()));
+                    } else {
+                        let rest_joined = rest.iter().map(|k| String::from_utf8_lossy(k).into_owned()).collect::<Vec<_>>().join(", ");
+                        let replacement =
+                            format!("attr_accessor {names_joined}\n{indent}attr_reader {rest_joined}");
+                        self.fixes.push((m.start, m.end, replacement.into_bytes()));
+                    }
+                } else if all_bisected {
+                    let (line_start, _, line_end_incl) = ewo_line_bounds(self.src, m.start, m.end);
+                    self.fixes.push((line_start, line_end_incl, Vec::new()));
+                } else {
+                    let rest_joined = rest.iter().map(|k| String::from_utf8_lossy(k).into_owned()).collect::<Vec<_>>().join(", ");
+                    let replacement = format!("attr_writer {rest_joined}");
+                    self.fixes.push((m.start, m.end, replacement.into_bytes()));
+                }
+            }
+        }
+    }
+}

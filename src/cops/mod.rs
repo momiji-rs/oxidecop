@@ -243,7 +243,7 @@ const IMPLEMENTED: &[&str] = &[
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
     "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops", "Style/SlicingWithRange",
-    "Style/RedundantInterpolation",
+    "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
 ];
 
 impl Engine {
@@ -2399,6 +2399,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_camel_case_name(&node.constant_path());
         self.check_inherit_exception_class(node);
         self.check_ineffective_access_modifier(node.body());
+        self.check_bisected_attr_accessor(node.body());
         self.check_empty_lines_around_class_body(node);
         self.check_access_modifier_indentation_class(node);
         self.check_struct_inheritance(node);
@@ -2444,6 +2445,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_module_function(node);
         self.check_empty_lines_around_module_body(node);
         self.check_ineffective_access_modifier(node.body());
+        self.check_bisected_attr_accessor(node.body());
         self.check_access_modifier_indentation_module(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
@@ -2653,6 +2655,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(), node.body().is_some(), false, true);
         self.check_trailing_body_on_class(node.class_keyword_loc().start_offset(), l.end_offset(), node.body());
+        self.check_bisected_attr_accessor(node.body());
         // Layout/EmptyLinesAroundAccessModifier's `@class_or_module_def_first_line`
         // uses `node.identifier.source_range.first_line` — the `<<` expression
         // (usually `self`), not the `class` keyword.
