@@ -1779,3 +1779,162 @@ fn mivn_message(style: &str, ivar_name: &[u8], suggested_var: &[u8], method_name
         )
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Naming/VariableNumber — upstream's `on_arg` is aliased ONLY to
+    /// `on_lvasgn`/`on_ivasgn`/`on_cvasgn`/`on_gvasgn` (unlike
+    /// Naming/VariableName, it does NOT alias `on_optarg`/`on_restarg`/
+    /// `on_kwarg`/`on_kwoptarg`/`on_kwrestarg`/`on_blockarg`/`on_lvar`), so
+    /// only a REQUIRED positional/block parameter (prism's
+    /// `RequiredParameterNode`) and the five write-ish node families
+    /// (local/instance/class/global var writes, op-writes, `&&=`/`||=`
+    /// writes, and multi-assign/rescue/for-loop targets) reach this check —
+    /// see each call site in `mod.rs`'s `Visit` impl. Globals get the FULL
+    /// style check here (unlike VariableName's gvasgn, which is
+    /// forbidden-identifiers-only) because upstream's `on_gvasgn` for THIS
+    /// cop is the same `on_arg` alias, not a separate method.
+    pub(crate) fn check_variable_number(&mut self, name: &[u8], anchor: usize) {
+        const COP: &str = "Naming/VariableNumber";
+        if !self.on(COP) {
+            return;
+        }
+        if self.vn2_allowed_identifier(name) {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        if variable_number_matches_style(name, style) || self.allowed(COP, name) {
+            return;
+        }
+        self.push(anchor, COP, false, format!("Use {style} for variable numbers."));
+    }
+
+    /// Naming/VariableNumber on a `def`/`defs` — the method's own name,
+    /// gated by `CheckMethodNames` (default `true`). Mirrors
+    /// `check_method_name_def`'s `class_emitter_method?` escape hatch (a
+    /// singleton method named after a sibling class is exempt), which is
+    /// the other half of this cop's overridden `valid_name?`.
+    pub(crate) fn check_variable_number_def(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Naming/VariableNumber";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.get(COP, "CheckMethodNames") == Some("false") {
+            return;
+        }
+        let name = node.name().as_slice();
+        if self.vn2_allowed_identifier(name) {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        if variable_number_matches_style(name, style) {
+            return;
+        }
+        if node.receiver().is_some()
+            && self.class_children_stack.iter().any(|f| f.iter().any(|c| c == name))
+        {
+            return;
+        }
+        if self.allowed(COP, name) {
+            return;
+        }
+        self.push(node.name_loc().start_offset(), COP, false,
+            format!("Use {style} for method name numbers."));
+    }
+
+    /// Naming/VariableNumber on a `sym` literal, gated by `CheckSymbols`
+    /// (default `true`). Anchored on the WHOLE symbol node (`:sym1`, colon
+    /// included), matching upstream's `check_name(node, node.value, node)`
+    /// passing the node itself (not `node.loc.expression` split out) as the
+    /// offense range.
+    pub(crate) fn check_variable_number_sym(&mut self, node: &ruby_prism::SymbolNode) {
+        const COP: &str = "Naming/VariableNumber";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.get(COP, "CheckSymbols") == Some("false") {
+            return;
+        }
+        let name = node.unescaped();
+        if self.vn2_allowed_identifier(name) {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        if variable_number_matches_style(name, style) || self.allowed(COP, name) {
+            return;
+        }
+        self.push(node.location().start_offset(), COP, false,
+            format!("Use {style} for symbol numbers."));
+    }
+
+    /// `AllowedIdentifiers#allowed_identifier?` for this cop specifically
+    /// (own `AllowedIdentifiers` config key, sigil-stripped exact match —
+    /// same semantics as `vn_allowed_identifier` above, just scoped to
+    /// `Naming/VariableNumber`'s own config section rather than
+    /// `Naming/VariableName`'s).
+    fn vn2_allowed_identifier(&self, name: &[u8]) -> bool {
+        let ids = match self.cfg.get("Naming/VariableNumber", "AllowedIdentifiers") {
+            Some(v) => crate::config::parse_allowed_list(v),
+            None => Vec::new(),
+        };
+        if ids.is_empty() {
+            return false;
+        }
+        let stripped = vn_strip_sigils(name);
+        ids.iter().any(|id| id.as_bytes() == stripped.as_slice())
+    }
+}
+
+/// `ConfigurableNumbering::FORMATS` — does `name`'s trailing digit run (if
+/// any) match the given `EnforcedStyle`? Ported branch-for-branch from the
+/// three regexes (`implicit_param = /\A_\d+\z/`):
+///   snake_case:  `/(?:\D|_\d+|\A\d+)\z/`
+///   normalcase:  `/(?:\D|[^_\d]\d+|\A\d+)\z|#{implicit_param}/`
+///   non_integer: `/(\D|\A\d+)\z|#{implicit_param}/`
+///
+/// Since `\z` anchors the absolute end and `match?` just needs ANY match,
+/// every branch reduces to a check on the string's END:
+/// - `\A\d+\z` (all three): the WHOLE name is nothing but ASCII digits
+///   (how `:"42"` passes every style).
+/// - `\D\z` (all three): the LAST character isn't a digit — nothing to
+///   check regardless of style.
+/// - otherwise the name ends in a digit and isn't all-digits: look at the
+///   character immediately before the maximal trailing run of digits.
+///   `snake_case` wants it to be `_`; `normalcase` wants it to be anything
+///   OTHER than `_` (it can never be a digit by construction of "maximal
+///   run"), or the whole-name `implicit_param` escape (`_1`); `non_integer`
+///   has no such middle branch at all — ANY trailing digit fails it unless
+///   `implicit_param` saves it.
+fn variable_number_matches_style(name: &[u8], style: &str) -> bool {
+    let s = String::from_utf8_lossy(name);
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return false;
+    }
+    if chars.iter().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if !chars.last().unwrap().is_ascii_digit() {
+        return true;
+    }
+    let mut i = chars.len();
+    while i > 0 && chars[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    // `i > 0`: the all-digits case above already handled a trailing run
+    // that reaches all the way back to index 0.
+    let preceding = chars[i - 1];
+    match style {
+        "snake_case" => preceding == '_',
+        "normalcase" => preceding != '_' || variable_number_implicit_param(&chars),
+        "non_integer" => variable_number_implicit_param(&chars),
+        _ => false,
+    }
+}
+
+/// `implicit_param = /\A_\d+\z/` — the WHOLE name (not merely a suffix) is a
+/// single leading underscore followed by nothing but (one or more) ASCII
+/// digits, e.g. `_1`.
+fn variable_number_implicit_param(chars: &[char]) -> bool {
+    chars.len() >= 2 && chars[0] == '_' && chars[1..].iter().all(|c| c.is_ascii_digit())
+}

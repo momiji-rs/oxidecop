@@ -368,7 +368,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber",
 ];
 
 impl Engine {
@@ -1767,6 +1767,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_boolean_symbol(node);
         self.check_symbol_literal(node);
         self.check_percent_literal_delimiters_sym(node);
+        self.check_variable_number_sym(node);
     }
     fn visit_interpolated_symbol_node(&mut self, node: &ruby_prism::InterpolatedSymbolNode<'pr>) {
         self.check_lii_dsym(node);
@@ -1883,6 +1884,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // no `name_loc` — a required parameter IS just its identifier, so
         // `location()` is already the exact name range.
         self.check_variable_name(node.name().as_slice(), node.location().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_rest_parameter_node(&mut self, node: &ruby_prism::RestParameterNode<'pr>) {
         // anonymous `*` carries no name — nothing to check.
@@ -2162,12 +2164,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.rse_assignment_value.insert(node.value().location().start_offset());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_class_variable_write_node(self, node);
     }
     fn visit_class_variable_operator_write_node(&mut self, node: &ruby_prism::ClassVariableOperatorWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
         assignment_operator_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_class_variable_operator_write_node(self, node);
     }
     fn visit_class_variable_or_write_node(&mut self, node: &ruby_prism::ClassVariableOrWriteNode<'pr>) {
@@ -2176,6 +2180,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_class_variable_or_write_node(self, node);
     }
     fn visit_class_variable_and_write_node(&mut self, node: &ruby_prism::ClassVariableAndWriteNode<'pr>) {
@@ -2183,6 +2188,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_cvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_class_variable_and_write_node(self, node);
     }
     fn visit_class_variable_target_node(&mut self, node: &ruby_prism::ClassVariableTargetNode<'pr>) {
@@ -2190,6 +2196,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // cvasgn in whitequark, so upstream's on_cvasgn fires per target
         self.check_class_vars(node.name().as_slice(), node.location().start_offset());
         self.check_variable_name(node.name().as_slice(), node.location().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
@@ -2208,12 +2215,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.rse_assignment_value.insert(node.value().location().start_offset());
         assignment_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_global_variable_write_node(self, node);
     }
     fn visit_global_variable_operator_write_node(&mut self, node: &ruby_prism::GlobalVariableOperatorWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
         assignment_operator_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_global_variable_operator_write_node(self, node);
     }
     fn visit_global_variable_or_write_node(&mut self, node: &ruby_prism::GlobalVariableOrWriteNode<'pr>) {
@@ -2222,6 +2231,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
         assignment_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_global_variable_or_write_node(self, node);
     }
     fn visit_global_variable_and_write_node(&mut self, node: &ruby_prism::GlobalVariableAndWriteNode<'pr>) {
@@ -2229,11 +2239,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_gvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_global_variable_and_write_node(self, node);
     }
     fn visit_global_variable_target_node(&mut self, node: &ruby_prism::GlobalVariableTargetNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
         self.check_variable_name_gvasgn(node.name().as_slice(), node.location().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_numbered_reference_read_node(&mut self, node: &ruby_prism::NumberedReferenceReadNode<'pr>) {
         self.check_perl_backrefs_numbered(node);
@@ -2263,6 +2275,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         // Style/MethodCallWithoutArgsParentheses's `same_name_assignment?`:
         // this name is a live "ancestor assignment" for the whole `value`
         // subtree — see the `mcwap_assign_stack` field doc.
@@ -2273,6 +2286,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
         assignment_operator_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
         ruby_prism::visit_local_variable_operator_write_node(self, node);
         self.mcwap_assign_stack.pop();
@@ -2283,6 +2297,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
         ruby_prism::visit_local_variable_or_write_node(self, node);
         self.mcwap_assign_stack.pop();
@@ -2292,6 +2307,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
         ruby_prism::visit_local_variable_and_write_node(self, node);
         self.mcwap_assign_stack.pop();
@@ -2302,6 +2318,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `pattern_depth`'s doc comment).
         if self.pattern_depth == 0 {
             self.check_variable_name(node.name().as_slice(), node.location().start_offset());
+            self.check_variable_number(node.name().as_slice(), node.location().start_offset());
         }
     }
     fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
@@ -2315,6 +2332,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.rse_assignment_value.insert(node.value().location().start_offset());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_instance_variable_write_node(self, node);
     }
     fn visit_instance_variable_operator_write_node(
@@ -2323,6 +2341,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     ) {
         assignment_operator_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_instance_variable_operator_write_node(self, node);
     }
     fn visit_instance_variable_or_write_node(&mut self, node: &ruby_prism::InstanceVariableOrWriteNode<'pr>) {
@@ -2330,12 +2349,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_instance_variable_or_write_node(self, node);
     }
     fn visit_instance_variable_and_write_node(&mut self, node: &ruby_prism::InstanceVariableAndWriteNode<'pr>) {
         self.check_self_assignment_ivar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_instance_variable_and_write_node(self, node);
     }
     fn visit_instance_variable_target_node(&mut self, node: &ruby_prism::InstanceVariableTargetNode<'pr>) {
@@ -2343,6 +2364,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `rescue => @e` is an ivasgn in whitequark, so upstream's
         // on_ivasgn fires per target (ivars can never appear in a pattern).
         self.check_variable_name(node.name().as_slice(), node.location().start_offset());
+        self.check_variable_number(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
         self.check_class_length_casgn(&node.value());
@@ -3439,6 +3461,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.check_trailing_body_on_method_definition(node);
         }
         self.check_method_name_def(node);
+        self.check_variable_number_def(node);
         self.check_predicate_prefix_def(node);
         self.check_binary_operator_parameter(node);
         self.check_nested_method_definition(node);
