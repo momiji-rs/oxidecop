@@ -308,7 +308,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
     "Style/ExplicitBlockArgument",
     "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
-    "Style/MethodCallWithoutArgsParentheses",
+    "Style/MethodCallWithoutArgsParentheses", "Style/Alias",
 ];
 
 impl Engine {
@@ -995,6 +995,55 @@ pub(crate) struct Cops<'a> {
     // Mirrors `ut_call_child`/`mlbl_call_child`; kept as its own field per
     // this file's one-field-per-cop convention.
     pub(crate) isc_send_child: HashSet<usize>,
+    // Style/Alias: nearest-enclosing-scope stack for `scope_type` (rubocop's
+    // ancestor walk stopping at the first `class`/`module` (0 = :lexical),
+    // `def`/`defs`/block-or-lambda-not-instance_eval (1 = :dynamic), or an
+    // `instance_eval` block (2 = :instance_eval)). Pushed by
+    // `visit_class_node`/`visit_module_node` (0), `visit_def_node` (1,
+    // regardless of receiver — defs counts as :dynamic same as def),
+    // `visit_lambda_node` (1 — a stabby lambda is a "block whose send is
+    // `lambda`", never instance_eval), and `visit_block_node` (1 or 2, from
+    // `alias_pending_instance_eval`). Nodes that don't match any of these
+    // (if/begin/`class << self`/...) push nothing, so the climb transparently
+    // passes through them — mirrors rubocop's `case parent.type` falling
+    // through unmatched types. Empty stack == top level == :lexical.
+    pub(crate) alias_scope_stack: Vec<u8>,
+    // Style/Alias: nearest-enclosing class-or-module stack for
+    // `lexical_scope_type` (rubocop's `node.each_ancestor(:class,
+    // :module).first` — unlike `scope_type` above, this ancestor search
+    // passes straight through `def`/block/lambda frames, only stopping at an
+    // actual `class`/`module`). `true` = class, `false` = module; empty ==
+    // top level. Pushed only by `visit_class_node`/`visit_module_node`.
+    pub(crate) alias_cm_stack: Vec<bool>,
+    // Style/Alias: count of enclosing PLAIN `def` nodes (receiver-less —
+    // whitequark's `:def`, NOT `:defs`) — rubocop's `each_ancestor(:def)`
+    // guard in `alias_method_possible?`. Only a regular instance-method body
+    // blocks the `alias` -> `alias_method` correction (self would be the
+    // instance, not the class, at runtime); a singleton `def self.foo`/`def
+    // obj.foo` body does not increment this.
+    pub(crate) alias_def_depth: usize,
+    // Style/Alias: set by `visit_call_node` right before descending into a
+    // block it owns (`self.visit(&b)`) — whether THIS call's method name is
+    // `instance_eval`, for the immediately following `visit_block_node` to
+    // push the right `alias_scope_stack` entry. `None` when the descent
+    // wasn't reached that way (mirrors `nle_pending`/`ms_pending_block`).
+    pub(crate) alias_pending_instance_eval: Option<bool>,
+    // Style/Alias: start offsets of nodes that are a direct positional
+    // ARGUMENT of an enclosing NON-safe-navigation call — rubocop's
+    // `node.argument?` (`parent&.send_type? && parent.arguments.include?
+    // (self)`). Used by `alias_method_value_used?` to skip `alias_method`
+    // calls whose return value feeds another call (`public alias_method
+    // :a, :b`). Populated eagerly in `visit_call_node`'s argument loop.
+    pub(crate) alias_arg_offsets: HashSet<usize>,
+    // Style/Alias: start offsets of `ConstantWriteNode` RHS values — rubocop's
+    // `node.parent&.assignment?` guard in `alias_method_value_used?`
+    // (`NAME = alias_method :a, :b`). Populated eagerly in
+    // `visit_constant_write_node` before descending. Other assignment
+    // flavors (ivar/cvar/gvar/lvar, op-assign, multiple-assignment) as the
+    // direct RHS of an `alias_method` call aren't covered — untested by the
+    // fixture and vanishingly rare (`alias_method`'s return value is a
+    // symbol, not normally something worth assigning).
+    pub(crate) alias_value_offsets: HashSet<usize>,
     // Style/RedundantInterpolation: start offsets of `InterpolatedStringNode`s
     // that are a direct PART of an implicit-concatenation wrapper (an outer
     // `InterpolatedStringNode` with no opening/closing quotes of its own,
@@ -1557,6 +1606,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
         let v = node.value();
+        // Style/Alias's `alias_method_value_used?`: `node.parent&.assignment?`
+        // — `NAME = alias_method :a, :b`.
+        self.alias_value_offsets.insert(v.location().start_offset());
         self.check_ascii_constant_write(node);
         self.check_constant_name(node.name().as_slice(), node.name_loc().start_offset(), Some(&v));
         self.check_self_assignment_const(node.location().start_offset(), node.name().as_slice(), &v);
@@ -2365,6 +2417,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // line is the block's own delimiter (`end` or `}`).
         let block_end_line = self.idx.loc(node.closing_loc().start_offset()).0;
         self.se_ancestor_end_lines.push(block_end_line);
+        // Style/Alias's `scope_type`: this block is `:instance_eval` iff the
+        // owning call (set right before `visit_call_node` descended into us)
+        // is named `instance_eval`; otherwise it's `:dynamic` like any other
+        // block. `None` (unreached via that path) defaults to `:dynamic`.
+        let alias_instance_eval = self.alias_pending_instance_eval.take().unwrap_or(false);
+        self.alias_scope_stack.push(if alias_instance_eval { 2 } else { 1 });
         if let Some(params) = node.parameters() {
             self.visit(&params);
         }
@@ -2375,6 +2433,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
             self.visit(&body);
         }
+        self.alias_scope_stack.pop();
         self.se_ancestor_end_lines.pop();
         self.rs_scope_stack.pop();
         self.rs_block_stack.pop();
@@ -2746,7 +2805,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ms_scope_depth += 1;
         // Default walk — covers the superclass expression too, not just the body.
         self.class_module_depth += 1;
+        self.alias_scope_stack.push(0);
+        self.alias_cm_stack.push(true);
         ruby_prism::visit_class_node(self, node);
+        self.alias_cm_stack.pop();
+        self.alias_scope_stack.pop();
         self.class_module_depth -= 1;
         self.ms_scope_depth -= 1;
         self.ms_class_stack.pop();
@@ -2782,7 +2845,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.style_attr_custom_method_stack.push(has_custom_attr);
         self.class_module_depth += 1;
         self.ms_scope_depth += 1;
+        self.alias_scope_stack.push(0);
+        self.alias_cm_stack.push(false);
         ruby_prism::visit_module_node(self, node);
+        self.alias_cm_stack.pop();
+        self.alias_scope_stack.pop();
         self.ms_scope_depth -= 1;
         self.class_module_depth -= 1;
         self.style_attr_custom_method_stack.pop();
@@ -2883,7 +2950,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Style/ExplicitBlockArgument: this def's precomputed facts (block
         // name, signature edit, zsuper arg texts) — see `EbaDefInfo`'s doc.
         self.eba_def_stack.push(style::eba_build_def_info(self.src, node));
+        self.alias_scope_stack.push(1);
+        let alias_plain_def = node.receiver().is_none();
+        if alias_plain_def {
+            self.alias_def_depth += 1;
+        }
         ruby_prism::visit_def_node(self, node);
+        if alias_plain_def {
+            self.alias_def_depth -= 1;
+        }
+        self.alias_scope_stack.pop();
         self.eba_def_stack.pop();
         self.def_name_stack.pop();
         self.nle_stack.pop();
@@ -2924,7 +3000,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Lint/MissingSuper: a stabby lambda is an `any_block` ancestor too
         // (same rewrite noted above) but is never `Class.new(x)`-shaped.
         self.ms_block_stack.push(None);
+        // Style/Alias's `scope_type`: same rewrite as above — a stabby lambda
+        // is a `:block` whose method is `lambda`, never `instance_eval`.
+        self.alias_scope_stack.push(1);
         ruby_prism::visit_lambda_node(self, node);
+        self.alias_scope_stack.pop();
         self.ms_block_stack.pop();
         self.nle_stack.pop();
         self.usage_block_depth -= 1;
@@ -3028,6 +3108,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_alias_method_node(&mut self, node: &ruby_prism::AliasMethodNode<'pr>) {
         self.check_method_name_alias(node);
+        self.check_alias(node);
         ruby_prism::visit_alias_method_node(self, node);
     }
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
@@ -3116,6 +3197,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.check_method_name_macros(node);
         self.check_predicate_prefix_dynamic(node);
+        self.check_alias_method(node);
         self.check_colon_method_call(node);
         self.check_deprecated_class_methods(node);
         self.check_marshal_load(node);
@@ -3275,6 +3357,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Lint/ImplicitStringConcatenation: same `parent&.send_type?` guard as
         // `ut_track` — see `isc_send_child`.
         let isc_track = !node.is_safe_navigation() && self.on("Lint/ImplicitStringConcatenation");
+        // Style/Alias's `alias_method_value_used?`: `node.argument?` — same
+        // `parent&.send_type?` (non-safe-nav) guard as `isc_track` above.
+        let alias_track = !node.is_safe_navigation() && self.on("Style/Alias");
         // Style/MultilineTernaryOperator: a ternary that's this call's
         // receiver or (positional) argument has a `:send`/`:csend` parent —
         // `SINGLE_LINE_TYPES`, unless the call itself is an assignment method
@@ -3382,6 +3467,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 if isc_track {
                     self.isc_send_child.insert(arg.location().start_offset());
                 }
+                if alias_track {
+                    self.alias_arg_offsets.insert(arg.location().start_offset());
+                }
                 self.mto_note_child(&arg, mto_call_start, !mto_is_assign_method);
                 self.visit(&arg);
             }
@@ -3415,6 +3503,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 // Style/ExplicitBlockArgument: this call's own shape — see
                 // the `eba_pending` field doc.
                 self.eba_pending = Some(style::eba_call_owner(node));
+                // Style/Alias's `scope_type`: `parent.method?(:instance_eval)`
+                // for the block we're about to descend into.
+                self.alias_pending_instance_eval = Some(node.name().as_slice() == b"instance_eval");
             }
             // Consumed by the `visit_block_node` call this triggers below
             // (`&:sym` block-pass args aren't block nodes, so this is false
@@ -3631,6 +3722,12 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         chi_heredoc_ctx: HashMap::new(),
         isc_array_child: HashSet::new(),
         isc_send_child: HashSet::new(),
+        alias_scope_stack: Vec::new(),
+        alias_cm_stack: Vec::new(),
+        alias_def_depth: 0,
+        alias_pending_instance_eval: None,
+        alias_arg_offsets: HashSet::new(),
+        alias_value_offsets: HashSet::new(),
         ri_concat_child: HashSet::new(),
         ri_percent_array_child: HashSet::new(),
         interpolated_node_depth: 0,

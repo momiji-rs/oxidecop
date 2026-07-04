@@ -16801,3 +16801,153 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/Alias — `EnforcedStyle: prefer_alias` (default) flags
+    /// `alias_method` calls that could be an `alias` keyword statement
+    /// instead (and `alias :sym :sym` symbol-argument uses); `EnforcedStyle:
+    /// prefer_alias_method` flags every `alias` keyword use. Ported from
+    /// `RuboCop::Cop::Style::Alias`'s `on_send`/`on_alias`.
+    ///
+    /// Scope tracking mirrors upstream's `scope_type`/`lexical_scope_type`
+    /// ancestor walks via two dedicated stacks maintained in `mod.rs`'s
+    /// visitors (see `alias_scope_stack`/`alias_cm_stack`'s field docs) plus
+    /// `alias_def_depth` (upstream's `each_ancestor(:def).none?` — ONLY a
+    /// plain, receiver-less `def` blocks the `alias` keyword's use; a
+    /// singleton `def self.foo`/`def obj.foo` does not).
+    ///
+    /// `alias_method_value_used?` (upstream: `node.argument? ||
+    /// node.parent&.assignment?`) is approximated via `alias_arg_offsets`
+    /// (any positional argument of a non-safe-nav call) and
+    /// `alias_value_offsets` (currently just `ConstantWriteNode` RHS values —
+    /// the only shape the fixture exercises; see those fields' docs).
+    fn alias_scope_type(&self) -> u8 {
+        self.alias_scope_stack.last().copied().unwrap_or(0)
+    }
+    fn alias_lexical_scope_type(&self) -> &'static str {
+        match self.alias_cm_stack.last() {
+            None => "at the top level",
+            Some(true) => "in a class body",
+            Some(false) => "in a module body",
+        }
+    }
+    /// upstream's `identifier`: a plain (non-interpolated) symbol argument
+    /// renders as `:name` (`node.children.first` — the unescaped symbol
+    /// value, colon prepended unconditionally, so a bareword `foo` and a
+    /// quoted `:foo`/`:'foo'` all normalize to `:foo`); anything else
+    /// (bareword handled the same way here, since its "unescaped value" IS
+    /// its source; an interpolated symbol / dsym) renders as its raw source,
+    /// unchanged.
+    fn alias_identifier(&self, node: &ruby_prism::Node) -> Vec<u8> {
+        if let Some(sym) = node.as_symbol_node() {
+            let mut out = vec![b':'];
+            out.extend_from_slice(sym.unescaped());
+            out
+        } else {
+            self.node_src(node).to_vec()
+        }
+    }
+    /// upstream's `bareword?`: a plain symbol node written WITHOUT a leading
+    /// colon (`opening_loc` absent) is a bareword; anything that ISN'T a
+    /// plain symbol node at all (namely an interpolated dsym — the only other
+    /// shape `alias`'s grammar accepts) counts as a bareword too (exempt from
+    /// the symbol-args offense), per upstream's `dsym_type?` half of the OR.
+    fn alias_bareword(&self, node: &ruby_prism::Node) -> bool {
+        match node.as_symbol_node() {
+            Some(sym) => sym.opening_loc().is_none(),
+            None => true,
+        }
+    }
+    /// `on_send`: `alias_method` -> `alias` (EnforcedStyle: prefer_alias).
+    pub(crate) fn check_alias_method(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/Alias";
+        if !self.on(COP) {
+            return;
+        }
+        // `command?(:alias_method)`: no explicit receiver, right name.
+        if node.receiver().is_some() || node.name().as_slice() != b"alias_method" {
+            return;
+        }
+        if self.cfg.enforced_style(COP) != "prefer_alias" {
+            return;
+        }
+        // `alias_keyword_possible?`: not in dynamic scope, and every
+        // argument is a plain (non-interpolated) symbol literal.
+        if self.alias_scope_type() == 1 {
+            return;
+        }
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.len() != 2 || !args.iter().all(|a| a.as_symbol_node().is_some()) {
+            return;
+        }
+        // `alias_method_value_used?`: the call's return value feeds another
+        // call (`public alias_method :a, :b`) or an assignment RHS.
+        let start = node.location().start_offset();
+        if self.alias_arg_offsets.contains(&start) || self.alias_value_offsets.contains(&start) {
+            return;
+        }
+        let Some(sel) = node.message_loc() else { return };
+        let lexical = self.alias_lexical_scope_type();
+        self.push(sel.start_offset(), COP, true, format!("Use `alias` instead of `alias_method` {lexical}."));
+        let new_id = self.alias_identifier(&args[0]);
+        let old_id = self.alias_identifier(&args[1]);
+        let mut replacement = b"alias ".to_vec();
+        replacement.extend_from_slice(&new_id);
+        replacement.push(b' ');
+        replacement.extend_from_slice(&old_id);
+        let l = node.location();
+        self.fixes.push((l.start_offset(), l.end_offset(), replacement));
+    }
+    /// `on_alias`: the `alias` keyword, per `EnforcedStyle` and scope.
+    pub(crate) fn check_alias(&mut self, node: &ruby_prism::AliasMethodNode) {
+        const COP: &str = "Style/Alias";
+        if !self.on(COP) {
+            return;
+        }
+        // `alias_method_possible?`: gvar aliases never reach this hook (a
+        // distinct `AliasGlobalVariableNode`, exempt unconditionally); not
+        // inside an `instance_eval` block; not inside a plain `def` body.
+        if self.alias_scope_type() == 2 || self.alias_def_depth > 0 {
+            return;
+        }
+        let dynamic = self.alias_scope_type() == 1;
+        let prefer_alias_method = self.cfg.enforced_style(COP) == "prefer_alias_method";
+        let new_name = node.new_name();
+        let old_name = node.old_name();
+        if dynamic || prefer_alias_method {
+            let kw = node.keyword_loc();
+            self.push(kw.start_offset(), COP, true, "Use `alias_method` instead of `alias`.");
+            let new_id = self.alias_identifier(&new_name);
+            let old_id = self.alias_identifier(&old_name);
+            let mut replacement = b"alias_method ".to_vec();
+            replacement.extend_from_slice(&new_id);
+            replacement.extend_from_slice(b", ");
+            replacement.extend_from_slice(&old_id);
+            let l = node.location();
+            self.fixes.push((l.start_offset(), l.end_offset(), replacement));
+        } else if !self.alias_bareword(&new_name) && !self.alias_bareword(&old_name) {
+            let existing = format!(
+                "{} {}",
+                String::from_utf8_lossy(self.node_src(&new_name)),
+                String::from_utf8_lossy(self.node_src(&old_name)),
+            );
+            let preferred = format!(
+                "{} {}",
+                String::from_utf8_lossy(&self.node_src(&new_name)[1..]),
+                String::from_utf8_lossy(&self.node_src(&old_name)[1..]),
+            );
+            self.push(
+                new_name.location().start_offset(),
+                COP,
+                true,
+                format!("Use `alias {preferred}` instead of `alias {existing}`."),
+            );
+            let nl = new_name.location();
+            let ol = old_name.location();
+            self.fixes.push((nl.start_offset(), nl.start_offset() + 1, Vec::new()));
+            self.fixes.push((ol.start_offset(), ol.start_offset() + 1, Vec::new()));
+        }
+    }
+}
