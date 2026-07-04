@@ -11823,3 +11823,386 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// ===========================================================================
+// Layout/ElseAlignment — ports rubocop's `EndKeywordAlignment#variable_
+// alignment?`/`#line_break_before_keyword?` (via the cop's own `check_
+// assignment`), `Alignment#configured_indentation_width`-free direct column
+// math (this cop overrides `Alignment#check_alignment` itself, so the mixin's
+// own `each_bad_alignment`/`display_column` are never reached), and
+// `CheckAssignment`, applied to `if`/`unless`/`case`/`case-in`/rescue's
+// `else` (and an `if`'s `elsif`) keyword.
+//
+// rubocop's own node model folds `elsif` into nested `if` nodes (an `elsif`
+// IS an `if`-type node, chained via the enclosing `if`'s `else_branch`) and
+// funnels EVERY level through the SAME `on_if` entry point, guarded by
+// `ignored_node?`/`ignore_node` so a chain is only ever walked once, from
+// its own head. Prism gives an `elsif` its own `IfNode` too (chained via
+// `IfNode#subsequent`, alongside a terminal `ElseNode` for a real `else`),
+// visited independently by the normal traversal exactly like whitequark's
+// nested shape — so the same one-walk-per-chain discipline applies: the
+// chain HEAD (a real `if`/`unless`, not an `elsif`) walks its entire
+// `subsequent` chain in one recursive sweep; the entry hook for every OTHER
+// `IfNode` (`if_keyword_loc` reads `elsif`) is always a no-op, since it will
+// already have been visited by the head's own walk before the traversal
+// engine reaches it directly (pre-order: the head's own hook runs, and
+// completes its whole recursive walk, before `ruby_prism::visit_if_node`
+// auto-recurses into its `subsequent` child).
+//
+// `CheckAssignment` additionally needs real cross-hook coordination (an
+// assignment's LHS/RHS can resolve to a DIFFERENT base than the node's own
+// keyword — `EnforcedStyleAlignWith: variable` aligns to the assignment's
+// left-hand side instead), so `ea_ignored` (keyed by the `if`/`unless`
+// node's own start offset) suppresses the natural traversal's later,
+// keyword-based re-check once `check_else_alignment_assignment` has already
+// walked that same node with its resolved base.
+struct EaBase {
+    col: i64,
+    word: String,
+}
+
+/// `base_range.source[/^\S*/]`: the leading non-whitespace run of `bytes`,
+/// UTF-8-decoded (lossily, though a mid-run split can't happen — the run
+/// itself only ever contains identifier/operator/keyword characters).
+fn ea_first_word(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| b.is_ascii_whitespace()).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+impl<'a> super::Cops<'a> {
+    /// `RangeHelp#effective_column`: the 0-based CHARACTER column of `off` on
+    /// its own line (matching `Range#column`, not byte offset), with the
+    /// upstream BOM correction — a byte-order mark is a single CHARACTER (one
+    /// codepoint, however many bytes it takes to encode) sitting invisibly at
+    /// the very start of line 1, which `effective_column` hides from every
+    /// line-1 column by subtracting 1.
+    fn ea_effective_col(&self, off: usize) -> i64 {
+        let (line, _) = self.idx.loc(off);
+        let line_start = self.idx.starts[line - 1];
+        let prefix = &self.src[line_start..off];
+        let mut col =
+            if prefix.is_ascii() { prefix.len() as i64 } else { String::from_utf8_lossy(prefix).chars().count() as i64 };
+        if line == 1 && self.src.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            col -= 1;
+        }
+        col
+    }
+
+    /// `Util#begins_its_line?`: nothing but whitespace precedes `off` on its
+    /// own physical line.
+    fn ea_begins_its_line(&self, off: usize) -> bool {
+        let (line, _) = self.idx.loc(off);
+        let line_start = self.idx.starts[line - 1];
+        self.src[line_start..off].iter().all(|b| b.is_ascii_whitespace())
+    }
+
+    /// A `base_range` built directly from a KEYWORD location (`if`/`unless`/
+    /// `begin`/`def`/`when`/`in`): the keyword's own text is already a single
+    /// word, and its start IS the base range's start (a location always
+    /// begins at its own first token).
+    fn ea_kw_base(&self, loc: ruby_prism::Location) -> EaBase {
+        EaBase { col: self.ea_effective_col(loc.start_offset()), word: String::from_utf8_lossy(loc.as_slice()).into_owned() }
+    }
+
+    /// The cop's own `check_alignment` (NOT `Alignment#check_alignment` —
+    /// this cop's method of the same name, defined directly on the class,
+    /// shadows the mixin's): `column_offset_between(base_range, else_range)`
+    /// via `RangeHelp`, an `add_offense` with the exact byte-for-byte message
+    /// format, and the `AlignmentCorrector.correct` autocorrect.
+    fn ea_check_alignment(&mut self, cop: &'static str, base: &EaBase, else_start: usize, else_end: usize) {
+        if !self.ea_begins_its_line(else_start) {
+            return;
+        }
+        let else_col = self.ea_effective_col(else_start);
+        let delta = base.col - else_col;
+        if delta == 0 {
+            return;
+        }
+        let else_word = String::from_utf8_lossy(&self.src[else_start..else_end]).into_owned();
+        let msg = format!("Align `{else_word}` with `{}`.", base.word);
+        self.push(else_start, cop, true, msg);
+        self.ea_autocorrect(else_start, delta);
+    }
+
+    /// `AlignmentCorrector.correct` for a single-line `node` (the `else`/
+    /// `elsif` keyword's own range is always one line): `using_tabs?` bails
+    /// out of autocorrection entirely (offense still reported); otherwise a
+    /// positive delta inserts `delta` spaces immediately before the keyword,
+    /// and a negative delta removes the `abs(delta)` bytes immediately before
+    /// it — but ONLY when those bytes are pure space/tab (silently skipping
+    /// the fix, same as upstream, when they're not).
+    fn ea_autocorrect(&mut self, else_start: usize, delta: i64) {
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            return;
+        }
+        if delta > 0 {
+            self.fixes.push((else_start, else_start, vec![b' '; delta as usize]));
+        } else {
+            let n = (-delta) as usize;
+            if else_start >= n && self.src[else_start - n..else_start].iter().all(|&b| b == b' ' || b == b'\t') {
+                self.fixes.push((else_start - n, else_start, Vec::new()));
+            }
+        }
+    }
+
+    /// Entry point for EVERY visited `IfNode` (both a genuine chain head and
+    /// every `elsif` link) — see the section doc for why an `elsif` link is
+    /// always a no-op here, and `ea_ignored` for the `CheckAssignment`
+    /// dedup.
+    pub(crate) fn check_else_alignment_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Layout/ElseAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(kw) = node.if_keyword_loc() else { return }; // a `?:` ternary
+        if kw.as_slice() == b"elsif" {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.ea_ignored.contains(&start) {
+            return;
+        }
+        self.ea_on_if(COP, node, None);
+    }
+
+    /// `on_if`: resolves the default (keyword-based) base when none was
+    /// supplied by `CheckAssignment`, then walks the whole `elsif`/`else`
+    /// chain. A `?:` ternary (no `if_keyword_loc`) mirrors whitequark's
+    /// `node.else?` being unconditionally false for one (a ternary has no
+    /// `:else` location at all) — matters when `base` DOES arrive non-`None`
+    /// here, straight from `check_else_alignment_assignment`'s `rhs.if_type?`
+    /// (ternaries count as `if_type?` too), which must still no-op.
+    fn ea_on_if(&mut self, cop: &'static str, node: &ruby_prism::IfNode, base: Option<EaBase>) {
+        let Some(kw) = node.if_keyword_loc() else { return };
+        let base = base.unwrap_or_else(|| self.ea_kw_base(kw));
+        self.ea_walk_if_chain(cop, node, &base);
+    }
+
+    /// `check_nested`: checks `node`'s own `else`/`elsif`, then (only for a
+    /// genuine `elsif` subsequent) recurses one level further — covering an
+    /// arbitrarily long `elsif` chain since each recursion is itself another
+    /// call to this same function.
+    fn ea_walk_if_chain(&mut self, cop: &'static str, node: &ruby_prism::IfNode, base: &EaBase) {
+        let Some(subsequent) = node.subsequent() else { return };
+        if let Some(elsif) = subsequent.as_if_node() {
+            let Some(kw) = elsif.if_keyword_loc() else { return };
+            self.ea_check_alignment(cop, base, kw.start_offset(), kw.end_offset());
+            if kw.as_slice() == b"elsif" {
+                self.ea_walk_if_chain(cop, &elsif, base);
+            }
+        } else if let Some(els) = subsequent.as_else_node() {
+            let kw = els.else_keyword_loc();
+            self.ea_check_alignment(cop, base, kw.start_offset(), kw.end_offset());
+        }
+    }
+
+    /// Entry point for `UnlessNode` — `unless` can never chain an `elsif`,
+    /// so this is just the single-level version of `ea_on_if`.
+    pub(crate) fn check_else_alignment_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Layout/ElseAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.ea_ignored.contains(&start) {
+            return;
+        }
+        self.ea_on_unless(COP, node, None);
+    }
+
+    fn ea_on_unless(&mut self, cop: &'static str, node: &ruby_prism::UnlessNode, base: Option<EaBase>) {
+        let base = base.unwrap_or_else(|| self.ea_kw_base(node.keyword_loc()));
+        let Some(els) = node.else_clause() else { return };
+        let kw = els.else_keyword_loc();
+        self.ea_check_alignment(cop, &base, kw.start_offset(), kw.end_offset());
+    }
+
+    /// `on_case`: base is the LAST `when` branch's own keyword.
+    pub(crate) fn check_else_alignment_case(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Layout/ElseAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(els) = node.else_clause() else { return };
+        let Some(last_when) = node.conditions().iter().last().and_then(|c| c.as_when_node()) else { return };
+        let base = self.ea_kw_base(last_when.keyword_loc());
+        let kw = els.else_keyword_loc();
+        self.ea_check_alignment(COP, &base, kw.start_offset(), kw.end_offset());
+    }
+
+    /// `on_case_match`: base is the LAST `in` branch's own keyword.
+    pub(crate) fn check_else_alignment_case_match(&mut self, node: &ruby_prism::CaseMatchNode) {
+        const COP: &str = "Layout/ElseAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(els) = node.else_clause() else { return };
+        let Some(last_in) = node.conditions().iter().last().and_then(|c| c.as_in_node()) else { return };
+        let base = self.ea_kw_base(last_in.in_loc());
+        let kw = els.else_keyword_loc();
+        self.ea_check_alignment(COP, &base, kw.start_offset(), kw.end_offset());
+    }
+
+    /// `on_rescue` + `base_range_of_rescue`'s `:def`/`:defs` branch: prism
+    /// synthesizes an implicit `BeginNode` for a `def`'s rescue/else/ensure
+    /// body (spanning through the `def`'s own `end` — never treat its END as
+    /// "content end" elsewhere, but irrelevant here, only the `else` keyword
+    /// matters).
+    pub(crate) fn check_else_alignment_rescue_def(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Layout/ElseAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(begin) = node.body().and_then(|b| b.as_begin_node()) else { return };
+        let Some(els) = begin.else_clause() else { return };
+        let base = self.ea_base_for_method_definition(node);
+        let kw = els.else_keyword_loc();
+        self.ea_check_alignment(COP, &base, kw.start_offset(), kw.end_offset());
+    }
+
+    /// `base_for_method_definition`: `private def foo; end`'s `private`
+    /// selector (`ea_def_modifier`, populated by `visit_call_node`) when this
+    /// `def` is (one of) a bare call's arguments; otherwise the `def` keyword
+    /// itself.
+    fn ea_base_for_method_definition(&self, node: &ruby_prism::DefNode) -> EaBase {
+        let def_start = node.location().start_offset();
+        if let Some(&(sel_start, sel_end)) = self.ea_def_modifier.get(&def_start) {
+            return EaBase { col: self.ea_effective_col(sel_start), word: ea_first_word(&self.src[sel_start..sel_end]) };
+        }
+        self.ea_kw_base(node.def_keyword_loc())
+    }
+
+    /// `on_rescue` + `base_range_of_rescue`'s `:kwbegin` branch: only an
+    /// EXPLICIT `begin...end` reaches here (`begin_keyword_loc` absent for
+    /// the implicit `def`/block-body `BeginNode` prism synthesizes) — base is
+    /// the `begin` keyword itself.
+    pub(crate) fn check_else_alignment_rescue_kwbegin(&mut self, node: &ruby_prism::BeginNode) {
+        const COP: &str = "Layout/ElseAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(begin_loc) = node.begin_keyword_loc() else { return };
+        let Some(els) = node.else_clause() else { return };
+        let base = self.ea_kw_base(begin_loc);
+        let kw = els.else_keyword_loc();
+        self.ea_check_alignment(COP, &base, kw.start_offset(), kw.end_offset());
+    }
+
+    /// `on_rescue` + `base_range_of_rescue`'s `:block`/`:numblock`/`:itblock`
+    /// branch: prism unifies all three under one `CallNode` + `BlockNode`
+    /// pair (no separate numbered/`it`-param node types), so a single entry
+    /// point covers all of upstream's three cases.
+    pub(crate) fn check_else_alignment_rescue_block(
+        &mut self,
+        call: &ruby_prism::CallNode,
+        block: &ruby_prism::BlockNode,
+    ) {
+        const COP: &str = "Layout/ElseAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(begin) = block.body().and_then(|b| b.as_begin_node()) else { return };
+        let Some(els) = begin.else_clause() else { return };
+        let base = self.ea_base_for_block(call, block);
+        let kw = els.else_keyword_loc();
+        self.ea_check_alignment(COP, &base, kw.start_offset(), kw.end_offset());
+    }
+
+    /// `assignment_node(parent)` + the `same_line?` check: an enclosing
+    /// assignment whose value is directly this block's owning call, ONLY
+    /// when that assignment starts on the SAME line as the block itself
+    /// (`ea_block_assignment`, populated by the `assignment_write!`-family
+    /// macros + `visit_multi_write_node`); otherwise `parent.send_node.
+    /// source_range` — the call's own span, EXCLUDING its trailing block
+    /// (prism's `CallNode#location` spans through the block's own closer —
+    /// the block-range prism-vs-whitequark trap — so the "send-only" end is
+    /// recomputed here: the closing paren of an explicit argument list, else
+    /// the message/selector's own end).
+    fn ea_base_for_block(&self, call: &ruby_prism::CallNode, block: &ruby_prism::BlockNode) -> EaBase {
+        let block_start = block.location().start_offset();
+        if let Some(&(a_start, a_end, a_line)) = self.ea_block_assignment.get(&block_start) {
+            let block_line = self.idx.loc(block_start).0;
+            if a_line == block_line {
+                return EaBase { col: self.ea_effective_col(a_start), word: ea_first_word(&self.src[a_start..a_end]) };
+            }
+        }
+        let call_start = call.location().start_offset();
+        let send_end = call
+            .closing_loc()
+            .map(|l| l.end_offset())
+            .or_else(|| call.message_loc().map(|l| l.end_offset()))
+            .unwrap_or_else(|| call.location().end_offset());
+        EaBase { col: self.ea_effective_col(call_start), word: ea_first_word(&self.src[call_start..send_end]) }
+    }
+
+    /// `assignment_node`'s populate side: when a write node's OWN value is
+    /// directly a call with a literal block, remember (this write node's own
+    /// span + first line) keyed by the block's start offset, for
+    /// `ea_base_for_block` to look up once it reaches that block's own
+    /// rescue/else body (visited later, deeper in the same top-down pass).
+    pub(crate) fn ea_note_block_assignment(&mut self, assign_start: usize, assign_end: usize, value: &ruby_prism::Node) {
+        if !self.on("Layout/ElseAlignment") {
+            return;
+        }
+        let Some(call) = value.as_call_node() else { return };
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return };
+        let assign_line = self.idx.loc(assign_start).0;
+        self.ea_block_assignment.insert(block.location().start_offset(), (assign_start, assign_end, assign_line));
+    }
+
+    /// `CheckAssignment#on_lvasgn` (aliased to every write-node type) and
+    /// `#on_send` (any `CallNode` — including, but NOT limited to, a setter/
+    /// index assignment like `foo.bar = ...`/`foo[bar] = ...`, themselves
+    /// plain `CallNode`s here with no distinct "write" node type; a
+    /// receiverless `foo(if ...)` reaches here too, verified against a live
+    /// `rubocop` run — upstream's guard never restricts to genuine
+    /// assignment-flavored sends) + `#check_assignment`: `node_start`/
+    /// `node_end` is the assignment/call's own full span (for the `variable`
+    /// style's message word AND column — both always coincide with the
+    /// span's own start, per `Node#source_range` always beginning at its
+    /// first token); `rhs` is `extract_rhs`'s result (a write node's `value`,
+    /// or a call's `last_argument`).
+    pub(crate) fn check_else_alignment_assignment(&mut self, node_start: usize, node_end: usize, rhs: ruby_prism::Node) {
+        const COP: &str = "Layout/ElseAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        // `first_part_of_call_chain`: climbs a RECEIVER chain (`if...end.abc
+        // .join("")`) down to the underlying if/unless — shared with
+        // `Layout/IndentationWidth`'s identical port of the same `Util`
+        // helper.
+        let Some(unwrapped) = iw_first_part_of_call_chain(Some(rhs)) else { return };
+        let iff = unwrapped.as_if_node();
+        let unl = unwrapped.as_unless_node();
+        if iff.is_none() && unl.is_none() {
+            return; // `return unless rhs.if_type?` (checked AFTER computing
+                     // base upstream, but base is pure/side-effect-free, so
+                     // reordering the guard first is equivalent and cheaper)
+        }
+        let style = self.cfg.get("Layout/EndAlignment", "EnforcedStyleAlignWith").unwrap_or("keyword");
+        let node_line = self.idx.loc(node_start).0;
+        let rhs_start = unwrapped.location().start_offset();
+        let rhs_line = self.idx.loc(rhs_start).0;
+        // `variable_alignment?` + `line_break_before_keyword?`.
+        let variable_alignment = style != "keyword" && !(rhs_line > node_line);
+        let base = if variable_alignment {
+            EaBase { col: self.ea_effective_col(node_start), word: ea_first_word(&self.src[node_start..node_end]) }
+        } else {
+            EaBase {
+                col: self.ea_effective_col(rhs_start),
+                word: ea_first_word(&self.src[rhs_start..unwrapped.location().end_offset()]),
+            }
+        };
+        // `check_nested(rhs, base)` + `ignore_node(rhs)` — marked regardless
+        // of whether `unwrapped` turns out to be a no-op ternary (matches
+        // upstream marking `ignore_node` unconditionally once `if_type?`
+        // holds).
+        self.ea_ignored.insert(rhs_start);
+        if let Some(f) = iff {
+            self.ea_on_if(COP, &f, Some(base));
+        } else if let Some(u) = unl {
+            self.ea_on_unless(COP, &u, Some(base));
+        }
+    }
+}

@@ -389,7 +389,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
-    "Lint/ScriptPermission", "Migration/DepartmentName",
+    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment",
 ];
 
 impl Engine {
@@ -1996,6 +1996,27 @@ pub(crate) struct Cops<'a> {
     // x`) has no whitequark counterpart at all; its `receiver`/`arguments`
     // must attach directly to the `MatchWithLvasgn` frame.
     pub(crate) rp_pending_transparent_call: bool,
+    // Layout/ElseAlignment: start offsets of `if`/`unless` nodes already
+    // handled via `CheckAssignment`'s explicit `on_lvasgn`/`on_send`-style
+    // entry point (rubocop's `ignore_node`/`ignored_node?`) — skipped when
+    // the normal top-down traversal reaches that SAME node's own `on_if`/
+    // `on_unless` hook a second time with the default (keyword) base.
+    pub(crate) ea_ignored: HashSet<usize>,
+    // Layout/ElseAlignment: a `def`/`defs` node's own start offset -> the
+    // (start, end) byte range of the selector of a bare wrapping call, when
+    // this def is (one of) that call's arguments — rubocop's
+    // `base_for_method_definition`'s one-level `node.parent&.send_type?`
+    // check (`private def foo; end`). Populated eagerly in `visit_call_node`
+    // before descending into arguments.
+    pub(crate) ea_def_modifier: HashMap<usize, (usize, usize)>,
+    // Layout/ElseAlignment: a block node's own start offset -> the (start,
+    // end, first-line) of an enclosing assignment node whose value is
+    // directly this block's owning call — rubocop's `assignment_node`
+    // one-level-up check inside `base_range_of_rescue`'s `:block`/
+    // `:numblock`/`:itblock` branch. Populated eagerly by the
+    // `assignment_write!`-family macros and `visit_multi_write_node` before
+    // descending into the value.
+    pub(crate) ea_block_assignment: HashMap<usize, (usize, usize, usize)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2224,6 +2245,12 @@ macro_rules! assignment_write {
         $self.check_indentation_width_assignment(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
+        $self.ea_note_block_assignment($node.location().start_offset(), $node.location().end_offset(), &$node.value());
+        $self.check_else_alignment_assignment(
+            $node.location().start_offset(),
+            $node.location().end_offset(),
+            $node.value(),
+        );
     }};
 }
 macro_rules! assignment_operator_write {
@@ -2235,6 +2262,12 @@ macro_rules! assignment_operator_write {
         $self.check_indentation_width_assignment(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
+        $self.ea_note_block_assignment($node.location().start_offset(), $node.location().end_offset(), &$node.value());
+        $self.check_else_alignment_assignment(
+            $node.location().start_offset(),
+            $node.location().end_offset(),
+            $node.value(),
+        );
     }};
 }
 macro_rules! assignment_path_write {
@@ -2245,6 +2278,12 @@ macro_rules! assignment_path_write {
         $self.check_indentation_width_assignment(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
+        $self.ea_note_block_assignment($node.location().start_offset(), $node.location().end_offset(), &$node.value());
+        $self.check_else_alignment_assignment(
+            $node.location().start_offset(),
+            $node.location().end_offset(),
+            $node.value(),
+        );
     }};
 }
 macro_rules! assignment_path_operator_write {
@@ -2255,6 +2294,12 @@ macro_rules! assignment_path_operator_write {
         $self.check_indentation_width_assignment(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
+        $self.ea_note_block_assignment($node.location().start_offset(), $node.location().end_offset(), &$node.value());
+        $self.check_else_alignment_assignment(
+            $node.location().start_offset(),
+            $node.location().end_offset(),
+            $node.value(),
+        );
     }};
 }
 
@@ -2697,6 +2742,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_multiline_ternary_operator(node);
         self.check_ternary_parentheses(node);
         self.check_else_layout_if(node);
+        self.check_else_alignment_if(node);
         self.check_assignment_in_condition(&node.predicate());
         self.check_indentation_width_if(node);
         self.check_negated_if(node);
@@ -2831,6 +2877,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.rsn_cond_pos.insert(node.predicate().location().start_offset());
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_else_layout_unless(node);
+        self.check_else_alignment_unless(node);
         // whitequark's parser has no distinct `unless` node type — `unless
         // cond` compiles to `(if cond nil body)`, so upstream's `on_if` (which
         // Lint/AssignmentInCondition aliases to `on_while`/`on_until`, but
@@ -3185,6 +3232,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.assignment_indentation_hook(lhs_start, op_end, node.value());
         self.check_indentation_width_assignment(lhs_start, node.value());
+        self.ea_note_block_assignment(node.location().start_offset(), node.location().end_offset(), &node.value());
+        self.check_else_alignment_assignment(node.location().start_offset(), node.location().end_offset(), node.value());
         self.check_self_assignment_masgn(node);
         self.check_trailing_underscore_variable(node);
         // Style/RedundantSelf: only plain local-var masgn targets carry a
@@ -3324,6 +3373,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_float_comparison_case(node);
         self.check_empty_when(node);
         self.check_case_indentation(node);
+        self.check_else_alignment_case(node);
         self.check_indentation_width_case(node);
         self.check_empty_else_case(node);
         self.check_hash_like_case(node);
@@ -3350,6 +3400,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.rsn_cond_pos.insert(pred.location().start_offset());
         }
         self.check_case_match_indentation(node);
+        self.check_else_alignment_case_match(node);
         self.check_indentation_width_case_match(node);
         self.check_identical_conditional_branches_case_match(node);
         self.check_conditional_assignment_case_match(node);
@@ -4196,6 +4247,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_lines_around_begin_body(node);
         self.check_empty_lines_around_exception_handling_keywords_kwbegin(node);
         self.check_begin_end_alignment(node);
+        self.check_else_alignment_rescue_kwbegin(node);
         // Order matters for `other_offense_in_same_range?`: upstream's real
         // top-down traversal visits the OUTERMOST wrapper first — `kwbegin`
         // (whose own target, when a rescue/ensure clause is present, already
@@ -4780,6 +4832,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_optional_boolean_parameter(node);
         self.check_empty_lines_around_method_body(node);
         self.check_empty_lines_around_exception_handling_keywords_def(node);
+        self.check_else_alignment_rescue_def(node);
         self.check_indentation_width_def(node);
         self.check_disjunctive_assignment_in_constructor(node);
         self.check_useless_setter_call(node);
@@ -5147,6 +5200,32 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_or_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // Layout/ElseAlignment: `CheckAssignment#on_send` fires for EVERY
+        // call whose (call-chain-unwrapped) last argument is an `if`/
+        // `unless` — not just genuine setter/index assignments (`foo.bar =
+        // ...`/`foo[bar] = ...`, themselves plain `CallNode`s here, no
+        // distinct "write" node type) — see `check_else_alignment_assignment`'s
+        // doc. Also seeds `ea_def_modifier` (`private def foo; end`'s
+        // `base_for_method_definition`) for every argument that is directly
+        // a `def`/`defs` node, before descending into either.
+        if self.on("Layout/ElseAlignment") {
+            if let Some(args) = node.arguments() {
+                for arg in args.arguments().iter() {
+                    if let Some(def) = arg.as_def_node() {
+                        let sel = node.message_loc().unwrap_or_else(|| node.location());
+                        self.ea_def_modifier
+                            .insert(def.location().start_offset(), (sel.start_offset(), sel.end_offset()));
+                    }
+                }
+                if let Some(last) = args.arguments().iter().last() {
+                    self.check_else_alignment_assignment(
+                        node.location().start_offset(),
+                        node.location().end_offset(),
+                        last,
+                    );
+                }
+            }
+        }
         // Layout/HashAlignment: `on_send`/`on_csend`'s `ignore_hash_argument?`
         // and `autocorrect_incompatible_with_other_cops?` both key off THIS
         // call's own shape — see the `ha_ignored`/`ha_incompatible` field docs.
@@ -5725,6 +5804,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_metrics_complexity_define_method(node, &bn);
                 self.check_method_length_block(node, &bn);
                 self.check_empty_lines_around_exception_handling_keywords_block(node, &bn);
+                self.check_else_alignment_rescue_block(node, &bn);
                 self.check_indentation_width_block(node, &bn);
                 self.check_block_length(node, &bn);
                 self.check_next_block(node, &bn);
@@ -6138,6 +6218,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         dm_lvasgn_rhs: HashSet::new(),
         dm_pending_block: None,
         dm_pending_casgn_new_block: false,
+        ea_ignored: HashSet::new(),
+        ea_def_modifier: HashMap::new(),
+        ea_block_assignment: HashMap::new(),
     };
 
     let t = tick(&T_PREP, t);
