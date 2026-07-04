@@ -26493,3 +26493,250 @@ fn ta_accessor(kind: &'static str, method_name: &[u8]) -> Vec<u8> {
     out.extend_from_slice(trimmed);
     out
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/Lambda — `->` literal vs `lambda` method syntax, per
+    /// `EnforcedStyle`: `line_count_dependent` (default: single-line wants
+    /// `->`, multiline wants `lambda`), `lambda` (always `lambda`), `literal`
+    /// (always `->`).
+    ///
+    /// Ported from rubocop's `on_block`/`on_numblock`/`on_itblock` — all
+    /// three alias to the very same handler upstream, and collapse to one
+    /// concept here too: prism represents a numbered-param (`_1`) or
+    /// `it`-param stabby literal as a `LambdaNode` just like any other, and a
+    /// numbered-param/`it`-param `lambda { }` method call as an ordinary
+    /// `BlockNode` (see `visit_block_node`'s doc) — no separate visit needed.
+    /// Two prism entry points cover the two AST SHAPES instead:
+    ///   - `check_lambda_method`, from `visit_call_node`, for `lambda { }` /
+    ///     `lambda do ... end` (a `CallNode` + `BlockNode` pair).
+    ///   - `check_lambda_literal`, from `visit_lambda_node`, for a stabby
+    ///     `-> { }` / `->(x) do ... end` (its own `LambdaNode`).
+    ///
+    /// Upstream compares `node.send_node.source` byte-for-byte against the
+    /// literal strings `'->'`/`'lambda'` (`OFFENDING_SELECTORS`'s only two
+    /// possible values). Since a call with a receiver, explicit parens, or
+    /// arguments (`obj.lambda { }`, `lambda() { }`) has different selector
+    /// source text, it can never equal either constant, regardless of style
+    /// — so `node.lambda?`'s `send_node.method?(:lambda)` guard (which
+    /// ignores receiver entirely, a real upstream quirk) needs no separate
+    /// port: the exact-text compare in `check_lambda_method` already
+    /// subsumes it by requiring the call's own source (receiver through
+    /// arguments, excluding any block) to equal exactly `"lambda"`.
+    fn lambda_offending(style: &str, is_arrow: bool, multiline: bool) -> bool {
+        // OFFENDING_SELECTORS[:style][style][lines] collapsed: which
+        // selector kind offends for this style + multiline combination.
+        let offending_is_arrow = match style {
+            "lambda" => true,
+            "literal" => false,
+            _ => multiline, // line_count_dependent: multiline -> '->', single line -> 'lambda'
+        };
+        is_arrow == offending_is_arrow
+    }
+
+    /// `message`/`message_line_modifier`: `METHOD_MESSAGE`/`LITERAL_MESSAGE`
+    /// with the `%<modifier>s` interpolation filled in.
+    fn lambda_message(style: &str, is_arrow: bool, multiline: bool) -> String {
+        let modifier = if style == "line_count_dependent" {
+            if multiline { "multiline" } else { "single line" }
+        } else {
+            "all"
+        };
+        if is_arrow {
+            format!("Use the `lambda` method for {modifier} lambdas.")
+        } else {
+            format!("Use the `-> {{ ... }}` lambda literal syntax for {modifier} lambdas.")
+        }
+    }
+
+    /// `lambda { }` / `lambda do ... end` — the METHOD-call form. Anchor and
+    /// highlighted range both match rubocop's `add_offense(node.send_node,
+    /// ...)`: the call's own "selector" source range. `CallNode#location`
+    /// spans the WHOLE call INCLUDING a receiver/parens/args, but — unlike
+    /// the Ruby `parser` gem's whitequark `send` node — does NOT extend
+    /// through an attached block; still, since the only text that can ever
+    /// equal the literal `"lambda"` is a receiverless, paren-less,
+    /// argument-less call, checking those three conditions directly (rather
+    /// than slicing a constructed range) is both simpler and exactly
+    /// equivalent — in that case `message_loc` alone already covers the
+    /// call's entire non-block source range.
+    pub(crate) fn check_lambda_method(&mut self, call: &ruby_prism::CallNode<'_>) {
+        const COP: &str = "Style/Lambda";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return };
+        if call.receiver().is_some() || call.opening_loc().is_some() || call.arguments().is_some() {
+            return;
+        }
+        let Some(message_loc) = call.message_loc() else { return };
+        if message_loc.as_slice() != b"lambda" {
+            return;
+        }
+        let (open, close) = (block.opening_loc(), block.closing_loc());
+        let multiline = self.idx.loc(open.start_offset()).0 != self.idx.loc(close.start_offset()).0;
+        let style = self.cfg.enforced_style(COP);
+        if !Self::lambda_offending(style, false, multiline) {
+            return;
+        }
+        self.push(message_loc.start_offset(), COP, true, Self::lambda_message(style, false, multiline));
+        self.autocorrect_lambda_method_to_literal(&message_loc, &block);
+    }
+
+    /// `-> { }` / `->(x) do ... end` — the stabby LITERAL form. Anchor
+    /// matches `node.send_node`'s start for the synthetic `->`-selector send
+    /// node upstream's Prism translation builds: `node.operator_loc()`'s
+    /// start (the `->` itself always begins the "send").
+    pub(crate) fn check_lambda_literal(&mut self, node: &ruby_prism::LambdaNode<'_>) {
+        const COP: &str = "Style/Lambda";
+        if !self.on(COP) {
+            return;
+        }
+        let (open, close) = (node.opening_loc(), node.closing_loc());
+        let multiline = self.idx.loc(open.start_offset()).0 != self.idx.loc(close.start_offset()).0;
+        let style = self.cfg.enforced_style(COP);
+        if !Self::lambda_offending(style, true, multiline) {
+            return;
+        }
+        self.push(node.operator_loc().start_offset(), COP, true, Self::lambda_message(style, true, multiline));
+        self.autocorrect_lambda_literal_to_method(node);
+    }
+
+    /// `autocorrect_method_to_literal` — `lambda { |x| x }` -> `->(x) { x }`
+    /// / `lambda { || x }`/`lambda { x }` -> `-> { x }` (no named params: the
+    /// pipe section, if present at all, carries nothing to move into parens).
+    fn autocorrect_lambda_method_to_literal(
+        &mut self,
+        message_loc: &ruby_prism::Location<'_>,
+        block: &ruby_prism::BlockNode<'_>,
+    ) {
+        let (call_start, call_end) = (message_loc.start_offset(), message_loc.end_offset());
+        self.fixes.push((call_start, call_end, b"->".to_vec()));
+        let Some(bp) = block.parameters().and_then(|p| p.as_block_parameters_node()) else { return };
+        if bp.parameters().is_none() && bp.locals().iter().next().is_none() {
+            return; // `lambda { || ... }` — empty pipes, nothing to carry over
+        }
+        let arg_str = format!("({})", self.lambda_param_source_list(&bp));
+        self.fixes.push((call_end, call_end, arg_str.into_bytes()));
+        // `node.loc.begin.end.join(node.arguments.loc.end)`: from right after
+        // the opening `{`/`do` through the end of the whole `|...|` group.
+        let remove_start = block.opening_loc().end_offset();
+        let remove_end = bp.location().end_offset();
+        self.fixes.push((remove_start, remove_end, Vec::new()));
+    }
+
+    /// Joins a block/lambda parameter list's actual params (+ any
+    /// `;`-declared shadow locals) in source order — upstream's
+    /// `args.children.map(&:source).join(', ')` applied to whitequark's
+    /// unified `args` node, whose children are exactly this list (Ruby's
+    /// grammar only allows params in required/optional/rest/post/keyword/
+    /// kwrest/block order, which IS textual order; shadow locals always
+    /// trail after them, following the `;`).
+    fn lambda_param_source_list(&self, bp: &ruby_prism::BlockParametersNode<'_>) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(p) = bp.parameters() {
+            for n in ewo_ordered_params(&p) {
+                parts.push(String::from_utf8_lossy(self.node_src(&n)).into_owned());
+            }
+        }
+        for l in bp.locals().iter() {
+            parts.push(String::from_utf8_lossy(self.node_src(&l)).into_owned());
+        }
+        parts.join(", ")
+    }
+
+    /// `LambdaLiteralToMethodCorrector` — `->(x) { x }` -> `lambda { |x| x }`,
+    /// plus its whitespace/delimiter cleanup for the many "unusual spacing"
+    /// shapes a stabby lambda can take (see the class's own doc comment
+    /// upstream for the `lambdado`-avoidance rationale).
+    fn autocorrect_lambda_literal_to_method(&mut self, node: &ruby_prism::LambdaNode<'_>) {
+        let operator = node.operator_loc();
+        let selector_end = operator.end_offset();
+        let block_begin = node.opening_loc();
+        let block_begin_start = block_begin.start_offset();
+
+        // `block_node.block_type?`: false for a numbered-param (`_1`) or
+        // `it`-param literal — those always have EMPTY `arguments` upstream
+        // (see `BlockNode#arguments`'s "numblocks/itblocks have no explicit
+        // block arguments" comment), so only `None` (bare, zero params) or
+        // `Some(BlockParametersNode)` (named/positional params, parenthesized
+        // or not) count as "block_type?" here.
+        let params_node = node.parameters();
+        let bp = params_node.as_ref().and_then(|p| p.as_block_parameters_node());
+        let is_block_type = params_node.is_none() || bp.is_some();
+        let has_args =
+            is_block_type && bp.as_ref().is_some_and(|b| b.parameters().is_some() || b.locals().iter().next().is_some());
+
+        if has_args {
+            let bp = bp.as_ref().unwrap();
+            let parenthesized = bp.opening_loc().is_some();
+            if !parenthesized {
+                // remove_unparenthesized_whitespace: eat the gap between
+                // `->` and the first bare param entirely, then trim the gap
+                // between the last param and the block's opening delimiter
+                // down to exactly one space (never adds one back).
+                let (args_start, args_end) = (bp.location().start_offset(), bp.location().end_offset());
+                if args_start > selector_end {
+                    self.fixes.push((selector_end, args_start, Vec::new()));
+                }
+                if block_begin_start > args_end + 1 {
+                    self.fixes.push((args_end + 1, block_begin_start, Vec::new()));
+                }
+            }
+        }
+
+        if is_block_type {
+            // insert_separating_space: avoid `lambdado`/`lambda(x)do` when
+            // there's zero gap between `->`/the arg-parens and the block's
+            // own opening delimiter.
+            let (args_begin_pos, args_end_pos) = match &bp {
+                Some(b) => (b.opening_loc().map(|l| l.start_offset()), b.closing_loc().map(|l| l.end_offset())),
+                None => (None, None),
+            };
+            let needs_space = (args_end_pos == Some(block_begin_start) && args_begin_pos == Some(selector_end))
+                || block_begin_start == selector_end;
+            if needs_space {
+                self.fixes.push((block_begin_start, block_begin_start, b" ".to_vec()));
+            }
+            // remove_arguments: the whole parameter-list node is dropped
+            // whenever it has ANY written representation at all — even
+            // empty-but-parenthesized `->()`  — `empty_and_without_
+            // delimiters?` (`loc.expression.nil?`) only trips when NOTHING
+            // was written, i.e. `bp` itself is absent here.
+            if let Some(b) = &bp {
+                let bl = b.location();
+                self.fixes.push((bl.start_offset(), bl.end_offset(), Vec::new()));
+            }
+        }
+
+        // replace_selector
+        self.fixes.push((operator.start_offset(), operator.end_offset(), b"lambda".to_vec()));
+
+        // replace_delimiters: convert `do...end` to `{ }` ONLY when this
+        // literal (or the hash-pair wrapping it) is a direct, non-receiver
+        // argument of an unparenthesized call — see `lambda_unparen_arg`'s
+        // doc for why (a bare trailing `do...end` argument is ambiguous).
+        let block_end = node.closing_loc();
+        let is_braces = block_end.as_slice() == b"}";
+        if !is_braces && self.lambda_unparen_arg.contains(&node.location().start_offset()) {
+            // separating_space?: the byte right after the 2-char `do` is
+            // already whitespace (a space, or the newline before a
+            // multiline body) — if not, insert one so `{`/`}` doesn't fuse
+            // with what follows.
+            let after = block_begin_start + 2;
+            let has_space = self.src.get(after).is_some_and(|b| b.is_ascii_whitespace());
+            if !has_space {
+                self.fixes.push((block_begin.end_offset(), block_begin.end_offset(), b" ".to_vec()));
+            }
+            self.fixes.push((block_begin_start, block_begin.end_offset(), b"{".to_vec()));
+            self.fixes.push((block_end.start_offset(), block_end.end_offset(), b"}".to_vec()));
+        }
+
+        // insert_arguments
+        if has_args {
+            let b = bp.as_ref().unwrap();
+            let arg_str = format!(" |{}|", self.lambda_param_source_list(b));
+            self.fixes.push((block_begin.end_offset(), block_begin.end_offset(), arg_str.into_bytes()));
+        }
+    }
+}

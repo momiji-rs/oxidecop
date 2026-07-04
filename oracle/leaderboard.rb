@@ -323,6 +323,7 @@ COPS = {
   'Style/MultipleComparison'         => 'style/style_multiple_comparison',
   'Style/TrivialAccessors'           => 'style/trivial_accessors',
   'Naming/FileName'                  => 'naming/file_name',
+  'Style/Lambda'                     => 'style/lambda',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -370,6 +370,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
+    "Style/Lambda",
 ];
 
 impl Engine {
@@ -694,6 +695,16 @@ pub(crate) struct Cops<'a> {
     // `csend` call (parens or not — matches whitequark's `call_type?`, which
     // doesn't care whether the call itself is parenthesized).
     pub(crate) rl_call_child: HashSet<usize>,
+    // Style/Lambda's `arg_to_unparenthesized_call?`: start offsets of nodes
+    // that are a DIRECT argument (never the receiver) of an unparenthesized
+    // `send`/`csend` call — for a hash-pair argument (`foo key: value`), the
+    // PAIR'S VALUE offset is stored (mirroring upstream's climb through a
+    // `pair_type?` parent to its grandparent send before checking
+    // `sibling_index`). A multiline arrow-lambda literal found in this set,
+    // when converted lambda-literal->method, gets its `do`/`end` delimiters
+    // swapped to `{`/`}` (unparenthesized `do...end` block arguments other
+    // than a call's receiver are syntactically ambiguous).
+    pub(crate) lambda_unparen_arg: HashSet<usize>,
     // Inner `File.dirname` calls claimed by an outer chain (NestedFileDirname).
     pub(crate) dirname_ignore: Vec<usize>,
     // Innermost statement-list span starts — Lint/DuplicateRequire scopes by it.
@@ -3759,6 +3770,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_nil_lambda_stabby(node);
         self.check_stabby_lambda_parentheses(node);
         self.check_empty_lambda_parameter(node);
+        self.check_lambda_literal(node);
         if let Some(p) = node.parameters() {
             self.check_keyword_parameters_order_block(&p);
         }
@@ -3993,6 +4005,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        // Style/Lambda's `arg_to_unparenthesized_call?` — see
+        // `lambda_unparen_arg`'s doc. Runs for every unparenthesized call
+        // with arguments (not just ones with a literal block) since the
+        // qualifying node here is an ARGUMENT of THIS call, not necessarily
+        // this call's own block.
+        if node.opening_loc().is_none() {
+            if let Some(args) = node.arguments() {
+                for a in args.arguments().iter() {
+                    if let Some(kw) = a.as_keyword_hash_node() {
+                        for elem in kw.elements().iter() {
+                            if let Some(assoc) = elem.as_assoc_node() {
+                                self.lambda_unparen_arg.insert(assoc.value().location().start_offset());
+                            }
+                        }
+                    } else {
+                        self.lambda_unparen_arg.insert(a.location().start_offset());
+                    }
+                }
+            }
+        }
         // Layout/SpaceAroundKeyword's `on_send`: `prefix_not?` — a `not x`
         // call (name `!`, but SPELLED `not`, distinct from `!x`'s bare `!`
         // selector, which this cop never checks).
@@ -4119,6 +4151,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_comparable_clamp_min_max(node);
         self.check_redundant_freeze(node);
         self.check_nil_lambda_call(node);
+        self.check_lambda_method(node);
         self.check_preferred_hash_methods(node);
         self.check_sample(node);
         self.check_single_argument_dig(node);
@@ -4606,6 +4639,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         wa_matrix_stack: Vec::new(),
         pa_invalid_ctx: HashSet::new(),
         rl_call_child: HashSet::new(),
+        lambda_unparen_arg: HashSet::new(),
         dirname_ignore: Vec::new(),
         stmts_stack: Vec::new(),
         unless_else_spans: Vec::new(),
