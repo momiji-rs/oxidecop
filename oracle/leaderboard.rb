@@ -302,6 +302,7 @@ COPS = {
   'Style/RescueStandardError'        => 'style/rescue_standard_error',
   'Naming/MemoizedInstanceVariableName' => 'naming/memoized_instance_variable_name',
   'Lint/OutOfRangeRegexpRef'         => 'lint/out_of_range_regexp_ref',
+  'Style/PercentLiteralDelimiters'   => 'style/percent_literal_delimiters',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

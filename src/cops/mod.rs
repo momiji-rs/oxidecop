@@ -313,7 +313,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters",
 ];
 
 impl Engine {
@@ -1596,6 +1596,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_percent_q_str(node);
         self.check_percent_q_literals(node);
         self.check_bare_percent_literals_str(node);
+        self.check_percent_literal_delimiters_str(node);
         self.ll_check_str(node);
     }
     fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
@@ -1622,6 +1623,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_percent_q_dstr(node);
         self.check_lii_dstr(node);
         self.check_bare_percent_literals_dstr(node);
+        self.check_percent_literal_delimiters_dstr(node);
         self.ll_check_dstr(node);
         self.check_redundant_interpolation(node);
         // Mark direct parts of an implicit-concatenation wrapper (an outer
@@ -1658,6 +1660,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {
         self.check_boolean_symbol(node);
         self.check_symbol_literal(node);
+        self.check_percent_literal_delimiters_sym(node);
     }
     fn visit_interpolated_symbol_node(&mut self, node: &ruby_prism::InterpolatedSymbolNode<'pr>) {
         self.check_lii_dsym(node);
@@ -1671,6 +1674,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         node: &ruby_prism::InterpolatedRegularExpressionNode<'pr>,
     ) {
         self.check_lii_iregexp(node);
+        self.check_percent_literal_delimiters_iregexp(node);
         self.interpolated_node_depth += 1;
         let prev_brace_eligible = self.sgv_brace_eligible;
         self.sgv_brace_eligible = true;
@@ -1680,6 +1684,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_interpolated_x_string_node(&mut self, node: &ruby_prism::InterpolatedXStringNode<'pr>) {
         self.check_space_inside_percent_literal_delimiters_ixstr(node);
+        self.check_percent_literal_delimiters_ixstr(node);
         self.check_lii_ixstr(node);
         self.check_heredoc_delimiter_case(Some(node.opening_loc()), Some(node.closing_loc()));
         self.check_closing_heredoc_indentation(Some(node.opening_loc()), Some(node.closing_loc()));
@@ -1719,6 +1724,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             );
         }
         self.check_space_inside_percent_literal_delimiters_xstr(node);
+        self.check_percent_literal_delimiters_xstr(node);
         ruby_prism::visit_x_string_node(self, node);
     }
     fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
@@ -1864,6 +1870,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_regular_expression_node(&mut self, node: &ruby_prism::RegularExpressionNode<'pr>) {
         self.check_mixed_regexp_capture_types(node);
+        self.check_percent_literal_delimiters_regexp(node);
         ruby_prism::visit_regular_expression_node(self, node);
     }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
@@ -2885,6 +2892,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_word_array(node);
         self.check_min_max_array(node);
         self.check_space_inside_percent_literal_delimiters_array(node);
+        self.check_percent_literal_delimiters_array(node);
         if self.ll_active {
             let heredoc_arg_index = node
                 .elements()

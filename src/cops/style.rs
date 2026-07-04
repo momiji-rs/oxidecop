@@ -20613,3 +20613,306 @@ fn rse_const_name_root(node: &ruby_prism::Node) -> Option<String> {
     }
     None
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/PercentLiteralDelimiters — enforces consistent `%`-literal
+    /// delimiters across every literal type (`%w`, `%W`, `%i`, `%I`, `%r`,
+    /// bare `%`, `%Q`, `%q`, `%s`, `%x`).
+    ///
+    /// Ported from rubocop's `PercentLiteralDelimiters`, which mixes in the
+    /// `PercentLiteral` module: each `on_array`/`on_regexp`/`on_str`
+    /// (aliased to `on_dstr`)/`on_sym`/`on_xstr` hook calls `process(node,
+    /// *types)`, which fires `on_percent_literal` only when the node's
+    /// `type(node)` — `node.loc.begin.source[0..-2]`, i.e. the opening
+    /// delimiter token minus its final byte (`"%w("[0..-2] == "%w"`) — is
+    /// one of the types that hook cares about.
+    ///
+    /// Config note: rubocop's real `PreferredDelimiters` is a NESTED hash
+    /// (`{'default' => '()', '%i' => '[]', ...}` — see default.yml).  This
+    /// engine's `.rubocop.yml` model is flat (`Config::sections: HashMap<
+    /// String, HashMap<String, String>>`), so it cannot represent a nested
+    /// map at all; a config author (or the oracle's own spec-fixture
+    /// flattening, `parse_val`'s `'default'`-key regex in oracle.rb) can
+    /// only ever hand this cop a single flat `PreferredDelimiters: XX`
+    /// 2-char pair, which is applied UNIFORMLY to every literal type
+    /// (`pld_preferred`). Per-type overrides that a real nested rubocop.yml
+    /// might specify without a `default:` key at the SAME nesting level
+    /// (`  PreferredDelimiters:\n    '%w': '[]'`) happen to flatten to a
+    /// same-level `'%w'`/`default` key in THIS engine's line-based parser —
+    /// `pld_pair` tries the exact type key and `default` first before
+    /// falling back to the flat `PreferredDelimiters` value, so those
+    /// (unquoted-key) shapes are honored too. Absent any config at all,
+    /// falls back to rubocop's own default.yml per-type table.
+    fn pld_pair(&self, key: &str) -> Option<(u8, u8)> {
+        let v = self.cfg.get("Style/PercentLiteralDelimiters", key)?;
+        let v = v.trim().trim_matches(|c| c == '\'' || c == '"');
+        let b = v.as_bytes();
+        (b.len() >= 2).then(|| (b[0], b[1]))
+    }
+
+    /// `PreferredDelimiters.new(type, config, nil).delimiters` — resolved
+    /// per literal type, falling back to rubocop's default.yml table
+    /// (`default: ()`, `%i`/`%I`/`%w`/`%W: []`, `%r: {}`) when unconfigured.
+    fn pld_preferred(&self, ty: &str) -> (u8, u8) {
+        self.pld_pair(ty)
+            .or_else(|| self.pld_pair("default"))
+            .or_else(|| self.pld_pair("PreferredDelimiters"))
+            .unwrap_or_else(|| match ty {
+                "%i" | "%I" | "%w" | "%W" => (b'[', b']'),
+                "%r" => (b'{', b'}'),
+                _ => (b'(', b')'),
+            })
+    }
+
+    /// `matchpairs(begin_delimiter)` — the bracket pair "used" by the
+    /// current delimiter char, consulted only for exact `%w`/`%i` types
+    /// (`include_same_character_as_used_for_delimiter?`). A non-bracket
+    /// delimiter (e.g. `|`) matches only itself, mirroring
+    /// `.fetch(begin_delimiter, [begin_delimiter])`.
+    fn pld_matchpair(used_open: u8) -> (u8, u8) {
+        match used_open {
+            b'(' => (b'(', b')'),
+            b'[' => (b'[', b']'),
+            b'{' => (b'{', b'}'),
+            b'<' => (b'<', b'>'),
+            c => (c, c),
+        }
+    }
+
+    /// `on_percent_literal`: given the resolved type, the opening/closing
+    /// delimiter locations, the offense anchor (`node.loc.expression`'s
+    /// start), and the content "pieces" to scan (rubocop's `string_source`
+    /// per child, already filtered/cooked per node kind by each caller
+    /// below) — apply `uses_preferred_delimiter?`, `contains_preferred_
+    /// delimiter?`, and (for `%w`/`%i`) `include_same_character_as_used_
+    /// for_delimiter?`, then push the offense + autocorrect.
+    fn pld_check(
+        &mut self,
+        ty: &str,
+        opening: ruby_prism::Location,
+        closing: ruby_prism::Location,
+        node_start: usize,
+        pieces: &[Vec<u8>],
+    ) {
+        const COP: &str = "Style/PercentLiteralDelimiters";
+        let used_open = *opening.as_slice().last().unwrap();
+        let (pref_open, pref_close) = self.pld_preferred(ty);
+        // `uses_preferred_delimiter?`
+        if used_open == pref_open {
+            return;
+        }
+        // `contains_preferred_delimiter?`
+        if pieces.iter().any(|p| p.contains(&pref_open) || p.contains(&pref_close)) {
+            return;
+        }
+        // `include_same_character_as_used_for_delimiter?` — exact `%w`/`%i` only.
+        if ty == "%w" || ty == "%i" {
+            let (mo, mc) = Self::pld_matchpair(used_open);
+            if pieces.iter().any(|p| p.contains(&mo) || p.contains(&mc)) {
+                return;
+            }
+        }
+        let msg = format!(
+            "`{ty}`-literals should be delimited by `{}` and `{}`.",
+            pref_open as char, pref_close as char
+        );
+        self.push(node_start, COP, true, msg);
+        let mut replacement = ty.as_bytes().to_vec();
+        replacement.push(pref_open);
+        self.fixes.push((opening.start_offset(), opening.end_offset(), replacement));
+        // The closing delimiter is always exactly one byte; a regex's
+        // `closing_loc` (unlike every other literal type's) also swallows
+        // any trailing option flags (`)i` as ONE span for `%r(...)i` —
+        // whitequark's `loc.end`, which real rubocop's `corrector.replace`
+        // targets, is just the bracket) — replace only that first byte so
+        // trailing flags survive untouched.
+        let close_start = closing.start_offset();
+        self.fixes.push((close_start, close_start + 1, vec![pref_close]));
+    }
+
+    /// `type(node)`: the opening delimiter token minus its last byte, e.g.
+    /// `"%w("[0..-2] == "%w"`. `None` when the opening isn't valid UTF-8
+    /// (never happens for a real percent-literal opener) or is too short.
+    fn pld_type(opening: &[u8]) -> Option<&str> {
+        if opening.first() != Some(&b'%') || opening.len() < 2 {
+            return None;
+        }
+        std::str::from_utf8(&opening[..opening.len() - 1]).ok()
+    }
+
+    /// `on_array` — `%w`/`%W`/`%i`/`%I`. Content pieces: each element's RAW
+    /// source text — whitequark's `string_source` on a `str`/`sym` AST
+    /// child returns `.source` (uninterpreted, escapes intact) — skipping
+    /// interpolated elements (`%W`/`%I` words containing `#{}`) entirely:
+    /// such an element's whitequark type is `dstr`/`dsym`, which
+    /// `string_source` doesn't recognize, so it contributes nothing.
+    pub(crate) fn check_percent_literal_delimiters_array(&mut self, node: &ruby_prism::ArrayNode) {
+        const COP: &str = "Style/PercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(opening) = node.opening_loc() else { return };
+        let Some(ty) = Self::pld_type(opening.as_slice()) else { return };
+        if !matches!(ty, "%w" | "%W" | "%i" | "%I") {
+            return;
+        }
+        let Some(closing) = node.closing_loc() else { return };
+
+        let pieces: Vec<Vec<u8>> = node
+            .elements()
+            .iter()
+            .filter_map(|el| {
+                if el.as_string_node().is_some() || el.as_symbol_node().is_some() {
+                    Some(self.node_src(&el).to_vec())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        self.pld_check(ty, opening, closing, node.location().start_offset(), &pieces);
+    }
+
+    /// `on_str` (also aliased `on_dstr`) — bare `%`, `%Q`, `%q`, no real
+    /// interpolation. Content piece: the single cooked (`unescaped`) value,
+    /// mirroring whitequark's `str` node whose one child is the evaluated
+    /// `String`.
+    pub(crate) fn check_percent_literal_delimiters_str(&mut self, node: &ruby_prism::StringNode) {
+        const COP: &str = "Style/PercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(opening) = node.opening_loc() else { return };
+        let Some(ty) = Self::pld_type(opening.as_slice()) else { return };
+        if !matches!(ty, "%" | "%Q" | "%q") {
+            return;
+        }
+        let Some(closing) = node.closing_loc() else { return };
+        let pieces = vec![node.unescaped().to_vec()];
+        self.pld_check(ty, opening, closing, node.location().start_offset(), &pieces);
+    }
+
+    /// `on_dstr` — bare `%`/`%Q` WITH real interpolation. Content pieces:
+    /// each literal-text part's cooked value; embedded `#{}` clauses
+    /// contribute nothing (whitequark's `begin` child isn't `str`/`sym`).
+    pub(crate) fn check_percent_literal_delimiters_dstr(&mut self, node: &ruby_prism::InterpolatedStringNode) {
+        const COP: &str = "Style/PercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(opening) = node.opening_loc() else { return };
+        let Some(ty) = Self::pld_type(opening.as_slice()) else { return };
+        if !matches!(ty, "%" | "%Q" | "%q") {
+            return;
+        }
+        let Some(closing) = node.closing_loc() else { return };
+        let pieces: Vec<Vec<u8>> = node
+            .parts()
+            .iter()
+            .filter_map(|p| p.as_string_node().map(|s| s.unescaped().to_vec()))
+            .collect();
+        self.pld_check(ty, opening, closing, node.location().start_offset(), &pieces);
+    }
+
+    /// `on_sym` — `%s` only (never interpolated). rubocop's own
+    /// `string_source` returns `nil` for a `%s` node's single Symbol child
+    /// (it's neither a `String` nor a `str`/`sym` AST node itself), so
+    /// content NEVER blocks correction here — pieces are always empty.
+    pub(crate) fn check_percent_literal_delimiters_sym(&mut self, node: &ruby_prism::SymbolNode) {
+        const COP: &str = "Style/PercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(opening) = node.opening_loc() else { return };
+        let Some(ty) = Self::pld_type(opening.as_slice()) else { return };
+        if ty != "%s" {
+            return;
+        }
+        let Some(closing) = node.closing_loc() else { return };
+        self.pld_check(ty, opening, closing, node.location().start_offset(), &[]);
+    }
+
+    /// `on_xstr` — `%x`, no real interpolation. Content piece: the single
+    /// cooked value.
+    pub(crate) fn check_percent_literal_delimiters_xstr(&mut self, node: &ruby_prism::XStringNode) {
+        const COP: &str = "Style/PercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+        let opening = node.opening_loc();
+        let Some(ty) = Self::pld_type(opening.as_slice()) else { return };
+        if ty != "%x" {
+            return;
+        }
+        let closing = node.closing_loc();
+        let pieces = vec![node.unescaped().to_vec()];
+        self.pld_check(ty, opening, closing, node.location().start_offset(), &pieces);
+    }
+
+    /// `on_xstr` — `%x` WITH real interpolation. Same part-filtering as the
+    /// `%`/`%Q` dstr case.
+    pub(crate) fn check_percent_literal_delimiters_ixstr(&mut self, node: &ruby_prism::InterpolatedXStringNode) {
+        const COP: &str = "Style/PercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+        let opening = node.opening_loc();
+        let Some(ty) = Self::pld_type(opening.as_slice()) else { return };
+        if ty != "%x" {
+            return;
+        }
+        let closing = node.closing_loc();
+        let pieces: Vec<Vec<u8>> = node
+            .parts()
+            .iter()
+            .filter_map(|p| p.as_string_node().map(|s| s.unescaped().to_vec()))
+            .collect();
+        self.pld_check(ty, opening, closing, node.location().start_offset(), &pieces);
+    }
+
+    /// `on_regexp` — `%r`, no real interpolation. rubocop's regex "str"
+    /// children are proper `str` AST nodes holding RAW source text (regex
+    /// escape semantics differ from string escapes, so whitequark never
+    /// evaluates them) — content piece is the content span's raw bytes, not
+    /// `.unescaped()`.
+    pub(crate) fn check_percent_literal_delimiters_regexp(&mut self, node: &ruby_prism::RegularExpressionNode) {
+        const COP: &str = "Style/PercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+        let opening = node.opening_loc();
+        let Some(ty) = Self::pld_type(opening.as_slice()) else { return };
+        if ty != "%r" {
+            return;
+        }
+        let closing = node.closing_loc();
+        let c = node.content_loc();
+        let pieces = vec![self.src[c.start_offset()..c.end_offset()].to_vec()];
+        self.pld_check(ty, opening, closing, node.location().start_offset(), &pieces);
+    }
+
+    /// `on_regexp` — `%r` WITH real interpolation. Same raw-source
+    /// filtering as the non-interpolated case, per literal-text part.
+    pub(crate) fn check_percent_literal_delimiters_iregexp(
+        &mut self,
+        node: &ruby_prism::InterpolatedRegularExpressionNode,
+    ) {
+        const COP: &str = "Style/PercentLiteralDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+        let opening = node.opening_loc();
+        let Some(ty) = Self::pld_type(opening.as_slice()) else { return };
+        if ty != "%r" {
+            return;
+        }
+        let closing = node.closing_loc();
+        let pieces: Vec<Vec<u8>> = node
+            .parts()
+            .iter()
+            .filter_map(|p| p.as_string_node().map(|s| self.node_src(&s.as_node()).to_vec()))
+            .collect();
+        self.pld_check(ty, opening, closing, node.location().start_offset(), &pieces);
+    }
+}
