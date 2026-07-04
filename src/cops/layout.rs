@@ -10237,3 +10237,644 @@ fn mbl_char_count(bytes: &[u8]) -> usize {
         String::from_utf8_lossy(bytes).chars().count()
     }
 }
+
+
+// ---------------------------------------------------------------------
+// Layout/HashAlignment — ports `HashAlignmentStyles` (the `KeyAlignment`/
+// `TableAlignment`/`SeparatorAlignment`/`KeywordSplatAlignment` delta
+// classes + `HashElementNode`/`HashElementDelta`) and the cop itself
+// (`lib/rubocop/cop/layout/hash_alignment.rb`) ~verbatim.
+// ---------------------------------------------------------------------
+
+/// One hash "element" — a `pair` (`AssocNode`) or a `kwsplat`/forwarded
+/// `**` (`AssocSplatNode`) — reduced to the byte offsets the delta math
+/// below needs. For a pair, `start` is the KEY's own start, which is always
+/// the pair's own overall start too (a pair's range begins at its key); for
+/// a kwsplat, `start` is the `**` operator's start (rubocop-ast's
+/// `KeywordSplatNode#node_parts` duck-types `key`/`value` to the whole node
+/// itself, so "key" and the node's own range coincide there too).
+///
+/// prism merges a colon-label key's trailing `:` into the KEY node's own
+/// location (`key: 1`'s key `SymbolNode` spans `"key:"`, not just `"key"`),
+/// unlike whitequark's parser gem where `pair.key.source_range` excludes
+/// the colon and `pair.loc.operator` is the colon's own 1-byte range
+/// (starting exactly where the excluded key ends). `key_end`/`op_start`/
+/// `op_end` below undo that merge: `key_end` is the DISPLAY key end (colon
+/// excluded — matches whitequark's `key.source_range.end`), `op_start`/
+/// `op_end` bracket the separator itself (for a colon: `key_end` and
+/// `key_end + 1`, i.e. the one excluded byte; for a hash rocket: prism's
+/// own `operator_loc`). Every formula below reads columns as plain
+/// DIFFERENCES between two such offsets, so which "base" `idx.loc` counts
+/// from (0- or 1-indexed) never matters — only the one absolute use (the
+/// left-edge clamp in `ha_correct`) explicitly normalizes to 0-based.
+#[derive(Clone, Copy)]
+struct HaElem {
+    kwsplat: bool,
+    hash_rocket: bool,
+    start: usize,
+    end: usize,
+    key_end: usize,
+    op_start: usize,
+    op_end: usize,
+    value_start: usize,
+    value_omitted: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum HaFormat {
+    Key,
+    Table,
+    Separator,
+    KwSplat,
+}
+
+impl HaFormat {
+    fn message(self) -> &'static str {
+        match self {
+            HaFormat::Key => "Align the keys of a hash literal if they span more than one line.",
+            HaFormat::Table => {
+                "Align the keys and values of a hash literal if they span more than one line."
+            }
+            HaFormat::Separator => {
+                "Align the separators of a hash literal if they span more than one line."
+            }
+            HaFormat::KwSplat => {
+                "Align keyword splats with the rest of the hash if it spans more than one line."
+            }
+        }
+    }
+}
+
+/// A pending correction's `{ key:, separator:, value: }` — `None` means the
+/// key was absent from the Ruby delta hash (never computed, so it never
+/// participates in `good_alignment?`'s "all zero" check and defaults to 0
+/// in `correct_node`).
+#[derive(Clone, Copy, Default)]
+struct HaDelta {
+    key: Option<isize>,
+    separator: Option<isize>,
+    value: Option<isize>,
+}
+impl HaDelta {
+    /// `good_alignment?`: every PRESENT delta is zero (vacuously true for
+    /// `{}, e.g. `SeparatorAlignment#deltas_for_first_pair`).
+    fn good(&self) -> bool {
+        [self.key, self.separator, self.value].iter().all(|d| d.map_or(true, |v| v == 0))
+    }
+}
+
+/// `check_delta`: record that `elem_start` was considered under `fmt`
+/// (inserting an empty bucket + noting insertion ORDER even when the delta
+/// turns out to be good — `add_offenses`'s `min_by` ties break by this
+/// order), then, only if the delta is bad, remember it for correction and
+/// push the element onto that format's offense list (which — mirroring
+/// upstream exactly — can end up holding the very first pair's own start
+/// TWICE: once from `deltas_for_first_pair`, once again from the main
+/// `node.children` loop re-deriving the same delta for it. Harmless: both
+/// computations agree, `ha_register` dedupes by start before emitting).
+fn ha_note_delta(
+    order: &mut Vec<HaFormat>,
+    buckets: &mut std::collections::HashMap<HaFormat, Vec<usize>>,
+    deltas: &mut std::collections::HashMap<(HaFormat, usize), HaDelta>,
+    fmt: HaFormat,
+    elem_start: usize,
+    delta: HaDelta,
+) {
+    if !buckets.contains_key(&fmt) {
+        order.push(fmt);
+        buckets.insert(fmt, Vec::new());
+    }
+    if delta.good() {
+        return;
+    }
+    deltas.insert((fmt, elem_start), delta);
+    buckets.get_mut(&fmt).unwrap().push(elem_start);
+}
+
+impl<'a> super::Cops<'a> {
+    fn ha_line(&self, off: usize) -> usize {
+        self.idx.loc(off).0
+    }
+    fn ha_col(&self, off: usize) -> isize {
+        self.idx.loc(off).1 as isize
+    }
+    /// `HashElementNode#same_line?`: `loc.last_line == other.loc.line ||
+    /// loc.line == other.loc.last_line` (a multiline element is "on the
+    /// same line" as another if it shares EITHER of its own two boundary
+    /// lines with either of the other's).
+    fn ha_same_line(&self, a: &HaElem, b: &HaElem) -> bool {
+        let a_first = self.ha_line(a.start);
+        let a_last = self.ha_line(a.end.saturating_sub(1).max(a.start));
+        let b_first = self.ha_line(b.start);
+        let b_last = self.ha_line(b.end.saturating_sub(1).max(b.start));
+        a_last == b_first || a_first == b_last
+    }
+    /// `Util#begins_its_line?`: every byte before `off` on its own line is
+    /// whitespace.
+    fn ha_begins_its_line(&self, off: usize) -> bool {
+        let line = self.ha_line(off);
+        let line_start = self.idx.starts[line - 1];
+        self.src[line_start..off].iter().all(|&b| b == b' ' || b == b'\t')
+    }
+    /// `key.source.length` (display key text, colon excluded) in CHARACTERS
+    /// — `TableAlignment#max_key_width`.
+    fn ha_key_chars(&self, e: &HaElem) -> isize {
+        String::from_utf8_lossy(&self.src[e.start..e.key_end]).chars().count() as isize
+    }
+
+    /// Reduce a hash's `elements()` (pairs + kwsplats, in source order) to
+    /// `HaElem`s — see the struct doc for the colon-merge adjustment.
+    fn ha_collect(&self, elements: &[ruby_prism::Node]) -> Vec<HaElem> {
+        elements
+            .iter()
+            .filter_map(|e| {
+                if let Some(assoc) = e.as_assoc_node() {
+                    let kloc = assoc.key().location();
+                    let raw_key_end = kloc.end_offset();
+                    let value = assoc.value();
+                    let value_omitted = value.as_implicit_node().is_some();
+                    let (op_start, op_end, hash_rocket, key_end) =
+                        if let Some(op) = assoc.operator_loc() {
+                            (op.start_offset(), op.end_offset(), true, raw_key_end)
+                        } else {
+                            let ke = raw_key_end.saturating_sub(1);
+                            (ke, raw_key_end, false, ke)
+                        };
+                    Some(HaElem {
+                        kwsplat: false,
+                        hash_rocket,
+                        start: kloc.start_offset(),
+                        end: assoc.location().end_offset(),
+                        key_end,
+                        op_start,
+                        op_end,
+                        value_start: value.location().start_offset(),
+                        value_omitted,
+                    })
+                } else if let Some(splat) = e.as_assoc_splat_node() {
+                    let l = splat.location();
+                    Some(HaElem {
+                        kwsplat: true,
+                        hash_rocket: false,
+                        start: l.start_offset(),
+                        end: l.end_offset(),
+                        key_end: l.end_offset(),
+                        op_start: l.start_offset(),
+                        op_end: l.end_offset(),
+                        value_start: l.start_offset(),
+                        value_omitted: false,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// `EnforcedHashRocketStyle`/`EnforcedColonStyle`: a scalar style name,
+    /// OR (`AllowMultipleStyles`) a list of them — `new_alignment`'s
+    /// `formats = [formats] if formats.is_a? String; formats.uniq.map {...}`.
+    /// An unrecognized style name is dropped rather than raising (upstream
+    /// raises a bare `RuntimeError`, which just aborts that one check — for
+    /// us that's equivalent to the format list ending up unable to satisfy
+    /// `checkable_layout?`, which is exactly what an empty list does below).
+    fn ha_style_list(&self, key: &str) -> Vec<HaFormat> {
+        const COP: &str = "Layout/HashAlignment";
+        let raw = self.cfg.get(COP, key).unwrap_or("key");
+        let names: Vec<String> = if raw.trim_start().starts_with('[') {
+            crate::config::parse_allowed_list(raw)
+        } else {
+            vec![raw.trim().to_string()]
+        };
+        let mut out = Vec::new();
+        for n in names {
+            let fmt = match n.as_str() {
+                "key" => HaFormat::Key,
+                "table" => HaFormat::Table,
+                "separator" => HaFormat::Separator,
+                _ => continue,
+            };
+            if !out.contains(&fmt) {
+                out.push(fmt);
+            }
+        }
+        out
+    }
+
+    // ---- KeyAlignment ----
+    /// `KeyAlignment#separator_delta`.
+    fn ha_ka_separator_delta(&self, p: &HaElem) -> isize {
+        if p.hash_rocket {
+            (self.ha_col(p.key_end) + 1) - self.ha_col(p.op_start)
+        } else {
+            0
+        }
+    }
+    /// `KeyAlignment#value_delta`.
+    fn ha_ka_value_delta(&self, p: &HaElem) -> isize {
+        if p.value_omitted || self.ha_line(p.start) != self.ha_line(p.value_start) {
+            return 0;
+        }
+        (self.ha_col(p.op_end) + 1) - self.ha_col(p.value_start)
+    }
+
+    // ---- TableAlignment (ValueAlignment) ----
+    /// `TableAlignment#hash_rocket_delta`.
+    fn ha_ta_hash_rocket_delta(&self, first: &HaElem, current: &HaElem, max_key_width: isize) -> isize {
+        self.ha_col(first.start) + max_key_width + 1 - self.ha_col(current.op_start)
+    }
+    /// `TableAlignment#value_delta`.
+    fn ha_ta_value_delta(
+        &self,
+        first: &HaElem,
+        current: &HaElem,
+        max_key_width: isize,
+        max_delim_width: isize,
+    ) -> isize {
+        if current.value_omitted {
+            return 0;
+        }
+        (self.ha_col(first.start) + max_key_width + max_delim_width) - self.ha_col(current.value_start)
+    }
+
+    // ---- SeparatorAlignment (ValueAlignment) ----
+    /// `SeparatorAlignment#key_delta` — `first_pair.key_delta(current, :right)`.
+    fn ha_sa_key_delta(&self, first: &HaElem, current: &HaElem) -> isize {
+        if self.ha_same_line(first, current) {
+            0
+        } else {
+            self.ha_col(first.key_end) - self.ha_col(current.key_end)
+        }
+    }
+    /// `SeparatorAlignment#hash_rocket_delta` — `first_pair.delimiter_delta(current)`.
+    fn ha_sa_hash_rocket_delta(&self, first: &HaElem, current: &HaElem) -> isize {
+        if self.ha_same_line(first, current) || first.hash_rocket != current.hash_rocket {
+            0
+        } else {
+            self.ha_col(first.op_start) - self.ha_col(current.op_start)
+        }
+    }
+    /// `SeparatorAlignment#value_delta` — `first_pair.value_delta(current)`.
+    fn ha_sa_value_delta(&self, first: &HaElem, current: &HaElem) -> isize {
+        if current.value_omitted {
+            return 0;
+        }
+        if self.ha_same_line(first, current) {
+            0
+        } else {
+            self.ha_col(first.value_start) - self.ha_col(current.value_start)
+        }
+    }
+
+    /// `on_hash`/`on_keyword_hash` (explicit `{}` vs. an implicit trailing
+    /// keyword-args group are two distinct prism node kinds; rubocop-ast's
+    /// `hash_type?` covers both under one node).
+    pub(crate) fn check_hash_alignment_hash(&mut self, node: &ruby_prism::HashNode) {
+        let l = node.location();
+        let elems = self.ha_collect(&node.elements().iter().collect::<Vec<_>>());
+        self.ha_process(l.start_offset(), l.end_offset(), elems);
+    }
+    pub(crate) fn check_hash_alignment_keyword_hash(&mut self, node: &ruby_prism::KeywordHashNode) {
+        let l = node.location();
+        let elems = self.ha_collect(&node.elements().iter().collect::<Vec<_>>());
+        self.ha_process(l.start_offset(), l.end_offset(), elems);
+    }
+
+    /// `on_hash`'s early-return gate: `autocorrect_incompatible_with_other_
+    /// cops?(node) || ignored_node?(node) || node.pairs.empty? ||
+    /// node.single_line?`, then the `checkable_layout?` gate before
+    /// `check_pairs`.
+    fn ha_process(&mut self, start: usize, end: usize, elems: Vec<HaElem>) {
+        const COP: &str = "Layout/HashAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.ha_incompatible.contains(&start) || self.ha_ignored.contains(&start) {
+            return;
+        }
+        if elems.is_empty() {
+            return;
+        }
+        if self.ha_line(start) == self.ha_line(end.saturating_sub(1).max(start)) {
+            return; // single_line?
+        }
+        let real: Vec<HaElem> = elems.iter().copied().filter(|e| !e.kwsplat).collect();
+        if real.is_empty() {
+            return; // node.pairs.empty?
+        }
+        let rocket_styles = self.ha_style_list("EnforcedHashRocketStyle");
+        let colon_styles = self.ha_style_list("EnforcedColonStyle");
+        let mixed = real.iter().any(|p| p.hash_rocket != real[0].hash_rocket);
+        let same_line_pairs = real.windows(2).any(|w| self.ha_same_line(&w[0], &w[1]));
+        let checkable = |fmt: HaFormat| -> bool {
+            match fmt {
+                HaFormat::Key | HaFormat::KwSplat => true,
+                HaFormat::Table | HaFormat::Separator => !mixed && !same_line_pairs,
+            }
+        };
+        if !rocket_styles.iter().any(|f| checkable(*f)) || !colon_styles.iter().any(|f| checkable(*f)) {
+            return;
+        }
+        self.ha_check_pairs(&elems, &real, &rocket_styles, &colon_styles);
+    }
+
+    /// `check_pairs`: the `deltas_for_first_pair` pass, then `node.children`
+    /// (every pair AND kwsplat, in source order — including the first pair
+    /// again), then `add_offenses`.
+    fn ha_check_pairs(&mut self, elems: &[HaElem], real: &[HaElem], rocket: &[HaFormat], colon: &[HaFormat]) {
+        let first = real[0];
+        let max_key_width: isize = real.iter().map(|p| self.ha_key_chars(p)).max().unwrap_or(0);
+        let max_delim_width: isize = real.iter().map(|p| if p.hash_rocket { 4 } else { 2 }).max().unwrap_or(0);
+
+        let mut order: Vec<HaFormat> = Vec::new();
+        let mut buckets: std::collections::HashMap<HaFormat, Vec<usize>> = std::collections::HashMap::new();
+        let mut deltas: std::collections::HashMap<(HaFormat, usize), HaDelta> = std::collections::HashMap::new();
+        let mut by_start: std::collections::HashMap<usize, HaElem> = std::collections::HashMap::new();
+        for e in elems {
+            by_start.insert(e.start, *e);
+        }
+
+        let alignment_for = |e: &HaElem| -> Vec<HaFormat> {
+            if e.kwsplat {
+                vec![HaFormat::KwSplat]
+            } else if e.hash_rocket {
+                rocket.to_vec()
+            } else {
+                colon.to_vec()
+            }
+        };
+
+        // `register_offenses_with_format`'s correction block reads
+        // `column_deltas[alignment_for(offense).first.class][offense]` — NOT
+        // the delta under whichever format `min_by` picked for OFFENSE
+        // SELECTION. `alignment_for(offense).first` is the FIRST style in
+        // THAT element's own (rocket-or-colon) configured list, so with e.g.
+        // `EnforcedHashRocketStyle: [table, key]` the winning format (for
+        // deciding WHICH pairs get flagged, and the message) can be `key`
+        // while the correction actually applied to each flagged pair is
+        // `table`'s (or vice-versa) — and if that first-listed style judges
+        // the pair as ALREADY good (no entry ever landed in `deltas`), the
+        // flagged offense gets NO correction at all (its `unless delta.nil?`
+        // guard) even though it's reported. `rocket[0]`/`colon[0]` are safe:
+        // `ha_process`'s gate already proved both lists are non-empty.
+        let first_style_of = |e: &HaElem| -> HaFormat {
+            if e.kwsplat {
+                HaFormat::KwSplat
+            } else if e.hash_rocket {
+                rocket[0]
+            } else {
+                colon[0]
+            }
+        };
+        let first_style: std::collections::HashMap<usize, HaFormat> =
+            elems.iter().map(|e| (e.start, first_style_of(e))).collect();
+
+        for fmt in alignment_for(&first) {
+            let delta = match fmt {
+                HaFormat::Key => HaDelta {
+                    key: None,
+                    separator: Some(self.ha_ka_separator_delta(&first)),
+                    value: Some(self.ha_ka_value_delta(&first)),
+                },
+                HaFormat::Table => {
+                    let sep = if first.hash_rocket {
+                        self.ha_ta_hash_rocket_delta(&first, &first, max_key_width)
+                    } else {
+                        0
+                    };
+                    let val = self.ha_ta_value_delta(&first, &first, max_key_width, max_delim_width) - sep;
+                    HaDelta { key: None, separator: Some(sep), value: Some(val) }
+                }
+                HaFormat::Separator | HaFormat::KwSplat => HaDelta::default(),
+            };
+            ha_note_delta(&mut order, &mut buckets, &mut deltas, fmt, first.start, delta);
+        }
+
+        for cur in elems {
+            for fmt in alignment_for(cur) {
+                let delta = match fmt {
+                    HaFormat::Key => {
+                        if !self.ha_begins_its_line(cur.start) {
+                            HaDelta::default()
+                        } else {
+                            let key_delta = if self.ha_same_line(&first, cur) {
+                                0
+                            } else {
+                                self.ha_col(first.start) - self.ha_col(cur.start)
+                            };
+                            HaDelta {
+                                key: Some(key_delta),
+                                separator: Some(self.ha_ka_separator_delta(cur)),
+                                value: Some(self.ha_ka_value_delta(cur)),
+                            }
+                        }
+                    }
+                    HaFormat::Table => {
+                        let key_delta = if self.ha_same_line(&first, cur) {
+                            0
+                        } else {
+                            self.ha_col(first.start) - self.ha_col(cur.start)
+                        };
+                        let sep_delta = if cur.hash_rocket {
+                            self.ha_ta_hash_rocket_delta(&first, cur, max_key_width) - key_delta
+                        } else {
+                            0
+                        };
+                        let val_delta =
+                            self.ha_ta_value_delta(&first, cur, max_key_width, max_delim_width) - key_delta - sep_delta;
+                        HaDelta { key: Some(key_delta), separator: Some(sep_delta), value: Some(val_delta) }
+                    }
+                    HaFormat::Separator => {
+                        let key_delta = self.ha_sa_key_delta(&first, cur);
+                        let sep_delta = if cur.hash_rocket {
+                            self.ha_sa_hash_rocket_delta(&first, cur) - key_delta
+                        } else {
+                            0
+                        };
+                        let val_delta = self.ha_sa_value_delta(&first, cur) - key_delta - sep_delta;
+                        HaDelta { key: Some(key_delta), separator: Some(sep_delta), value: Some(val_delta) }
+                    }
+                    HaFormat::KwSplat => {
+                        if !self.ha_begins_its_line(cur.start) {
+                            HaDelta::default()
+                        } else {
+                            let key_delta = if self.ha_same_line(&first, cur) {
+                                0
+                            } else {
+                                self.ha_col(first.start) - self.ha_col(cur.start)
+                            };
+                            HaDelta { key: Some(key_delta), separator: None, value: None }
+                        }
+                    }
+                };
+                ha_note_delta(&mut order, &mut buckets, &mut deltas, fmt, cur.start, delta);
+            }
+        }
+
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // `kwsplat_offenses = offenses_by.delete(KeywordSplatAlignment)` —
+        // always registered, independent of the key/table/separator vote.
+        if let Some(list) = buckets.get(&HaFormat::KwSplat).cloned() {
+            self.ha_register(HaFormat::KwSplat, &list, &deltas, &by_start, &first_style, &mut seen);
+        }
+
+        // `offenses_by.min_by { |_, v| v.length }` — ties keep the format
+        // seen FIRST (insertion order recorded by `ha_note_delta`, mirroring
+        // Ruby `Hash`'s order-preserving iteration + `min_by`'s "only
+        // replace on strictly less" semantics).
+        let mut best: Option<(HaFormat, usize)> = None;
+        for fmt in &order {
+            if *fmt == HaFormat::KwSplat {
+                continue;
+            }
+            let len = buckets.get(fmt).map(|v| v.len()).unwrap_or(0);
+            match best {
+                None => best = Some((*fmt, len)),
+                Some((_, blen)) if len < blen => best = Some((*fmt, len)),
+                _ => {}
+            }
+        }
+        if let Some((fmt, _)) = best {
+            let list = buckets.get(&fmt).cloned().unwrap_or_default();
+            self.ha_register(fmt, &list, &deltas, &by_start, &first_style, &mut seen);
+        }
+    }
+
+    /// `register_offenses_with_format`: `add_offense` per flagged element —
+    /// `seen` mirrors rubocop-core's `current_offense_locations` Set (an
+    /// element can appear twice in `list`, see `ha_note_delta`'s doc; only
+    /// the first registration survives, exactly like upstream's `add_offense
+    /// unless current_offense_locations.add?(range)`). The MESSAGE comes
+    /// from `fmt` (the winning format), but the correction delta is looked
+    /// up under `first_style` — see that variable's doc in `ha_check_pairs`.
+    fn ha_register(
+        &mut self,
+        fmt: HaFormat,
+        list: &[usize],
+        deltas: &std::collections::HashMap<(HaFormat, usize), HaDelta>,
+        by_start: &std::collections::HashMap<usize, HaElem>,
+        first_style: &std::collections::HashMap<usize, HaFormat>,
+        seen: &mut std::collections::HashSet<usize>,
+    ) {
+        const COP: &str = "Layout/HashAlignment";
+        let msg = fmt.message();
+        for &start in list {
+            if !seen.insert(start) {
+                continue;
+            }
+            let Some(&elem) = by_start.get(&start) else { continue };
+            self.push(elem.start, COP, true, msg);
+            let correct_fmt = first_style.get(&start).copied().unwrap_or(fmt);
+            if let Some(&delta) = deltas.get(&(correct_fmt, start)) {
+                self.ha_correct(&elem, delta);
+            }
+        }
+    }
+
+    /// `correct_node`: a kwsplat (never `respond_to?(:value_omission?)`) or
+    /// an omitted-value pair (`a:`) both fall to `correct_no_value` (shift
+    /// the WHOLE element by its `key` delta); otherwise `correct_key_value`
+    /// shifts key/separator/value independently, clamping the key's own
+    /// leftward shift so it never crosses column 0.
+    fn ha_correct(&mut self, e: &HaElem, d: HaDelta) {
+        if e.kwsplat || e.value_omitted {
+            let kd = d.key.unwrap_or(0);
+            self.ha_adjust(kd, e.start);
+            return;
+        }
+        let sep = d.separator.unwrap_or(0);
+        let val = d.value.unwrap_or(0);
+        let mut key_delta = d.key.unwrap_or(0);
+        let key_col0 = self.ha_col(e.start) - 1; // 0-based, for the absolute clamp only
+        if key_delta < -key_col0 {
+            key_delta = -key_col0;
+        }
+        self.ha_adjust(key_delta, e.start);
+        self.ha_adjust(sep, e.op_start);
+        self.ha_adjust(val, e.value_start);
+    }
+    /// `adjust`: insert `delta` spaces before `pos`, or remove `-delta`
+    /// bytes immediately before it.
+    fn ha_adjust(&mut self, delta: isize, pos: usize) {
+        if delta > 0 {
+            self.fixes.push((pos, pos, vec![b' '; delta as usize]));
+        } else if delta < 0 {
+            let n = (-delta) as usize;
+            self.fixes.push((pos.saturating_sub(n), pos, Vec::new()));
+        }
+    }
+
+    /// `on_send`/`on_csend`/`on_super`/`on_yield`'s `ignore_hash_argument?`:
+    /// the call's last argument, if it's hash-typed (explicit `{}` or an
+    /// implicit trailing keyword-args group), gets `ignore_node`d per
+    /// `EnforcedLastArgumentHashStyle`.
+    pub(crate) fn ha_ignore_last_arg(&mut self, args: Option<ruby_prism::ArgumentsNode>) {
+        const COP: &str = "Layout/HashAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(args) = args else { return };
+        let Some(last) = args.arguments().iter().last() else { return };
+        let (start, braces) = if let Some(h) = last.as_hash_node() {
+            (h.location().start_offset(), true)
+        } else if let Some(kh) = last.as_keyword_hash_node() {
+            (kh.location().start_offset(), false)
+        } else {
+            return;
+        };
+        let style = self.cfg.get(COP, "EnforcedLastArgumentHashStyle").unwrap_or("always_inspect");
+        let ignore = match style {
+            "always_ignore" => true,
+            "ignore_explicit" => braces,
+            "ignore_implicit" => !braces,
+            _ => false, // "always_inspect" (default) and anything unrecognized
+        };
+        if ignore {
+            self.ha_ignored.insert(start);
+        }
+    }
+
+    /// `autocorrect_incompatible_with_other_cops?`: only relevant when
+    /// `Layout/ArgumentAlignment` is `with_fixed_indentation` — for every
+    /// hash-typed argument of THIS call with at least one real pair, compare
+    /// its first pair's line against the preceding argument (or, lacking
+    /// one, the call's own selector — or, lacking THAT too, e.g. `foo.(...)`,
+    /// the whole call expression).
+    pub(crate) fn ha_check_fixed_indentation(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/HashAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.get("Layout/ArgumentAlignment", "EnforcedStyle") != Some("with_fixed_indentation") {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        for (i, arg) in list.iter().enumerate() {
+            let (hash_start, elements): (usize, Vec<ruby_prism::Node>) = if let Some(h) = arg.as_hash_node() {
+                (h.location().start_offset(), h.elements().iter().collect())
+            } else if let Some(kh) = arg.as_keyword_hash_node() {
+                (kh.location().start_offset(), kh.elements().iter().collect())
+            } else {
+                continue;
+            };
+            let elems = self.ha_collect(&elements);
+            let Some(first_real) = elems.iter().find(|e| !e.kwsplat) else { continue };
+            let pair_line = self.ha_line(first_real.start);
+            let (sel_first, sel_last) = if i > 0 {
+                let l = list[i - 1].location();
+                (self.ha_line(l.start_offset()), self.ha_line(l.end_offset().saturating_sub(1)))
+            } else if let Some(ml) = node.message_loc() {
+                let l = self.ha_line(ml.start_offset());
+                (l, l)
+            } else {
+                let l = node.location();
+                (self.ha_line(l.start_offset()), self.ha_line(l.end_offset().saturating_sub(1)))
+            };
+            if sel_first == pair_line || sel_last == pair_line {
+                self.ha_incompatible.insert(hash_start);
+            }
+        }
+    }
+}

@@ -387,7 +387,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
-    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout",
+    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment",
 ];
 
 impl Engine {
@@ -1175,6 +1175,19 @@ pub(crate) struct Cops<'a> {
     // chain (outermost visited first); only the first actually checks/offends
     // — every other visit (including the def's own `on_def`) short-circuits.
     pub(crate) dea_ignored: HashSet<usize>,
+    // Layout/HashAlignment: hash node start offsets rubocop's `ignore_node`
+    // marked via `on_send`/`on_csend`/`on_super`/`on_yield`'s
+    // `ignore_hash_argument?` (the hash is the call's last argument and
+    // `EnforcedLastArgumentHashStyle` says to skip it) — checked (and
+    // skipped) when that same hash node is later visited.
+    pub(crate) ha_ignored: HashSet<usize>,
+    // Layout/HashAlignment: hash node start offsets rubocop's
+    // `autocorrect_incompatible_with_other_cops?` flagged — the hash is a
+    // direct argument of a call, `Layout/ArgumentAlignment` is configured
+    // `with_fixed_indentation`, and the hash's first real pair starts on the
+    // same line as the preceding argument (or the call's own selector, or —
+    // lacking a selector, e.g. `foo.(...)` — the whole call expression).
+    pub(crate) ha_incompatible: HashSet<usize>,
     // Layout/DefEndAlignment: def-node start offset -> the start offset of
     // the immediate (single-level) wrapping call, when the def is the
     // resolved target of a `def`-modifier chain — rubocop's
@@ -2387,6 +2400,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.opening_loc().start_offset(),
             node.closing_loc().start_offset(),
         );
+        self.check_hash_alignment_hash(node);
         if self.ll_active {
             let l = node.location();
             self.ll_enter_collection(
@@ -2413,6 +2427,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_keyword_hash_node(&mut self, node: &ruby_prism::KeywordHashNode<'pr>) {
         self.check_hash_syntax_keyword_hash(node);
+        self.check_hash_alignment_keyword_hash(node);
         ruby_prism::visit_keyword_hash_node(self, node);
     }
     fn visit_hash_pattern_node(&mut self, node: &ruby_prism::HashPatternNode<'pr>) {
@@ -4839,6 +4854,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.usage_block_depth -= 1;
     }
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+        // Layout/HashAlignment: `on_super`'s `ignore_hash_argument?`.
+        self.ha_ignore_last_arg(node.arguments());
         {
             let kw = node.keyword_loc();
             self.sak_check(kw.start_offset(), kw.end_offset(), b"super");
@@ -5034,6 +5051,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_or_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // Layout/HashAlignment: `on_send`/`on_csend`'s `ignore_hash_argument?`
+        // and `autocorrect_incompatible_with_other_cops?` both key off THIS
+        // call's own shape — see the `ha_ignored`/`ha_incompatible` field docs.
+        self.ha_ignore_last_arg(node.arguments());
+        self.ha_check_fixed_indentation(node);
         if let Some(args) = node.arguments() {
             self.ium_register_collection(&node.as_node(), args.arguments().iter().collect());
         }
@@ -5695,6 +5717,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_splat_node(self, node);
     }
     fn visit_yield_node(&mut self, node: &ruby_prism::YieldNode<'pr>) {
+        // Layout/HashAlignment: `on_yield`'s `ignore_hash_argument?`.
+        self.ha_ignore_last_arg(node.arguments());
         let kw = node.keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"yield");
         self.hs_register_dispatch(
@@ -5928,6 +5952,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         grrv_seen: false,
         mlbl_call_child: HashSet::new(),
         dea_ignored: HashSet::new(),
+        ha_ignored: HashSet::new(),
+        ha_incompatible: HashSet::new(),
         dea_parent: HashMap::new(),
         chi_call_root: HashMap::new(),
         chi_heredoc_ctx: HashMap::new(),
