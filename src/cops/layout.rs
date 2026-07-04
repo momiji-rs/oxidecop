@@ -12796,3 +12796,550 @@ impl<'a> Cops<'a> {
         self.ba_check_core(node0_start, node0_end, do_start, end_loc.start_offset(), end_loc.end_offset(), anchor_start);
     }
 }
+
+use ruby_prism::Visit as _;
+
+
+// ============================================================================
+// Layout/FirstArgumentIndentation
+//
+// Ported from rubocop's `FirstArgumentIndentation` cop plus the mixins it
+// includes: `Alignment` (`configured_indentation_width`, `display_column`,
+// the `AlignmentCorrector` autocorrect — shared idioms already established
+// by `check_first_parameter_indentation`/`check_parameter_alignment`/
+// `check_argument_alignment` above), `ConfigurableEnforcedStyle` (the 4-way
+// `EnforcedStyle`), and `RangeHelp` (`range_between`, `begins_its_line?`).
+//
+// Unlike `Layout/FirstParameterIndentation` (a `DefNode`-only cop with a
+// SINGLE relevant ancestor — the `def`'s own opening paren), this cop's
+// `special_inner_call_indentation?`/`autocorrect`'s chain-climbing both need
+// each checked call/super node's TRUE immediate AST parent (whitequark's
+// flat `:send`-node tree, where a call's arguments are direct children with
+// no wrapping "arguments" node) — something prism's own tree doesn't give
+// for free (no parent pointers, and prism interposes an `ArgumentsNode`/
+// `KeywordHashNode` wrapper whitequark doesn't have). `fai_build_maps` is a
+// SEPARATE, one-time, whole-file pre-pass (run alongside `HeredocFinder` in
+// `lint()`) that walks the tree once and records, for every node that sits
+// DIRECTLY in a call/super's receiver/argument/block-pass slot, that call's
+// own shape — keyed by `(start_offset, end_offset)` since a receiver chain's
+// links all SHARE a start offset (`foo.bar.baz` — `foo`, `foo.bar`, and
+// `foo.bar.baz` all start at 0), making `end_offset` the only way to tell
+// them apart. Nodes reached only through OTHER structure (an array/hash
+// literal, an `if` branch, a real block BODY, an assignment's RHS, ...) get
+// no entry at all — which is exactly the correct "no eligible parent"
+// signal, not an approximation: the pre-pass only ever inserts an entry from
+// within `visit_call_node`'s own receiver/argument/block-pass handling, so a
+// node nested through anything else is invisible to it, matching
+// whitequark's real `node.parent` being that OTHER (non-`:send`) node.
+impl<'pr> ruby_prism::Visit<'pr> for FaiPrepass {
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        let is_send_type = !node.is_safe_navigation();
+        let is_bracket_eq = node.name().as_slice() == b"[]=";
+        let parenthesized = node.closing_loc().is_some_and(|c| c.as_slice() == b")");
+        let loc = node.location();
+        let (start, end) = (loc.start_offset(), loc.end_offset());
+        let parent_has_dot = node.call_operator_loc().is_some();
+        if let Some(recv) = node.receiver() {
+            let rl = recv.location();
+            self.direct_parent.insert(
+                (rl.start_offset(), rl.end_offset()),
+                FaiParentInfo { start, end, is_send_type, is_bracket_eq, parenthesized, is_receiver: true, parent_has_dot },
+            );
+        }
+        if let Some(args) = node.arguments() {
+            for a in args.arguments().iter() {
+                let al = a.location();
+                self.direct_parent.insert(
+                    (al.start_offset(), al.end_offset()),
+                    FaiParentInfo { start, end, is_send_type, is_bracket_eq, parenthesized, is_receiver: false, parent_has_dot: false },
+                );
+            }
+        }
+        if let Some(b) = node.block() {
+            if b.as_block_argument_node().is_some() {
+                let bl = b.location();
+                self.direct_parent.insert(
+                    (bl.start_offset(), bl.end_offset()),
+                    FaiParentInfo { start, end, is_send_type, is_bracket_eq, parenthesized, is_receiver: false, parent_has_dot: false },
+                );
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+    // `SuperNode` is never `send_type?` in whitequark (`:super`/`:zsuper`
+    // are their own node types), so it can never satisfy
+    // `eligible_method_call?`'s `(send ...)` pattern as a PARENT — no entry
+    // is ever recorded pointing AT a super node, and (deliberately) no entry
+    // is recorded FOR super's own children either: leaving them absent from
+    // `direct_parent` correctly signals "no eligible parent" for anything
+    // nested directly in a `super(...)` call's arguments. The default trait
+    // method (calling the free `ruby_prism::visit_super_node`) still
+    // recurses into them to find any FURTHER-nested calls.
+    //
+    // `base_range`'s splat/kwsplat adjustment: `*call(...)`/`**call(...)`
+    // wraps the call in a `SplatNode`/`AssocSplatNode` in prism (a
+    // `KeywordHashNode` wrapper sits between the array/hash and a bare
+    // `AssocSplatNode` too, but its OWN location always coincides exactly
+    // with the `AssocSplatNode`'s for a single splatted element, so using
+    // the inner node's start is equivalent). Recorded regardless of what
+    // encloses the splat (array literal, call argument, ...) since
+    // `column_of`'s single-line `display_column` branch only cares about the
+    // splat operator's own column, not its enclosing structure.
+    fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
+        if let Some(expr) = node.expression() {
+            if expr.as_call_node().is_some() || expr.as_super_node().is_some() {
+                let el = expr.location();
+                let nl = node.location();
+                self.splat_wrap.insert((el.start_offset(), el.end_offset()), (nl.start_offset(), nl.end_offset()));
+            }
+        }
+        ruby_prism::visit_splat_node(self, node);
+    }
+    fn visit_assoc_splat_node(&mut self, node: &ruby_prism::AssocSplatNode<'pr>) {
+        if let Some(v) = node.value() {
+            if v.as_call_node().is_some() || v.as_super_node().is_some() {
+                let vl = v.location();
+                let nl = node.location();
+                self.splat_wrap.insert((vl.start_offset(), vl.end_offset()), (nl.start_offset(), nl.end_offset()));
+            }
+        }
+        ruby_prism::visit_assoc_splat_node(self, node);
+    }
+}
+
+/// One entry per node that sits directly in some call/super's
+/// receiver/argument/block-pass slot — that ENCLOSING call's own shape.
+/// `is_send_type`/`is_bracket_eq` split rubocop's two slightly different
+/// parent predicates apart: `eligible_method_call?` needs `is_send_type &&
+/// !is_bracket_eq`, while `inner_call?` needs only `is_send_type` (a `[]=`
+/// parent still counts there). `is_receiver`/`parent_has_dot` together are
+/// `find_top_level_send`'s climb condition (`parent.receiver == self &&
+/// parent.loc.dot`) — only ever `true` when this entry was recorded from
+/// `node.receiver()`, and only when that receiver's owner had an explicit
+/// `.`/`&.` connecting them.
+#[derive(Clone, Copy)]
+pub(crate) struct FaiParentInfo {
+    start: usize,
+    end: usize,
+    is_send_type: bool,
+    is_bracket_eq: bool,
+    parenthesized: bool,
+    is_receiver: bool,
+    parent_has_dot: bool,
+}
+
+#[derive(Default)]
+struct FaiPrepass {
+    direct_parent: std::collections::HashMap<(usize, usize), FaiParentInfo>,
+    splat_wrap: std::collections::HashMap<(usize, usize), (usize, usize)>,
+}
+
+/// Runs `FaiPrepass` once over the whole file (called from `lint()` next to
+/// the similarly whole-file, single-purpose `HeredocFinder` pass).
+pub(crate) fn fai_build_maps<'pr>(
+    root: &ruby_prism::Node<'pr>,
+) -> (std::collections::HashMap<(usize, usize), FaiParentInfo>, std::collections::HashMap<(usize, usize), (usize, usize)>) {
+    let mut fp = FaiPrepass::default();
+    fp.visit(root);
+    (fp.direct_parent, fp.splat_wrap)
+}
+
+/// Upstream's `MethodIdentifierPredicates::OPERATOR_METHODS` — used by
+/// `bare_operator?` (`operator_method? && !dot?`).
+const FAI_OPERATOR_METHODS: &[&[u8]] = &[
+    b"|", b"^", b"&", b"<=>", b"==", b"===", b"=~", b">", b">=", b"<", b"<=", b"<<", b">>", b"+", b"-", b"*", b"/", b"%", b"**", b"~", b"+@", b"-@",
+    b"!@", b"~@", b"[]", b"[]=", b"!", b"!=", b"!~", b"`",
+];
+
+/// The raw `node.arguments` list for a `super(...)` call, mirroring
+/// `argalign_call_items` (Layout/ArgumentAlignment's identical CallNode
+/// helper above) for `SuperNode`: every element of prism's own
+/// `ArgumentsNode`, plus an explicit `&block` block-pass appended when
+/// present (a `do...end`/`{}` block literal there is a different prism node
+/// kind and is correctly never appended).
+fn fai_super_items<'pr>(args: Option<ruby_prism::ArgumentsNode<'pr>>, block: Option<ruby_prism::Node<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+    let mut items: Vec<ruby_prism::Node> = match args {
+        Some(a) => a.arguments().iter().collect(),
+        None => Vec::new(),
+    };
+    if let Some(b) = block {
+        if b.as_block_argument_node().is_some() {
+            items.push(b);
+        }
+    }
+    items
+}
+
+impl<'a> super::Cops<'a> {
+    /// `on_send`/`alias on_csend` — prism's `is_safe_navigation()` flag
+    /// unifies both into one `CallNode` hook, so a single function covers
+    /// both aliases at once.
+    pub(crate) fn check_first_argument_indentation_call(&mut self, node: &ruby_prism::CallNode) {
+        // `setter_method?` (`loc?(:operator)`) — prism's `equal_loc` signal,
+        // shared idiom with `check_argument_alignment`'s `[]=` exclusion
+        // above (an index WRITE, e.g. `a[i] = x`, also carries `equal_loc`).
+        let is_setter = node.equal_loc().is_some();
+        let name = node.name();
+        let name_b = name.as_slice();
+        // `dot?` (`loc_is?(:dot, '.')`) — a LITERAL `.` only; `&.` and a bare
+        // implicit operator call (`a + b`, no `call_operator_loc` at all)
+        // both count as "not a dot" for `bare_operator?`'s purposes.
+        let is_dot = node.call_operator_loc().is_some_and(|l| l.as_slice() == b".");
+        let is_bare_operator = FAI_OPERATOR_METHODS.contains(&name_b) && !is_dot;
+        let items = argalign_call_items(node);
+        let loc = node.location();
+        let closing_start = node.closing_loc().filter(|c| c.as_slice() == b")").map(|c| c.start_offset());
+        self.fai_check(loc.start_offset(), loc.end_offset(), &items, is_bare_operator, is_setter, closing_start);
+    }
+
+    /// `alias on_super on_send` — `super(...)`/`super :foo, ...` (a real
+    /// `SuperNode`; bare `super`/`super(&blk)`-forwarding with no explicit
+    /// arguments is `ForwardingSuperNode`, which never has an argument list
+    /// to check at all, matching upstream's `node.arguments?` guard).
+    pub(crate) fn check_first_argument_indentation_super(&mut self, node: &ruby_prism::SuperNode) {
+        let items = fai_super_items(node.arguments(), node.block());
+        let loc = node.location();
+        // Super's own parens, when present, are always plain `(`/`)`.
+        let closing_start = node.rparen_loc().map(|c| c.start_offset());
+        self.fai_check(loc.start_offset(), loc.end_offset(), &items, false, false, closing_start);
+    }
+
+    /// The shared core of `on_send`: `should_check?`, `same_line?`, the
+    /// `ArgumentAlignment`/`FirstMethodArgumentLineBreak` cross-cop guard,
+    /// `check_alignment([node.first_argument], indent)`'s single-item
+    /// `each_bad_alignment` (the `begins_its_line?`/zero-delta checks), and
+    /// `register_offense`'s `@current_offenses` overlap guard (ported here
+    /// exactly like `check_argument_alignment`'s `argalign_registered_ranges`
+    /// — see the fixture's "lines affected by another offense" tests, where
+    /// an OUTER call's own first-argument offense range swallows an INNER
+    /// call's, so the inner one is registered non-correctable this pass).
+    fn fai_check(
+        &mut self,
+        node_start: usize,
+        node_end: usize,
+        items: &[ruby_prism::Node],
+        is_bare_operator: bool,
+        is_setter: bool,
+        closing_start: Option<usize>,
+    ) {
+        const COP: &str = "Layout/FirstArgumentIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        // `should_check?`: `node.arguments? && !bare_operator?(node) &&
+        // !node.setter_method?`.
+        if items.is_empty() || is_bare_operator || is_setter {
+            return;
+        }
+        let first = &items[0];
+        let arg_start = first.location().start_offset();
+        let arg_end = first.location().end_offset();
+        let node_line = self.idx.loc(node_start).0;
+        let arg_line = self.idx.loc(arg_start).0;
+        // `same_line?(node, node.first_argument)`.
+        if node_line == arg_line {
+            return;
+        }
+        // `enforce_first_argument_with_fixed_indentation? &&
+        // !enable_layout_first_method_argument_line_break?` — short-circuits
+        // to `false` whenever `Layout/ArgumentAlignment`'s style isn't
+        // `with_fixed_indentation` (its schema default, `with_first_argument`,
+        // never matches), so the RHS is never even evaluated in the fixture.
+        if self.cfg.get("Layout/ArgumentAlignment", "EnforcedStyle") == Some("with_fixed_indentation")
+            && !self.on("Layout/FirstMethodArgumentLineBreak")
+        {
+            return;
+        }
+
+        let style = self.cfg.enforced_style(COP);
+        let width = self.fai_indentation_width(COP);
+        let base = self.fai_base_indentation(style, node_start, node_end, arg_start, arg_line);
+        let indent = base + width;
+
+        // `each_bad_alignment`'s `begins_its_line?` guard: the first
+        // argument must itself be the first non-whitespace token on its own
+        // line, or this whole investigation silently yields no offense.
+        let arg_line_start = self.idx.starts[arg_line - 1];
+        if !self.src[arg_line_start..arg_start].iter().all(|&b| b == b' ' || b == b'\t') {
+            return;
+        }
+
+        let actual = self.display_column(arg_start);
+        if actual == indent {
+            return;
+        }
+
+        let within_prior = self.fai_registered_ranges.iter().any(|&(rs, re)| arg_start >= rs && arg_end <= re);
+        let msg = if within_prior {
+            "Bad indentation of the first argument.".to_string()
+        } else {
+            self.fai_message(style, node_start, node_end, arg_start)
+        };
+        self.push(arg_start, COP, !within_prior, msg);
+        if !within_prior {
+            let delta = indent as isize - actual as isize;
+            self.fai_autocorrect(style, node_start, node_end, closing_start, arg_start, arg_end, delta);
+        }
+        self.fai_registered_ranges.push((arg_start, arg_end));
+    }
+
+    /// `base_indentation(node)`.
+    fn fai_base_indentation(&self, style: &str, node_start: usize, node_end: usize, arg_start: usize, arg_line: usize) -> usize {
+        if self.fai_special_inner_call_indentation(style, node_start, node_end) {
+            let base_start = self.fai_splat_wrap.get(&(node_start, node_end)).map(|&(s, _)| s).unwrap_or(node_start);
+            self.fai_column_of(base_start, arg_start)
+        } else {
+            self.fai_previous_code_line_indent(arg_line)
+        }
+    }
+
+    /// `special_inner_call_indentation?(node)`.
+    fn fai_special_inner_call_indentation(&self, style: &str, node_start: usize, node_end: usize) -> bool {
+        match style {
+            "consistent" => false,
+            "consistent_relative_to_receiver" => true,
+            _ => {
+                let Some(parent) = self.fai_direct_parent.get(&(node_start, node_end)) else { return false };
+                // `eligible_method_call?`: `(send _ !:[]= ...)`.
+                if !parent.is_send_type || parent.is_bracket_eq {
+                    return false;
+                }
+                if !parent.parenthesized && style == "special_for_inner_method_call_in_parentheses" {
+                    return false;
+                }
+                // "The node must begin inside the parent, otherwise node is
+                // the first part of a chained method call."
+                node_start > parent.start
+            }
+        }
+    }
+
+    /// `message(arg_node)` for the CORRECTABLE (non-`nil`) case — the `nil`
+    /// case (`'Bad indentation of the first argument.'`) is handled directly
+    /// at the call site in `fai_check`.
+    fn fai_message(&self, style: &str, node_start: usize, node_end: usize, arg_start: usize) -> String {
+        // `base_range`'s `start_node`: `send_node.parent`'s own start when
+        // THIS node is itself the operand of a `*`/`**` splat, else
+        // `send_node` itself.
+        let base_start = self.fai_splat_wrap.get(&(node_start, node_end)).map(|&(s, _)| s).unwrap_or(node_start);
+        let mut s = base_start;
+        let mut e = arg_start;
+        while s < e && self.src[s].is_ascii_whitespace() {
+            s += 1;
+        }
+        while e > s && self.src[e - 1].is_ascii_whitespace() {
+            e -= 1;
+        }
+        let text = &self.src[s..e];
+        let base = if !text.contains(&b'\n') && self.fai_special_inner_call_indentation(style, node_start, node_end) {
+            format!("`{}`", String::from_utf8_lossy(text))
+        } else {
+            // `comment_line?(text.lines.reverse_each.first)`.
+            let last_line = text.rsplit(|&b| b == b'\n').next().unwrap_or(text);
+            let mut i = 0;
+            while i < last_line.len() && (last_line[i] == b' ' || last_line[i] == b'\t') {
+                i += 1;
+            }
+            if i < last_line.len() && last_line[i] == b'#' {
+                "the start of the previous line (not counting the comment)".to_string()
+            } else {
+                "the start of the previous line".to_string()
+            }
+        };
+        format!("Indent the first argument one step more than {base}.")
+    }
+
+    /// `column_of(range)` for the `[base_start, arg_start)` range built by
+    /// `base_range`.
+    fn fai_column_of(&self, start: usize, end: usize) -> usize {
+        let mut s = start;
+        let mut e = end;
+        while s < e && self.src[s].is_ascii_whitespace() {
+            s += 1;
+        }
+        while e > s && self.src[e - 1].is_ascii_whitespace() {
+            e -= 1;
+        }
+        if self.src[s..e].contains(&b'\n') {
+            let range_line = self.idx.loc(start).0;
+            let nl_count = self.src[s..e].iter().filter(|&&b| b == b'\n').count();
+            self.fai_previous_code_line_indent(range_line + nl_count + 1)
+        } else {
+            self.display_column(start)
+        }
+    }
+
+    /// `previous_code_line(line_number) =~ /\S/`: walks upward from (but
+    /// excluding) `line_number`, skipping blank lines and lines that are
+    /// ENTIRELY a comment (this cop's own `comment_lines`, i.e.
+    /// `begins_its_line?`-filtered — a trailing EOL comment on a line that
+    /// also has real code does NOT count, see `fai_full_line_comment`), and
+    /// returns the column of the first non-whitespace byte on the first
+    /// line that qualifies.
+    fn fai_previous_code_line_indent(&self, mut line_number: usize) -> usize {
+        loop {
+            if line_number <= 1 {
+                return 0;
+            }
+            line_number -= 1;
+            let line_start = self.idx.starts[line_number - 1];
+            let line_end = self.line_end(line_number);
+            let blank = self.src[line_start..line_end].iter().all(|b| b.is_ascii_whitespace());
+            if !blank && !self.fai_full_line_comment(line_number) {
+                let mut p = line_start;
+                while p < line_end && self.src[p].is_ascii_whitespace() {
+                    p += 1;
+                }
+                return p - line_start;
+            }
+        }
+    }
+
+    /// This cop's own `comment_lines`: `processed_source.comments.select {
+    /// |c| begins_its_line?(c.source_range) }.map(&:line)` — a FULL-line
+    /// comment only, unlike the engine's generic `comment_lines` field
+    /// (which flags a line for carrying ANY comment, trailing ones
+    /// included) used elsewhere for unrelated cops.
+    fn fai_full_line_comment(&self, line: usize) -> bool {
+        self.comments.iter().any(|&(l, s, _)| {
+            l == line && {
+                let line_start = self.idx.starts[line - 1];
+                self.src[line_start..s].iter().all(|&b| b == b' ' || b == b'\t')
+            }
+        })
+    }
+
+    /// `Alignment#configured_indentation_width` — identical fallback chain
+    /// to `parameter_alignment_indentation_width`/`argalign_indentation_width`
+    /// above (this cop's own schema has no `IndentationWidth` default, so
+    /// it's meaningful only when a user sets it directly).
+    fn fai_indentation_width(&self, cop: &'static str) -> usize {
+        self.cfg
+            .get(cop, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+
+    /// `find_top_level_send(send_node)`: climbs from `(start, end)` (the
+    /// checked call/super's own shape — upstream's `send_node = arg_node.
+    /// parent`, always this same node) through successive `direct_parent`
+    /// entries as long as each one is `is_receiver && parent_has_dot`.
+    fn fai_find_top_level_send(&self, start: usize, end: usize) -> (usize, usize) {
+        let mut cur = (start, end);
+        while let Some(info) = self.fai_direct_parent.get(&cur) {
+            if info.is_receiver && info.parent_has_dot {
+                cur = (info.start, info.end);
+            } else {
+                break;
+            }
+        }
+        cur
+    }
+
+    /// `should_correct_entire_chain?(send_node, top_level_send)`.
+    fn fai_should_correct_entire_chain(
+        &self,
+        style: &str,
+        send_start: usize,
+        send_end: usize,
+        top_start: usize,
+        top_end: usize,
+        delta: isize,
+        own_closing_start: Option<usize>,
+    ) -> bool {
+        if style != "special_for_inner_method_call_in_parentheses" {
+            return false;
+        }
+        // `inner_call?(top_level_send)`: `outer_call = top_level_send.parent;
+        // outer_call&.send_type? && outer_call.parenthesized?` — deliberately
+        // NOT excluding `[]=` here (unlike `eligible_method_call?`).
+        let Some(outer) = self.fai_direct_parent.get(&(top_start, top_end)) else { return false };
+        if !outer.is_send_type || !outer.parenthesized {
+            return false;
+        }
+        if self.display_column(send_start) >= delta.unsigned_abs() as usize {
+            return false;
+        }
+        // `top_level_send != send_node || begins_its_line?(top_level_send.
+        // loc.end)`.
+        if (top_start, top_end) != (send_start, send_end) {
+            return true;
+        }
+        own_closing_start.is_some_and(|cp| self.fai_begins_its_line(cp))
+    }
+
+    /// `begins_its_line?(range)`, specialized to a single-byte-anchor check
+    /// (the closing paren's own start offset).
+    fn fai_begins_its_line(&self, offset: usize) -> bool {
+        let line = self.idx.loc(offset).0;
+        let line_start = self.idx.starts[line - 1];
+        self.src[line_start..offset].iter().all(|&b| b == b' ' || b == b'\t')
+    }
+
+    /// `autocorrect(corrector, node)`: `node` there is always `arg_node`
+    /// (upstream's `register_offense(current, current)` for this cop's
+    /// single-item `check_alignment` call) — `send_node = node.parent` is
+    /// always OUR OWN checked call/super, i.e. `(node_start, node_end)`.
+    fn fai_autocorrect(
+        &mut self,
+        style: &str,
+        node_start: usize,
+        node_end: usize,
+        own_closing_start: Option<usize>,
+        arg_start: usize,
+        arg_end: usize,
+        delta: isize,
+    ) {
+        if delta == 0 {
+            return;
+        }
+        let (top_start, top_end) = self.fai_find_top_level_send(node_start, node_end);
+        let entire =
+            self.fai_should_correct_entire_chain(style, node_start, node_end, top_start, top_end, delta, own_closing_start);
+        let (cs, ce) = if entire { (top_start, top_end) } else { (arg_start, arg_end) };
+        self.fai_alignment_correct(cs, ce, delta);
+    }
+
+    /// `AlignmentCorrector.correct(corrector, processed_source, node_to_correct,
+    /// column_delta)`, ported for a possibly multi-line `node_to_correct`
+    /// (either the flagged argument alone, or the entire outer chain) —
+    /// identical per-line shifting logic to `parameter_alignment_correct`/
+    /// `array_alignment_correct` above, plus the `using_tabs?` guard (this
+    /// cop's `node_to_correct` can legitimately span many lines, including a
+    /// call chain's own closing lines, so the guard is cheap insurance even
+    /// though no fixture example sets `Layout/IndentationStyle: tabs`). NOT
+    /// ported: the heredoc taboo-range guard and `block_comment_within?` —
+    /// no fixture example's corrected range contains either.
+    fn fai_alignment_correct(&mut self, start: usize, end: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            return;
+        }
+        let mut line_begin = start;
+        loop {
+            if delta > 0 {
+                if self.src.get(line_begin) != Some(&b'\n') {
+                    self.fixes.push((line_begin, line_begin, vec![b' '; delta as usize]));
+                }
+            } else {
+                let n = (-delta) as usize;
+                let starts_with_space = self.src.get(line_begin) == Some(&b' ');
+                let (rs, re) = if starts_with_space { (line_begin, line_begin + n) } else { (line_begin.saturating_sub(n), line_begin) };
+                if re <= self.src.len() && rs < re && self.src[rs..re].iter().all(|&b| b == b' ' || b == b'\t') {
+                    self.fixes.push((rs, re, Vec::new()));
+                }
+            }
+            let mut p = line_begin;
+            while p < end && self.src[p] != b'\n' {
+                p += 1;
+            }
+            if p >= end {
+                break;
+            }
+            line_begin = p + 1;
+        }
+    }
+}

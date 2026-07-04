@@ -389,7 +389,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
-    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment",
+    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation",
 ];
 
 impl Engine {
@@ -668,6 +668,21 @@ pub(crate) struct Cops<'a> {
     // `where(...)`, and its `!x.zero?` negation) without a parent pointer.
     // Spans index into src — no per-node allocation.
     pub(crate) call_stack: Vec<(usize, usize)>,
+    // Layout/FirstArgumentIndentation: precomputed once per file (see
+    // `layout::fai_build_maps`) — see `layout::FaiParentInfo`'s doc for why
+    // a live parent-tracking stack maintained during the main traversal
+    // can't give this cop's `special_inner_call_indentation?`/autocorrect
+    // chain-climbing the exact whitequark-style "direct AST parent" they
+    // need. `fai_direct_parent` maps a node's `(start, end)` to its
+    // enclosing call/super's shape; `fai_splat_wrap` maps a `*x`/`**x`
+    // splatted call/super to its splat/double-splat operator's own span.
+    pub(crate) fai_direct_parent: HashMap<(usize, usize), layout::FaiParentInfo>,
+    pub(crate) fai_splat_wrap: HashMap<(usize, usize), (usize, usize)>,
+    // Layout/FirstArgumentIndentation's own `@current_offenses` overlap
+    // guard — every `(start, end)` byte range already flagged this file, in
+    // visitation order (mirrors `check_argument_alignment`'s
+    // `argalign_registered_ranges`).
+    pub(crate) fai_registered_ranges: Vec<(usize, usize)>,
     // Ancestor counters for Lint/NestedMethodDefinition: how many enclosing
     // `def`s, and how many enclosing "scoping" blocks/sclass (Class.new,
     // instance_eval, class << self, AllowedMethods, …). A nested def is an
@@ -5027,6 +5042,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
         // Layout/HashAlignment: `on_super`'s `ignore_hash_argument?`.
         self.ha_ignore_last_arg(node.arguments());
+        self.check_first_argument_indentation_super(node);
         {
             let kw = node.keyword_loc();
             self.sak_check(kw.start_offset(), kw.end_offset(), b"super");
@@ -5595,6 +5611,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_slicing_with_range(node);
         self.check_empty_lines_around_arguments(node);
         self.check_argument_alignment(node);
+        self.check_first_argument_indentation_call(node);
         self.check_format_parameter_mismatch(node);
         // Lint/SafeNavigationChain: the main per-node check (see its doc
         // comment for why this must run BEFORE this call's own arguments are
@@ -6029,6 +6046,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     let mut lit_spans = hd.lit_spans;
     lit_spans.sort_unstable();
 
+    // Layout/FirstArgumentIndentation: see `layout::fai_build_maps`'s doc.
+    let (fai_direct_parent, fai_splat_wrap) = layout::fai_build_maps(&result.node());
+
     let (hot, file_disabled) = eng.file_view(rel_path);
     let mut cops = Cops {
         src,
@@ -6041,6 +6061,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         fixes: Vec::new(),
         eng,
         call_stack: Vec::new(),
+        fai_direct_parent,
+        fai_splat_wrap,
+        fai_registered_ranges: Vec::new(),
         def_depth: 0,
         scoping_depth: 0,
         def_name_stack: Vec::new(),
