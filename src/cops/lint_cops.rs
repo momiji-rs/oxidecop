@@ -10033,3 +10033,224 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+/// `Dir.glob(...)`/`Dir[...]` — a bare `Dir` or root `::Dir` receiver, per
+/// `def_node_matcher`'s `{nil? cbase}` (bare constant or `::`-rooted, never a
+/// namespaced one like `Foo::Dir`).
+fn ndro_dir_recv(node: &ruby_prism::Node) -> bool {
+    const_name_root(node).as_deref() == Some("Dir")
+}
+
+/// `unsorted_dir_block?` — the call ITSELF is `Dir.glob(...)`; a block or
+/// block-pass attaches directly, with no intervening `.each`.
+fn ndro_dir_glob_call(call: &ruby_prism::CallNode) -> bool {
+    call.name().as_slice() == b"glob" && call.receiver().is_some_and(|r| ndro_dir_recv(&r))
+}
+
+/// `unsorted_dir_each?` — the call is `.each` chained onto `Dir[...]` or
+/// `Dir.glob(...)`.
+fn ndro_dir_each_call(call: &ruby_prism::CallNode) -> bool {
+    if call.name().as_slice() != b"each" {
+        return false;
+    }
+    let Some(recv) = call.receiver() else { return false };
+    let Some(recv_call) = recv.as_call_node() else { return false };
+    matches!(recv_call.name().as_slice(), b"[]" | b"glob")
+        && recv_call.receiver().is_some_and(|r| ndro_dir_recv(&r))
+}
+
+/// `method_require?` — a block-pass (`&expr`) wrapping `method(:require)` or
+/// `method(:require_relative)`.
+fn ndro_method_require_pass(barg: &ruby_prism::BlockArgumentNode) -> bool {
+    let Some(expr) = barg.expression() else { return false };
+    let Some(inner) = expr.as_call_node() else { return false };
+    if inner.receiver().is_some() || inner.name().as_slice() != b"method" {
+        return false;
+    }
+    let Some(args) = inner.arguments() else { return false };
+    let items: Vec<_> = args.arguments().iter().collect();
+    items.len() == 1
+        && items[0]
+            .as_symbol_node()
+            .is_some_and(|s| matches!(s.unescaped(), b"require" | b"require_relative"))
+}
+
+/// The block's loop-variable candidate names. An explicit `|var|` — exactly
+/// one plain required param, nothing else, matching upstream's
+/// `def_node_matcher :loop_variable, "(args (arg $_))"` — yields that one
+/// name. Numbered params (`_1`, `_2`, ...) yield every numbered name up to
+/// the block's `maximum`, mirroring `on_numblock`'s
+/// `node.argument_list.filter { ... }` (each candidate checked
+/// independently; any one being required is enough). Anything else (zero
+/// params, splat/optional/keyword/destructured args) yields no candidates,
+/// same as upstream's silent non-match — `it`-params are never reached here
+/// since they require Ruby 3.4+ and this cop is gated to `<= 2.7`.
+fn ndro_loop_var_names(params: Option<ruby_prism::Node>) -> Vec<Vec<u8>> {
+    let Some(p) = params else { return Vec::new() };
+    if let Some(np) = p.as_numbered_parameters_node() {
+        return (1..=np.maximum()).map(|i| format!("_{i}").into_bytes()).collect();
+    }
+    let Some(bp) = p.as_block_parameters_node() else { return Vec::new() };
+    let Some(pp) = bp.parameters() else { return Vec::new() };
+    if pp.requireds().len() != 1
+        || pp.optionals().len() != 0
+        || pp.rest().is_some()
+        || pp.posts().len() != 0
+        || pp.keywords().len() != 0
+        || pp.keyword_rest().is_some()
+        || pp.block().is_some()
+    {
+        return Vec::new();
+    }
+    pp.requireds()
+        .iter()
+        .next()
+        .and_then(|n| n.as_required_parameter_node())
+        .map(|rp| vec![rp.name().as_slice().to_vec()])
+        .unwrap_or_default()
+}
+
+/// `var_is_required?` — recursively searches `body` (if/else nesting and
+/// deeper included, like upstream's `def_node_search`) for
+/// `require(var)`/`require_relative(var)` where `var` is a bare local-
+/// variable read matching `var` by name.
+fn ndro_var_is_required(body: &ruby_prism::Node, var: &[u8]) -> bool {
+    struct Finder<'h> {
+        var: &'h [u8],
+        found: bool,
+    }
+    impl<'pr, 'h> ruby_prism::Visit<'pr> for Finder<'h> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if self.found {
+                return;
+            }
+            if node.receiver().is_none() && matches!(node.name().as_slice(), b"require" | b"require_relative") {
+                if let Some(args) = node.arguments() {
+                    let items: Vec<_> = args.arguments().iter().collect();
+                    if items.len() == 1 {
+                        if let Some(lvar) = items[0].as_local_variable_read_node() {
+                            if lvar.name().as_slice() == self.var {
+                                self.found = true;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut finder = Finder { var, found: false };
+    use ruby_prism::Visit;
+    finder.visit(body);
+    finder.found
+}
+
+/// The "logical send" range — receiver through the end of the call's own
+/// arguments/parens, EXCLUDING any attached `do...end`/`{}` block (whose
+/// prism `CallNode::location` otherwise extends through the block's `end`).
+/// A block-pass (`&expr`) never extends `location()` past the closing paren,
+/// so this only matters for the real-block case.
+fn ndro_call_range_no_block(call: &ruby_prism::CallNode) -> (usize, usize) {
+    let start = call.location().start_offset();
+    let end = if let Some(closing) = call.closing_loc() {
+        closing.end_offset()
+    } else if let Some(args) = call.arguments() {
+        args.location().end_offset()
+    } else if let Some(m) = call.message_loc() {
+        m.end_offset()
+    } else {
+        call.location().end_offset()
+    };
+    (start, end)
+}
+
+impl<'a> super::Cops<'a> {
+    /// Lint/NonDeterministicRequireOrder — `Dir[...]`/`Dir.glob(...)` make no
+    /// ordering guarantee; requiring the results without `.sort` first can
+    /// load files in a different order (and fail differently) across
+    /// operating systems/filesystems. `Dir.glob`/`Dir[]` sort by default
+    /// starting in Ruby 3.0, so upstream disables the ENTIRE cop above that
+    /// (`maximum_target_ruby_version 2.7`) — nothing below ever runs once
+    /// `TargetRubyVersion > 2.7`.
+    pub(crate) fn check_non_deterministic_require_order(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/NonDeterministicRequireOrder";
+        if !self.on(COP) || self.cfg.target_ruby() > 2.7 {
+            return;
+        }
+        let Some(b) = node.block() else { return };
+        if let Some(block) = b.as_block_node() {
+            self.ndro_check_block(node, &block);
+        } else if let Some(barg) = b.as_block_argument_node() {
+            self.ndro_check_block_pass(node, &barg);
+        }
+    }
+
+    /// `on_block`/`on_numblock` — offense anchors on the call the block
+    /// attaches to (`Dir.glob(...)` itself, or the `.each` chained onto
+    /// `Dir[...]`/`Dir.glob(...)`); `correct_block`'s two branches replace
+    /// that same span with either its own source or its receiver's source,
+    /// plus `.sort.each`.
+    fn ndro_check_block(&mut self, call: &ruby_prism::CallNode, block: &ruby_prism::BlockNode) {
+        const COP: &str = "Lint/NonDeterministicRequireOrder";
+        let is_glob_block = ndro_dir_glob_call(call);
+        let is_each = ndro_dir_each_call(call);
+        if !is_glob_block && !is_each {
+            return;
+        }
+        let Some(body) = block.body() else { return };
+        let names = ndro_loop_var_names(block.parameters());
+        if names.is_empty() || !names.iter().any(|n| ndro_var_is_required(&body, n)) {
+            return;
+        }
+        let anchor = call.location().start_offset();
+        self.push(anchor, COP, true, "Sort files before requiring them.");
+        let (start, end) = ndro_call_range_no_block(call);
+        let mut repl = Vec::new();
+        if is_glob_block {
+            repl.extend_from_slice(&self.src[start..end]);
+        } else {
+            // `unsorted_dir_each?` matched, so a receiver is guaranteed.
+            let rl = call.receiver().expect("each-chain has a receiver").location();
+            repl.extend_from_slice(&self.src[rl.start_offset()..rl.end_offset()]);
+        }
+        repl.extend_from_slice(b".sort.each");
+        self.fixes.push((start, end, repl));
+    }
+
+    /// `on_block_pass` — offense anchors on the whole call carrying the
+    /// block-pass (`Dir.glob(pattern, &method(:require))` or
+    /// `Dir[...].each(&method(:require))`). `correct_block_pass`'s two
+    /// branches: the direct-glob form moves `&method(...)` out past a new
+    /// `.sort.each(...)`; the `.each`-chain form just renames the selector.
+    fn ndro_check_block_pass(&mut self, call: &ruby_prism::CallNode, barg: &ruby_prism::BlockArgumentNode) {
+        const COP: &str = "Lint/NonDeterministicRequireOrder";
+        if !ndro_method_require_pass(barg) {
+            return;
+        }
+        let is_glob_pass = ndro_dir_glob_call(call);
+        let is_each_pass = ndro_dir_each_call(call);
+        if !is_glob_pass && !is_each_pass {
+            return;
+        }
+        let anchor = call.location().start_offset();
+        self.push(anchor, COP, true, "Sort files before requiring them.");
+        if is_glob_pass {
+            let barg_loc = barg.location();
+            let prev_end = call
+                .arguments()
+                .and_then(|a| a.arguments().iter().last())
+                .map(|n| n.location().end_offset())
+                .unwrap_or_else(|| barg_loc.start_offset());
+            self.fixes.push((prev_end, barg_loc.end_offset(), Vec::new()));
+            let call_end = call.location().end_offset();
+            let mut ins = b".sort.each(".to_vec();
+            ins.extend_from_slice(&self.src[barg_loc.start_offset()..barg_loc.end_offset()]);
+            ins.push(b')');
+            self.fixes.push((call_end, call_end, ins));
+        } else if let Some(sel) = call.message_loc() {
+            self.fixes.push((sel.start_offset(), sel.end_offset(), b"sort.each".to_vec()));
+        }
+    }
+}

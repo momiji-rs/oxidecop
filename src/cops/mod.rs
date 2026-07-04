@@ -312,7 +312,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
-    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength",
+    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder",
 ];
 
 impl Engine {
@@ -3444,6 +3444,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_unreachable_loop_call(node);
         self.check_insecure_protocol_source(node);
         self.check_required_ruby_version(node);
+        self.check_non_deterministic_require_order(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
         let n = node.as_node();
