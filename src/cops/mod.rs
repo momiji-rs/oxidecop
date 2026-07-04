@@ -233,7 +233,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
-    "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem",
+    "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
 ];
 
 impl Engine {
@@ -2637,6 +2637,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_single_argument_dig(node);
         self.check_nested_parenthesized_calls(node);
         self.check_require_parentheses(node);
+        self.check_parentheses_as_grouped_expression(node);
         self.check_non_nil_check(node);
         self.check_multiline_method_call_brace_layout(node);
         // Naming/AsciiIdentifiers scans tIDENTIFIER tokens — method call

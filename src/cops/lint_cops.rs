@@ -9125,3 +9125,83 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// `Lint/ParenthesesAsGroupedExpression` — `method (arg)` with a space
+    /// before a parenthesized SOLE argument is ambiguous: Ruby parses it as
+    /// `method(the_whole_parenthesized_expr)`, not as call-parens around
+    /// `arg`. Upstream's whitequark-oriented `valid_context?` guards
+    /// (`any_block_type?`/`hash_type?`/`ternary_expression?`/
+    /// `compound_range?`/`chained_calls?`) all test `node.first_argument`
+    /// itself — which, whenever `parenthesized_call?` holds, is ALWAYS the
+    /// synthetic wrapper node (whitequark's `:begin`, prism's
+    /// `ParenthesesNode`), never the unwrapped inner expression. So those
+    /// predicates are unreachable in practice (verified against real
+    /// `rubocop` 1.88: a parenthesized block/hash/ternary body still
+    /// offends). The two guards that DO matter are `operator_method?` and
+    /// `setter_method?`, plus the two structural gates below. Ported to
+    /// prism terms:
+    ///   - `node.arguments.one?` -> exactly one call argument.
+    ///   - `first_argument.parenthesized_call?` (own `loc.begin == '('`) ->
+    ///     that sole argument is ITSELF a `ParenthesesNode` (the entire
+    ///     argument is one explicit `(...)` group) — this is the ONLY shape
+    ///     that structurally corresponds to the ambiguous surface syntax;
+    ///     any other node type (a plain call with its own args-parens like
+    ///     `b(c)`, `yield(c)`/`super(c)`/`defined?(c)` with their own
+    ///     keyword-parens, a chain `(x).foo.bar`, a compound range
+    ///     `(a-b)..(c-d)`, a multi-arg hash-pattern key, etc.) is NOT a
+    ///     `ParenthesesNode` and is excluded for free, matching upstream's
+    ///     early-exit `return true unless ...` AND its independent
+    ///     `spaces_before_left_parenthesis` string-prefix check in one shot.
+    ///   - `node.parenthesized?` (`loc.end.is?(')')`, the CALL's own parens)
+    ///     -> `node.opening_loc().is_some()`.
+    pub(crate) fn check_parentheses_as_grouped_expression(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/ParenthesesAsGroupedExpression";
+        if !self.on(COP) {
+            return;
+        }
+
+        // `node.parenthesized?` — the call itself already has real parens
+        // around its arguments; nothing ambiguous here.
+        if node.opening_loc().is_some() {
+            return;
+        }
+
+        let Some(args) = node.arguments() else { return };
+        let arg_list = args.arguments();
+        if arg_list.len() != 1 {
+            return;
+        }
+
+        // `first_argument.parenthesized_call?` — the sole argument must
+        // itself be a full `(...)` group (a prism `ParenthesesNode`), not
+        // merely have a `(` appear somewhere inside it.
+        let Some(paren) = arg_list.iter().next().unwrap().as_parentheses_node() else {
+            return;
+        };
+
+        // `node.operator_method? || node.setter_method?`
+        let name = node.name().as_slice();
+        if is_operator_method_name(name) || node.equal_loc().is_some() {
+            return;
+        }
+
+        let Some(selector) = node.message_loc() else { return };
+        let sel_end = selector.end_offset();
+        let paren_loc = paren.location();
+        let paren_start = paren_loc.start_offset();
+
+        // `spaces_before_left_parenthesis` / `space_length.positive?` — the
+        // offense range is exactly the (possibly multi-byte) gap between the
+        // selector and the opening paren.
+        if paren_start <= sel_end {
+            return;
+        }
+
+        let argument_src = String::from_utf8_lossy(&self.src[paren_start..paren_loc.end_offset()]);
+        let message = format!("`{argument_src}` interpreted as grouped expression.");
+        self.push(sel_end, COP, true, message);
+        self.fixes.push((sel_end, paren_start, Vec::new()));
+    }
+}
+
