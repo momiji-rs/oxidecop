@@ -7,6 +7,7 @@ mod gemspec;
 mod layout;
 mod lint_cops;
 mod metrics;
+mod migration;
 mod naming;
 mod style;
 
@@ -388,6 +389,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
+    "Lint/ScriptPermission", "Migration/DepartmentName",
 ];
 
 impl Engine {
@@ -6207,6 +6209,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     cops.check_redundant_cop_enable_directive();
     cops.check_commented_keyword();
     cops.check_duplicated_assignment(&result.node());
+    cops.check_script_permission();
+    cops.check_department_name();
     let t = tick(&T_VISIT, t);
 
     let mut offenses = cops.offenses;

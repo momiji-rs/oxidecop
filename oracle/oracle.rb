@@ -987,6 +987,15 @@ fails = []
 # oxidecop's --fix matches byte-for-byte, verified live for every entry
 # here). Those examples' correction expectations are DSL artifacts, not
 # CLI behavior; they are excluded from the FIX denominator.
+# Examples whose EXPECTATION depends on RSpec-runtime state that no
+# file-driven CLI can reproduce: an in-memory ProcessedSource with no
+# backing file (File.exist? is always true for a staged temp file — the
+# real rubocop CLI flags these exact sources too when given a real file,
+# verified live). Skipped as unrepresentable.
+CLI_UNREPRESENTABLE = [
+  ['Lint/ScriptPermission', "#!/usr/bin/ruby\nputs 'hello, world'"],
+].freeze
+
 FIX_DSL_LOOP_QUIRKS = [
   ['Layout/IndentationWidth',
    "def my_func\n  puts 'do something outside block'\n  begin\n  puts 'do something error prone'"],
@@ -1087,9 +1096,21 @@ examples.each_with_index do |ex, n|
     g[:skipped] += 1
     next
   end
+  if CLI_UNREPRESENTABLE.any? { |cop, prefix| cop == COP && src.start_with?(prefix) }
+    g[:skipped] += 1
+    next
+  end
+  exp = ex[:expected].map { |l, c, m| [l, c, resolve_interp(m, cfg_hash, ex[:lets] || {})] }
+  # Same rule for EXPECTED MESSAGES: an annotation whose text still carries
+  # an unresolved `\#{ident}` (Lint/ScriptPermission's runtime Tempfile
+  # basename) can never be matched by any implementation — the expectation
+  # itself is unrepresentable.
+  if exp.any? { |(_, _, m)| m =~ /\#\{\w+\}/ }
+    g[:skipped] += 1
+    next
+  end
 
   actual = run_poc(POC, src, build_cfg(COP, cfg_hash, ex[:as], extra_sections, replace: replace, ruby: ex[:ruby]), ex[:filename])
-  exp = ex[:expected].map { |l, c, m| [l, c, resolve_interp(m, cfg_hash, ex[:lets] || {})] }
   g[:total] += 1
 
   exp_loc = exp.map { |l, c, _| [l, c] }.sort
