@@ -369,7 +369,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
-    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain",
+    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison",
 ];
 
 impl Engine {
@@ -1529,6 +1529,20 @@ pub(crate) struct Cops<'a> {
     // step would just drop. Maps line -> (index into `fixes` of that line's
     // current removal edit if one's been pushed yet, cumulative delta).
     pub(crate) nx_reindented: HashMap<usize, (Option<usize>, i64)>,
+    // Style/MultipleComparison: (start, end) spans of `OrNode`s that are the
+    // immediate `left`/`right` child of ANOTHER `OrNode` — mirrors
+    // `root_of_or_node`'s parent-walk (prism gives no parent pointers). Keyed
+    // by the FULL span, not just the start offset: a left-associative `||`
+    // chain's outer node and its nested left child share the very same start
+    // offset (both begin at the chain's leftmost token), so start-offset-only
+    // keying (this file's usual "populate ahead of time" idiom) would
+    // conflate them and wrongly skip the true root too. `visit_or_node` marks
+    // both children (if they're themselves `OrNode`s) BEFORE descending, so
+    // by the time traversal reaches a nested one, this is already populated;
+    // `check_style_multiple_comparison` only ever processes the OUTERMOST
+    // `or` of a chain (`node == root_of_or_node(node)`), i.e. one whose own
+    // (start, end) is NOT in this set.
+    pub(crate) mc_nested_or: HashSet<(usize, usize)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -3899,6 +3913,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 lint_cops::SnavParent::LogicalOperand { is_and: false, is_rhs: true, is_symbol_op, lhs_receiver: None },
             );
         }
+        if node.left().as_or_node().is_some() {
+            let l = node.left().location();
+            self.mc_nested_or.insert((l.start_offset(), l.end_offset()));
+        }
+        if node.right().as_or_node().is_some() {
+            let l = node.right().location();
+            self.mc_nested_or.insert((l.start_offset(), l.end_offset()));
+        }
+        self.check_style_multiple_comparison(node);
         ruby_prism::visit_or_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
@@ -4607,6 +4630,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         dn_return_arg_offsets: HashSet::new(),
         dn_pending_define_method: None,
         nx_reindented: HashMap::new(),
+        mc_nested_or: HashSet::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),

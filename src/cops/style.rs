@@ -26026,3 +26026,204 @@ impl<'a> super::Cops<'a> {
         haystack[from..].windows(needle.len()).position(|w| w == needle).map(|p| p + from)
     }
 }
+
+
+// ============================================================================
+// Style/MultipleComparison
+//
+// `a == 'a' || a == 'b' || a == 'c'` (same variable compared against N
+// values via a chain of `||`-ed `==` sends) -> `['a', 'b', 'c'].include?(a)`.
+//
+// Only the OUTERMOST `or` of a `||`-chain is ever processed — upstream's
+// `on_or` bails unless `node == root_of_or_node(node)` (a parent-walk prism
+// gives us no pointers for); mirrored via `mc_nested_or`
+// (`Cops::mc_nested_or`), populated in `visit_or_node` by marking a node's
+// `left`/`right` BEFORE descending whenever that child is itself an `OrNode`
+// — by the time traversal reaches the nested one, it's already marked.
+//
+// `variable`/`values` bookkeeping mirrors upstream's `find_offending_var`
+// (a `Set` + growing `Array`, both mutated in place across the whole
+// recursive walk) using plain byte-slices of source text as the equality key
+// (standing in for `Parser::AST::Node#==`/`#hash` structural equality — safe
+// for the fixture's shapes, which never rely on whitespace-insensitive
+// matching). Crucially, `variables` growing past size 1 (a differing
+// variable found on some OTHER leaf) poisons the rest of the walk: once
+// poisoned, even a LATER leaf whose `var` matches the very first one no
+// longer contributes its `obj` to `values` — this is why
+// `bar.do_something == bar || foo == :sym` registers no offense (the first
+// leaf's `obj` alone is below `ComparisonsThreshold`), and why
+// `var == foo || var == 'bar' || var == 'baz'` (under `AllowMethodComparison:
+// true`, default) offends starting at `var == 'bar'` — the leading `var ==
+// foo` leaf is excluded from `variables`/`values` entirely (its `obj`,
+// `foo`, is itself a method call) rather than poisoning anything.
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_style_multiple_comparison(&mut self, node: &ruby_prism::OrNode) {
+        const COP: &str = "Style/MultipleComparison";
+        const MSG: &str = "Avoid comparing a variable with multiple items in a conditional, use `Array#include?` instead.";
+        if !self.on(COP) {
+            return;
+        }
+        let node_loc = node.location();
+        if self.mc_nested_or.contains(&(node_loc.start_offset(), node_loc.end_offset())) {
+            return;
+        }
+        let allow_method_comparison = self.cfg.get(COP, "AllowMethodComparison") != Some("false");
+        // `nested_comparison?(node)`: both direct sides of THIS `or` must be
+        // a `simple_comparison` (directly, or transitively via their own
+        // nested `or`s).
+        if !(mc_comparison(&node.left(), allow_method_comparison)
+            && mc_comparison(&node.right(), allow_method_comparison))
+        {
+            return;
+        }
+        let mut variables: Vec<Vec<u8>> = Vec::new();
+        let mut values: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        mc_find_offending_var(&node.left(), &mut variables, &mut values, allow_method_comparison, self.src);
+        mc_find_offending_var(&node.right(), &mut variables, &mut values, allow_method_comparison, self.src);
+        if variables.is_empty() {
+            return;
+        }
+        let threshold = self.cfg.int(COP, "ComparisonsThreshold");
+        if values.len() < threshold {
+            return;
+        }
+        // `offense_range`: `values.first.parent.source_range.begin.join
+        // (values.last.parent.source_range.end)` — spans from the start of
+        // the FIRST included comparison's `==` send to the end of the LAST
+        // included one (NOT the whole root `or` node — a leading/trailing
+        // excluded leaf, like `var == foo ||` above, is left untouched).
+        let range_start = values[0].1;
+        let range_end = values[values.len() - 1].2;
+        self.push(range_start, COP, true, MSG);
+        let elements: Vec<&[u8]> = values.iter().map(|(obj, _, _)| obj.as_slice()).collect();
+        let mut replacement = Vec::new();
+        replacement.push(b'[');
+        for (i, el) in elements.iter().enumerate() {
+            if i > 0 {
+                replacement.extend_from_slice(b", ");
+            }
+            replacement.extend_from_slice(el);
+        }
+        replacement.extend_from_slice(b"].include?(");
+        replacement.extend_from_slice(&variables[0]);
+        replacement.push(b')');
+        self.fixes.push((range_start, range_end, replacement));
+    }
+}
+
+/// `simple_double_comparison?`: `(send lvar :== lvar)` exactly — an "lvar ==
+/// lvar" comparison is exempted entirely regardless of `AllowMethodComparison`
+/// (ambiguous which side is "the" compared variable).
+fn mc_is_double_lvar_comparison(call: &ruby_prism::CallNode) -> bool {
+    if call.name().as_slice() != b"==" {
+        return false;
+    }
+    let Some(receiver) = call.receiver() else { return false };
+    if receiver.as_local_variable_read_node().is_none() {
+        return false;
+    }
+    let Some(args) = call.arguments() else { return false };
+    let mut it = args.arguments().iter();
+    let Some(arg) = it.next() else { return false };
+    if it.next().is_some() {
+        return false;
+    }
+    arg.as_local_variable_read_node().is_some()
+}
+
+fn mc_is_lvar_or_call(node: &ruby_prism::Node) -> bool {
+    node.as_local_variable_read_node().is_some() || node.as_call_node().is_some()
+}
+
+/// `simple_comparison`: an `==` send with exactly one argument, whose
+/// receiver-or-argument is a `{lvar call}` — receiver checked FIRST
+/// (matching upstream's `||` short-circuit: if the receiver structurally
+/// qualifies, that's `var` even if the `AllowMethodComparison` filter then
+/// rejects it outright, without ever trying the argument side). Returns
+/// `(var, obj)`.
+fn mc_simple_comparison<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+    allow_method_comparison: bool,
+) -> Option<(ruby_prism::Node<'pr>, ruby_prism::Node<'pr>)> {
+    if call.name().as_slice() != b"==" {
+        return None;
+    }
+    let receiver = call.receiver()?;
+    let args = call.arguments()?;
+    let mut it = args.arguments().iter();
+    let arg = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
+    if mc_is_lvar_or_call(&receiver) {
+        if receiver.as_call_node().is_some() && !allow_method_comparison {
+            return None;
+        }
+        return Some((receiver, arg));
+    }
+    if mc_is_lvar_or_call(&arg) {
+        if arg.as_call_node().is_some() && !allow_method_comparison {
+            return None;
+        }
+        return Some((arg, receiver));
+    }
+    None
+}
+
+/// `comparison?`: a leaf directly matches `simple_comparison`, or is itself
+/// an `or` whose two sides both (recursively) qualify.
+fn mc_comparison(node: &ruby_prism::Node, allow_method_comparison: bool) -> bool {
+    if let Some(call) = node.as_call_node() {
+        if mc_simple_comparison(&call, allow_method_comparison).is_some() {
+            return true;
+        }
+    }
+    let Some(or) = node.as_or_node() else { return false };
+    mc_comparison(&or.left(), allow_method_comparison) && mc_comparison(&or.right(), allow_method_comparison)
+}
+
+/// `find_offending_var`: walks the `or`-tree left-to-right, collecting every
+/// leaf's `(var, obj)` via `simple_comparison` (a `simple_double_comparison?`
+/// leaf, or one whose `obj` is itself a method call under
+/// `AllowMethodComparison: true`, contributes nothing at all — neither
+/// `variables` nor `values`). `variables`/`values` are threaded through
+/// exactly like upstream's mutable `Set`/`Array` accumulators: seeing a
+/// second, DIFFERENT `var` grows `variables` past size 1 and poisons every
+/// subsequent leaf (even ones matching the original `var`) for the rest of
+/// this walk.
+fn mc_find_offending_var<'pr>(
+    node: &ruby_prism::Node<'pr>,
+    variables: &mut Vec<Vec<u8>>,
+    values: &mut Vec<(Vec<u8>, usize, usize)>,
+    allow_method_comparison: bool,
+    src: &[u8],
+) {
+    if let Some(or) = node.as_or_node() {
+        mc_find_offending_var(&or.left(), variables, values, allow_method_comparison, src);
+        mc_find_offending_var(&or.right(), variables, values, allow_method_comparison, src);
+        return;
+    }
+    let Some(call) = node.as_call_node() else { return };
+    if mc_is_double_lvar_comparison(&call) {
+        return;
+    }
+    let Some((var, obj)) = mc_simple_comparison(&call, allow_method_comparison) else { return };
+    if allow_method_comparison && obj.as_call_node().is_some() {
+        return;
+    }
+    let var_src = mc_node_src(&var, src);
+    if !variables.iter().any(|v| v.as_slice() == var_src) {
+        variables.push(var_src.to_vec());
+    }
+    if variables.len() > 1 {
+        return;
+    }
+    let obj_src = mc_node_src(&obj, src).to_vec();
+    let cl = call.location();
+    values.push((obj_src, cl.start_offset(), cl.end_offset()));
+}
+
+fn mc_node_src<'s>(n: &ruby_prism::Node, src: &'s [u8]) -> &'s [u8] {
+    let l = n.location();
+    &src[l.start_offset()..l.end_offset()]
+}
