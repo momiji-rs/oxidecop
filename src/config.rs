@@ -349,6 +349,21 @@ impl Config {
                 .unwrap_or_default(),
         }
     }
+    /// A section's Include patterns (per-cop Include), compiled. The
+    /// generated schema doesn't carry Include arrays, so the rubocop
+    /// default.yml values for filename-scoped cops (Bundler/Gemspec
+    /// departments) live in DEFAULT_COP_INCLUDES; a user Include REPLACES
+    /// them, mirroring section_exclude_matchers.
+    pub fn section_include_matchers(&self, section: &str) -> Vec<regex::Regex> {
+        match self.sections.get(section).and_then(|s| s.get("Include")) {
+            Some(v) => parse_allowed_list(v).iter().filter_map(|p| exclude_regex(p)).collect(),
+            None => DEFAULT_COP_INCLUDES
+                .iter()
+                .find(|(c, _)| *c == section)
+                .map(|(_, pats)| pats.iter().filter_map(|p| exclude_regex(p)).collect())
+                .unwrap_or_default(),
+        }
+    }
     /// AllCops/ActiveSupportExtensionsEnabled (default false). Gates whether
     /// `proc`/`lambda`/`Proc.new` blocks are candidates for Style/SymbolProc.
     pub fn active_support(&self) -> bool {
@@ -359,6 +374,19 @@ impl Config {
             .unwrap_or(false)
     }
 }
+
+/// rubocop default.yml per-cop Include globs (filename-scoped cops).
+const DEFAULT_COP_INCLUDES: &[(&str, &[&str])] = &[
+    ("Bundler/DuplicatedGem", &["**/*.gemfile", "**/Gemfile", "**/gems.rb"]),
+    ("Bundler/DuplicatedGroup", &["**/*.gemfile", "**/Gemfile", "**/gems.rb"]),
+    ("Bundler/GemFilename", &["**/Gemfile", "**/gems.rb", "**/Gemfile.lock", "**/gems.locked"]),
+    ("Bundler/InsecureProtocolSource", &["**/*.gemfile", "**/Gemfile", "**/gems.rb"]),
+    ("Bundler/OrderedGems", &["**/*.gemfile", "**/Gemfile", "**/gems.rb"]),
+    ("Gemspec/DuplicatedAssignment", &["**/*.gemspec"]),
+    ("Gemspec/OrderedDependencies", &["**/*.gemspec"]),
+    ("Gemspec/RequiredRubyVersion", &["**/*.gemspec"]),
+    ("Gemspec/RubyVersionGlobalsUsage", &["**/*.gemspec"]),
+];
 
 /// Minimal rubocop-glob compiler: `**` crosses directory separators, `*` and
 /// `?` don't. Anchored to the whole path.

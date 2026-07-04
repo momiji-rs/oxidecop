@@ -694,9 +694,21 @@ def build_cfg(cop, cfg_hash, as_val = nil, extra_sections = [], replace: false, 
   lines.join("\n") + "\n"
 end
 
+# RSpec's expect_offense bypasses per-cop Include (in-memory source); the
+# engine applies Include per file, so default the temp filename to one the
+# department's Include accepts when the fixture doesn't pass one.
+DEFAULT_NAME =
+  if COP.start_with?('Gemspec/')
+    'ex.gemspec'
+  elsif COP.start_with?('Bundler/')
+    'Gemfile'
+  else
+    'ex.rb'
+  end
+
 def run_poc(poc, src, cfg, filename = nil)
   Dir.mktmpdir do |d|
-    rb = File.join(d, filename || 'ex.rb')
+    rb = File.join(d, filename || DEFAULT_NAME)
     FileUtils.mkdir_p(File.dirname(rb))
     yml = File.join(d, 'c.yml')
     File.write(rb, src)
@@ -720,7 +732,7 @@ groups = Hash.new { |h, k| h[k] = { loc: 0, full: 0, total: 0, skipped: 0 } }
 fails = []
 def run_fix(poc, src, cfg, filename = nil, once: false)
   Dir.mktmpdir do |d|
-    rb = File.join(d, filename || 'ex.rb')
+    rb = File.join(d, filename || DEFAULT_NAME)
     FileUtils.mkdir_p(File.dirname(rb))
     yml = File.join(d, 'c.yml')
     File.write(rb, src)

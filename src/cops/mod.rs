@@ -95,6 +95,9 @@ pub struct Engine {
     style_guide_base: String,
     // Per-cop Exclude patterns (cop name, matchers) — applied per file.
     cop_excludes: Vec<(&'static str, Vec<regex::Regex>)>,
+    // per-cop Include (filename-scoped cops): the cop runs ONLY on matching
+    // paths — rubocop's TargetFinder-level gating, applied per file here.
+    cop_includes: Vec<(&'static str, Vec<regex::Regex>)>,
 }
 
 /// Enablement + configuration the per-NODE checks consult. Everything here is
@@ -396,9 +399,16 @@ impl Engine {
                 (!m.is_empty()).then_some((*c, m))
             })
             .collect();
+        let cop_includes: Vec<(&'static str, Vec<regex::Regex>)> = IMPLEMENTED
+            .iter()
+            .filter_map(|c| {
+                let m = cfg.section_include_matchers(c);
+                (!m.is_empty()).then_some((*c, m))
+            })
+            .collect();
         Engine {
             decl, enabled, allowed_patterns, allowed_methods, debugger_on, debugger_last, hot,
-            cop_excludes, display_style_guide, style_guide_base,
+            cop_excludes, cop_includes, display_style_guide, style_guide_base,
         }
     }
     /// The " (https://...)" message suffix for a cop, when configured —
@@ -428,6 +438,11 @@ impl Engine {
     pub fn file_view(&self, rel_path: &str) -> (Hot, Vec<&'static str>) {
         let mut hot = self.hot.clone();
         let mut disabled = Vec::new();
+        for (cop, matchers) in &self.cop_includes {
+            if !matchers.iter().any(|re| re.is_match(rel_path)) {
+                disabled.push(*cop);
+            }
+        }
         for (cop, matchers) in &self.cop_excludes {
             if matchers.iter().any(|re| re.is_match(rel_path)) {
                 disabled.push(*cop);
