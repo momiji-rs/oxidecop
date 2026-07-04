@@ -11699,3 +11699,125 @@ fn nsrc<'pr>(n: &ruby_prism::Node, src: &'pr [u8]) -> &'pr [u8] {
     let l = n.location();
     &src[l.start_offset()..l.end_offset()]
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/MultilineTernaryOperator — a `?:` ternary whose predicate/branches
+    /// span more than one physical line. Correction depends on where the
+    /// ternary sits (`use_assignment_method?`/`enforce_single_line_ternary_operator?`
+    /// upstream, tracked via `mto_single_line`/`mto_parent_start` — see the
+    /// visitor call sites in mod.rs that populate them before descending into
+    /// a ternary):
+    ///   - the sole argument of `return`, or the receiver/argument of a
+    ///     non-assignment method call (`do_something cond ?\n a : b`) — the
+    ///     fix collapses it to a single-line ternary (`MSG_SINGLE_LINE`);
+    ///   - anything else (plain statement, RHS of an assignment, nested
+    ///     inside another conditional, attribute/index-writer call like
+    ///     `a.foo = .../a[:k] = ...`) — the fix expands to `if`/`else`/`end`
+    ///     (`MSG_IF`).
+    /// Comments strictly between the ternary's own first line and the line
+    /// its else-branch starts on (upstream's `comments_in_range`, exclusive
+    /// of that last line) would otherwise be silently dropped by the
+    /// wholesale replace, so they're hoisted verbatim to just before the
+    /// immediate parent statement (`mto_parent_start`) — matching upstream's
+    /// `corrector.insert_before(parent, comments_in_condition)`. With no
+    /// tracked parent (a bare top-level ternary statement) upstream skips the
+    /// hoist entirely and those comments are lost; we mirror that.
+    ///
+    /// A single AST pass (one `visit_if_node` walk) processes ternaries
+    /// top-down: when an outer multiline ternary gets its fix queued, its
+    /// range is remembered in `mto_fixed_ranges` so any nested ternary
+    /// visited afterward (`part_of_ignored_node?` upstream) still gets an
+    /// offense, but no fix — the outer's replacement text already carries its
+    /// original, unconverted source, and a fresh follow-up pass (the
+    /// `--fix`/`-a` autocorrect loop, run by the harness, not this function)
+    /// re-discovers and converts it, one level of nesting per pass.
+    pub(crate) fn check_multiline_ternary_operator(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/MultilineTernaryOperator";
+        const MSG_IF: &str = "Avoid multi-line ternary operators, use `if` or `unless` instead.";
+        const MSG_SINGLE_LINE: &str = "Avoid multi-line ternary operators, use single-line instead.";
+        if !self.on(COP) {
+            return;
+        }
+        // `node.ternary?` upstream: a `?:` ternary never has an `if`/`unless`
+        // keyword (only modifier/statement `if` does).
+        if node.if_keyword_loc().is_some() {
+            return;
+        }
+        let node_loc = node.location();
+        let start = node_loc.start_offset();
+        let end = node_loc.end_offset();
+        let (start_line, _) = self.idx.loc(start);
+        let (end_line, _) = self.idx.loc(end.saturating_sub(1).max(start));
+        // `node.multiline?` upstream: more than one physical source line.
+        if start_line == end_line {
+            return;
+        }
+        let Some(stmts) = node.statements() else { return };
+        let Some(else_node) = node.subsequent().and_then(|s| s.as_else_node()) else { return };
+        let Some(else_stmts) = else_node.statements() else { return };
+
+        let cond_src = self.node_src(&node.predicate());
+        let if_src = self.node_src(&stmts.as_node());
+        let else_src = self.node_src(&else_stmts.as_node());
+        let enforce_single_line = self.mto_single_line.contains(&start);
+
+        let mut replacement = Vec::new();
+        if enforce_single_line {
+            replacement.extend_from_slice(cond_src);
+            replacement.extend_from_slice(b" ? ");
+            replacement.extend_from_slice(if_src);
+            replacement.extend_from_slice(b" : ");
+            replacement.extend_from_slice(else_src);
+        } else {
+            replacement.extend_from_slice(b"if ");
+            replacement.extend_from_slice(cond_src);
+            replacement.push(b'\n');
+            replacement.extend_from_slice(b"  ");
+            replacement.extend_from_slice(if_src);
+            replacement.extend_from_slice(b"\nelse\n");
+            replacement.extend_from_slice(b"  ");
+            replacement.extend_from_slice(else_src);
+            replacement.extend_from_slice(b"\nend");
+        }
+        // `node.source != replacement(node)` upstream — e.g. a ternary whose
+        // only multiline part is a receiver/predicate line-break already
+        // reads identically once collapsed to the single-line template
+        // (`do_something(arg\n  .foo ? bar : baz)`), so there's nothing to fix.
+        let node_src_full = self.node_src(&node.as_node());
+        if node_src_full == replacement.as_slice() {
+            return;
+        }
+
+        let message = if enforce_single_line { MSG_SINGLE_LINE } else { MSG_IF };
+        self.push(start, COP, true, message.to_string());
+
+        // `part_of_ignored_node?` upstream — an ancestor ternary already
+        // consumed this range with its own (unconverted-inner-text) fix this
+        // pass; leave this one for the next pass.
+        if self.mto_fixed_ranges.iter().any(|&(s, e)| s <= start && end <= e) {
+            return;
+        }
+        self.fixes.push((start, end, replacement));
+        self.mto_fixed_ranges.push((start, end));
+
+        // `comments_in_range`: comments on lines [start_line, else_line) —
+        // `find_end_line`'s `node.ternary?` branch uses the else-branch's
+        // OWN start line as the exclusive upper bound, so a comment trailing
+        // the else-branch value itself (same line) is left untouched (it's
+        // outside the replaced byte range anyway).
+        let (else_line, _) = self.idx.loc(else_stmts.location().start_offset());
+        let mut hoist: Vec<u8> = Vec::new();
+        for &(cline, cstart, cend) in self.comments {
+            if cline >= start_line && cline < else_line {
+                hoist.extend_from_slice(&self.src[cstart..cend]);
+                hoist.push(b'\n');
+            }
+        }
+        if !hoist.is_empty() {
+            if let Some(&parent_start) = self.mto_parent_start.get(&start) {
+                self.fixes.push((parent_start, parent_start, hoist));
+            }
+        }
+    }
+}

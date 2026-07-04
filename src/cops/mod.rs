@@ -194,7 +194,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException", "Style/TrailingUnderscoreVariable",
     "Lint/NonLocalExitFromIterator", "Layout/EmptyComment", "Style/EmptyCaseCondition", "Style/OneLineConditional",
-    "Style/IfWithSemicolon",
+    "Style/IfWithSemicolon", "Style/MultilineTernaryOperator",
 ];
 
 impl Engine {
@@ -586,6 +586,24 @@ pub(crate) struct Cops<'a> {
     // reported — avoids duplicate offenses when the same nested ternary appears
     // in multiple outer ternaries.
     pub(crate) nested_ternary_reported: HashSet<usize>,
+    // Style/MultilineTernaryOperator: parent-context lookup, keyed by a
+    // ternary if-node's own start offset (prism has no parent pointers, so
+    // whichever node visits the ternary as a direct child registers itself
+    // here BEFORE recursing — mirrors `ut_call_child`'s idiom). `mto_parent_start`
+    // holds the immediate parent's own start offset (used to position hoisted
+    // comments, upstream's `corrector.insert_before(parent, ...)`);
+    // `mto_single_line` holds ternaries whose parent is `return`/`break`/`next`
+    // or a non-assignment `send`/`csend` call (upstream's
+    // `enforce_single_line_ternary_operator?`), which corrects to a single-line
+    // ternary instead of expanding to `if`/`else`.
+    pub(crate) mto_parent_start: HashMap<usize, usize>,
+    pub(crate) mto_single_line: HashSet<usize>,
+    // Style/MultilineTernaryOperator: byte ranges of ternaries already
+    // corrected in THIS pass — a nested ternary whose range falls inside one
+    // of these is `part_of_ignored_node?` upstream: still gets an offense, but
+    // no fix is queued (the outer replacement already consumed its source; a
+    // later autocorrect pass will re-discover and fix it fresh).
+    pub(crate) mto_fixed_ranges: Vec<(usize, usize)>,
     // Style/NestedModifier: byte ranges (start, end) of modifier if/unless/
     // while/until nodes already flagged as the INNER half of a nested-modifier
     // pair — rubocop's `ignore_node`/`part_of_ignored_node?`. A candidate
@@ -896,6 +914,26 @@ impl<'a> Cops<'a> {
         let l = n.location();
         &self.src[l.start_offset()..l.end_offset()]
     }
+    /// Style/MultilineTernaryOperator parent-tracking: `child` is a direct
+    /// AST child of a node starting at `parent_start` (a plain assignment's
+    /// RHS, `return`'s argument, a call's receiver/argument, ...). If `child`
+    /// is a `?:` ternary, remember `parent_start` for comment hoisting, and
+    /// (when `single_line_eligible`) mark it as one whose correction collapses
+    /// to a single-line ternary instead of expanding to `if`/`else`.
+    pub(crate) fn mto_note_child(&mut self, child: &ruby_prism::Node, parent_start: usize, single_line_eligible: bool) {
+        if !self.on("Style/MultilineTernaryOperator") {
+            return;
+        }
+        let Some(iff) = child.as_if_node() else { return };
+        if iff.if_keyword_loc().is_some() {
+            return;
+        }
+        let off = iff.location().start_offset();
+        self.mto_parent_start.insert(off, parent_start);
+        if single_line_eligible {
+            self.mto_single_line.insert(off);
+        }
+    }
     /// Autocorrects for DECLARATIVE-table cops (the one thing a pattern row
     /// can't express). Returns whether a fix was produced.
     fn decl_fix(&mut self, cop: &str, node: &ruby_prism::CallNode) -> bool {
@@ -1172,6 +1210,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_ascii_constant_write(node);
         self.check_constant_name(node.name().as_slice(), node.name_loc().start_offset(), Some(&v));
         self.check_self_assignment_const(node.location().start_offset(), node.name().as_slice(), &v);
+        self.mto_note_child(&v, node.location().start_offset(), false);
         assignment_write!(self, node);
         ruby_prism::visit_constant_write_node(self, node);
     }
@@ -1194,6 +1233,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let v = node.value();
             self.check_constant_name(name.as_slice(), t.name_loc().start_offset(), Some(&v));
         }
+        self.mto_note_child(&node.value(), node.location().start_offset(), false);
         assignment_path_write!(self, node);
         ruby_prism::visit_constant_path_write_node(self, node);
     }
@@ -1226,6 +1266,24 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_nested_ternary_operator(node);
+        // pre-order, before recursion: register THIS ternary's branches as
+        // having it for a parent (a nested ternary in the else-branch, e.g.
+        // `cond_a? ? foo : cond_b? ? bar : baz`), then check this node itself.
+        if node.if_keyword_loc().is_none() {
+            if let Some(stmts) = node.statements() {
+                if let Some(only) = stmts.body().iter().next() {
+                    self.mto_note_child(&only, node.location().start_offset(), false);
+                }
+            }
+            if let Some(else_stmts) =
+                node.subsequent().and_then(|s| s.as_else_node()).and_then(|e| e.statements())
+            {
+                if let Some(only) = else_stmts.body().iter().next() {
+                    self.mto_note_child(&only, node.location().start_offset(), false);
+                }
+            }
+        }
+        self.check_multiline_ternary_operator(node);
         self.check_else_layout_if(node);
         self.check_assignment_in_condition(&node.predicate());
         self.check_negated_if(node);
@@ -1317,6 +1375,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_shorthand_cvar(node);
         self.check_self_assignment_cvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_cvar(node);
+        self.mto_note_child(&node.value(), node.location().start_offset(), false);
         assignment_write!(self, node);
         ruby_prism::visit_class_variable_write_node(self, node);
     }
@@ -1352,6 +1411,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_gvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_gvar(node);
         self.check_global_std_stream_gvasgn(node.name().as_slice(), &node.value());
+        self.mto_note_child(&node.value(), node.location().start_offset(), false);
         assignment_write!(self, node);
         ruby_prism::visit_global_variable_write_node(self, node);
     }
@@ -1390,6 +1450,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_shorthand_lvar(node);
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_lvar(node);
+        self.mto_note_child(&node.value(), node.location().start_offset(), false);
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         ruby_prism::visit_local_variable_write_node(self, node);
@@ -1415,6 +1476,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_shorthand_ivar(node);
         self.check_self_assignment_ivar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_redundant_self_assignment_ivar(node);
+        self.mto_note_child(&node.value(), node.location().start_offset(), false);
         assignment_write!(self, node);
         ruby_prism::visit_instance_variable_write_node(self, node);
     }
@@ -1556,6 +1618,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_top_level_return_with_argument(node);
         self.check_non_local_exit_from_iterator(node);
         self.ecc_mark_not_supported_parent(node.arguments());
+        // Style/MultilineTernaryOperator: `return cond ? a : b` — a single
+        // return value that's a ternary corrects to single-line, mirroring
+        // upstream's `SINGLE_LINE_TYPES` including `:return`.
+        if let Some(args) = node.arguments() {
+            let list = args.arguments();
+            if list.iter().count() == 1 {
+                if let Some(only) = list.iter().next() {
+                    self.mto_note_child(&only, node.location().start_offset(), true);
+                }
+            }
+        }
         ruby_prism::visit_return_node(self, node);
     }
     fn visit_break_node(&mut self, node: &ruby_prism::BreakNode<'pr>) {
@@ -2384,6 +2457,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Lint/ImplicitStringConcatenation: same `parent&.send_type?` guard as
         // `ut_track` — see `isc_send_child`.
         let isc_track = !node.is_safe_navigation() && self.on("Lint/ImplicitStringConcatenation");
+        // Style/MultilineTernaryOperator: a ternary that's this call's
+        // receiver or (positional) argument has a `:send`/`:csend` parent —
+        // `SINGLE_LINE_TYPES`, unless the call itself is an assignment method
+        // (`foo=`, `[]=`, but not a comparison operator like `==`).
+        let mto_name = node.name();
+        let mto_is_assign_method = mto_name.as_slice().ends_with(b"=")
+            && !matches!(mto_name.as_slice(), b"==" | b"===" | b"!=" | b"<=" | b">=");
+        let mto_call_start = node.location().start_offset();
         if let Some(r) = node.receiver() {
             if track_args {
                 self.assumed_arg_offsets.insert(r.location().start_offset());
@@ -2391,6 +2472,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if ut_track {
                 self.ut_call_child.insert(r.location().start_offset());
             }
+            self.mto_note_child(&r, mto_call_start, !mto_is_assign_method);
             if mlbl_track {
                 self.mlbl_call_child.insert(r.location().start_offset());
             }
@@ -2482,6 +2564,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 if isc_track {
                     self.isc_send_child.insert(arg.location().start_offset());
                 }
+                self.mto_note_child(&arg, mto_call_start, !mto_is_assign_method);
                 self.visit(&arg);
             }
             if framed {
@@ -2652,6 +2735,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         regexp_bang_ignore: Vec::new(),
         multiline_if_mod_seen: HashSet::new(),
         nested_ternary_reported: HashSet::new(),
+        mto_parent_start: HashMap::new(),
+        mto_single_line: HashSet::new(),
+        mto_fixed_ranges: Vec::new(),
         nested_modifier_ignored: Vec::new(),
         assignment_leftmost: HashMap::new(),
         block_owns_next_stmts: false,
