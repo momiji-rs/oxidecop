@@ -632,7 +632,10 @@ def parse_val(v)
     # Guarded to hashes with NO unquoted array values so grouped-array configs
     # (`{ 'Pry' => %w[...] }`) keep the values.flatten behavior below.
     if (dm = v.match(/['"]default['"]\s*=>\s*(['"])([^'"]*)\1/)) && v !~ /=>\s*%?[wi]{0,2}\[/
-      return dm[2]
+      pairs = v.scan(/['"]([^'"]+)['"]\s*=>\s*(['"])([^'"]*)\2/).map { |k, _, val| [k, val] }
+      # a single default-only hash still collapses to its value; per-type
+      # overrides survive as a real Hash (emitted as nested YAML keys).
+      return pairs.size <= 1 ? dm[2] : pairs.to_h
     end
     return v.scan(/%[wi]\[([^\]]*)\]/).flat_map { |m| m[0].split(/\s+/) } +
            v.scan(/\[([^\]]*)\]/).flat_map { |m| split_top(m[0]).map { |x| normalize_pattern(x) } }
@@ -703,7 +706,10 @@ end
 # Array values (AllowedPatterns) are emitted as single-quoted YAML flow sequences.
 def emit_pairs(lines, h)
   h.each do |k, v|
-    if v.is_a?(Array)
+    if v.is_a?(Hash)
+      lines << "  #{k}:"
+      v.each { |kk, vv| lines << "    #{kk}: '#{vv}'" }
+    elsif v.is_a?(Array)
       lines << "  #{k}: [#{v.map { |p| "'#{p}'" }.join(', ')}]"
     else
       lines << "  #{k}: #{v}"

@@ -176,7 +176,10 @@ impl Config {
                     }
                 }
             } else if let (Some(sec), Some((k, v))) = (&cur, t.split_once(':')) {
-                let (k, v) = (k.trim().to_string(), v.trim().to_string());
+                // strip key quotes too — rubocop configs write per-type
+                // delimiter keys as `'%w': '()'`.
+                let k = k.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+                let v = v.trim().to_string();
                 cur_list_key = v.is_empty().then(|| k.clone());
                 sections.get_mut(sec).unwrap().insert(k, v);
             }
