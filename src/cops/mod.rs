@@ -369,7 +369,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
-    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin",
+    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional",
 ];
 
 impl Engine {
@@ -837,6 +837,21 @@ pub(crate) struct Cops<'a> {
     // (body-wise), this transitively suppresses deeper pairs in a long
     // modifier chain, matching upstream's ancestor-walking `part_of_ignored_node?`.
     pub(crate) nested_modifier_ignored: Vec<(usize, usize)>,
+    // Style/SoleNestedConditional: mirrors upstream's `ignore_node`/
+    // `ignored_node?` — once an outer conditional's nested branch has been
+    // folded into it, that branch's own start offset is recorded here so
+    // that, when the SAME traversal pass later visits it in its own right
+    // (it's still a proper `if`/`unless` node with possibly its own further
+    // nested offense), its correction is skipped for THIS pass (the offense
+    // itself still fires) rather than emitting edits that would overlap the
+    // enclosing correction's — `apply_fixes`'s per-edit overlap skip is too
+    // coarse-grained to keep such a correction's several edits atomic, so
+    // without this a partial application can drop only SOME of a
+    // correction's edits and desync the source (e.g. removing an outer
+    // `end` without the matching condition merge). Reset per `lint()` call,
+    // so `apply_fixes_iter`'s next pass (fresh parse) picks the deferred
+    // fold up cleanly, matching upstream's own multi-pass convergence.
+    pub(crate) snc_ignored: Vec<usize>,
     // Layout/AssignmentIndentation: maps a chained assignment's own start
     // offset (`bar` in `foo = bar = baz`) to the start offset of its
     // immediate same-line enclosing assignment (`foo`) — see
@@ -2082,6 +2097,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_safe_navigation_with_empty(&node.predicate());
         self.check_or_assignment_if(node);
         self.check_identical_conditional_branches_if(node);
+        self.check_sole_nested_conditional(&node.as_node());
         if let Some(kw) = node.if_keyword_loc() {
             if matches!(kw.as_slice(), b"if" | b"elsif") {
                 let kw_text = if kw.as_slice() == b"elsif" { "elsif" } else { "if" };
@@ -2164,6 +2180,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_non_nil_check_unless(node);
         self.check_if_with_semicolon_unless(node);
         self.check_or_assignment_unless(node);
+        self.check_sole_nested_conditional(&node.as_node());
         self.check_multiline_if_then(
             node.then_keyword_loc(),
             node.end_keyword_loc(),
@@ -4437,6 +4454,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         icb_assign_start: HashMap::new(),
         mto_fixed_ranges: Vec::new(),
         nested_modifier_ignored: Vec::new(),
+        snc_ignored: Vec::new(),
         assignment_leftmost: HashMap::new(),
         block_owns_next_stmts: false,
         rel_path,

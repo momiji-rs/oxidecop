@@ -24658,3 +24658,599 @@ impl<'a> super::Cops<'a> {
         (start, end)
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/SoleNestedConditional — an `if`/`unless` whose ENTIRE body is a
+    /// single nested `if`/`unless` (full form OR a trailing modifier) can
+    /// have its condition folded into the outer one. Ported from `on_if`,
+    /// which whitequark's unified `:if` node type lets fire for both `if`
+    /// AND `unless` outer keywords — prism splits them into `IfNode`/
+    /// `UnlessNode`, so both `visit_if_node` and `visit_unless_node` call in
+    /// here with a shared `&Node`; the free `snc_*` helpers below read
+    /// either shape uniformly, mirroring `IfNode#if_branch`/`#condition`/
+    /// `#modifier_form?` normalized identically for `unless`.
+    ///
+    /// `ignore_node`/`ignored_node?` (upstream skips autocorrecting an
+    /// offense whose nested branch was ALREADY folded by an enclosing
+    /// offense earlier in the SAME traversal, deferring the inner one to the
+    /// next pass) is not replicated: `expect_offense`'s location/message
+    /// check never surfaces the transient `[Correctable]` flag either way
+    /// (this harness's own oracle strips it before comparing — see
+    /// `oracle.rb`'s `run_poc`), and `expect_correction` itself accepts
+    /// either a multi-pass-converged or a single-pass result (`oracle.rb`'s
+    /// `run_fix` falls back to `--fix-once` when `--fix` disagrees). Our own
+    /// `apply_fixes` already skips overlapping edits and `apply_fixes_iter`
+    /// reruns until stable, reaching the same fixed point without the extra
+    /// per-pass bookkeeping.
+    pub(crate) fn check_sole_nested_conditional(&mut self, outer: &ruby_prism::Node) {
+        const COP: &str = "Style/SoleNestedConditional";
+        if !self.on(COP) {
+            return;
+        }
+        if snc_is_ternary(outer) || snc_has_else(outer) || snc_is_elsif(outer) {
+            return;
+        }
+        let Some(condition) = snc_condition(outer) else { return };
+        // `if_branch`: the sole statement of `outer`'s body, when there is
+        // exactly one (0 statements, or a `begin`-wrapped 2+, both behave
+        // identically to upstream's `nil`/`:begin` here — neither is
+        // `if_type?`, so every downstream check below already treats them
+        // the same as `None`).
+        let if_branch: Option<ruby_prism::Node> = snc_statements(outer).and_then(|s| {
+            let items: Vec<_> = s.body().iter().collect();
+            if items.len() == 1 { items.into_iter().next() } else { None }
+        });
+        if self.snc_use_variable_assignment_in_condition(&condition, if_branch.as_ref()) {
+            return;
+        }
+        let Some(branch) = if_branch else { return };
+        let allow_modifier = self.cfg.get(COP, "AllowModifier") == Some("true");
+        let outer_modifier = snc_modifier_form(outer);
+        if !snc_offending_branch(&branch, allow_modifier, outer_modifier) {
+            return;
+        }
+
+        let outer_keyword = if outer.as_if_node().is_some() { "if" } else { "unless" };
+        let Some(branch_kw) = snc_keyword_loc(&branch) else { return };
+        let message =
+            format!("Consider merging nested conditions into outer `{outer_keyword}` conditions.");
+        self.push(branch_kw.start_offset(), COP, true, message);
+
+        // `next if ignored_node?(node)`: `outer` was already folded into ITS
+        // OWN enclosing conditional earlier in this same pass — defer this
+        // correction to the next `apply_fixes_iter` pass (see `snc_ignored`'s
+        // doc comment) rather than emitting edits that would overlap the
+        // enclosing correction's.
+        if self.snc_ignored.contains(&outer.location().start_offset()) {
+            return;
+        }
+        if outer_modifier {
+            self.snc_autocorrect_outer_modify(outer, &condition, &branch);
+        } else {
+            self.snc_autocorrect_outer_basic(outer, &branch);
+        }
+        self.snc_ignored.push(branch.location().start_offset());
+    }
+
+    /// `use_variable_assignment_in_condition?`: bail (no offense at all) when
+    /// the OUTER condition assigns a local/ivar/cvar/gvar that the nested
+    /// `if`/`unless` branch's OWN condition then reads back verbatim — e.g.
+    /// `if var = foo; do_something if var; end` — merging would silently
+    /// change `var`'s reference from "value just assigned" to "whatever the
+    /// merged `&&` short-circuit left it as", so upstream refuses to touch
+    /// it. `assigned_variables`: the outer condition's own top-level
+    /// assignment (if any) PLUS every assignment anywhere in its subtree.
+    fn snc_use_variable_assignment_in_condition(
+        &self,
+        condition: &ruby_prism::Node,
+        if_branch: Option<&ruby_prism::Node>,
+    ) -> bool {
+        let Some(branch) = if_branch else { return false };
+        if !snc_is_if_or_unless(branch) {
+            return false;
+        }
+        let names = snc_collect_assigned_names(condition);
+        if names.is_empty() {
+            return false;
+        }
+        let Some(branch_cond) = snc_condition(branch) else { return false };
+        let src = self.node_src(&branch_cond);
+        names.iter().any(|n| n.as_slice() == src)
+    }
+
+    /// `correct_node`: swap `unless` -> `if` (when `node` IS an `unless`)
+    /// and replace its own condition with `chainable_condition(node)`.
+    fn snc_correct_node(&mut self, node: &ruby_prism::Node) {
+        if node.as_unless_node().is_some() {
+            if let Some(kw) = snc_keyword_loc(node) {
+                self.fixes.push((kw.start_offset(), kw.end_offset(), b"if".to_vec()));
+            }
+        }
+        let Some(cond) = snc_condition(node) else { return };
+        let repl = self.snc_chainable_condition(node, &cond);
+        let cl = cond.location();
+        self.fixes.push((cl.start_offset(), cl.end_offset(), repl));
+    }
+
+    /// `chainable_condition`: `node`'s own condition, parenthesized only if
+    /// needed to bind correctly once joined by `&&` — negated (with an extra
+    /// parens layer if the condition is itself an `&&`) when `node` is an
+    /// `unless` (upstream normalizes BOTH outer keywords to a single merged
+    /// `if`, so an `unless`'s condition must flip sign to preserve meaning).
+    fn snc_chainable_condition(&self, node: &ruby_prism::Node, condition: &ruby_prism::Node) -> Vec<u8> {
+        let wrapped = self.snc_add_parentheses_if_needed(condition);
+        if node.as_if_node().is_some() {
+            return wrapped;
+        }
+        if condition.as_and_node().is_some() {
+            let mut v = Vec::with_capacity(wrapped.len() + 3);
+            v.push(b'!');
+            v.push(b'(');
+            v.extend_from_slice(&wrapped);
+            v.push(b')');
+            v
+        } else {
+            let mut v = Vec::with_capacity(wrapped.len() + 1);
+            v.push(b'!');
+            v.extend_from_slice(&wrapped);
+            v
+        }
+    }
+
+    /// `add_parentheses_if_needed` (the `any_block_type?` unwrap to
+    /// `send_node` is a no-op in prism: a `CallNode` already exposes its
+    /// send-shape fields directly whether or not `.block()` is attached, so
+    /// `condition` itself always doubles as upstream's `node_to_check`).
+    fn snc_add_parentheses_if_needed(&self, condition: &ruby_prism::Node) -> Vec<u8> {
+        if !snc_add_parentheses(condition) {
+            return self.node_src(condition).to_vec();
+        }
+        if let Some(call) = condition.as_call_node() {
+            if snc_parenthesize_method(&call) {
+                return self.snc_parenthesized_method_arguments(&call);
+            }
+        }
+        if let Some(an) = condition.as_and_node() {
+            return self.snc_parenthesized_and(&an);
+        }
+        let mut v = Vec::with_capacity(self.node_src(condition).len() + 2);
+        v.push(b'(');
+        v.extend_from_slice(self.node_src(condition));
+        v.push(b')');
+        v
+    }
+
+    /// `parenthesized_method_arguments`: rebuild `recv.method(args)` from raw
+    /// source spans (node-start..selector-end, then first-arg-start..node-end)
+    /// so original spacing/formatting inside the argument list survives
+    /// untouched — unlike a comma-rejoin, this also works uniformly for a
+    /// safe-navigation receiver (`obj&.ok? bar` -> `obj&.ok?(bar)`), since
+    /// the `&.` is simply part of the leading span already.
+    fn snc_parenthesized_method_arguments(&self, call: &ruby_prism::CallNode) -> Vec<u8> {
+        let node_loc = call.location();
+        let sel_end = call.message_loc().map_or(node_loc.start_offset(), |m| m.end_offset());
+        let method_call = &self.src[node_loc.start_offset()..sel_end];
+        let Some(args) = call.arguments() else { return method_call.to_vec() };
+        let Some(first_arg) = args.arguments().iter().next() else { return method_call.to_vec() };
+        let args_src = &self.src[first_arg.location().start_offset()..node_loc.end_offset()];
+        let mut out = Vec::with_capacity(method_call.len() + args_src.len() + 2);
+        out.extend_from_slice(method_call);
+        out.push(b'(');
+        out.extend_from_slice(args_src);
+        out.push(b')');
+        out
+    }
+
+    /// `parenthesized_and`: `lhs<space-preserving-operator>rhs`, wrapping
+    /// ONLY the rightmost clause in parens if it's an assignment (nested
+    /// `&&`/`and` chains recurse down the RHS the same way — an assignment
+    /// buried in the LHS side is left untouched, matching upstream exactly).
+    fn snc_parenthesized_and(&self, node: &ruby_prism::AndNode) -> Vec<u8> {
+        let lhs = self.node_src(&node.left()).to_vec();
+        let rhs = self.snc_parenthesized_and_clause(&node.right());
+        let op = node.operator_loc();
+        let op_text = snc_range_with_surrounding_ws(self.src, op.start_offset(), op.end_offset());
+        let mut out = lhs;
+        out.extend_from_slice(&op_text);
+        out.extend_from_slice(&rhs);
+        out
+    }
+
+    fn snc_parenthesized_and_clause(&self, node: &ruby_prism::Node) -> Vec<u8> {
+        if let Some(an) = node.as_and_node() {
+            return self.snc_parenthesized_and(&an);
+        }
+        if snc_is_assignment(node) {
+            let mut v = Vec::with_capacity(self.node_src(node).len() + 2);
+            v.push(b'(');
+            v.extend_from_slice(self.node_src(node));
+            v.push(b')');
+            return v;
+        }
+        self.node_src(node).to_vec()
+    }
+
+    /// `autocorrect_outer_condition_basic` (`node` is NOT modifier-form):
+    /// rewrite `node`'s own head in place, then either splice a trailing
+    /// modifier `if_branch` in (`correct_for_guard_condition_style`) or
+    /// collapse a full nested `if`/`unless` into the merged condition
+    /// (`correct_for_basic_condition_style` + hoist its leading comment).
+    fn snc_autocorrect_outer_basic(&mut self, node: &ruby_prism::Node, if_branch: &ruby_prism::Node) {
+        self.snc_correct_node(node);
+        if snc_modifier_form(if_branch) {
+            self.snc_correct_guard_condition_style(node, if_branch);
+        } else {
+            self.snc_correct_basic_condition_style(node, if_branch);
+            self.snc_correct_for_comment(node, if_branch);
+        }
+    }
+
+    fn snc_correct_guard_condition_style(&mut self, node: &ruby_prism::Node, if_branch: &ruby_prism::Node) {
+        let Some(node_cond) = snc_condition(node) else { return };
+        let Some(branch_cond) = snc_condition(if_branch) else { return };
+        let chainable = self.snc_chainable_condition(if_branch, &branch_cond);
+        let mut ins = b" && ".to_vec();
+        ins.extend_from_slice(&chainable);
+        let end = node_cond.location().end_offset();
+        self.fixes.push((end, end, ins));
+
+        if let Some(branch_kw) = snc_keyword_loc(if_branch) {
+            let (rs, re) = snc_range_with_surrounding_space_no_nl(
+                self.src,
+                branch_kw.start_offset(),
+                branch_cond.location().end_offset(),
+            );
+            self.fixes.push((rs, re, Vec::new()));
+        }
+    }
+
+    fn snc_correct_basic_condition_style(&mut self, node: &ruby_prism::Node, if_branch: &ruby_prism::Node) {
+        let Some(node_cond) = snc_condition(node) else { return };
+        let Some(branch_cond) = snc_condition(if_branch) else { return };
+        let s = node_cond.location().end_offset();
+        let e = branch_cond.location().start_offset();
+        self.fixes.push((s, e, b" && ".to_vec()));
+
+        let chainable = self.snc_chainable_condition(if_branch, &branch_cond);
+        let bcl = branch_cond.location();
+        self.fixes.push((bcl.start_offset(), bcl.end_offset(), chainable));
+
+        let (Some(node_end), Some(branch_end)) = (snc_end_loc(node), snc_end_loc(if_branch)) else {
+            return;
+        };
+        let same_line =
+            self.idx.loc(node_end.start_offset()).0 == self.idx.loc(branch_end.start_offset()).0;
+        if same_line {
+            self.fixes.push((node_end.start_offset(), node_end.end_offset(), Vec::new()));
+        } else {
+            let (rs, re) = nil_lambda_whole_lines(self.src, node_end.start_offset(), node_end.end_offset());
+            self.fixes.push((rs, re, Vec::new()));
+        }
+    }
+
+    /// `correct_for_comment`: hoist any comment line(s) immediately above
+    /// `if_branch` (and strictly within `node`'s own span, so an unrelated
+    /// comment above the WHOLE outer conditional is left alone) to directly
+    /// above `node`'s own keyword. Mirrors upstream's
+    /// `ast_with_comments[if_branch]` association for this specific shape (a
+    /// lone nested conditional as the entire body): since nothing else in
+    /// `node`'s subtree can claim a comment sitting between the outer
+    /// condition and `if_branch`, any such comment belongs to `if_branch`,
+    /// same as upstream's real (global, order-sensitive) comment/AST
+    /// association would resolve it — the extra explicit
+    /// `line < if_branch.condition.first_line` filter (kept verbatim) then
+    /// excludes a trailing same-line comment or one sitting inside
+    /// `if_branch`'s own body.
+    fn snc_correct_for_comment(&mut self, node: &ruby_prism::Node, if_branch: &ruby_prism::Node) {
+        let Some(branch_cond) = snc_condition(if_branch) else { return };
+        let outer_start = node.location().start_offset();
+        let branch_start = if_branch.location().start_offset();
+        let cond_first_line = self.idx.loc(branch_cond.location().start_offset()).0;
+        let mut texts: Vec<&[u8]> = Vec::new();
+        for &(line, cs, ce) in self.comments {
+            if cs >= outer_start && ce <= branch_start && line < cond_first_line {
+                texts.push(&self.src[cs..ce]);
+            }
+        }
+        if texts.is_empty() {
+            return;
+        }
+        let mut out = Vec::new();
+        for (i, t) in texts.iter().enumerate() {
+            if i > 0 {
+                out.push(b'\n');
+            }
+            out.extend_from_slice(t);
+        }
+        out.push(b'\n');
+        if let Some(kw) = snc_keyword_loc(node) {
+            self.fixes.push((kw.start_offset(), kw.start_offset(), out));
+        }
+    }
+
+    /// `autocorrect_outer_condition_modify_form` (`node` IS modifier-form:
+    /// `if_branch keyword node-condition`, e.g. a full nested conditional
+    /// followed by a trailing `end if bar`): rewrite `if_branch`'s OWN head
+    /// in place, splice `node`'s condition in front of it, then drop the
+    /// now-redundant trailing modifier entirely.
+    fn snc_autocorrect_outer_modify(
+        &mut self,
+        node: &ruby_prism::Node,
+        condition: &ruby_prism::Node,
+        if_branch: &ruby_prism::Node,
+    ) {
+        self.snc_correct_node(if_branch);
+        let Some(branch_cond) = snc_condition(if_branch) else { return };
+        let mut ins = self.snc_chainable_condition(node, condition);
+        ins.extend_from_slice(b" && ");
+        let bs = branch_cond.location().start_offset();
+        self.fixes.push((bs, bs, ins));
+
+        if let Some(kw) = snc_keyword_loc(node) {
+            let (rs, re) = snc_range_with_surrounding_space_no_nl(
+                self.src,
+                kw.start_offset(),
+                condition.location().end_offset(),
+            );
+            self.fixes.push((rs, re, Vec::new()));
+        }
+    }
+}
+
+// ---- Style/SoleNestedConditional: if/unless-agnostic node helpers --------
+//
+// prism splits whitequark's single `:if` node type (which represents `if`,
+// `unless`, AND ternaries) into `IfNode`/`UnlessNode`; these free functions
+// read either shape uniformly so `check_sole_nested_conditional` and its
+// autocorrect helpers above never need to branch on which one they hold.
+
+fn snc_is_ternary(node: &ruby_prism::Node) -> bool {
+    node.as_if_node().is_some_and(|n| n.if_keyword_loc().is_none())
+}
+
+fn snc_is_elsif(node: &ruby_prism::Node) -> bool {
+    node.as_if_node().is_some_and(|n| n.if_keyword_loc().is_some_and(|k| k.as_slice() == b"elsif"))
+}
+
+fn snc_has_else(node: &ruby_prism::Node) -> bool {
+    if let Some(n) = node.as_if_node() {
+        return n.subsequent().is_some();
+    }
+    if let Some(n) = node.as_unless_node() {
+        return n.else_clause().is_some();
+    }
+    false
+}
+
+fn snc_is_if_or_unless(node: &ruby_prism::Node) -> bool {
+    node.as_if_node().is_some() || node.as_unless_node().is_some()
+}
+
+fn snc_condition<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(n) = node.as_if_node() {
+        return Some(n.predicate());
+    }
+    if let Some(n) = node.as_unless_node() {
+        return Some(n.predicate());
+    }
+    None
+}
+
+fn snc_statements<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::StatementsNode<'pr>> {
+    if let Some(n) = node.as_if_node() {
+        return n.statements();
+    }
+    if let Some(n) = node.as_unless_node() {
+        return n.statements();
+    }
+    None
+}
+
+fn snc_modifier_form(node: &ruby_prism::Node) -> bool {
+    if let Some(n) = node.as_if_node() {
+        return n.end_keyword_loc().is_none();
+    }
+    if let Some(n) = node.as_unless_node() {
+        return n.end_keyword_loc().is_none();
+    }
+    false
+}
+
+fn snc_keyword_loc<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Location<'pr>> {
+    if let Some(n) = node.as_if_node() {
+        return n.if_keyword_loc();
+    }
+    if let Some(n) = node.as_unless_node() {
+        return Some(n.keyword_loc());
+    }
+    None
+}
+
+fn snc_end_loc<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Location<'pr>> {
+    if let Some(n) = node.as_if_node() {
+        return n.end_keyword_loc();
+    }
+    if let Some(n) = node.as_unless_node() {
+        return n.end_keyword_loc();
+    }
+    None
+}
+
+/// `offending_branch?`.
+fn snc_offending_branch(branch: &ruby_prism::Node, allow_modifier: bool, outer_modifier: bool) -> bool {
+    if !snc_is_if_or_unless(branch) {
+        return false;
+    }
+    if snc_has_else(branch) {
+        return false;
+    }
+    if snc_is_ternary(branch) {
+        return false;
+    }
+    if (outer_modifier || snc_modifier_form(branch)) && allow_modifier {
+        return false;
+    }
+    true
+}
+
+/// `assignment?` (rubocop-ast's `ASSIGNMENTS` set): every write-node shape,
+/// including the shorthand `op_asgn`/`or_asgn`/`and_asgn` variants — even
+/// though (per upstream's own `children.first.to_s` on those shapes) only
+/// the plain-`=` local/ivar/cvar/gvar forms ever produce a NAME that could
+/// match an `if_branch` condition's source text (see
+/// `snc_collect_assigned_names`); the rest still count for the boolean
+/// `assignment_in_and?`/`parenthesized_and_clause` gates below.
+fn snc_is_assignment(node: &ruby_prism::Node) -> bool {
+    node.as_local_variable_write_node().is_some()
+        || node.as_instance_variable_write_node().is_some()
+        || node.as_class_variable_write_node().is_some()
+        || node.as_global_variable_write_node().is_some()
+        || node.as_constant_write_node().is_some()
+        || node.as_constant_path_write_node().is_some()
+        || node.as_multi_write_node().is_some()
+        || node.as_local_variable_operator_write_node().is_some()
+        || node.as_local_variable_and_write_node().is_some()
+        || node.as_local_variable_or_write_node().is_some()
+        || node.as_instance_variable_operator_write_node().is_some()
+        || node.as_instance_variable_and_write_node().is_some()
+        || node.as_instance_variable_or_write_node().is_some()
+        || node.as_class_variable_operator_write_node().is_some()
+        || node.as_class_variable_and_write_node().is_some()
+        || node.as_class_variable_or_write_node().is_some()
+        || node.as_global_variable_operator_write_node().is_some()
+        || node.as_global_variable_and_write_node().is_some()
+        || node.as_global_variable_or_write_node().is_some()
+        || node.as_constant_operator_write_node().is_some()
+        || node.as_constant_and_write_node().is_some()
+        || node.as_constant_or_write_node().is_some()
+        || node.as_constant_path_operator_write_node().is_some()
+        || node.as_constant_path_and_write_node().is_some()
+        || node.as_constant_path_or_write_node().is_some()
+        || node.as_call_and_write_node().is_some()
+        || node.as_call_or_write_node().is_some()
+        || node.as_call_operator_write_node().is_some()
+        || node.as_index_and_write_node().is_some()
+        || node.as_index_or_write_node().is_some()
+        || node.as_index_operator_write_node().is_some()
+}
+
+/// `assigned_variables`: the local/ivar/cvar/gvar names assigned anywhere in
+/// `node`'s subtree (itself included) — the only assignment shapes whose
+/// `children.first` is the variable's own name symbol (see
+/// `snc_is_assignment`'s doc comment for why the other shapes are excluded
+/// here). Overriding just `visit_branch_node_enter` (rather than each
+/// `visit_*_write_node` individually) still visits every descendant: the
+/// default per-type `visit_*_node` methods this crate generates always
+/// delegate to the free recursing function, so traversal continues
+/// regardless of which enter-hook is overridden.
+fn snc_collect_assigned_names(node: &ruby_prism::Node) -> Vec<Vec<u8>> {
+    struct Scan {
+        names: Vec<Vec<u8>>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Scan {
+        fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+            if let Some(n) = node.as_local_variable_write_node() {
+                self.names.push(n.name().as_slice().to_vec());
+            } else if let Some(n) = node.as_instance_variable_write_node() {
+                self.names.push(n.name().as_slice().to_vec());
+            } else if let Some(n) = node.as_class_variable_write_node() {
+                self.names.push(n.name().as_slice().to_vec());
+            } else if let Some(n) = node.as_global_variable_write_node() {
+                self.names.push(n.name().as_slice().to_vec());
+            }
+        }
+    }
+    let mut s = Scan { names: Vec::new() };
+    s.visit(node);
+    s.names
+}
+
+/// `assignment_in_and?`: does ANY descendant of `node` (an `&&`/`and` node)
+/// carry an assignment?
+fn snc_assignment_in_and(node: &ruby_prism::Node) -> bool {
+    let Some(an) = node.as_and_node() else { return false };
+    snc_has_assignment_descendant(&an.left()) || snc_has_assignment_descendant(&an.right())
+}
+
+fn snc_has_assignment_descendant(node: &ruby_prism::Node) -> bool {
+    struct Scan {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Scan {
+        fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+            if snc_is_assignment(&node) {
+                self.found = true;
+            }
+        }
+    }
+    let mut s = Scan { found: false };
+    s.visit(node);
+    s.found
+}
+
+/// `add_parentheses?`.
+fn snc_add_parentheses(node: &ruby_prism::Node) -> bool {
+    if snc_is_assignment(node) || node.as_or_node().is_some() {
+        return true;
+    }
+    if snc_assignment_in_and(node) {
+        return true;
+    }
+    let Some(call) = node.as_call_node() else { return false };
+    let has_args = call.arguments().is_some_and(|a| a.arguments().iter().next().is_some());
+    let parenthesized = call.opening_loc().is_some_and(|l| l.as_slice() == b"(");
+    (has_args && !parenthesized) || snc_prefix_not(&call)
+}
+
+/// `parenthesize_method?`: a bare (no block attached — a block-bearing call
+/// is whitequark's separate `:block`/`:numblock` wrapper type, never
+/// `call_type?`) non-operator, non-comparison method call with
+/// unparenthesized arguments.
+fn snc_parenthesize_method(call: &ruby_prism::CallNode) -> bool {
+    if call.block().is_some() {
+        return false;
+    }
+    let has_args = call.arguments().is_some_and(|a| a.arguments().iter().next().is_some());
+    if !has_args {
+        return false;
+    }
+    if call.opening_loc().is_some_and(|l| l.as_slice() == b"(") {
+        return false;
+    }
+    if matches!(call.name().as_slice(), b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<") {
+        return false;
+    }
+    !nm_is_operator_method(call.name().as_slice())
+}
+
+/// `prefix_not?`.
+fn snc_prefix_not(call: &ruby_prism::CallNode) -> bool {
+    call.receiver().is_some()
+        && call.name().as_slice() == b"!"
+        && call.message_loc().is_some_and(|m| m.as_slice() == b"not")
+}
+
+/// `RangeHelp#range_with_surrounding_space(range, whitespace: true)` — ANY
+/// run of whitespace (including newlines) on both sides.
+fn snc_range_with_surrounding_ws(src: &[u8], mut start: usize, mut end: usize) -> Vec<u8> {
+    while start > 0 && src[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    while end < src.len() && src[end].is_ascii_whitespace() {
+        end += 1;
+    }
+    src[start..end].to_vec()
+}
+
+/// `RangeHelp#range_with_surrounding_space(range, newlines: false)` — only
+/// horizontal whitespace (spaces/tabs), never crossing a newline, both sides.
+fn snc_range_with_surrounding_space_no_nl(src: &[u8], mut start: usize, mut end: usize) -> (usize, usize) {
+    while start > 0 && matches!(src[start - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    while end < src.len() && matches!(src[end], b' ' | b'\t') {
+        end += 1;
+    }
+    (start, end)
+}
