@@ -307,6 +307,7 @@ COPS = {
   'Style/DoubleNegation'             => 'style/double_negation',
   'Naming/VariableNumber'            => 'naming/variable_number',
   'Style/CommandLiteral'             => 'style/command_literal',
+  'Style/AccessorGrouping'           => 'style/accessor_grouping',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

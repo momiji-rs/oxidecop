@@ -368,7 +368,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping",
 ];
 
 impl Engine {
@@ -3342,6 +3342,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_ineffective_access_modifier(node.body());
         self.check_bisected_attr_accessor(node.body());
         self.check_mixin_grouping(node.body());
+        self.check_accessor_grouping(node.body());
         self.check_empty_lines_around_class_body(node);
         self.check_access_modifier_indentation_class(node);
         self.check_struct_inheritance(node);
@@ -3396,6 +3397,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_ineffective_access_modifier(node.body());
         self.check_bisected_attr_accessor(node.body());
         self.check_mixin_grouping(node.body());
+        self.check_accessor_grouping(node.body());
         self.check_access_modifier_indentation_module(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
@@ -3660,6 +3662,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_class(l.start_offset(), l.end_offset(), node.body().is_some(), false, true);
         self.check_trailing_body_on_class(node.class_keyword_loc().start_offset(), l.end_offset(), node.body());
         self.check_bisected_attr_accessor(node.body());
+        self.check_accessor_grouping(node.body());
         // Layout/EmptyLinesAroundAccessModifier's `@class_or_module_def_first_line`
         // uses `node.identifier.source_range.first_line` — the `<<` expression
         // (usually `self`), not the `class` keyword.

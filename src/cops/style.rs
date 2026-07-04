@@ -21256,3 +21256,411 @@ impl<'a> super::Cops<'a> {
         self.pld_preferred("%x")
     }
 }
+
+
+// ---- Style/AccessorGrouping helpers ----
+
+/// `attribute_accessor?`: a bare (no-receiver) `attr_reader`/`attr_writer`/
+/// `attr_accessor`/`attr` call — returns its method-name bytes.
+fn ag_attribute_accessor_name(n: &ruby_prism::Node) -> Option<Vec<u8>> {
+    let call = n.as_call_node()?;
+    if call.receiver().is_some() {
+        return None;
+    }
+    let name = call.name();
+    if matches!(name.as_slice(), b"attr_reader" | b"attr_writer" | b"attr_accessor" | b"attr") {
+        Some(name.as_slice().to_vec())
+    } else {
+        None
+    }
+}
+
+/// `access_modifier?`: a bare-or-non-bare `private`/`protected`/`public`/
+/// `module_function` call (any arg count) — used only by `groupable_accessor?`.
+fn ag_is_access_modifier(call: &ruby_prism::CallNode) -> bool {
+    call.receiver().is_none()
+        && matches!(call.name().as_slice(), b"private" | b"protected" | b"public" | b"module_function")
+}
+
+/// `casgn_type?` (whitequark) — plain or scoped constant assignment.
+fn ag_is_casgn(n: &ruby_prism::Node) -> bool {
+    n.as_constant_write_node().is_some() || n.as_constant_path_write_node().is_some()
+}
+
+/// The line a preceding statement's "signature" ends on, EXCLUDING any
+/// attached `do...end`/`{ }` block — mirrors whitequark's block-node
+/// unwrapping (`previous_expression.child_nodes.find(&:send_type?)`) before
+/// `groupable_accessor?`'s blank-line check, since prism's `CallNode`
+/// location spans through the block's own `end`/`}` (see the "block nodes"
+/// trap) while the extracted whitequark `send` node never did.
+fn ag_effective_last_line(call: &ruby_prism::CallNode, idx: &super::LineIndex) -> usize {
+    if call.block().is_some() {
+        let end = call
+            .arguments()
+            .map(|a| a.location().end_offset())
+            .or_else(|| call.message_loc().map(|m| m.end_offset()))
+            .unwrap_or_else(|| call.location().end_offset());
+        idx.loc(end.saturating_sub(1)).0
+    } else {
+        idx.loc(call.location().end_offset().saturating_sub(1)).0
+    }
+}
+
+/// `node_visibility` (`VisibilityHelp`) narrowed to our context: accessor
+/// macros are never `def` nodes, so only `node_visibility_from_visibility_block`
+/// applies — the nearest PRECEDING sibling that's a BARE `private`/
+/// `protected`/`public` call (no receiver, no args, no block; `module_function`
+/// does NOT count here, unlike `access_modifier?`).
+fn ag_node_visibility(items: &[ruby_prism::Node], i: usize) -> &'static str {
+    for j in (0..i).rev() {
+        let Some(c) = items[j].as_call_node() else { continue };
+        if c.receiver().is_some() || c.arguments().is_some() || c.block().is_some() {
+            continue;
+        }
+        match c.name().as_slice() {
+            b"private" => return "private",
+            b"protected" => return "protected",
+            b"public" => return "public",
+            _ => {}
+        }
+    }
+    "public"
+}
+
+/// `comment_line?` on the single source line: whitespace then `#`, nothing else.
+fn ag_comment_only_line(idx: &super::LineIndex, src: &[u8], line: usize) -> bool {
+    if line < 1 || line > idx.starts.len() {
+        return false;
+    }
+    let s = idx.starts[line - 1];
+    let e = idx.starts.get(line).map(|&x| x.saturating_sub(1)).unwrap_or(src.len());
+    let seg = if e >= s { &src[s..e] } else { &src[s..s] };
+    let mut p = 0;
+    while p < seg.len() && matches!(seg[p], b' ' | b'\t') {
+        p += 1;
+    }
+    seg.get(p) == Some(&b'#')
+}
+
+/// `previous_line_comment?`: the line directly above `n`'s own first line is
+/// a comment-only line — exempts the macro from grouping entirely.
+fn ag_previous_line_comment(idx: &super::LineIndex, src: &[u8], n: &ruby_prism::Node) -> bool {
+    let first_line = idx.loc(n.location().start_offset()).0;
+    if first_line < 2 {
+        return false;
+    }
+    ag_comment_only_line(idx, src, first_line - 1)
+}
+
+/// `groupable_accessor?`: is `items[i]` allowed to participate in grouping
+/// at all, based on its immediately preceding statement (if any)? A Sorbet
+/// `sig { ... }` (or any other call-with-block) immediately before is
+/// unwrapped to its own bare-call identity for this check (see
+/// `ag_effective_last_line`). An RBS::Inline trailing annotation comment
+/// (`#:...`) on the previous statement's line hard-disqualifies regardless
+/// of anything else.
+fn ag_groupable_accessor(
+    items: &[ruby_prism::Node],
+    i: usize,
+    idx: &super::LineIndex,
+    src: &[u8],
+    comments: &[(usize, usize, usize)],
+) -> bool {
+    if i == 0 {
+        return true;
+    }
+    let prev = &items[i - 1];
+    let Some(prev_call) = prev.as_call_node() else { return true };
+
+    let prev_first_line = idx.loc(prev.location().start_offset()).0;
+    let has_rbs_inline =
+        comments.iter().any(|&(cline, cs, ce)| cline == prev_first_line && src[cs..ce].starts_with(b"#:"));
+    if has_rbs_inline {
+        return false;
+    }
+
+    if ag_attribute_accessor_name(prev).is_some() || ag_is_access_modifier(&prev_call) {
+        return true;
+    }
+
+    let node_first_line = idx.loc(items[i].location().start_offset()).0;
+    let prev_last_line = ag_effective_last_line(&prev_call, idx);
+    node_first_line.saturating_sub(prev_last_line) > 1
+}
+
+/// `groupable_sibling_accessor?(items[i], items[j])`: same macro name, same
+/// visibility scope, `j` itself groupable, and not comment-exempted.
+fn ag_groupable_sibling(
+    items: &[ruby_prism::Node],
+    i: usize,
+    j: usize,
+    idx: &super::LineIndex,
+    src: &[u8],
+    comments: &[(usize, usize, usize)],
+) -> bool {
+    let Some(name_i) = ag_attribute_accessor_name(&items[i]) else { return false };
+    let Some(name_j) = ag_attribute_accessor_name(&items[j]) else { return false };
+    if name_i != name_j {
+        return false;
+    }
+    if ag_node_visibility(items, i) != ag_node_visibility(items, j) {
+        return false;
+    }
+    if !ag_groupable_accessor(items, j, idx, src, comments) {
+        return false;
+    }
+    if ag_previous_line_comment(idx, src, &items[j]) {
+        return false;
+    }
+    true
+}
+
+/// `groupable_sibling_accessors`: every statement-level sibling (INCLUDING
+/// `items[i]` itself) satisfying `ag_groupable_sibling`, in appearance order.
+/// Stable across which member of a group it's computed from, since the
+/// filter only compares against `items[i]`'s own name/visibility — identical
+/// for every true member of the same group.
+fn ag_groupable_siblings(
+    items: &[ruby_prism::Node],
+    i: usize,
+    idx: &super::LineIndex,
+    src: &[u8],
+    comments: &[(usize, usize, usize)],
+) -> Vec<usize> {
+    (0..items.len()).filter(|&j| ag_groupable_sibling(items, i, j, idx, src, comments)).collect()
+}
+
+/// `skip_for_grouping?` ("Group after constants"): a constant assignment
+/// sits SOMEWHERE among `items[i]`'s right siblings, AND at least one of
+/// those right siblings is itself a groupable sibling accessor of `items[i]`.
+fn ag_skip_for_grouping(
+    items: &[ruby_prism::Node],
+    i: usize,
+    idx: &super::LineIndex,
+    src: &[u8],
+    comments: &[(usize, usize, usize)],
+) -> bool {
+    let has_casgn_right = (i + 1..items.len()).any(|j| ag_is_casgn(&items[j]));
+    if !has_casgn_right {
+        return false;
+    }
+    (i + 1..items.len()).any(|j| items[j].as_call_node().is_some() && ag_groupable_sibling(items, i, j, idx, src, comments))
+}
+
+/// A stand-in for whitequark's `Node#==` (structural value equality,
+/// location-independent) for the narrow shapes `attr_*` arguments take:
+/// symbol literals compare by their unescaped value, everything else
+/// (splats, constants, ...) falls back to raw source-text equality.
+fn ag_arg_key(n: &ruby_prism::Node, src: &[u8]) -> Vec<u8> {
+    if let Some(sym) = n.as_symbol_node() {
+        let mut v = b"sym:".to_vec();
+        v.extend_from_slice(sym.unescaped());
+        return v;
+    }
+    let l = n.location();
+    src[l.start_offset()..l.end_offset()].to_vec()
+}
+
+/// `processed_source.ast_with_comments` narrowed to a call's own top-level
+/// argument list: each argument (in order) claims first any whole-line
+/// comments that end at or before its own start (the "leading" pass), then
+/// any comment on its own last line (the "decorating" pass) — mirroring
+/// `Comment::Associator`'s per-node leading/trailing sweep for these leaf
+/// argument nodes. `relevant` must already be scoped to just the comments
+/// inside this call's own argument-list span, in source order.
+fn ag_associate_arg_comments(
+    relevant: &[(usize, usize, usize)],
+    idx: &super::LineIndex,
+    args: &[ruby_prism::Node],
+) -> Vec<Vec<(usize, usize)>> {
+    let mut result: Vec<Vec<(usize, usize)>> = vec![Vec::new(); args.len()];
+    let mut ci = 0usize;
+    for (ai, arg) in args.iter().enumerate() {
+        let arg_start = arg.location().start_offset();
+        while ci < relevant.len() && relevant[ci].2 <= arg_start {
+            result[ai].push((relevant[ci].1, relevant[ci].2));
+            ci += 1;
+        }
+        let arg_last_line = idx.loc(arg.location().end_offset().saturating_sub(1)).0;
+        while ci < relevant.len() && relevant[ci].0 == arg_last_line {
+            result[ai].push((relevant[ci].1, relevant[ci].2));
+            ci += 1;
+        }
+    }
+    result
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/AccessorGrouping — flags `attr_reader`/`attr_writer`/
+    /// `attr_accessor`/`attr` statements in a `class`/`module`/`class << self`
+    /// body that violate the configured style.
+    ///
+    /// `grouped` (default): 2+ SAME-method, SAME-visibility accessor macros
+    /// in the body (not necessarily adjacent) get merged into one; `groupable_
+    /// accessor?` exempts a macro (and disqualifies it as a merge target)
+    /// when its immediately preceding statement is a plain call/method
+    /// def/etc. adjacent with no blank line (Sorbet `sig` idiom), or when an
+    /// RBS::Inline `#:` trailing annotation sits on the preceding line.
+    /// `separated`: any single macro with 2+ arguments gets split one per line.
+    /// Either style: a macro directly preceded (no blank line) by a
+    /// comment-only line is exempt outright (`previous_line_comment?`).
+    ///
+    /// Ported from `AccessorGrouping#check`/`preferred_accessors`/
+    /// `group_accessors`/`separate_accessors`. Every reported offense is
+    /// autocorrectable. Grouped style: the group's FIRST member (in body
+    /// order) gets the merged replacement text (all siblings' args,
+    /// deduplicated by exact source text, in appearance order); every OTHER
+    /// member gets its whole line removed (leading indent + preceding
+    /// newlines, via the same `range_with_surrounding_space(side: :left)`
+    /// shape used elsewhere in this file). "Group after constants"
+    /// (`skip_for_grouping?`) relocates the merge target to whichever member
+    /// comes AFTER a constant assignment sitting inside the group's span, so
+    /// a splat like `*OTHER_ATTRS` never gets grouped onto a line before its
+    /// own definition. Separated style extends the replaced range to include
+    /// a trailing comment on the LAST argument's own line, and reproduces
+    /// each argument's own associated comments above its new `attr_*` line
+    /// (see `ag_associate_arg_comments`); only the very FIRST argument (by
+    /// value, not position — a later argument with identical source, e.g. a
+    /// repeated `:one`, counts too) keeps its original left-margin position,
+    /// since it inherits the untouched indentation already present before
+    /// the replaced range.
+    pub(crate) fn check_accessor_grouping(&mut self, body: Option<ruby_prism::Node>) {
+        const COP: &str = "Style/AccessorGrouping";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = body else { return };
+        if body.as_def_node().is_some() {
+            return;
+        }
+        let items: Vec<ruby_prism::Node> = if let Some(stmts) = body.as_statements_node() {
+            stmts.body().iter().collect()
+        } else if body.as_call_node().is_some() {
+            vec![body]
+        } else {
+            return;
+        };
+
+        let grouped_style = self.cfg.enforced_style(COP) != "separated";
+
+        for i in 0..items.len() {
+            let Some(method) = ag_attribute_accessor_name(&items[i]) else { continue };
+            if ag_previous_line_comment(self.idx, self.src, &items[i]) {
+                continue;
+            }
+            if !ag_groupable_accessor(&items, i, self.idx, self.src, self.comments) {
+                continue;
+            }
+            let call = items[i].as_call_node().unwrap();
+            let method_str = String::from_utf8_lossy(&method).into_owned();
+
+            if grouped_style {
+                let siblings = ag_groupable_siblings(&items, i, self.idx, self.src, self.comments);
+                if siblings.len() <= 1 {
+                    continue;
+                }
+                let message = format!("Group together all `{method_str}` attributes.");
+                self.push(call.location().start_offset(), COP, true, message);
+                self.ag_autocorrect_grouped(&items, i, &siblings, &method_str);
+            } else {
+                let args_count = call.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0);
+                if args_count <= 1 {
+                    continue;
+                }
+                let message = format!("Use one attribute per `{method_str}`.");
+                self.push(call.location().start_offset(), COP, true, message);
+                let args: Vec<ruby_prism::Node> =
+                    call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                self.ag_autocorrect_separated(&call, &args, &method_str);
+            }
+        }
+    }
+
+    /// `preferred_accessors`/`autocorrect` for `grouped` style, for the
+    /// single offending macro `items[i]` (siblings already computed by the
+    /// caller — see the type doc for the replace-vs-remove split).
+    fn ag_autocorrect_grouped(&mut self, items: &[ruby_prism::Node], i: usize, siblings: &[usize], method_str: &str) {
+        if ag_skip_for_grouping(items, i, self.idx, self.src, self.comments) {
+            self.ag_remove_left(&items[i]);
+            return;
+        }
+        let first = siblings[0];
+        if i != first && !ag_skip_for_grouping(items, first, self.idx, self.src, self.comments) {
+            self.ag_remove_left(&items[i]);
+            return;
+        }
+
+        // `group_accessors`: every sibling's own args, in appearance order,
+        // deduplicated by exact source text (Ruby's `Array#uniq` on `.source`).
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        for &s in siblings {
+            let sib_call = items[s].as_call_node().unwrap();
+            if let Some(a) = sib_call.arguments() {
+                for arg in a.arguments().iter() {
+                    let l = arg.location();
+                    let text = self.src[l.start_offset()..l.end_offset()].to_vec();
+                    if !names.iter().any(|n| n == &text) {
+                        names.push(text);
+                    }
+                }
+            }
+        }
+        let joined = names.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect::<Vec<_>>().join(", ");
+        let replacement = format!("{method_str} {joined}");
+        let l = items[i].location();
+        self.fixes.push((l.start_offset(), l.end_offset(), replacement.into_bytes()));
+    }
+
+    /// `range_with_surrounding_space(node.source_range, side: :left)` then
+    /// remove: extend the deletion leftward over horizontal whitespace, then
+    /// over any consecutive newlines, leaving `node`'s own trailing newline
+    /// (if any) untouched.
+    fn ag_remove_left(&mut self, node: &ruby_prism::Node) {
+        let l = node.location();
+        let (start, end) = (l.start_offset(), l.end_offset());
+        let mut p = start;
+        while p > 0 && matches!(self.src[p - 1], b' ' | b'\t') {
+            p -= 1;
+        }
+        while p > 0 && self.src[p - 1] == b'\n' {
+            p -= 1;
+        }
+        self.fixes.push((p, end, Vec::new()));
+    }
+
+    /// `separate_accessors` + `range_with_trailing_argument_comment` for
+    /// `separated` style.
+    fn ag_autocorrect_separated(&mut self, call: &ruby_prism::CallNode, args: &[ruby_prism::Node], method_str: &str) {
+        let Some(last_arg) = args.last() else { return };
+        let l = call.location();
+        let call_start = l.start_offset();
+        let call_end = l.end_offset();
+        let indent = " ".repeat(self.idx.loc(call_start).1 - 1);
+
+        let last_line = self.idx.loc(last_arg.location().end_offset().saturating_sub(1)).0;
+        let scan_end = self.idx.starts.get(last_line).copied().unwrap_or(self.src.len());
+        let relevant: Vec<(usize, usize, usize)> =
+            self.comments.iter().copied().filter(|&(_, s, _)| s >= call_start && s < scan_end).collect();
+        let comment_map = ag_associate_arg_comments(&relevant, self.idx, args);
+
+        let first_key = ag_arg_key(&args[0], self.src);
+        let mut lines: Vec<String> = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            let al = arg.location();
+            let arg_src = String::from_utf8_lossy(&self.src[al.start_offset()..al.end_offset()]).into_owned();
+            let mut this_lines: Vec<String> =
+                comment_map[i].iter().map(|&(s, e)| String::from_utf8_lossy(&self.src[s..e]).into_owned()).collect();
+            this_lines.push(format!("{method_str} {arg_src}"));
+            if ag_arg_key(arg, self.src) == first_key {
+                lines.extend(this_lines);
+            } else {
+                lines.extend(this_lines.into_iter().map(|ln| format!("{indent}{ln}")));
+            }
+        }
+        let replacement = lines.join("\n");
+
+        let range_end =
+            comment_map.last().and_then(|v| v.last()).map(|&(_, e)| e.max(call_end)).unwrap_or(call_end);
+        self.fixes.push((call_start, range_end, replacement.into_bytes()));
+    }
+}
