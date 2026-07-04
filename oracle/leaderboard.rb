@@ -225,6 +225,7 @@ COPS = {
   'Layout/EmptyComment'              => 'layout/empty_comment',
   'Style/EmptyCaseCondition'         => 'style/empty_case_condition',
   'Style/OneLineConditional'         => 'style/one_line_conditional',
+  'Style/IfWithSemicolon'            => 'style/if_with_semicolon',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

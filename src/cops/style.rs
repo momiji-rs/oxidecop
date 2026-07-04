@@ -11214,3 +11214,488 @@ fn olc_keyword_with_changed_precedence(node: &ruby_prism::Node) -> bool {
     }
     false
 }
+
+
+/// Style/IfWithSemicolon — `if cond; body end` (and the `unless` form) is
+/// flagged and rewritten as a ternary, a multi-line `if`, or (when the body
+/// can't be squeezed onto one clause) just has its `;` swapped for a
+/// newline. Ported from `OnNormalIfUnless#on_if` + `IfWithSemicolon`.
+///
+/// Two whitequark-specific quirks drive most of the plumbing below:
+///
+/// * `node.parent&.if_type?` — whitequark never wraps a single statement in
+///   a synthetic `:begin`, so an `elsif` (itself stored as a nested `:if` in
+///   the `else` slot) OR a manually-nested `if`/`unless` that happens to be
+///   the SOLE statement of an enclosing if/unless's then/else body has that
+///   enclosing node as its literal AST parent. Prism has no parent pointers
+///   at all, so `if_semicolon_suppressed` reconstructs this by having every
+///   visited if/unless node mark its own such children BEFORE checking
+///   whether it itself is marked — this must run unconditionally (not
+///   gated on whether the current node's own offense fires), because the
+///   real whitequark check is purely structural.
+/// * `ignore_node`/`part_of_ignored_node?` — once a node is flagged, its
+///   entire range is exempt from ITS descendants firing independently (e.g.
+///   a nested `if cond; ...; end` inside a block argument passed to the
+///   flagged node's body). `if_semicolon_spans` replicates this the same
+///   way `Style/UnlessElse`'s `unless_else_spans` does: range containment
+///   instead of true ancestor walking (equivalent for a well-formed tree).
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_if_with_semicolon(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/IfWithSemicolon";
+        if !self.on(COP) {
+            return;
+        }
+        let src = self.src;
+        let self_start = node.location().start_offset();
+        // Structural bookkeeping (see doc comment) — unconditional.
+        self.if_semicolon_mark_sole_child(node.statements());
+        if let Some(sub) = node.subsequent() {
+            if let Some(elsif) = sub.as_if_node() {
+                self.if_semicolon_suppressed.insert(elsif.location().start_offset());
+            } else if let Some(else_node) = sub.as_else_node() {
+                self.if_semicolon_mark_sole_child(else_node.statements());
+            }
+        }
+        if self.if_semicolon_suppressed.contains(&self_start) {
+            return;
+        }
+        if self.if_semicolon_spans.iter().any(|(s, e)| self_start >= *s && self_start < *e) {
+            return;
+        }
+        // `on_if`'s `return if node.modifier_form? || node.ternary?`.
+        if node.if_keyword_loc().is_none() || node.end_keyword_loc().is_none() {
+            return;
+        }
+        if node.then_keyword_loc().is_some() {
+            return; // uses literal `then`, not `;`
+        }
+        let Some(semi) = if_semicolon_scan(src, node.predicate().location().end_offset()) else {
+            return;
+        };
+        // Flatten if/elsif/.../else branches, exactly like `IfNode#branches`.
+        let mut shapes = vec![if_branch_shape(node.statements())];
+        let mut cur = node.subsequent();
+        loop {
+            match cur {
+                None => break,
+                Some(n) => {
+                    if let Some(elsif) = n.as_if_node() {
+                        shapes.push(if_branch_shape(elsif.statements()));
+                        cur = elsif.subsequent();
+                    } else if let Some(else_node) = n.as_else_node() {
+                        shapes.push(if_branch_shape(else_node.statements()));
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        let require_newline =
+            shapes.iter().any(if_shape_is_begin_like) || shapes.iter().any(if_shape_is_return_with_arg);
+        let masgn_or_block = shapes.iter().any(if_shape_is_masgn_or_block);
+        let top_else_is_if = if_top_else_is_iflike(node.subsequent());
+        let cond_src = nsrc(&node.predicate(), src);
+        let node_end = node.location().end_offset();
+        self.if_semicolon_report(COP, "if", self_start, node_end, cond_src, require_newline, masgn_or_block, top_else_is_if);
+        if require_newline || masgn_or_block {
+            self.fixes.push((semi, semi + 1, b"\n".to_vec()));
+        } else if top_else_is_if {
+            let text = build_if_semicolon_chain_text(&node.as_node(), src);
+            self.fixes.push((self_start, node_end, text));
+        } else {
+            let then_shape = if_branch_shape(node.statements());
+            let else_shape = if_semicolon_top_else_shape(node.subsequent());
+            let text = build_if_semicolon_ternary(src, cond_src, &then_shape, &else_shape, false);
+            self.fixes.push((self_start, node_end, text));
+        }
+    }
+
+    pub(crate) fn check_if_with_semicolon_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Style/IfWithSemicolon";
+        if !self.on(COP) {
+            return;
+        }
+        let src = self.src;
+        let self_start = node.location().start_offset();
+        self.if_semicolon_mark_sole_child(node.statements());
+        if let Some(else_node) = node.else_clause() {
+            self.if_semicolon_mark_sole_child(else_node.statements());
+        }
+        if self.if_semicolon_suppressed.contains(&self_start) {
+            return;
+        }
+        if self.if_semicolon_spans.iter().any(|(s, e)| self_start >= *s && self_start < *e) {
+            return;
+        }
+        if node.end_keyword_loc().is_none() {
+            return; // modifier form
+        }
+        if node.then_keyword_loc().is_some() {
+            return;
+        }
+        let Some(semi) = if_semicolon_scan(src, node.predicate().location().end_offset()) else {
+            return;
+        };
+        // `ruby_prism` node types don't implement `Clone`, so the (cheap,
+        // pointer-dereferencing) `else_clause()` accessor is just called
+        // again everywhere a fresh `Option<Node>` is needed, rather than
+        // stashing and reusing one value.
+        //
+        // NOTE: this uses `if_branch_shape` directly (not
+        // `if_semicolon_top_else_shape`, which collapses a genuine
+        // multi-statement else to `None` — safe there ONLY because that
+        // helper is only ever consulted once `require_newline?` is already
+        // known false). `require_newline?`/`masgn_or_block?` need the real
+        // `Multi` shape preserved so a multi-statement else is detected.
+        let shapes = [
+            if_branch_shape(node.statements()),
+            node.else_clause().map_or(IfShape::None, |e| if_branch_shape(e.statements())),
+        ];
+        let require_newline =
+            shapes.iter().any(if_shape_is_begin_like) || shapes.iter().any(if_shape_is_return_with_arg);
+        let masgn_or_block = shapes.iter().any(if_shape_is_masgn_or_block);
+        let top_else_is_if = if_top_else_is_iflike(node.else_clause().map(|e| e.as_node()));
+        let cond_src = nsrc(&node.predicate(), src);
+        let node_end = node.location().end_offset();
+        self.if_semicolon_report(COP, "unless", self_start, node_end, cond_src, require_newline, masgn_or_block, top_else_is_if);
+        if require_newline || masgn_or_block {
+            self.fixes.push((semi, semi + 1, b"\n".to_vec()));
+        } else if top_else_is_if {
+            let text = build_if_semicolon_chain_text(&node.as_node(), src);
+            self.fixes.push((self_start, node_end, text));
+        } else {
+            let then_shape = if_branch_shape(node.statements());
+            let else_shape = if_semicolon_top_else_shape(node.else_clause().map(|e| e.as_node()));
+            let text = build_if_semicolon_ternary(src, cond_src, &then_shape, &else_shape, true);
+            self.fixes.push((self_start, node_end, text));
+        }
+    }
+
+    /// Marks `stmts`' sole statement (if it's an `if`/`unless`) as
+    /// suppressed — see the impl-level doc comment.
+    fn if_semicolon_mark_sole_child(&mut self, stmts: Option<ruby_prism::StatementsNode>) {
+        if let IfShape::Single(n) = if_branch_shape(stmts) {
+            if n.as_if_node().is_some() || n.as_unless_node().is_some() {
+                self.if_semicolon_suppressed.insert(n.location().start_offset());
+            }
+        }
+    }
+
+    /// Shared message + offense push for both entry points above.
+    fn if_semicolon_report(
+        &mut self,
+        cop: &'static str,
+        keyword: &str,
+        start: usize,
+        end: usize,
+        cond_src: &[u8],
+        require_newline: bool,
+        masgn_or_block: bool,
+        top_else_is_if: bool,
+    ) {
+        let cond_str = String::from_utf8_lossy(cond_src);
+        let suffix = if require_newline {
+            "use a newline instead."
+        } else if top_else_is_if || masgn_or_block {
+            "use `if/else` instead."
+        } else {
+            "use a ternary operator instead."
+        };
+        self.push(start, cop, true, format!("Do not use `{keyword} {cond_str};` - {suffix}"));
+        self.if_semicolon_spans.push((start, end));
+    }
+}
+
+/// The whitequark-normalized shape of an if/unless branch body: absent, a
+/// single statement (rubocop-ast's `if_branch`/`else_branch` — this CAN
+/// itself be an explicit `begin ... end` (prism's `BeginNode`, whitequark's
+/// `:kwbegin` — distinct from the `:begin` fold below), but a lone
+/// `kwbegin` statement is still just one node), or more than one statement
+/// (whitequark folds those into a synthetic `:begin`, which prism instead
+/// keeps as a flat `StatementsNode` — there's no single node to point at).
+enum IfShape<'pr> {
+    None,
+    Single(ruby_prism::Node<'pr>),
+    Multi,
+}
+
+fn if_branch_shape<'pr>(stmts: Option<ruby_prism::StatementsNode<'pr>>) -> IfShape<'pr> {
+    match stmts {
+        None => IfShape::None,
+        Some(s) => {
+            let body = s.body();
+            match body.len() {
+                0 => IfShape::None,
+                1 => IfShape::Single(body.first().expect("len == 1")),
+                _ => IfShape::Multi,
+            }
+        }
+    }
+}
+
+/// `branch.begin_type?` — true ONLY for a real multi-statement fold.
+/// Whitequark uses TWO distinct types here: an implicit multi-statement
+/// sequence is `:begin`, but an explicit `begin ... end` keyword block is
+/// `:kwbegin` (prism's `BeginNode`) — verified against real rubocop:
+/// `if cond; begin; a; b; end end` autocorrects to a TERNARY
+/// (`cond ? begin; a; b; end : nil`), not a newline-insert, because a
+/// single `kwbegin` statement does NOT satisfy `begin_type?`.
+fn if_shape_is_begin_like(shape: &IfShape) -> bool {
+    matches!(shape, IfShape::Multi)
+}
+
+/// `branch.type?(:masgn, :any_block)`.
+fn if_shape_is_masgn_or_block(shape: &IfShape) -> bool {
+    match shape {
+        IfShape::Single(n) => n.as_multi_write_node().is_some() || n.as_call_node().is_some_and(|c| c.block().is_some()),
+        _ => false,
+    }
+}
+
+/// `branch.return_type? && branch.arguments.any?`.
+fn if_shape_is_return_with_arg(shape: &IfShape) -> bool {
+    match shape {
+        IfShape::Single(n) => n
+            .as_return_node()
+            .is_some_and(|r| r.arguments().is_some_and(|a| !a.arguments().is_empty())),
+        _ => false,
+    }
+}
+
+/// The resolved next branch of an if/unless chain, mirroring
+/// `node.else_branch` — collapsed the same way whitequark collapses an
+/// EMPTY trailing `else` clause to the same `nil` as no `else` at all (both
+/// leave the AST child slot empty; only `else?`'s location bookkeeping,
+/// which this cop's logic never consults, can tell them apart).
+enum IfSemicolonNext<'pr> {
+    None,
+    /// `subsequent()` was itself an `elsif` (`IfNode`), OR the resolved
+    /// `else` clause's sole statement happens to be a manually-nested
+    /// `if`/`unless` — rubocop's `else_branch&.if_type?` doesn't care which.
+    IfLike(ruby_prism::Node<'pr>),
+    /// A genuine terminal `else` with (at most) one statement.
+    PlainElse(Option<ruby_prism::Node<'pr>>),
+}
+
+fn if_semicolon_resolve_next<'pr>(subsequent: Option<ruby_prism::Node<'pr>>) -> IfSemicolonNext<'pr> {
+    let Some(n) = subsequent else { return IfSemicolonNext::None };
+    if n.as_if_node().is_some() || n.as_unless_node().is_some() {
+        return IfSemicolonNext::IfLike(n);
+    }
+    if let Some(else_node) = n.as_else_node() {
+        return match if_branch_shape(else_node.statements()) {
+            IfShape::None => IfSemicolonNext::None,
+            IfShape::Single(inner) => {
+                if inner.as_if_node().is_some() || inner.as_unless_node().is_some() {
+                    IfSemicolonNext::IfLike(inner)
+                } else {
+                    IfSemicolonNext::PlainElse(Some(inner))
+                }
+            }
+            // Unreachable via the only caller (`replacement`'s path is only
+            // taken once `require_newline?` is confirmed false for every
+            // branch in the chain, which already rules out a multi-statement
+            // else) — kept total rather than panicking on malformed input.
+            IfShape::Multi => IfSemicolonNext::PlainElse(None),
+        };
+    }
+    IfSemicolonNext::None
+}
+
+fn if_top_else_is_iflike(subsequent: Option<ruby_prism::Node>) -> bool {
+    matches!(if_semicolon_resolve_next(subsequent), IfSemicolonNext::IfLike(_))
+}
+
+/// The OUTER (flagged) node's own else-branch shape, for the ternary-build
+/// path only (`top_else_is_if` is already known false whenever this is
+/// called, so the `IfLike` case below is unreachable in practice).
+fn if_semicolon_top_else_shape<'pr>(subsequent: Option<ruby_prism::Node<'pr>>) -> IfShape<'pr> {
+    match if_semicolon_resolve_next(subsequent) {
+        IfSemicolonNext::None | IfSemicolonNext::PlainElse(None) => IfShape::None,
+        IfSemicolonNext::PlainElse(Some(n)) => IfShape::Single(n),
+        IfSemicolonNext::IfLike(_) => IfShape::None,
+    }
+}
+
+fn if_like_condition<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(ifn) = n.as_if_node() {
+        Some(ifn.predicate())
+    } else if let Some(un) = n.as_unless_node() {
+        Some(un.predicate())
+    } else {
+        None
+    }
+}
+
+fn if_like_statements<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::StatementsNode<'pr>> {
+    if let Some(ifn) = n.as_if_node() {
+        ifn.statements()
+    } else if let Some(un) = n.as_unless_node() {
+        un.statements()
+    } else {
+        None
+    }
+}
+
+fn if_like_subsequent<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(ifn) = n.as_if_node() {
+        ifn.subsequent()
+    } else if let Some(un) = n.as_unless_node() {
+        un.else_clause().map(|e| e.as_node())
+    } else {
+        None
+    }
+}
+
+/// `IfWithSemicolon#correct_elsif` — rebuilds `if COND\n  BODY\nELSE\nend`
+/// from scratch. `node` is the originally-flagged if/unless node itself
+/// (never `elsif` — those are always suppressed); the "if"/"end" keywords
+/// are ALWAYS literal, even when `node` is an `unless` (verified against
+/// real rubocop: `unless cond; run else if x; y end end` autocorrects to a
+/// literal `if`, not `unless`, and does NOT negate/swap the branches —
+/// upstream's `correct_elsif`/`build_else_branch` never check `.unless?`,
+/// only `replacement`'s OWN ternary-building does, once, for `node` itself).
+fn build_if_semicolon_chain_text(node: &ruby_prism::Node, src: &[u8]) -> Vec<u8> {
+    let cond = if_like_condition(node).expect("caller only passes an if/unless node");
+    let cond_src = nsrc(&cond, src);
+    let if_branch_src = if_semicolon_single_src(if_like_statements(node), src);
+    let mut out = Vec::new();
+    out.extend_from_slice(b"if ");
+    out.extend_from_slice(cond_src);
+    out.push(b'\n');
+    out.extend_from_slice(b"  ");
+    out.extend_from_slice(if_branch_src.unwrap_or(b""));
+    out.push(b'\n');
+    let next = if_semicolon_resolve_next(if_like_subsequent(node));
+    let mut else_part = build_if_semicolon_else_branch(next, src);
+    if else_part.last() == Some(&b'\n') {
+        else_part.pop();
+    }
+    out.extend_from_slice(&else_part);
+    out.push(b'\n');
+    out.extend_from_slice(b"end");
+    out
+}
+
+/// `IfWithSemicolon#build_else_branch` — always ends in `\n` unless `next`
+/// is `None` (mirrors the ruby method never being called in that case).
+fn build_if_semicolon_else_branch(next: IfSemicolonNext, src: &[u8]) -> Vec<u8> {
+    match next {
+        IfSemicolonNext::None => Vec::new(),
+        IfSemicolonNext::PlainElse(body) => {
+            let mut out = Vec::new();
+            out.extend_from_slice(b"else\n  ");
+            if let Some(n) = body {
+                out.extend_from_slice(nsrc(&n, src));
+            }
+            out.push(b'\n');
+            out
+        }
+        IfSemicolonNext::IfLike(n) => {
+            let cond = if_like_condition(&n).expect("IfLike always wraps an if/unless node");
+            let cond_src = nsrc(&cond, src);
+            let if_branch_src = if_semicolon_single_src(if_like_statements(&n), src);
+            let mut out = Vec::new();
+            out.extend_from_slice(b"elsif ");
+            out.extend_from_slice(cond_src);
+            out.push(b'\n');
+            out.extend_from_slice(b"  ");
+            out.extend_from_slice(if_branch_src.unwrap_or(b""));
+            out.push(b'\n');
+            let deeper = if_semicolon_resolve_next(if_like_subsequent(&n));
+            if !matches!(deeper, IfSemicolonNext::None) {
+                out.extend_from_slice(&build_if_semicolon_else_branch(deeper, src));
+            }
+            out
+        }
+    }
+}
+
+fn if_semicolon_single_src<'pr>(stmts: Option<ruby_prism::StatementsNode<'pr>>, src: &'pr [u8]) -> Option<&'pr [u8]> {
+    match if_branch_shape(stmts) {
+        IfShape::Single(n) => Some(nsrc(&n, src)),
+        _ => None,
+    }
+}
+
+/// `IfWithSemicolon#replacement`'s ternary path: `COND ? THEN : ELSE`,
+/// swapping THEN/ELSE for `unless` (rubocop-ast's `if_branch`/`else_branch`
+/// accessors already normalize to SOURCE POSITION regardless of if/unless —
+/// see the real `node_parts` swap for `unless` — so `then_shape`/
+/// `else_shape` here are always "syntactically first"/"syntactically
+/// second", and `swap` is the ONLY place `unless` semantics enter).
+fn build_if_semicolon_ternary(src: &[u8], cond_src: &[u8], then_shape: &IfShape, else_shape: &IfShape, swap: bool) -> Vec<u8> {
+    let then_src = if_semicolon_build_expr(then_shape, src);
+    let else_src = if_semicolon_build_expr(else_shape, src);
+    let (a, b) = if swap { (else_src, then_src) } else { (then_src, else_src) };
+    let mut out = Vec::new();
+    out.extend_from_slice(cond_src);
+    out.extend_from_slice(b" ? ");
+    out.extend_from_slice(&a);
+    out.extend_from_slice(b" : ");
+    out.extend_from_slice(&b);
+    out
+}
+
+/// `IfWithSemicolon#build_expression`.
+fn if_semicolon_build_expr(shape: &IfShape, src: &[u8]) -> Vec<u8> {
+    match shape {
+        IfShape::None => b"nil".to_vec(),
+        // Unreachable: the ternary path only runs once every branch in the
+        // chain is confirmed non-begin-like (`require_newline?` false).
+        IfShape::Multi => Vec::new(),
+        IfShape::Single(n) => {
+            if let Some(call) = n.as_call_node() {
+                if if_semicolon_requires_parens(&call) {
+                    let msg_end = call.message_loc().map(|m| m.end_offset()).unwrap_or_else(|| call.location().end_offset());
+                    let method_src = &src[call.location().start_offset()..msg_end];
+                    let args = call.arguments().expect("checked by if_semicolon_requires_parens");
+                    let first = args.arguments().first().expect("checked non-empty by if_semicolon_requires_parens");
+                    let args_src = &src[first.location().start_offset()..call.location().end_offset()];
+                    let mut out = Vec::with_capacity(method_src.len() + args_src.len() + 2);
+                    out.extend_from_slice(method_src);
+                    out.push(b'(');
+                    out.extend_from_slice(args_src);
+                    out.push(b')');
+                    return out;
+                }
+            }
+            nsrc(n, src).to_vec()
+        }
+    }
+}
+
+/// `IfWithSemicolon#require_argument_parentheses?`.
+fn if_semicolon_requires_parens(call: &ruby_prism::CallNode) -> bool {
+    const ARITH: [&[u8]; 6] = [b"+", b"-", b"*", b"/", b"%", b"**"];
+    let name = call.name();
+    let name_bytes = name.as_slice();
+    if ARITH.iter().any(|a| *a == name_bytes) {
+        return false;
+    }
+    if call.closing_loc().is_some_and(|c| c.as_slice() == b")") {
+        return false;
+    }
+    if !call.arguments().is_some_and(|a| !a.arguments().is_empty()) {
+        return false;
+    }
+    name_bytes != b"[]" && name_bytes != b"[]="
+}
+
+fn if_semicolon_scan(src: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < src.len() {
+        match src[i] {
+            b' ' | b'\t' => i += 1,
+            b';' => return Some(i),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn nsrc<'pr>(n: &ruby_prism::Node, src: &'pr [u8]) -> &'pr [u8] {
+    let l = n.location();
+    &src[l.start_offset()..l.end_offset()]
+}

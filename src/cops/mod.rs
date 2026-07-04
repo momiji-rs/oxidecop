@@ -194,6 +194,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException", "Style/TrailingUnderscoreVariable",
     "Lint/NonLocalExitFromIterator", "Layout/EmptyComment", "Style/EmptyCaseCondition", "Style/OneLineConditional",
+    "Style/IfWithSemicolon",
 ];
 
 impl Engine {
@@ -489,6 +490,20 @@ pub(crate) struct Cops<'a> {
     // conditional fully inside an outer one's replaced range only gets an
     // offense (rubocop's `ignore_node`/`part_of_ignored_node?`).
     pub(crate) one_line_cond_spans: Vec<(usize, usize)>,
+    // Style/IfWithSemicolon: spans of already-flagged if/unless nodes
+    // (rubocop's `ignore_node`) — a node whose start falls inside one is
+    // `part_of_ignored_node?` and skipped entirely (no offense at all).
+    pub(crate) if_semicolon_spans: Vec<(usize, usize)>,
+    // Style/IfWithSemicolon: start offsets of if/unless nodes whose
+    // whitequark "parent" would be another if/unless node — an `elsif`
+    // (prism's `subsequent()` chain) or the sole statement of an enclosing
+    // if/unless's then/else body (whitequark doesn't wrap a single
+    // statement in `:begin`, so it becomes a direct AST child of the outer
+    // `:if` node). `on_normal_if_unless`'s `return if node.parent&.if_type?`
+    // guard is purely structural (independent of whether the outer node
+    // itself gets flagged), so this is populated for EVERY if/unless node
+    // visited, not just ones that end up with an offense.
+    pub(crate) if_semicolon_suppressed: HashSet<usize>,
     // multi-line plain-string line spans (Layout/EmptyLines token lines)
     pub(crate) multiline_str_lines: Vec<(usize, usize)>,
     // the file's frozen_string_literal magic-comment value, if any
@@ -1220,6 +1235,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_comparable_clamp_if(node);
         self.check_empty_else_if(node);
         self.check_one_line_conditional_if(node);
+        self.check_if_with_semicolon(node);
         self.check_safe_navigation_with_empty(&node.predicate());
         if let Some(kw) = node.if_keyword_loc() {
             if matches!(kw.as_slice(), b"if" | b"elsif") {
@@ -1273,6 +1289,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_conditional_body_unless(node);
         self.check_empty_else_unless(node);
         self.check_non_nil_check_unless(node);
+        self.check_if_with_semicolon_unless(node);
         self.check_multiline_if_then(
             node.then_keyword_loc(),
             node.end_keyword_loc(),
@@ -2601,6 +2618,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         stmts_stack: Vec::new(),
         unless_else_spans: Vec::new(),
         one_line_cond_spans: Vec::new(),
+        if_semicolon_spans: Vec::new(),
+        if_semicolon_suppressed: HashSet::new(),
         ll_active: false,
         ll_max: 0,
         ll_split: false,
