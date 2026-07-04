@@ -312,7 +312,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
-    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength",
+    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator",
 ];
 
 impl Engine {
@@ -2316,6 +2316,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.check_ruby_version_globals_usage_path(node);
+        self.check_space_after_double_colon(node);
         ruby_prism::visit_constant_path_node(self, node);
     }
     fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
@@ -3418,6 +3419,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_with_index(node);
         self.check_redundant_with_object(node);
         self.check_dot_position(node);
+        self.check_space_around_method_call_operator(node);
         self.check_comparable_clamp_min_max(node);
         self.check_redundant_freeze(node);
         self.check_nil_lambda_call(node);

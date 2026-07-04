@@ -294,6 +294,7 @@ COPS = {
   'Lint/FormatParameterMismatch'     => 'lint/format_parameter_mismatch',
   'Style/TrailingCommaInArrayLiteral' => 'style/trailing_comma_in_array_literal',
   'Metrics/MethodLength'             => 'metrics/method_length',
+  'Layout/SpaceAroundMethodCallOperator' => 'layout/space_around_method_call_operator',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

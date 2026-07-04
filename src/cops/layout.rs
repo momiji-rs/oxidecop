@@ -6559,3 +6559,82 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// ============================================================================
+// Layout/SpaceAroundMethodCallOperator
+// ============================================================================
+impl<'a> Cops<'a> {
+    /// Layout/SpaceAroundMethodCallOperator — no spaces around a `.`/`&.`
+    /// call operator (rubocop's `on_send`/`on_csend`, unified into one
+    /// prism `CallNode` — `dot?`/`safe_navigation?` only match a literal
+    /// `.`/`&.` source; a `::` call operator, e.g. `Foo::bar`, is a
+    /// DIFFERENT operator string and is never checked here) and around the
+    /// `::` that connects a namespace to a constant (rubocop's `on_const`,
+    /// prism's `ConstantPathNode` — see `check_space_after_double_colon`
+    /// below). Each check only fires when the gap is ENTIRELY spaces/tabs
+    /// (`SPACES_REGEXP = /\A[ \t]+\z/`) — a newline (multi-line chains) or
+    /// any other character (e.g. a comment) in the gap leaves it alone.
+    pub(crate) fn check_space_around_method_call_operator(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/SpaceAroundMethodCallOperator";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(dot_loc) = node.call_operator_loc() else { return };
+        let op = dot_loc.as_slice();
+        if op != b"." && op != b"&." {
+            return;
+        }
+        // `check_space_before_dot`: receiver end .. dot begin. The receiver
+        // is always present for a `.`/`&.` call.
+        if let Some(receiver) = node.receiver() {
+            self.samco_check(receiver.location().end_offset(), dot_loc.start_offset());
+        }
+        // `check_space_after_dot`: dot end .. selector begin, where the
+        // selector is the `(` of a bare `Proc#call` shorthand (`foo.()`,
+        // no explicit method name — `message_loc` is absent) rather than
+        // the (nonexistent) selector location.
+        let selector_off = if node.name().as_slice() == b"call" && node.message_loc().is_none() {
+            node.opening_loc().map(|l| l.start_offset())
+        } else {
+            node.message_loc().map(|l| l.start_offset())
+        };
+        if let Some(selector_off) = selector_off {
+            self.samco_check(dot_loc.end_offset(), selector_off);
+        }
+    }
+
+    /// `on_const`'s `check_space_after_double_colon` — only the space AFTER
+    /// the `::` is checked (never before); prism gives each level of a
+    /// `Foo::Bar::Baz` chain — including a leading `::` cbase, e.g.
+    /// `::Foo` — its own `ConstantPathNode` with its own
+    /// `delimiter_loc`/`name_loc`, so recursing into `parent` isn't needed:
+    /// the normal `visit_constant_path_node` traversal already visits every
+    /// level.
+    pub(crate) fn check_space_after_double_colon(&mut self, node: &ruby_prism::ConstantPathNode) {
+        const COP: &str = "Layout/SpaceAroundMethodCallOperator";
+        if !self.on(COP) {
+            return;
+        }
+        let delimiter = node.delimiter_loc();
+        let name = node.name_loc();
+        self.samco_check(delimiter.end_offset(), name.start_offset());
+    }
+
+    /// Shared `check_space`: offense (correctable, removing the range) iff
+    /// `[begin_off, end_off)` is non-empty and consists ENTIRELY of spaces
+    /// and/or tabs — a newline or any other byte (e.g. a comment) in the
+    /// gap disqualifies it, matching rubocop's `SPACES_REGEXP.match?`.
+    fn samco_check(&mut self, begin_off: usize, end_off: usize) {
+        const COP: &str = "Layout/SpaceAroundMethodCallOperator";
+        if end_off <= begin_off {
+            return;
+        }
+        let gap = &self.src[begin_off..end_off];
+        if !gap.iter().all(|&b| b == b' ' || b == b'\t') {
+            return;
+        }
+        self.push(begin_off, COP, true, "Avoid using spaces around a method call operator.");
+        self.fixes.push((begin_off, end_off, Vec::new()));
+    }
+}
