@@ -6148,3 +6148,107 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/FirstParameterIndentation — checks the indentation of the
+    /// first parameter of a multi-line `def`/`defs` (a single prism
+    /// `DefNode`, with or without a `receiver`, covers both — matching
+    /// rubocop's `on_def`/`alias on_defs`). Ports `on_def`/`check` plus the
+    /// shared `MultilineElementIndentation#check_first`, called from
+    /// `check` as `check_first(first_elem, left_parenthesis, nil, 0)` —
+    /// i.e. `left_brace = left_parenthesis` (the def's own opening paren),
+    /// `left_parenthesis = nil`, `offset = 0`.
+    ///
+    /// Passing `nil` for `left_parenthesis` makes two branches of
+    /// `MultilineElementIndentation#indent_base`/`detected_styles_for_column`
+    /// permanently dead for this call site: the `special_inside_parentheses`
+    /// branch (guarded on that argument being truthy — and this cop's
+    /// `SupportedStyles`, `consistent`/`align_parentheses`, never include
+    /// `special_inside_parentheses` anyway, so `style` could never equal it
+    /// either) is skipped entirely, leaving only the `align_parentheses`
+    /// ("the position of the opening parenthesis") and the fallback
+    /// "start of the line where the left parenthesis is" bases.
+    ///
+    /// NOT ported: `indent_base`'s `hash_pair_where_value_beginning_with`
+    /// check — `first_elem.parent` is always the `ParametersNode` here, and
+    /// ITS parent is the `DefNode` itself, never a `pair_type?` node, so
+    /// that branch is unreachable for this cop (it matters only for
+    /// `Layout/First{Hash,Array}ElementIndentation`, which reuse the same
+    /// mixin for literal elements, not method definitions). Also not
+    /// ported: `ConfigurableEnforcedStyle`'s `detected_style`/
+    /// `ambiguous_style_detected` bookkeeping — it only feeds
+    /// `--auto-gen-config` and never affects whether an offense is
+    /// registered or how autocorrect behaves.
+    ///
+    /// Autocorrect reuses `parameter_alignment_correct` (Layout/
+    /// ParameterAlignment's port of `AlignmentCorrector.correct`
+    /// specialized to a single misaligned node) verbatim — upstream's
+    /// `autocorrect` here is the exact same one-liner,
+    /// `AlignmentCorrector.correct(corrector, processed_source, node,
+    /// @column_delta)`.
+    pub(crate) fn check_first_parameter_indentation(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Layout/FirstParameterIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        // `node.arguments.empty?`
+        let items = match node.parameters() {
+            Some(p) => mlbl_ordered_params(&p),
+            None => Vec::new(),
+        };
+        if items.is_empty() {
+            return;
+        }
+        // `node.arguments.loc.begin.nil?` — defs called without parentheses
+        // (`def abc foo, bar`) are ignored entirely.
+        let Some(lparen) = node.lparen_loc() else { return };
+        let left_paren_start = lparen.start_offset();
+        let first = &items[0];
+        let first_start = first.location().start_offset();
+        let first_end = first.location().end_offset();
+
+        let (paren_line, _) = self.idx.loc(left_paren_start);
+        let (first_line, _) = self.idx.loc(first_start);
+        // `same_line?(first_elem, left_parenthesis)`
+        if first_line == paren_line {
+            return;
+        }
+
+        let align_parentheses = self.cfg.enforced_style(COP) == "align_parentheses";
+        let paren_line_start = self.idx.starts[paren_line - 1];
+        let (base_column, base_description): (usize, &'static str) = if align_parentheses {
+            (left_paren_start - paren_line_start, "the position of the opening parenthesis")
+        } else {
+            // `left_brace.source_line =~ /\S/` — the column of the first
+            // non-whitespace byte on the line containing the opening paren.
+            let mut p = paren_line_start;
+            while p < self.src.len() && matches!(self.src[p], b' ' | b'\t') {
+                p += 1;
+            }
+            (p - paren_line_start, "the start of the line where the left parenthesis is")
+        };
+
+        // `Alignment#configured_indentation_width`, shared verbatim with
+        // Layout/ParameterAlignment's own identical fallback chain.
+        let indentation_width = self.parameter_alignment_indentation_width(COP);
+        let expected_column = base_column + indentation_width;
+        let first_line_start = self.idx.starts[first_line - 1];
+        let actual_column = first_start - first_line_start;
+
+        if expected_column == actual_column {
+            return;
+        }
+
+        self.push(
+            first_start,
+            COP,
+            true,
+            format!(
+                "Use {indentation_width} spaces for indentation in method args, relative to {base_description}."
+            ),
+        );
+        let delta = expected_column as isize - actual_column as isize;
+        self.parameter_alignment_correct(first_start, first_end, delta);
+    }
+}

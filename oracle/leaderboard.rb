@@ -269,6 +269,7 @@ COPS = {
   'Layout/SpaceInsideParens'         => 'layout/space_inside_parens',
   'Style/ExplicitBlockArgument'      => 'style/explicit_block_argument',
   'Style/RescueModifier'             => 'style/rescue_modifier',
+  'Layout/FirstParameterIndentation' => 'layout/first_parameter_indentation',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

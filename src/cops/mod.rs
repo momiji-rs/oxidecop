@@ -307,7 +307,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
     "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
     "Style/ExplicitBlockArgument",
-    "Style/RescueModifier",
+    "Style/RescueModifier", "Layout/FirstParameterIndentation",
 ];
 
 impl Engine {
@@ -2787,6 +2787,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_keyword_parameters_order_def(node);
         self.check_non_nil_check_def(node);
         self.check_parameter_alignment(node);
+        self.check_first_parameter_indentation(node);
         self.check_missing_super(node);
         // Default walk (receiver, params, body) one def level deeper — matches
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
