@@ -387,7 +387,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
-    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation",
+    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency",
 ];
 
 impl Engine {
@@ -1546,6 +1546,44 @@ pub(crate) struct Cops<'a> {
     // (`register_offense(expr, nil)` -> `AlignmentCorrector.correct` no-ops
     // on a nil node) so the two rewrites don't collide in one pass.
     pub(crate) aa_registered_ranges: Vec<(usize, usize)>,
+    // Layout/IndentationConsistency: start offset of the top-level Program's
+    // own `StatementsNode` — rubocop's `node.parent` is `nil` exactly for the
+    // outermost implicit `:begin`/`:kwbegin`, which `base_column_for_normal_
+    // style`'s `unless node.parent` short-circuits on, and `in_macro_scope?`'s
+    // `root?` branch also matches. Set once in `visit_program_node`.
+    pub(crate) ic_top_level_stmts_start: Option<usize>,
+    // Layout/IndentationConsistency: body-start-offset (a `StatementsNode` or
+    // a plain, rescue/ensure-less `BeginNode`'s own start offset) -> its
+    // immediate whitequark `node.parent`'s own start offset. Populated for
+    // `ClassNode`/`ModuleNode`/`SingletonClassNode` bodies (always — these
+    // match `in_macro_scope?`'s `sclass class module` branch directly) and
+    // for a `BlockNode` body whose call matches `class_constructor?`
+    // (`Class.new`/`Module.new`/`Struct.new`/`Data.define do...end` — the
+    // `any_block` branch of `class_constructor?`, checked in
+    // `ic_note_class_constructor_block` from `visit_call_node`). A body not
+    // present here (and not the top-level one) is treated as NOT in macro
+    // scope — matches every fixture example, but under-approximates
+    // upstream's further `in_macro_scope?` recursion through a `kwbegin`/
+    // `begin`/`any_block`/non-condition-`if` wrapper that is ITSELF in macro
+    // scope (e.g. a bare `private` sitting inside a plain `if`/`begin` inside
+    // a class body) — no fixture example nests a modifier that way.
+    pub(crate) ic_parent_of_body: HashMap<usize, usize>,
+    // Layout/IndentationConsistency: byte ranges of every offense node
+    // registered so far THIS RUN, in traversal order — rubocop's cop-instance
+    // -wide `@current_offenses`, consulted by `Alignment#check_alignment`'s
+    // overlap guard exactly like `aa_registered_ranges` above (see its doc).
+    pub(crate) ic_registered_ranges: Vec<(usize, usize)>,
+    // Layout/IndentationConsistency: start offsets of a `StatementsNode`
+    // that is the PLAIN (rescue/ensure-less) body of an explicit
+    // `begin...end` — prism always wraps that body in its own
+    // `StatementsNode` (visited generically by `visit_statements_node`,
+    // which would otherwise ALSO fire `on_begin`'s check on it), but
+    // whitequark's `:kwbegin` node has those same statements as its OWN
+    // direct children with no intervening `:begin` node at all (verified
+    // live) — so `on_begin` must never re-check this exact list; it's
+    // already handled by `on_kwbegin`. Populated in `visit_begin_node`
+    // before the default traversal descends into it.
+    pub(crate) ic_kwbegin_plain_body: HashSet<usize>,
     // Style/SpecialGlobalVars: per-file `@required_english` flag — once a
     // `require 'English'` has been inserted (or was already present at the
     // relevant top-level position) for one offense, later offenses in the
@@ -3507,6 +3545,22 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_void_begin_group(&list, void_pending.unwrap_or(false));
             }
         }
+        // Layout/IndentationConsistency's `on_begin`: fires for the exact
+        // same whitequark `:begin` shape as `Lint/Void` above — a
+        // `StatementsNode` with 2+ statements — EXCEPT when this exact
+        // `StatementsNode` is itself the plain body of an explicit
+        // `begin...end` (`ic_kwbegin_plain_body`, populated by
+        // `visit_begin_node` before descending here): whitequark has no
+        // separate `:begin` node for that shape at all, so `on_kwbegin`
+        // alone already checked it.
+        if self.on("Layout/IndentationConsistency")
+            && !self.ic_kwbegin_plain_body.contains(&node.location().start_offset())
+        {
+            let list: Vec<ruby_prism::Node> = node.body().iter().collect();
+            if list.len() >= 2 {
+                self.check_indentation_consistency(node.location().start_offset(), list);
+            }
+        }
         // Style/HashSyntax: `node.right_sibling` for any statement that
         // isn't the last one in this list — see `hs_stmt_next`'s doc.
         if self.on("Style/HashSyntax") {
@@ -4045,6 +4099,29 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_lines_around_exception_handling_keywords_kwbegin(node);
         self.check_begin_end_alignment(node);
         let kwbegin = node.begin_keyword_loc().is_some();
+        // Layout/IndentationConsistency's `on_kwbegin`: fires only for an
+        // EXPLICIT `begin...end` (whitequark never wraps the implicit
+        // def/class/module rescue/ensure body in a `:kwbegin` — see
+        // `check_indentation_consistency`'s doc for the full shape
+        // breakdown). When this kwbegin has a `rescue`/`ensure` clause,
+        // whitequark's own kwbegin node has exactly ONE child (the nested
+        // `:rescue`/`:ensure` node) — `each_bad_alignment` can never flag a
+        // single-item list against its own derived base column, so that
+        // shape is skipped entirely as a guaranteed no-op; only the plain
+        // (rescue/ensure-less) body — whose statements ARE this kwbegin's
+        // direct whitequark children — is checked here.
+        if kwbegin
+            && self.on("Layout/IndentationConsistency")
+            && node.rescue_clause().is_none()
+            && node.ensure_clause().is_none()
+        {
+            if let Some(stmts) = node.statements() {
+                self.ic_kwbegin_plain_body.insert(stmts.location().start_offset());
+            }
+            let list: Vec<ruby_prism::Node> =
+                node.statements().map(|s| s.body().iter().collect()).unwrap_or_default();
+            self.check_indentation_consistency(node.location().start_offset(), list);
+        }
         // Layout/SpaceAroundKeyword: `on_kwbegin`'s `begin`/`end` (explicit
         // `begin...end` only — the IMPLICIT BeginNode wrapping a def's
         // rescue/ensure body has no `begin_keyword_loc` and isn't checked)
@@ -4367,6 +4444,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.interp_depth -= 1;
     }
     fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
+        // Layout/IndentationConsistency: the top-level `StatementsNode` is
+        // exactly the node whose whitequark `node.parent` is `nil` — see
+        // `ic_top_level_stmts_start`'s doc.
+        self.ic_top_level_stmts_start = Some(node.statements().location().start_offset());
         // Lint/RedundantSafeNavigation's `InferNonNilReceiver`: the top-level
         // program body is its own scope too (see `visit_def_node`'s doc).
         self.rsn_scan_scope(&node.statements().as_node());
@@ -4424,6 +4505,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_required_ruby_version_missing(has_code);
     }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        // Layout/IndentationConsistency: see `ic_parent_of_body`'s doc.
+        if let Some(body) = node.body() {
+            self.ic_parent_of_body.insert(body.location().start_offset(), node.location().start_offset());
+        }
         self.check_class_length_class(node);
         self.check_ascii_class(node);
         let l = node.location();
@@ -4494,6 +4579,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.leave_namespace();
     }
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        // Layout/IndentationConsistency: see `ic_parent_of_body`'s doc.
+        if let Some(body) = node.body() {
+            self.ic_parent_of_body.insert(body.location().start_offset(), node.location().start_offset());
+        }
         self.check_module_length_module(node);
         self.check_ascii_module(node);
         self.check_trailing_body_on_module(node);
@@ -4815,6 +4904,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_forwarding_super_node(self, node);
     }
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        // Layout/IndentationConsistency: see `ic_parent_of_body`'s doc.
+        if let Some(body) = node.body() {
+            self.ic_parent_of_body.insert(body.location().start_offset(), node.location().start_offset());
+        }
         self.check_class_length_sclass(node);
         self.check_empty_lines_around_sclass_body(node);
         self.check_access_modifier_indentation_sclass(node);
@@ -4967,6 +5060,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                             }
                         }
                     }
+                }
+            }
+        }
+        // Layout/IndentationConsistency: `class_constructor?`'s `any_block`
+        // branch — a `Class.new`/`Module.new`/`Struct.new`/`Data.define
+        // do...end` block's own body is a macro scope, exactly like a real
+        // `class`/`module` body — see `ic_parent_of_body`'s doc.
+        if layout::ic_is_class_constructor_call(node, self.src) {
+            if let Some(blk) = node.block().and_then(|b| b.as_block_node()) {
+                if let Some(body) = blk.body() {
+                    self.ic_parent_of_body
+                        .insert(body.location().start_offset(), blk.location().start_offset());
                 }
             }
         }
@@ -5860,6 +5965,10 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         aa_masgn_rhs: HashSet::new(),
         aa_unbracketed_rhs_parent: HashMap::new(),
         aa_registered_ranges: Vec::new(),
+        ic_top_level_stmts_start: None,
+        ic_parent_of_body: HashMap::new(),
+        ic_registered_ranges: Vec::new(),
+        ic_kwbegin_plain_body: HashSet::new(),
         oorr_valid_ref: Some(0),
         sigex_ignored: HashSet::new(),
         sigex_custom_fail_defined: false,

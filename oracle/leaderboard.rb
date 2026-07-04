@@ -354,6 +354,7 @@ COPS = {
   'Layout/EmptyLineAfterGuardClause' => 'layout/empty_line_after_guard_clause',
   'Layout/ExtraSpacing'              => 'layout/extra_spacing',
   'Layout/ClosingParenthesisIndentation' => 'layout/closing_parenthesis_indentation',
+  'Layout/IndentationConsistency'    => 'layout/indentation_consistency',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

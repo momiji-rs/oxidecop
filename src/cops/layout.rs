@@ -9407,3 +9407,253 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/IndentationConsistency — checks that entities on the same
+    /// logical depth share the same indentation (`EnforcedStyle: normal`,
+    /// the default), or that `protected`/`private` sections inside a
+    /// class/module/`class_constructor?` block may each have their OWN
+    /// internal indentation baseline as long as it's consistent within that
+    /// section (`EnforcedStyle: indented_internal_methods`). Ports rubocop's
+    /// `IndentationConsistency` cop + the shared `Alignment` mixin's
+    /// `check_alignment`/`each_bad_alignment`/`register_offense`, and the
+    /// `AlignmentCorrector` autocorrector — see `check_parameter_alignment`/
+    /// `check_array_alignment` above for the same mixin ported to other cops.
+    ///
+    /// Hooked from TWO call sites in `mod.rs`, matching whitequark's two
+    /// implicit multi-statement node shapes:
+    /// - `on_begin` (from `visit_statements_node`): fires for a
+    ///   `StatementsNode` with 2+ statements — every whitequark `:begin`
+    ///   node is exactly that (a single-statement body is never wrapped at
+    ///   all upstream, unlike prism's unconditional `StatementsNode`).
+    /// - `on_kwbegin` (from `visit_begin_node`): fires only for an EXPLICIT
+    ///   `begin...end` (`begin_keyword_loc` present) whose body has no
+    ///   `rescue`/`ensure` clause — verified live (`Parser::CurrentRuby`)
+    ///   that whitequark's `:kwbegin` node then has the raw statement list
+    ///   as its OWN direct children (0, 1, or 2+ of them), unlike the
+    ///   rescue/ensure case, where `:kwbegin` wraps exactly ONE child (the
+    ///   nested `:rescue`/`:ensure` node) — a single-item list can never
+    ///   produce an offense against a self-derived base column, so that
+    ///   shape is skipped entirely as a guaranteed no-op.
+    ///
+    /// `node_start` is the begin/kwbegin's own start offset — used both to
+    /// look up `ic_parent_of_body` (standing in for whitequark's
+    /// `node.parent`, populated only for `ClassNode`/`ModuleNode`/
+    /// `SingletonClassNode` bodies and `class_constructor?` block bodies —
+    /// see that field's doc) and to test equality against
+    /// `ic_top_level_stmts_start` (whitequark's `node.parent` is `nil`
+    /// there).
+    pub(crate) fn check_indentation_consistency(&mut self, node_start: usize, items_raw: Vec<ruby_prism::Node>) {
+        const COP: &str = "Layout/IndentationConsistency";
+        if !self.on(COP) {
+            return;
+        }
+        let in_macro_scope =
+            Some(node_start) == self.ic_top_level_stmts_start || self.ic_parent_of_body.contains_key(&node_start);
+        if self.cfg.enforced_style(COP) == "indented_internal_methods" {
+            // `check_indented_internal_methods_style`: a bare access
+            // modifier is a group divider (excluded from every group), not
+            // a member of one.
+            let mut groups: Vec<Vec<ruby_prism::Node>> = vec![Vec::new()];
+            for child in items_raw {
+                if self.ic_bare_access_modifier(&child, in_macro_scope) {
+                    groups.push(Vec::new());
+                } else {
+                    groups.last_mut().unwrap().push(child);
+                }
+            }
+            for group in groups {
+                self.ic_check_alignment(&group, None);
+            }
+        } else {
+            // `check_normal_style`: a bare access modifier is excluded from
+            // the checked list too, but (unlike the grouped style) doesn't
+            // split it — the whole rest of the body is one list, optionally
+            // pinned to the modifier's own column as its base.
+            let base = self.ic_base_column_for_normal_style(node_start, &items_raw, in_macro_scope);
+            let filtered: Vec<ruby_prism::Node> =
+                items_raw.into_iter().filter(|c| !self.ic_bare_access_modifier(c, in_macro_scope)).collect();
+            self.ic_check_alignment(&filtered, base);
+        }
+    }
+
+    /// `bare_access_modifier?`: a bare (no-receiver, no-block, no-argument —
+    /// `private()`'s empty parens count as "no argument" too, matching
+    /// whitequark's identical `s(:send, nil, :private)` for both) call to
+    /// `public`/`protected`/`private`/`module_function`, whose `macro?` +
+    /// `in_macro_scope?` predicate — "sits directly in a class/module/
+    /// sclass body, a `class_constructor?` block body, or the top-level
+    /// program" — is approximated by the caller-computed `in_macro_scope`
+    /// flag. NOT covered: `in_macro_scope?`'s further recursion through a
+    /// nested `kwbegin`/`begin`/`any_block`/non-condition-`if` wrapper that
+    /// is ITSELF in macro scope (e.g. a bare `private` sitting inside a
+    /// plain `if`/`begin` inside a class body) — no fixture example nests a
+    /// modifier that way.
+    fn ic_bare_access_modifier(&self, node: &ruby_prism::Node, in_macro_scope: bool) -> bool {
+        if !in_macro_scope {
+            return false;
+        }
+        let Some(call) = node.as_call_node() else { return false };
+        if call.receiver().is_some() || call.block().is_some() {
+            return false;
+        }
+        if call.arguments().is_some_and(|a| !a.arguments().is_empty()) {
+            return false;
+        }
+        matches!(call.name().as_slice(), b"public" | b"protected" | b"private" | b"module_function")
+    }
+
+    /// `base_column_for_normal_style`: `None` (meaning "derive from the
+    /// first non-modifier item") unless the RAW first child (before the
+    /// bare-modifier filter) is itself a bare access modifier. When it is:
+    /// short-circuit to the modifier's own column directly when this
+    /// begin/kwbegin IS the top-level program's own body (whitequark's
+    /// `node.parent` is `nil`); otherwise compare it against the tracked
+    /// parent's own starting column, using the modifier's column only when
+    /// it's indented deeper than the parent.
+    fn ic_base_column_for_normal_style(
+        &self,
+        node_start: usize,
+        items_raw: &[ruby_prism::Node],
+        in_macro_scope: bool,
+    ) -> Option<usize> {
+        let first = items_raw.first()?;
+        if !self.ic_bare_access_modifier(first, in_macro_scope) {
+            return None;
+        }
+        let access_modifier_indent = self.display_column(first.location().start_offset());
+        if Some(node_start) == self.ic_top_level_stmts_start {
+            return Some(access_modifier_indent);
+        }
+        let parent_start = *self.ic_parent_of_body.get(&node_start)?;
+        let module_indent = self.display_column(parent_start);
+        if access_modifier_indent > module_indent {
+            Some(access_modifier_indent)
+        } else {
+            None
+        }
+    }
+
+    /// `Alignment#check_alignment` + `each_bad_alignment` + `register_offense`:
+    /// walks `items` in order; a candidate is one that starts a NEW source
+    /// line relative to the previous item's line AND is the first
+    /// non-whitespace token on that line (`begins_its_line?`). Its
+    /// bad-alignment `column_delta` is `base - display_column(item)` (the
+    /// Unicode East-Asian-Width-aware column via `display_column`); a zero
+    /// delta needs no offense. `base` defaults to the FIRST item's own
+    /// column when `explicit_base` is `None` — `Option::None` here means
+    /// exactly "absent" and mirrors Ruby's `||=` (which does NOT override an
+    /// explicit `0`, since `0` is truthy in Ruby — `Some(0)` likewise stays
+    /// `0` here rather than being replaced).
+    ///
+    /// `@current_offenses`'s overlap guard: an offense node entirely within
+    /// an already-registered (necessarily enclosing) offense's range is
+    /// still reported, but its correction is dropped — `register_offense
+    /// (expr, nil)`, and `AlignmentCorrector.correct` no-ops on a `nil` node.
+    fn ic_check_alignment(&mut self, items: &[ruby_prism::Node], explicit_base: Option<usize>) {
+        const COP: &str = "Layout/IndentationConsistency";
+        if items.is_empty() {
+            return;
+        }
+        let base = explicit_base.unwrap_or_else(|| self.display_column(items[0].location().start_offset()));
+        let mut prev_line: Option<usize> = None;
+        for item in items {
+            let start = item.location().start_offset();
+            let (line, _) = self.idx.loc(start);
+            let starts_new_line = prev_line.map_or(true, |p| line > p);
+            if starts_new_line {
+                let line_start = self.idx.starts[line - 1];
+                let begins_its_line = self.src[line_start..start].iter().all(u8::is_ascii_whitespace);
+                if begins_its_line {
+                    let actual = self.display_column(start);
+                    let delta = base as isize - actual as isize;
+                    if delta != 0 {
+                        let end = item.location().end_offset();
+                        let within_prior =
+                            self.ic_registered_ranges.iter().any(|&(rs, re)| start >= rs && end <= re);
+                        self.push(start, COP, !within_prior, "Inconsistent indentation detected.");
+                        if !within_prior {
+                            self.ic_correct(start, end, delta);
+                        }
+                        self.ic_registered_ranges.push((start, end));
+                    }
+                }
+            }
+            prev_line = Some(line);
+        }
+    }
+
+    /// `AlignmentCorrector.correct`, ported for the single misaligned item
+    /// (upstream's `autocorrect(corrector, node)` always gets the one bad
+    /// node) — the identical per-physical-line-walk algorithm as
+    /// `array_alignment_correct`/`parameter_alignment_correct` above (see
+    /// either's doc): starting at the item's OWN begin offset (not the
+    /// physical line's start) for line 1, then at each subsequent line's
+    /// true start, widening (`delta > 0`) inserts `delta` spaces immediately
+    /// before that position; narrowing removes `-delta` bytes, taken from
+    /// the run starting at that position if it's itself a space (an
+    /// interior line's own leading whitespace) or from just before it
+    /// otherwise. Skips a would-be removal whose bytes aren't purely
+    /// spaces/tabs. The `using_tabs?` global disable (`Layout/
+    /// IndentationStyle: EnforcedStyle: tabs`) is ported; the heredoc/
+    /// quoted-string taboo-range guard and the `=begin`/`=end` block-comment
+    /// guard are NOT — no fixture example's misaligned item spans a
+    /// heredoc, a multi-line string, or a block comment.
+    fn ic_correct(&mut self, start: usize, end: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            return;
+        }
+        let mut line_begin = start;
+        loop {
+            if delta > 0 {
+                if self.src.get(line_begin) != Some(&b'\n') {
+                    self.fixes.push((line_begin, line_begin, vec![b' '; delta as usize]));
+                }
+            } else {
+                let n = (-delta) as usize;
+                let starts_with_space = self.src.get(line_begin) == Some(&b' ');
+                let (rs, re) = if starts_with_space {
+                    (line_begin, line_begin + n)
+                } else {
+                    (line_begin.saturating_sub(n), line_begin)
+                };
+                if re <= self.src.len() && rs < re && self.src[rs..re].iter().all(|&b| b == b' ' || b == b'\t') {
+                    self.fixes.push((rs, re, Vec::new()));
+                }
+            }
+            let mut p = line_begin;
+            while p < end && self.src[p] != b'\n' {
+                p += 1;
+            }
+            if p >= end {
+                break;
+            }
+            line_begin = p + 1;
+        }
+    }
+}
+
+/// Layout/IndentationConsistency: `class_constructor?`'s `any_block` branch,
+/// checked directly on a `CallNode` (from `visit_call_node`, before its
+/// `block` is visited): a call to `new` on a bare/`::`-qualified
+/// `Class`/`Module`/`Struct` constant, or `define` on `Data`, matching
+/// `global_const?`'s `(const {nil? cbase} %1)` — a plain top-level constant
+/// reference or one with a leading `::`, never a deeper-namespaced one
+/// (`Foo::Struct.new` doesn't match).
+pub(crate) fn ic_is_class_constructor_call(call: &ruby_prism::CallNode, src: &[u8]) -> bool {
+    if call.is_safe_navigation() {
+        return false;
+    }
+    let Some(r) = call.receiver() else { return false };
+    let l = r.location();
+    let recv = &src[l.start_offset()..l.end_offset()];
+    match call.name().as_slice() {
+        b"new" => matches!(recv, b"Class" | b"::Class" | b"Module" | b"::Module" | b"Struct" | b"::Struct"),
+        b"define" => matches!(recv, b"Data" | b"::Data"),
+        _ => false,
+    }
+}
