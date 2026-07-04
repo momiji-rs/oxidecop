@@ -193,7 +193,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
     "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException", "Style/TrailingUnderscoreVariable",
-    "Lint/NonLocalExitFromIterator", "Layout/EmptyComment", "Style/EmptyCaseCondition",
+    "Lint/NonLocalExitFromIterator", "Layout/EmptyComment", "Style/EmptyCaseCondition", "Style/OneLineConditional",
 ];
 
 impl Engine {
@@ -485,6 +485,10 @@ pub(crate) struct Cops<'a> {
     pub(crate) stmts_stack: Vec<usize>,
     // unless/else nodes already corrected — nested ones only get offenses.
     pub(crate) unless_else_spans: Vec<(usize, usize)>,
+    // Style/OneLineConditional spans already corrected — a nested one-line
+    // conditional fully inside an outer one's replaced range only gets an
+    // offense (rubocop's `ignore_node`/`part_of_ignored_node?`).
+    pub(crate) one_line_cond_spans: Vec<(usize, usize)>,
     // multi-line plain-string line spans (Layout/EmptyLines token lines)
     pub(crate) multiline_str_lines: Vec<(usize, usize)>,
     // the file's frozen_string_literal magic-comment value, if any
@@ -1215,6 +1219,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_conditional_body(node);
         self.check_comparable_clamp_if(node);
         self.check_empty_else_if(node);
+        self.check_one_line_conditional_if(node);
         self.check_safe_navigation_with_empty(&node.predicate());
         if let Some(kw) = node.if_keyword_loc() {
             if matches!(kw.as_slice(), b"if" | b"elsif") {
@@ -1264,6 +1269,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_safe_navigation_with_empty(&node.predicate());
         self.check_negated_unless(node);
         self.check_unless_else(node);
+        self.check_one_line_conditional_unless(node);
         self.check_empty_conditional_body_unless(node);
         self.check_empty_else_unless(node);
         self.check_non_nil_check_unless(node);
@@ -2594,6 +2600,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         dirname_ignore: Vec::new(),
         stmts_stack: Vec::new(),
         unless_else_spans: Vec::new(),
+        one_line_cond_spans: Vec::new(),
         ll_active: false,
         ll_max: 0,
         ll_split: false,

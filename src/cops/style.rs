@@ -10825,3 +10825,392 @@ fn ecc_contains_return(node: &ruby_prism::Node) -> bool {
     f.visit(node);
     f.found
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/OneLineConditional — single-line `if/then/else/end` and
+    /// `unless/then/else/end` (NOT ternaries, NOT modifier forms, NOT
+    /// `elsif` segments — `OnNormalIfUnless#on_if` guards those away before
+    /// `on_normal_if_unless` ever runs). Corrects to a ternary (default) or
+    /// to a genuine multi-line construct, per `AlwaysCorrectToMultiline` /
+    /// `cannot_replace_to_ternary?`.
+    ///
+    /// Ternary is `condition, if_branch, else_branch = *node` in upstream —
+    /// a RAW splat, not the `if_branch`/`else_branch` ACCESSOR methods. For
+    /// `if`, raw children are already (cond, then-part, else-part); for
+    /// `unless`, whitequark's builder stores raw children swapped by actual
+    /// boolean truth (true-branch first), so the raw splat there yields
+    /// (cond, else-part, then-part) — i.e. the ternary's true/false slots
+    /// are SWAPPED relative to source order. `IfThenCorrector`'s multi-line
+    /// correction instead uses the `if_branch`/`else_branch` ACCESSORS
+    /// (which normalize back to source order for BOTH keywords), so no swap
+    /// there — see the two builders below.
+    pub(crate) fn check_one_line_conditional_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/OneLineConditional";
+        if !self.on(COP) {
+            return;
+        }
+        // `on_if`: ternary (`if_keyword_loc` absent) or modifier form
+        // (`end_keyword_loc` absent) never reach `on_normal_if_unless`.
+        let Some(kw) = node.if_keyword_loc() else { return };
+        if node.end_keyword_loc().is_none() {
+            return;
+        }
+        // `node.elsif?`: an elsif segment is visited independently (via the
+        // outer if's `subsequent()` chain) but must not re-report — only
+        // the chain's true head (`if_keyword_loc == "if"`) does.
+        if kw.as_slice() != b"if" {
+            return;
+        }
+
+        let loc = node.location();
+        if !self.olc_single_line(&loc) {
+            return;
+        }
+
+        let else_target = olc_else_target(node.subsequent());
+        if !olc_else_present(&else_target) {
+            return;
+        }
+        // `node.if_branch&.begin_type?`: >= 2 statements in the `then` body
+        // disqualifies the offense entirely (not just forces multiline).
+        if node.statements().is_some_and(|s| s.body().len() >= 2) {
+            return;
+        }
+
+        let force_multiline = olc_cannot_replace_to_ternary(&else_target);
+        let always_multiline = self.cfg.get(COP, "AlwaysCorrectToMultiline") == Some("true");
+        let multiline = always_multiline || force_multiline;
+        let msg = olc_message(b"if", multiline);
+
+        let nested = self.olc_nested(loc.start_offset());
+        self.push(loc.start_offset(), COP, !nested, msg);
+        if nested {
+            return;
+        }
+        self.one_line_cond_spans.push((loc.start_offset(), loc.end_offset()));
+
+        let replacement = if multiline {
+            let (indentation, body_indent) = self.olc_indents(loc.start_offset());
+            olc_multiline_if(self, node, b"if", false, &indentation, &body_indent)
+        } else {
+            let cond_part = self.olc_wrap(&node.predicate());
+            let then_stmt = node.statements().and_then(|s| s.body().first());
+            let if_part = self.olc_wrap_opt(then_stmt);
+            let else_part = match &else_target {
+                OlcElse::Plain(e) => self.olc_wrap_opt(e.statements().and_then(|s| s.body().first())),
+                OlcElse::Elsif(elsif) => self.olc_wrap(&elsif.as_node()),
+                OlcElse::None => unreachable!("checked by olc_else_present above"),
+            };
+            let mut out = cond_part;
+            out.extend_from_slice(b" ? ");
+            out.extend_from_slice(&if_part);
+            out.extend_from_slice(b" : ");
+            out.extend_from_slice(&else_part);
+            out
+        };
+        self.fixes.push((loc.start_offset(), loc.end_offset(), replacement));
+    }
+
+    /// Style/OneLineConditional for `unless ... else ... end` — prism's
+    /// `UnlessNode` never chains into `elsif` (Ruby has no such syntax), so
+    /// this is the single-level case; see `check_one_line_conditional_if`
+    /// for the shared semantics and the `unless`-swap note.
+    pub(crate) fn check_one_line_conditional_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Style/OneLineConditional";
+        if !self.on(COP) {
+            return;
+        }
+        if node.end_keyword_loc().is_none() {
+            return; // modifier form
+        }
+
+        let loc = node.location();
+        if !self.olc_single_line(&loc) {
+            return;
+        }
+
+        let Some(else_node) = node.else_clause() else { return };
+        if else_node.statements().is_none() {
+            return;
+        }
+        if node.statements().is_some_and(|s| s.body().len() >= 2) {
+            return;
+        }
+
+        let force_multiline = else_node.statements().is_some_and(|s| s.body().len() >= 2);
+        let always_multiline = self.cfg.get(COP, "AlwaysCorrectToMultiline") == Some("true");
+        let multiline = always_multiline || force_multiline;
+        let msg = olc_message(b"unless", multiline);
+
+        let nested = self.olc_nested(loc.start_offset());
+        self.push(loc.start_offset(), COP, !nested, msg);
+        if nested {
+            return;
+        }
+        self.one_line_cond_spans.push((loc.start_offset(), loc.end_offset()));
+
+        let replacement = if multiline {
+            let (indentation, body_indent) = self.olc_indents(loc.start_offset());
+            olc_multiline_unless(self, node, &indentation, &body_indent)
+        } else {
+            // Raw-splat order for `unless` swaps the ternary's true/false
+            // slots relative to source order (see doc comment above).
+            let cond_part = self.olc_wrap(&node.predicate());
+            let then_stmt = node.statements().and_then(|s| s.body().first());
+            let if_part = self.olc_wrap_opt(then_stmt);
+            let else_part = self.olc_wrap_opt(else_node.statements().and_then(|s| s.body().first()));
+            let mut out = cond_part;
+            out.extend_from_slice(b" ? ");
+            out.extend_from_slice(&else_part);
+            out.extend_from_slice(b" : ");
+            out.extend_from_slice(&if_part);
+            out
+        };
+        self.fixes.push((loc.start_offset(), loc.end_offset(), replacement));
+    }
+
+    fn olc_single_line(&self, loc: &ruby_prism::Location) -> bool {
+        let (start_line, _) = self.idx.loc(loc.start_offset());
+        let (end_line, _) = self.idx.loc(loc.end_offset());
+        start_line == end_line
+    }
+
+    /// `ignore_node`/`part_of_ignored_node?`: a one-line conditional fully
+    /// nested inside an already-corrected outer one only gets an offense.
+    fn olc_nested(&self, start_offset: usize) -> bool {
+        self.one_line_cond_spans.iter().any(|(s, e)| start_offset >= *s && start_offset < *e)
+    }
+
+    /// `Alignment#configured_indentation_width` for this cop (schema has no
+    /// `IndentationWidth` param of its own — only meaningful when a user
+    /// sets it directly), then the base column of the node being corrected.
+    fn olc_indents(&self, start_offset: usize) -> (String, String) {
+        const COP: &str = "Style/OneLineConditional";
+        let width = self
+            .cfg
+            .param(COP, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2);
+        let (_, col) = self.idx.loc(start_offset);
+        (" ".repeat(col - 1), " ".repeat(width))
+    }
+
+    /// `expr_replacement(nil) => 'nil'`, else `requires_parentheses? ? "(#{src})" : src`.
+    fn olc_wrap_opt(&self, node: Option<ruby_prism::Node>) -> Vec<u8> {
+        match node {
+            None => b"nil".to_vec(),
+            Some(n) => self.olc_wrap(&n),
+        }
+    }
+
+    fn olc_wrap(&self, node: &ruby_prism::Node) -> Vec<u8> {
+        let src = self.node_src(node);
+        if olc_requires_parentheses(node) {
+            let mut v = Vec::with_capacity(src.len() + 2);
+            v.push(b'(');
+            v.extend_from_slice(src);
+            v.push(b')');
+            v
+        } else {
+            src.to_vec()
+        }
+    }
+}
+
+/// Normalized (textual) else-branch shape, independent of `if`/`unless`.
+enum OlcElse<'pr> {
+    None,
+    Elsif(ruby_prism::IfNode<'pr>),
+    Plain(ruby_prism::ElseNode<'pr>),
+}
+
+fn olc_else_target(subsequent: Option<ruby_prism::Node>) -> OlcElse {
+    match subsequent {
+        None => OlcElse::None,
+        Some(sub) => match sub.as_if_node() {
+            Some(elsif) => OlcElse::Elsif(elsif),
+            None => OlcElse::Plain(sub.as_else_node().expect("if subsequent is else or elsif")),
+        },
+    }
+}
+
+/// `return unless node.else_branch`: nil only when there's no `else`
+/// keyword at all, OR the `else` body is empty (`if x then y else end`).
+/// An `elsif` continuation always counts as present.
+fn olc_else_present(target: &OlcElse) -> bool {
+    match target {
+        OlcElse::None => false,
+        OlcElse::Elsif(_) => true,
+        OlcElse::Plain(e) => e.statements().is_some(),
+    }
+}
+
+/// `cannot_replace_to_ternary?`: an `elsif` continuation always forces
+/// multi-line; otherwise, >= 2 statements in the `else` body do.
+fn olc_cannot_replace_to_ternary(target: &OlcElse) -> bool {
+    match target {
+        OlcElse::None => unreachable!("checked by olc_else_present before this is called"),
+        OlcElse::Elsif(_) => true,
+        OlcElse::Plain(e) => e.statements().is_some_and(|s| s.body().len() >= 2),
+    }
+}
+
+/// `MSG_TERNARY`/`MSG_MULTILINE`, byte-for-byte.
+fn olc_message(keyword: &[u8], multiline: bool) -> String {
+    let kw = String::from_utf8_lossy(keyword);
+    if multiline {
+        format!("Favor multi-line `{kw}` over single-line `{kw}/then/else/end` constructs.")
+    } else {
+        format!("Favor the ternary operator (`?:`) over single-line `{kw}/then/else/end` constructs.")
+    }
+}
+
+/// `IfThenCorrector#replacement`, recursing down an `elsif` chain. Uses the
+/// `if_branch`/`else_branch` ACCESSOR semantics (source order, no `unless`
+/// swap) — `node.keyword`/`root_keyword` carries the literal keyword text.
+fn olc_multiline_if(
+    cops: &super::Cops,
+    node: &ruby_prism::IfNode,
+    root_keyword: &[u8],
+    is_elsif: bool,
+    indentation: &str,
+    body_indent: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    if is_elsif {
+        out.extend_from_slice(indentation.as_bytes());
+    }
+    out.extend_from_slice(root_keyword);
+    out.push(b' ');
+    out.extend_from_slice(cops.node_src(&node.predicate()));
+    out.push(b'\n');
+    out.extend_from_slice(indentation.as_bytes());
+    out.extend_from_slice(body_indent.as_bytes());
+    let then_src = node.statements().map(|s| cops.node_src(&s.as_node()));
+    out.extend_from_slice(then_src.unwrap_or(b"nil"));
+    out.push(b'\n');
+    match node.subsequent() {
+        None => {
+            out.extend_from_slice(indentation.as_bytes());
+            out.extend_from_slice(b"end");
+        }
+        Some(sub) => {
+            if let Some(elsif) = sub.as_if_node() {
+                out.extend_from_slice(&olc_multiline_if(cops, &elsif, b"elsif", true, indentation, body_indent));
+            } else if let Some(else_node) = sub.as_else_node() {
+                out.extend_from_slice(indentation.as_bytes());
+                out.extend_from_slice(b"else\n");
+                out.extend_from_slice(indentation.as_bytes());
+                out.extend_from_slice(body_indent.as_bytes());
+                let else_src = else_node.statements().map(|s| cops.node_src(&s.as_node())).unwrap_or(b"");
+                out.extend_from_slice(else_src);
+                out.push(b'\n');
+                out.extend_from_slice(indentation.as_bytes());
+                out.extend_from_slice(b"end");
+            }
+        }
+    }
+    out
+}
+
+/// `IfThenCorrector#replacement` for `unless` — never chains.
+fn olc_multiline_unless(
+    cops: &super::Cops,
+    node: &ruby_prism::UnlessNode,
+    indentation: &str,
+    body_indent: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"unless ");
+    out.extend_from_slice(cops.node_src(&node.predicate()));
+    out.push(b'\n');
+    out.extend_from_slice(indentation.as_bytes());
+    out.extend_from_slice(body_indent.as_bytes());
+    let then_src = node.statements().map(|s| cops.node_src(&s.as_node()));
+    out.extend_from_slice(then_src.unwrap_or(b"nil"));
+    out.push(b'\n');
+    out.extend_from_slice(indentation.as_bytes());
+    match node.else_clause() {
+        None => out.extend_from_slice(b"end"),
+        Some(else_node) => {
+            out.extend_from_slice(b"else\n");
+            out.extend_from_slice(indentation.as_bytes());
+            out.extend_from_slice(body_indent.as_bytes());
+            let else_src = else_node.statements().map(|s| cops.node_src(&s.as_node())).unwrap_or(b"");
+            out.extend_from_slice(else_src);
+            out.push(b'\n');
+            out.extend_from_slice(indentation.as_bytes());
+            out.extend_from_slice(b"end");
+        }
+    }
+    out
+}
+
+/// `OneLineConditional#requires_parentheses?`.
+fn olc_requires_parentheses(node: &ruby_prism::Node) -> bool {
+    if node.as_and_node().is_some()
+        || node.as_or_node().is_some()
+        || node.as_if_node().is_some()
+        || node.as_unless_node().is_some()
+        || clamp_is_assignment_like(node)
+    {
+        return true;
+    }
+    if olc_method_call_with_changed_precedence(node) {
+        return true;
+    }
+    olc_keyword_with_changed_precedence(node)
+}
+
+/// `method_call_with_changed_precedence?`: an unparenthesized non-operator
+/// method call WITH arguments (`check 1`) needs parens; a parenthesized one
+/// (`a(0)`), a bare one (`cond`), or an operator call (`0 + 0`) doesn't.
+fn olc_method_call_with_changed_precedence(node: &ruby_prism::Node) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    let Some(args) = call.arguments() else { return false };
+    if args.arguments().is_empty() {
+        return false;
+    }
+    if call.opening_loc().is_some() {
+        return false;
+    }
+    !CLAMP_OPERATOR_METHODS.contains(&call.name().as_slice())
+}
+
+/// `keyword_with_changed_precedence?`: `next`/`break`/`return` need parens
+/// only when carrying a value (their `parenthesized_call?` is always false
+/// upstream — whitequark tracks no `begin` loc for these — so args alone
+/// decide); `yield`/`super`/`defined?` only when unparenthesized; `self`
+/// and other keyword nodes without an `arguments?` concept never do.
+fn olc_keyword_with_changed_precedence(node: &ruby_prism::Node) -> bool {
+    if let Some(n) = node.as_next_node() {
+        return n.arguments().is_some();
+    }
+    if let Some(n) = node.as_break_node() {
+        return n.arguments().is_some();
+    }
+    if let Some(n) = node.as_return_node() {
+        return n.arguments().is_some();
+    }
+    if let Some(n) = node.as_yield_node() {
+        return n.arguments().is_some() && n.lparen_loc().is_none();
+    }
+    if let Some(n) = node.as_super_node() {
+        return n.arguments().is_some() && n.lparen_loc().is_none();
+    }
+    if let Some(n) = node.as_defined_node() {
+        return n.lparen_loc().is_none();
+    }
+    // `prefix_not?`: the literal `not` keyword form of `!` (not `!x`).
+    if let Some(call) = node.as_call_node() {
+        if call.receiver().is_some()
+            && call.name().as_slice() == b"!"
+            && call.message_loc().is_some_and(|m| m.as_slice() == b"not")
+        {
+            return true;
+        }
+    }
+    false
+}
