@@ -182,9 +182,20 @@ end
 # with the inherited context's config — emulate by concatenating the pair
 # lists (parse_cfg lets later keys win, like Hash#merge).
 def resolve_cop_config_text(body, cfg_stack)
-  # a bare identifier referencing a group-level `name = { ... }` local
-  if (id = body.strip[/\A\w+\z/]) && LOCAL_HASHES.key?(id)
-    return LOCAL_HASHES[id]
+  frame_lets = cfg_stack.any? ? cfg_stack.last[7] : {}
+  # a bare identifier referencing a group-level `name = { ... }` local —
+  # context-scoped frame lets (which see sibling-context redefinitions)
+  # shadow the flat whole-file LOCAL_HASHES prescan.
+  if (id = body.strip[/\A\w+\z/])
+    return frame_lets[id] if frame_lets.key?(id)
+    return LOCAL_HASHES[id] if LOCAL_HASHES.key?(id)
+  end
+  # `ident.merge('Key' => value)` — a local-hash base with inline overrides
+  if (m = body.strip.match(/\A(\w+)\.merge\(\s*(\{)?\s*(.*?)\s*(\})?\s*\)\z/m)) &&
+     (base_text = frame_lets[m[1]] || LOCAL_HASHES[m[1]])
+    base = base_text.sub(/\A\{\s*/, '').sub(/\s*\}\z/, '')
+    inner = m[3]
+    return "{ #{[base, inner].reject(&:empty?).join(', ')} }"
   end
   if (m = body.match(/super\(\)\s*\.merge\(\s*(.*?)\s*\)\s*\z/m))
     inner = m[1].sub(/\A\{\s*/, '').sub(/\s*\}\z/, '')
@@ -426,6 +437,36 @@ while i < lines.length
   if in_it_body && cfg_stack.any? &&
      l =~ /^\s+cop_config\[(['"])([^'"]+)\1\]\s*=\s*((?:\[[^\]]*\]|[^\[\]{}]+?))\s*$/
     it_cfg_mut = [Regexp.last_match(2), Regexp.last_match(3).strip]
+  end
+  # A group-level `name = { ... }` local hash (BlockDelimiters redefines
+  # `cop_config = {...}` in each of five sibling style contexts — the flat
+  # LOCAL_HASHES prescan can only keep ONE): capture per-context into the
+  # frame's lets, single- or multi-line (brace-balanced, quote-aware).
+  if !in_it_body && cfg_stack.any? &&
+     (lh_name = l[/^\s*(\w+)\s*=\s*\{/, 1]) && l !~ /\}\s*\.|=>\s*\{/
+    depth = 0
+    quote = nil
+    buf = +''
+    seg = l.sub(/^\s*\w+\s*=\s*/, '')
+    loop do
+      seg.each_char do |c|
+        if quote
+          quote = nil if c == quote
+        elsif c == "'" || c == '"'
+          quote = c
+        elsif c == '{'
+          depth += 1
+        elsif c == '}'
+          depth -= 1
+        end
+      end
+      buf << seg << ' '
+      break if depth <= 0
+      i += 1
+      break if i >= lines.length
+      seg = lines[i]
+    end
+    cfg_stack.last[7][lh_name] = buf.gsub(/\s+/, ' ').strip if depth.zero?
   end
   # An `it`-body local string assignment (`message = "..." \` + continuation
   # lines) — RSpec fixtures interpolate these into annotation messages just
