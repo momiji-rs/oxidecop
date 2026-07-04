@@ -250,6 +250,7 @@ COPS = {
   'Gemspec/RubyVersionGlobalsUsage'  => 'gemspec/ruby_version_globals_usage',
   'Gemspec/DuplicatedAssignment'     => 'gemspec/duplicated_assignment',
   'Gemspec/RequiredRubyVersion'      => 'gemspec/required_ruby_version',
+  'Gemspec/OrderedDependencies'      => 'gemspec/ordered_dependencies',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

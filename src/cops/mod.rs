@@ -240,7 +240,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
-    "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion",
+    "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
 ];
 
 impl Engine {
@@ -3165,6 +3165,10 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         cops.il_no_offense = style::infinite_loop_skips(&result.node());
     }
     cops.visit(&result.node());
+    // Gemspec/OrderedDependencies: a whole-file scan (collect every
+    // `add_dependency`-family call, then compare consecutive pairs) rather
+    // than a per-node hook — see gemspec.rs's doc comment.
+    cops.check_ordered_dependencies(&result.node());
     // needs the breakable nominations the walk collected
     cops.check_line_length();
     cops.check_semicolon_lines();
