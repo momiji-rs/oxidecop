@@ -231,7 +231,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException",
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
-    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort",
+    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject",
 ];
 
 impl Engine {
@@ -2373,6 +2373,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_security_eval(node);
         self.check_redundant_self_assignment_call(node);
         self.check_each_with_object_argument(node);
+        self.check_each_with_object(node);
         self.check_trailing_comma_in_attribute_declaration(node);
         self.check_class_variable_set(node);
         self.check_hash_compare_by_identity(node);

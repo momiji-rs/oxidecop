@@ -12522,3 +12522,347 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// Style/EachWithObject -------------------------------------------------
+//
+// Ported from `on_block`/`on_itblock` (an alias of `on_block`) and
+// `on_numblock`. Prism unifies whitequark's three block flavors (`:block`,
+// `:itblock`, `:numblock`) into one `BlockNode`, distinguished only by the
+// shape of `parameters()` — `BlockParametersNode` (named `|a, e|` params),
+// `NumberedParametersNode` (`_1`/`_2`), or `ItParametersNode` (`it`). Since
+// prism's `CallNode` (not `BlockNode`) owns the block via `.block()`, the
+// whole check runs from `visit_call_node` instead of a block visitor —
+// there is no need to thread call context through a "pending" field the
+// way e.g. `NonLocalExitFromIterator` does, because `CallNode` already
+// carries both the send AND the attached block directly.
+//
+// `each_with_object_block_candidate?`'s pattern requires the node's literal
+// type to be `:block` — a `:itblock` (Ruby 3.4 `it`) node never matches,
+// which is why `on_itblock` (aliased straight to `on_block`) never fires an
+// offense for `it` blocks. We reproduce that by simply not handling
+// `ItParametersNode` (or blocks with no `parameters()` at all, e.g. a block
+// with no `|...|` delimiters) below — same "no offense" outcome.
+impl<'a> Cops<'a> {
+    /// Style/EachWithObject — `inject`/`reduce` calls whose block just
+    /// accumulates into the (first) block param and returns it unchanged
+    /// at the end can drop the explicit return and swap to
+    /// `each_with_object`, which yields `(element, accumulator)` instead of
+    /// `inject`'s `(accumulator, element)`.
+    pub(crate) fn check_each_with_object(&mut self, call: &ruby_prism::CallNode) {
+        const COP: &str = "Style/EachWithObject";
+        if !self.on(COP) {
+            return;
+        }
+        if !matches!(call.name().as_slice(), b"inject" | b"reduce") {
+            return;
+        }
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return };
+        // `(call _ {:inject :reduce} _)` — exactly one argument (the
+        // initial accumulator value).
+        let Some(args) = call.arguments() else { return };
+        let arg_list: Vec<_> = args.arguments().iter().collect();
+        if arg_list.len() != 1 {
+            return;
+        }
+        // `simple_method_arg?`: a non-composite literal initial value (`0`,
+        // `:sym`, a plain string, ...) can't meaningfully "accumulate", so
+        // rubocop exempts it outright — checked BEFORE looking at the block
+        // shape at all (matches `return if simple_method_arg?(...)` running
+        // first in both `on_block` and `on_numblock`).
+        if ewo_is_basic_literal(&arg_list[0]) {
+            return;
+        }
+        let Some(msg_loc) = call.message_loc() else { return };
+        let method_name = call.name();
+        let Some(params) = block.parameters() else { return };
+
+        if let Some(bp) = params.as_block_parameters_node() {
+            self.check_each_with_object_block(&block, &bp, msg_loc.start_offset(), method_name.as_slice());
+        } else if let Some(np) = params.as_numbered_parameters_node() {
+            self.check_each_with_object_numblock(&block, &np, msg_loc.start_offset(), method_name.as_slice());
+        }
+    }
+
+    /// `on_block`/`on_itblock` path — named `|accumulator, element|` params.
+    fn check_each_with_object_block(
+        &mut self,
+        block: &ruby_prism::BlockNode,
+        bp: &ruby_prism::BlockParametersNode,
+        selector_off: usize,
+        method_name: &[u8],
+    ) {
+        const COP: &str = "Style/EachWithObject";
+        // `(args _ _)` — exactly two block parameters, of any kind.
+        let Some(params) = bp.parameters() else { return };
+        let param_nodes = ewo_ordered_params(&params);
+        if param_nodes.len() != 2 {
+            return;
+        }
+        let Some(accumulator_name) = ewo_simple_param_name(&param_nodes[0]) else { return };
+        // Empty body (`{ |a, e| }`) — `return_value(body)` upstream returns
+        // nil for a nil body, so no offense.
+        let Some(body) = block.body() else { return };
+        let Some(return_value) = ewo_return_value(&body) else { return };
+        if return_value.name().as_slice() != accumulator_name.as_slice() {
+            return;
+        }
+        if ewo_reassigns(&body, &accumulator_name) {
+            return;
+        }
+
+        let message = format!("Use `each_with_object` instead of `{}`.", String::from_utf8_lossy(method_name));
+        self.push(selector_off, COP, true, message);
+
+        // autocorrect_block: rename the selector, swap the two block
+        // params, and drop the trailing accumulator return (the whole line
+        // if it occupies one on its own, else just the expression itself).
+        self.fixes.push((selector_off, selector_off + method_name.len(), b"each_with_object".to_vec()));
+
+        let (f_start, f_end) = ewo_span(&param_nodes[0]);
+        let (s_start, s_end) = ewo_span(&param_nodes[1]);
+        let f_src = self.src[f_start..f_end].to_vec();
+        let s_src = self.src[s_start..s_end].to_vec();
+        self.fixes.push((f_start, f_end, s_src));
+        self.fixes.push((s_start, s_end, f_src));
+
+        let rv_loc = return_value.location();
+        let (rv_start, rv_end) = (rv_loc.start_offset(), rv_loc.end_offset());
+        if ewo_occupies_whole_line(self.src, rv_start, rv_end) {
+            let (line_start, _, line_end_incl) = ewo_line_bounds(self.src, rv_start, rv_end);
+            self.fixes.push((line_start, line_end_incl, Vec::new()));
+        } else {
+            self.fixes.push((rv_start, rv_end, Vec::new()));
+        }
+    }
+
+    /// `on_numblock` path — `_1`/`_2` numbered params (Ruby 2.7+, pre-3.4
+    /// `it`). Unlike the named-param path, the trailing accumulator return
+    /// is NOT removed (upstream: "We don't remove the return value to avoid
+    /// a clobbering error") — instead every `_1`/`_2` local-variable read in
+    /// the body is swapped, return statement included.
+    fn check_each_with_object_numblock(
+        &mut self,
+        block: &ruby_prism::BlockNode,
+        np: &ruby_prism::NumberedParametersNode,
+        selector_off: usize,
+        method_name: &[u8],
+    ) {
+        const COP: &str = "Style/EachWithObject";
+        // `(numblock $(call _ {:inject :reduce} _) 2 $_)` — arity must be
+        // exactly 2 (i.e. `_2` is referenced somewhere in the body).
+        if np.maximum() != 2 {
+            return;
+        }
+        let Some(body) = block.body() else { return };
+        let Some(return_value) = ewo_return_value(&body) else { return };
+        if return_value.name().as_slice() != b"_1" {
+            return;
+        }
+
+        let message = format!("Use `each_with_object` instead of `{}`.", String::from_utf8_lossy(method_name));
+        self.push(selector_off, COP, true, message);
+
+        self.fixes.push((selector_off, selector_off + method_name.len(), b"each_with_object".to_vec()));
+        let mut swapper = EwoNumSwap { fixes: Vec::new() };
+        swapper.visit(&body);
+        self.fixes.extend(swapper.fixes);
+    }
+}
+
+/// rubocop-ast's (non-recursive) `basic_literal?`: `int`/`float`/`sym`/
+/// `true`/`false`/`nil`/plain `str`/`rational`/`complex` — notably NOT
+/// composite literals (`{}`, `[]`, interpolated strings/symbols, ranges,
+/// regexps), which is exactly why `[].inject({}) { ... }` is never exempt
+/// but `array.reduce(0) { ... }` is.
+fn ewo_is_basic_literal(node: &ruby_prism::Node) -> bool {
+    node.as_string_node().is_some()
+        || node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+        || node.as_nil_node().is_some()
+        || node.as_rational_node().is_some()
+        || node.as_imaginary_node().is_some()
+}
+
+/// Block parameters in Ruby grammar order: required, optional, rest, post,
+/// keyword, keyword-rest, block. Mirrors `rs_params_of`'s traversal but
+/// keeps the nodes themselves (needed for `corrector.swap`'s source spans)
+/// instead of just their names.
+fn ewo_ordered_params<'pr>(params: &ruby_prism::ParametersNode<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    let mut out = Vec::new();
+    for n in params.requireds().iter() {
+        out.push(n);
+    }
+    for n in params.optionals().iter() {
+        out.push(n);
+    }
+    if let Some(r) = params.rest() {
+        out.push(r);
+    }
+    for n in params.posts().iter() {
+        out.push(n);
+    }
+    for n in params.keywords().iter() {
+        out.push(n);
+    }
+    if let Some(kr) = params.keyword_rest() {
+        out.push(kr);
+    }
+    if let Some(b) = params.block() {
+        out.push(b.as_node());
+    }
+    out
+}
+
+/// A single parameter's name — deliberately NOT recursing into
+/// `MultiTargetNode`/`SplatNode` (destructured `|(a, b), e|` params): rubocop
+/// extracts the accumulator name via a flat `accumulator_var, = *first_arg`,
+/// which for a destructured param yields the inner (m)lhs NODE, not a bare
+/// symbol, so it can never equal a plain lvar's name — i.e. upstream itself
+/// never treats a destructured first param as a trackable accumulator.
+/// Returning `None` here reproduces that "never matches" outcome.
+fn ewo_simple_param_name(node: &ruby_prism::Node) -> Option<Vec<u8>> {
+    if let Some(p) = node.as_required_parameter_node() {
+        return Some(p.name().as_slice().to_vec());
+    }
+    if let Some(p) = node.as_optional_parameter_node() {
+        return Some(p.name().as_slice().to_vec());
+    }
+    if let Some(p) = node.as_rest_parameter_node() {
+        return p.name().map(|n| n.as_slice().to_vec());
+    }
+    if let Some(p) = node.as_keyword_rest_parameter_node() {
+        return p.name().map(|n| n.as_slice().to_vec());
+    }
+    if let Some(p) = node.as_required_keyword_parameter_node() {
+        return Some(p.name().as_slice().to_vec());
+    }
+    if let Some(p) = node.as_optional_keyword_parameter_node() {
+        return Some(p.name().as_slice().to_vec());
+    }
+    if let Some(p) = node.as_block_parameter_node() {
+        return p.name().map(|n| n.as_slice().to_vec());
+    }
+    None
+}
+
+fn ewo_span(node: &ruby_prism::Node) -> (usize, usize) {
+    let l = node.location();
+    (l.start_offset(), l.end_offset())
+}
+
+/// `return_value(body)`: the block body's last statement (or the body
+/// itself, for a single-expression body prism doesn't wrap in a
+/// `StatementsNode`), but ONLY if it's a bare local-variable read —
+/// anything else (a method call, a literal, ...) means there's nothing to
+/// swap `each_with_object`'s implicit return onto.
+fn ewo_return_value<'pr>(body: &ruby_prism::Node<'pr>) -> Option<ruby_prism::LocalVariableReadNode<'pr>> {
+    if let Some(stmts) = body.as_statements_node() {
+        let last = stmts.body().iter().last()?;
+        last.as_local_variable_read_node()
+    } else {
+        body.as_local_variable_read_node()
+    }
+}
+
+/// `accumulator_param_assigned_to?`: does ANY descendant of `body` write to
+/// a local variable named `name` — a plain assignment, a compound
+/// (`+=`/`||=`/`&&=`) assignment, or a multiple-assignment/pattern-match
+/// target? Prism gives each of those its own flat node kind carrying the
+/// name directly (unlike whitequark's `op_asgn`/`and_asgn`/`or_asgn`, which
+/// wrap a nameless inner `(op_)asgn` node reached only by descending into
+/// it) so checking each kind's own `.name()` field covers exactly the same
+/// ground as upstream's `each_descendant`.
+fn ewo_reassigns(body: &ruby_prism::Node, name: &[u8]) -> bool {
+    let mut finder = EwoReassignFinder { name, found: false };
+    finder.visit(body);
+    finder.found
+}
+
+struct EwoReassignFinder<'n> {
+    name: &'n [u8],
+    found: bool,
+}
+
+impl<'pr, 'n> ruby_prism::Visit<'pr> for EwoReassignFinder<'n> {
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        if node.name().as_slice() == self.name {
+            self.found = true;
+        }
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        if node.name().as_slice() == self.name {
+            self.found = true;
+        }
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        if node.name().as_slice() == self.name {
+            self.found = true;
+        }
+        ruby_prism::visit_local_variable_and_write_node(self, node);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        if node.name().as_slice() == self.name {
+            self.found = true;
+        }
+        ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        if node.name().as_slice() == self.name {
+            self.found = true;
+        }
+        ruby_prism::visit_local_variable_target_node(self, node);
+    }
+}
+
+/// `autocorrect_numblock`: swap every `_1`/`_2` local-variable read in the
+/// block body (the return statement included — see
+/// `check_each_with_object_numblock`'s doc comment for why it's kept).
+struct EwoNumSwap {
+    fixes: Vec<super::Fix>,
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for EwoNumSwap {
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        let repl: Option<&[u8]> = match node.name().as_slice() {
+            b"_1" => Some(b"_2"),
+            b"_2" => Some(b"_1"),
+            _ => None,
+        };
+        if let Some(r) = repl {
+            let l = node.location();
+            self.fixes.push((l.start_offset(), l.end_offset(), r.to_vec()));
+        }
+        ruby_prism::visit_local_variable_read_node(self, node);
+    }
+}
+
+/// Is `[start, end)` the only non-whitespace content on its (single) source
+/// line? (`return_value_occupies_whole_line?`: `whole_line_expression(node)
+/// .source.strip == node.source`.)
+fn ewo_occupies_whole_line(src: &[u8], start: usize, end: usize) -> bool {
+    let (line_start, line_end, _) = ewo_line_bounds(src, start, end);
+    src[line_start..start].iter().all(|&b| b == b' ' || b == b'\t')
+        && src[end..line_end].iter().all(|&b| b == b' ' || b == b'\t')
+}
+
+/// `range_by_whole_lines(range, include_final_newline: true)`: the full
+/// source line(s) spanned by `[start, end)`. Returns
+/// `(line_start, line_end_excl_newline, line_end_incl_newline)`.
+fn ewo_line_bounds(src: &[u8], start: usize, end: usize) -> (usize, usize, usize) {
+    let mut s = start;
+    while s > 0 && src[s - 1] != b'\n' {
+        s -= 1;
+    }
+    let mut e = end;
+    while e < src.len() && src[e] != b'\n' {
+        e += 1;
+    }
+    let e_incl = if e < src.len() { e + 1 } else { e };
+    (s, e, e_incl)
+}
