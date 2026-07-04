@@ -20916,3 +20916,210 @@ impl<'a> super::Cops<'a> {
         self.pld_check(ty, opening, closing, node.location().start_offset(), &pieces);
     }
 }
+
+
+// ---- Style/DoubleNegation ----
+//
+// Ports `double_negative?`, `node.prefix_bang?`, and `allowed_in_returns?`
+// (with its `end_of_method_definition?`/`find_def_node_from_ascendant`/
+// `find_conditional_node_from_ascendant`/`find_parent_not_enumerable`/
+// `find_last_child` helpers) verbatim. Since prism gives no parent pointers,
+// the ascendant climbs are replaced by a hand-rolled `Vec<DnFrame>` ancestor
+// stack pushed/popped by `mod.rs`'s `visit_def_node`/`visit_block_node`
+// (define_method only)/`visit_if_node`/`visit_unless_node`/`visit_while_node`/
+// `visit_until_node`/`visit_case_node`/`visit_case_match_node`/
+// `visit_array_node`/`visit_hash_node`/`visit_assoc_node`/
+// `visit_statements_node` (only when it groups 2+ statements — see
+// `DnFrame`'s doc) — at the moment `check_double_negation` runs (from
+// `visit_call_node`, pre-order, before anything is pushed for the `!!` call
+// itself), that stack IS exactly the real ancestor chain from the Program
+// root down to (not including) the checked node.
+use super::{DnFrame, DnLastChild};
+
+impl<'a> super::Cops<'a> {
+    /// `on_send` (restricted to `:!` sends, like upstream's `RESTRICT_ON_SEND`).
+    pub(crate) fn check_double_negation(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/DoubleNegation";
+        if !self.on(COP) {
+            return;
+        }
+        if node.name().as_slice() != b"!" {
+            return;
+        }
+        // `double_negative?`: `(send (send _ :!) :!)` — this node's own
+        // receiver must itself be a `:!` send (either spelling, `!x` or
+        // `x.!`/`not x` — only the OUTER node's own spelling matters below).
+        let Some(receiver) = node.receiver() else { return };
+        let Some(inner) = receiver.as_call_node() else { return };
+        if inner.name().as_slice() != b"!" {
+            return;
+        }
+        // `node.prefix_bang?`: `negation_method? && loc.selector.is?('!')` —
+        // a receiver-having `:!` send is ALSO true for `x.!` (explicit dot
+        // dispatch), not just `!x`; it's false only for the `not` keyword
+        // spelling (whose selector text reads `not`), which is exactly why
+        // `not not x` never registers.
+        let Some(sel) = node.message_loc() else { return };
+        if sel.as_slice() != b"!" {
+            return;
+        }
+        let forbidden = self.cfg.enforced_style(COP) == "forbidden";
+        if !forbidden && self.dn_allowed_in_returns(node) {
+            return;
+        }
+        let start = sel.start_offset();
+        self.push(start, COP, true, "Avoid the use of double negation (`!!`).");
+        // fix: `corrector.remove(location)` (the outer `!`'s own selector),
+        // `corrector.insert_after(node, '.nil?')` (after the WHOLE node).
+        self.fixes.push((sel.start_offset(), sel.end_offset(), Vec::new()));
+        let end = node.location().end_offset();
+        self.fixes.push((end, end, b".nil?".to_vec()));
+    }
+
+    /// `allowed_in_returns?`: `node.parent&.return_type? ||
+    /// end_of_method_definition?(node)`.
+    fn dn_allowed_in_returns(&self, node: &ruby_prism::CallNode) -> bool {
+        if self.dn_return_arg_offsets.contains(&node.location().start_offset()) {
+            return true;
+        }
+        self.dn_end_of_method_definition(node)
+    }
+
+    /// `end_of_method_definition?`.
+    fn dn_end_of_method_definition(&self, node: &ruby_prism::CallNode) -> bool {
+        // `find_def_node_from_ascendant`: nearest `Def`/`DefineMethodCall`
+        // frame: `false unless (def_node = ...)` when there's no enclosing
+        // one at all; `None` payload when a `def_node` was found but its
+        // `find_last_child` couldn't be computed (e.g. an empty body).
+        let found = self.dn_ancestors.iter().rev().find_map(|f| match f {
+            DnFrame::Def(lc) | DnFrame::DefineMethodCall(lc) => Some(*lc),
+            _ => None,
+        });
+        let Some(Some(last_child)) = found else { return false };
+
+        let node_line = self.idx.loc(node.location().start_offset()).0;
+
+        // `find_conditional_node_from_ascendant`: nearest `Conditional` frame,
+        // climbing every level (no def-boundary stop, matching upstream).
+        let conditional_last_line =
+            self.dn_ancestors.iter().rev().find_map(|f| match f {
+                DnFrame::Conditional(l) => Some(*l),
+                _ => None,
+            });
+
+        if let Some(cond_last_line) = conditional_last_line {
+            // `double_negative_condition_return_value?`: `find_parent_not_
+            // enumerable` — climb past consecutive `Enumerable` (hash/array/
+            // pair) frames; the first non-enumerable one is `parent`.
+            let mut begin_last_line = None;
+            for f in self.dn_ancestors.iter().rev() {
+                match f {
+                    DnFrame::Enumerable => continue,
+                    DnFrame::BeginGroup(l) => begin_last_line = Some(*l),
+                    _ => {}
+                }
+                break;
+            }
+            if let Some(begin_last_line) = begin_last_line {
+                node_line == begin_last_line
+            } else {
+                last_child.last_line <= cond_last_line
+            }
+        } else if last_child.is_pair_or_hash || last_child.is_array_parent {
+            false
+        } else {
+            last_child.first_line <= node_line
+        }
+    }
+
+    /// `find_last_child(def_node.body)`, with the `:rescue`/`:ensure` peel
+    /// collapsed into ONE step: prism unifies both into a single `BeginNode`
+    /// whose own `.statements()` is exactly whitequark's "main body after
+    /// peeling rescue then ensure".
+    pub(crate) fn dn_compute_def_last_child(&self, def_node: &ruby_prism::DefNode) -> Option<DnLastChild> {
+        let body = def_node.body()?;
+        let stmts = if let Some(b) = body.as_begin_node() { b.statements()? } else { body.as_statements_node()? };
+        let list: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        let raw_last = list.last()?;
+        if list.len() > 1 {
+            // whitequark's `:begin` case: `node.child_nodes.last` with no
+            // further drilling — the raw last TOP-LEVEL statement itself.
+            Some(self.dn_classify_raw(raw_last))
+        } else {
+            // whitequark unwraps a single-statement body to that statement
+            // directly, so `find_last_child` drills ONE level into ITS OWN
+            // children instead.
+            Some(self.dn_drill_one_level(raw_last))
+        }
+    }
+
+    /// `find_last_child(def_node)` for the `define_method`/
+    /// `define_singleton_method` fake-def case: the call's own last argument
+    /// (typically the method-name symbol), no drilling — same "no rescue/
+    /// ensure, not `:begin`" default branch as above.
+    pub(crate) fn dn_compute_call_last_child(&self, call: &ruby_prism::CallNode) -> Option<DnLastChild> {
+        let last = call.arguments().and_then(|a| a.arguments().iter().last()).or_else(|| call.receiver());
+        last.map(|n| self.dn_classify_raw(&n))
+    }
+
+    /// Classifies a node exactly as whitequark's `last_child` when it was
+    /// NOT drilled further: `type?(:pair, :hash)` (checked on `n` itself)
+    /// true only for a bare `hash`/`assoc`; `parent.array_type?` is always
+    /// false here since `n`'s real parent is a `:begin`/send, never an array.
+    fn dn_classify_raw(&self, n: &ruby_prism::Node) -> DnLastChild {
+        let loc = n.location();
+        DnLastChild {
+            is_pair_or_hash: n.as_assoc_node().is_some() || n.as_hash_node().is_some(),
+            is_array_parent: false,
+            first_line: self.idx.loc(loc.start_offset()).0,
+            last_line: self.idx.loc(loc.end_offset().saturating_sub(1).max(loc.start_offset())).0,
+        }
+    }
+
+    /// `find_last_child(n)` when `n` is itself whitequark's unwrapped
+    /// single-statement body — one level of `n.child_nodes.last` drilling.
+    /// Array/hash literals are the only shapes the fixture drills through;
+    /// `IfNode`/`UnlessNode`/`CaseNode`/`CaseMatchNode` share their own
+    /// `last_line` with whatever their nested elsif/branch chain's real
+    /// `child_nodes.last` would be (prism gives every level of that chain
+    /// the SAME end position as the outermost node), so no drilling is
+    /// needed there; anything else falls back to classifying `n` itself.
+    fn dn_drill_one_level(&self, n: &ruby_prism::Node) -> DnLastChild {
+        if let Some(arr) = n.as_array_node() {
+            if let Some(last) = arr.elements().iter().last() {
+                let loc = last.location();
+                return DnLastChild {
+                    is_pair_or_hash: false,
+                    is_array_parent: true,
+                    first_line: self.idx.loc(loc.start_offset()).0,
+                    last_line: self.idx.loc(loc.end_offset().saturating_sub(1).max(loc.start_offset())).0,
+                };
+            }
+            return self.dn_classify_raw(n);
+        }
+        if let Some(h) = n.as_hash_node() {
+            if let Some(last) = h.elements().iter().last() {
+                let loc = last.location();
+                return DnLastChild {
+                    is_pair_or_hash: true,
+                    is_array_parent: false,
+                    first_line: self.idx.loc(loc.start_offset()).0,
+                    last_line: self.idx.loc(loc.end_offset().saturating_sub(1).max(loc.start_offset())).0,
+                };
+            }
+            return self.dn_classify_raw(n);
+        }
+        if let Some(call) = n.as_call_node() {
+            if let Some(args) = call.arguments() {
+                if let Some(last) = args.arguments().iter().last() {
+                    return self.dn_classify_raw(&last);
+                }
+            }
+            if let Some(recv) = call.receiver() {
+                return self.dn_classify_raw(&recv);
+            }
+            return self.dn_classify_raw(n);
+        }
+        self.dn_classify_raw(n)
+    }
+}

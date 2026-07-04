@@ -134,6 +134,61 @@ pub(crate) struct EbaDefInfo {
     pub(crate) zsuper_arg_texts: Vec<Vec<u8>>,
 }
 
+/// Style/DoubleNegation: rubocop's `find_last_child`, precomputed once (it
+/// only depends on a `def`/`define_method` call's OWN static shape, never on
+/// where the checked `!!` sits) into just the two facts `end_of_method_
+/// definition?` actually reads off it:
+/// - `is_pair_or_hash` mirrors `last_child.type?(:pair, :hash)`,
+/// - `is_array_parent` mirrors `last_child.parent.array_type?`
+///
+/// Both, if either is true, mean "never a return position" outright,
+/// regardless of the checked node's own line. Otherwise
+/// `first_line`/`last_line` (of `last_child` itself) feed the two remaining
+/// upstream comparisons (`last_child.first_line <= node.first_line` and
+/// `last_child.last_line <= conditional_node.last_line`).
+#[derive(Clone, Copy)]
+pub(crate) struct DnLastChild {
+    pub(crate) is_pair_or_hash: bool,
+    pub(crate) is_array_parent: bool,
+    pub(crate) first_line: usize,
+    pub(crate) last_line: usize,
+}
+
+/// Style/DoubleNegation: one entry per ancestor level that upstream's
+/// `allowed_in_returns?` climb (via rubocop-ast's real `node.parent`, which
+/// prism doesn't provide) actually cares about. Every OTHER node kind is
+/// transparently absent from the stack — none of the climbs
+/// (`find_def_node_from_ascendant`, `find_conditional_node_from_ascendant`,
+/// `find_parent_not_enumerable`) ever match on them, so skipping them is
+/// equivalent to including them as inert frames. The one exception is
+/// `find_parent_not_enumerable`, which upstream stops at the true immediate
+/// parent unconditionally (continuing only across `pair`/`hash`/`array`) —
+/// an intervening node kind of no interest to this cop (e.g. a plain method
+/// call's argument list) that happens to sit between an enumerable literal
+/// and its real non-enumerable parent would, in a pathological input, be
+/// skipped here where upstream would have stopped on it. Not exercised by
+/// the fixture.
+pub(crate) enum DnFrame {
+    /// A real `def`/`defs`. Carries the enclosing method's own
+    /// `find_last_child(def_node.body)`, or `None` when it couldn't be
+    /// computed (e.g. an empty body).
+    Def(Option<DnLastChild>),
+    /// A `define_method`/`define_singleton_method` block, standing in for
+    /// upstream's `def_node = the SEND node` special case. Carries
+    /// `find_last_child(def_node)` — the call's own last argument.
+    DefineMethodCall(Option<DnLastChild>),
+    /// An `if`/`unless`/`while`/`until`/`case`/`case/in` — `conditional?`.
+    /// Carries the node's own `last_line`.
+    Conditional(usize),
+    /// A `hash`, `array`, or hash-pair (`assoc`) literal — always skipped
+    /// over by `find_parent_not_enumerable`.
+    Enumerable,
+    /// A `StatementsNode` that groups 2+ statements — upstream's `:begin`
+    /// node. Carries the group's own `last_line` (for `node.loc.line ==
+    /// parent.loc.last_line`).
+    BeginGroup(usize),
+}
+
 /// Per-RUN state derived from the Config once — parsed patterns, resolved
 /// enablement, compiled exemption maps. lint() is called per file; nothing
 /// here should be rebuilt per file.
@@ -313,7 +368,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation",
 ];
 
 impl Engine {
@@ -1368,6 +1423,36 @@ pub(crate) struct Cops<'a> {
     // node.parent.parent` is exactly this node's parent whenever the splat's
     // immediate container equals that value outright.
     pub(crate) rse_assignment_value: HashSet<usize>,
+    // Style/DoubleNegation: a hand-rolled "ancestor stack" mirroring exactly
+    // the node kinds `allowed_in_returns?` climbs through (prism gives no
+    // parent pointers) — pushed/popped by `visit_def_node`, `visit_block_node`
+    // (only for a `define_method`/`define_singleton_method` block, via
+    // `dn_pending_define_method`), `visit_if_node`/`visit_unless_node`/
+    // `visit_while_node`/`visit_until_node`/`visit_case_node`/
+    // `visit_case_match_node` (conditionals), `visit_array_node`/
+    // `visit_hash_node`/`visit_assoc_node` (enumerable literals), and
+    // `visit_statements_node` (a "begin"-equivalent, only when it actually
+    // groups more than one statement — a single-statement body is
+    // transparent in whitequark's tree, so no frame is pushed for it). See
+    // `DnFrame`'s doc and `style::check_double_negation`.
+    pub(crate) dn_ancestors: Vec<DnFrame>,
+    // Style/DoubleNegation: start offsets of nodes that are a DIRECT argument
+    // of a `return` — `visit_return_node` populates this (skipping the
+    // `ArgumentsNode` wrapper prism interposes) BEFORE recursing, mirroring
+    // `node.parent&.return_type?`, which only ever looks at the true
+    // immediate parent (never a deeper descendant).
+    pub(crate) dn_return_arg_offsets: HashSet<usize>,
+    // Style/DoubleNegation: the `define_method`/`define_singleton_method`
+    // call's own precomputed "last child" — set by `visit_call_node` right
+    // before `self.visit(&b)` descends into that call's block (the
+    // established `nle_pending` idiom), consumed at the top of
+    // `visit_block_node`. `None` for an ordinary block.
+    // Outer `None` = not a `define_method`/`define_singleton_method` call
+    // (no frame pushed at all, matching upstream's `define_method?(parent)`
+    // staying false); `Some(inner)` = it is one, `inner` being the call's own
+    // `find_last_child` (which can itself be `None`, e.g. an argument-less
+    // call — still a real `def_node` upstream, just with a `nil` last_child).
+    pub(crate) dn_pending_define_method: Option<Option<DnLastChild>>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1767,7 +1852,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 breakable::LlCallInfo::default(),
             );
         }
+        // Style/DoubleNegation: `find_parent_not_enumerable`'s `hash_type?`.
+        self.dn_ancestors.push(DnFrame::Enumerable);
         ruby_prism::visit_hash_node(self, node);
+        self.dn_ancestors.pop();
         self.ll_exit_collection();
     }
     fn visit_optional_keyword_parameter_node(&mut self, node: &ruby_prism::OptionalKeywordParameterNode<'pr>) {
@@ -1982,7 +2070,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.rrs_note_modifier_body(node.statements(), node.location().end_offset());
         }
         self.cond_depth += 1;
+        // Style/DoubleNegation: `conditional?` (`CONDITIONALS` includes
+        // `:if`, which whitequark also uses for a ternary — this pushes for
+        // those too, matching upstream making no such distinction).
+        self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
         ruby_prism::visit_if_node(self, node);
+        self.dn_ancestors.pop();
         self.cond_depth -= 1;
         // post-order (after recursion): nested-modifier autocorrect needs the
         // inner node's fixes registered first (TreeRewriter insert order)
@@ -2048,7 +2141,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.rrs_note_modifier_body(node.statements(), node.location().end_offset());
         }
         self.cond_depth += 1;
+        self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
         ruby_prism::visit_unless_node(self, node);
+        self.dn_ancestors.pop();
         self.cond_depth -= 1;
         // post-order: see the if-visitor note.
         if node.end_keyword_loc().is_none() {
@@ -2359,7 +2454,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.sak_check(e.start_offset(), e.end_offset(), b"else");
         }
         self.cond_depth += 1;
+        self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
         ruby_prism::visit_case_node(self, node);
+        self.dn_ancestors.pop();
         self.cond_depth -= 1;
     }
     fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
@@ -2373,7 +2470,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.sak_check(e.start_offset(), e.end_offset(), b"else");
         }
         self.cond_depth += 1;
+        self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
         ruby_prism::visit_case_match_node(self, node);
+        self.dn_ancestors.pop();
         self.cond_depth -= 1;
     }
     fn visit_when_node(&mut self, node: &ruby_prism::WhenNode<'pr>) {
@@ -2477,6 +2576,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_top_level_return_with_argument(node);
         self.check_non_local_exit_from_iterator(node);
         self.ecc_mark_not_supported_parent(node.arguments());
+        // Style/DoubleNegation's `node.parent&.return_type?` — only the
+        // return's own DIRECT argument(s) count (prism interposes an
+        // `ArgumentsNode` wrapper whitequark doesn't have; skip straight
+        // through it), never a deeper descendant.
+        if let Some(args) = node.arguments() {
+            for a in args.arguments().iter() {
+                self.dn_return_arg_offsets.insert(a.location().start_offset());
+            }
+        }
         let kw = node.keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"return");
         // Style/MultilineTernaryOperator: `return cond ? a : b` — a single
@@ -2605,6 +2713,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_predicate_prefix_sig_scan(node);
         self.check_combinable_loops(node);
         self.stmts_stack.push(node.location().start_offset());
+        // Style/DoubleNegation: upstream's `:begin` node only ever exists
+        // when whitequark groups 2+ statements — a single-statement body is
+        // transparently unwrapped to that one statement directly, unlike
+        // prism's `StatementsNode`, which wraps unconditionally. Pushing a
+        // frame only when there's more than one statement reproduces that.
+        let dn_pushed_begin = node.body().iter().count() > 1;
+        if dn_pushed_begin {
+            let last_line = self.idx.loc(node.location().end_offset().saturating_sub(1)).0;
+            self.dn_ancestors.push(DnFrame::BeginGroup(last_line));
+        }
         if self.on("Naming/RescuedExceptionsVariableName") {
             // Hand-rolled (rather than the plain default-visitor call) so
             // that right after visiting a direct `kwbegin` (explicit
@@ -2631,6 +2749,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         } else {
             ruby_prism::visit_statements_node(self, node);
+        }
+        if dn_pushed_begin {
+            self.dn_ancestors.pop();
         }
         self.stmts_stack.pop();
     }
@@ -2738,6 +2859,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // block. `None` (unreached via that path) defaults to `:dynamic`.
         let alias_instance_eval = self.alias_pending_instance_eval.take().unwrap_or(false);
         self.alias_scope_stack.push(if alias_instance_eval { 2 } else { 1 });
+        // Style/DoubleNegation: consume the `define_method`/
+        // `define_singleton_method` verdict `visit_call_node` set right
+        // before descending into us — see the `dn_pending_define_method`
+        // field doc. `None` for an ordinary block (never pushed at all,
+        // exactly like upstream's `define_method?(parent)` staying false).
+        let dn_define_method = self.dn_pending_define_method.take();
+        if let Some(last_child) = dn_define_method {
+            self.dn_ancestors.push(DnFrame::DefineMethodCall(last_child));
+        }
         if let Some(params) = node.parameters() {
             self.visit(&params);
         }
@@ -2747,6 +2877,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.el_am_block_owns_next_stmts = true;
             }
             self.visit(&body);
+        }
+        if dn_define_method.is_some() {
+            self.dn_ancestors.pop();
         }
         self.alias_scope_stack.pop();
         self.se_ancestor_end_lines.pop();
@@ -2816,7 +2949,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.cond_depth += 1;
+        // Style/DoubleNegation: `conditional?`'s `CONDITIONALS` set includes
+        // `:while` but NOT `:while_post` — the `begin...end while` shape
+        // whitequark gives a distinct type, matching `is_begin_modifier()`.
+        let dn_pushed = !node.is_begin_modifier();
+        if dn_pushed {
+            self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
+        }
         ruby_prism::visit_while_node(self, node);
+        if dn_pushed {
+            self.dn_ancestors.pop();
+        }
         self.cond_depth -= 1;
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
@@ -2870,7 +3013,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.cond_depth += 1;
+        let dn_pushed = !node.is_begin_modifier();
+        if dn_pushed {
+            self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
+        }
         ruby_prism::visit_until_node(self, node);
+        if dn_pushed {
+            self.dn_ancestors.pop();
+        }
         self.cond_depth -= 1;
     }
     fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
@@ -3061,7 +3211,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        // Style/DoubleNegation: `find_parent_not_enumerable`'s `array_type?`.
+        self.dn_ancestors.push(DnFrame::Enumerable);
         ruby_prism::visit_array_node(self, node);
+        self.dn_ancestors.pop();
         self.wa_matrix_stack.pop();
         self.ll_exit_collection();
     }
@@ -3078,7 +3231,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.ll_str_skip.insert(node.value().location().start_offset());
         }
         self.check_space_after_colon_pair(node);
+        // Style/DoubleNegation: `find_parent_not_enumerable`'s `pair_type?`.
+        self.dn_ancestors.push(DnFrame::Enumerable);
         ruby_prism::visit_assoc_node(self, node);
+        self.dn_ancestors.pop();
     }
     fn visit_embedded_variable_node(&mut self, node: &ruby_prism::EmbeddedVariableNode<'pr>) {
         self.check_variable_interpolation(node);
@@ -3343,7 +3499,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if alias_plain_def {
             self.alias_def_depth += 1;
         }
+        // Style/DoubleNegation: `find_def_node_from_ascendant`'s `any_def_type?`
+        // stop, with `find_last_child(def_node.body)` precomputed eagerly —
+        // it only depends on this def's own static shape.
+        self.dn_ancestors.push(DnFrame::Def(self.dn_compute_def_last_child(node)));
         ruby_prism::visit_def_node(self, node);
+        self.dn_ancestors.pop();
         if alias_plain_def {
             self.alias_def_depth -= 1;
         }
@@ -3550,6 +3711,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        self.check_double_negation(node);
         // Lint/UselessMethodDefinition: register def-arguments of generic
         // macro calls (anything but a receiver-less access modifier).
         if let Some(args) = node.arguments() {
@@ -3960,6 +4122,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 // define method-name argument, if it qualifies — see the
                 // `mivn_pending_method_name` field doc.
                 self.mivn_pending_method_name = Some(naming::mivn_dynamic_define_name(node));
+                // Style/DoubleNegation: `define_method?(parent)` (no arg-count
+                // restriction, unlike `is_define_method` above — this cop's
+                // own upstream check is just `child.method?(:define_method)
+                // || child.method?(:define_singleton_method)`) — see the
+                // `dn_pending_define_method` field doc.
+                self.dn_pending_define_method = if matches!(
+                    node.name().as_slice(),
+                    b"define_method" | b"define_singleton_method"
+                ) {
+                    Some(self.dn_compute_call_last_child(node))
+                } else {
+                    None
+                };
                 // Lint/MissingSuper: this block's `class_new_block` verdict —
                 // see the `ms_pending_block` field doc.
                 self.ms_pending_block = self.ms_class_new_pending(node);
@@ -4169,6 +4344,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         sgv_climb: HashMap::new(),
         rse_ctx: HashMap::new(),
         rse_assignment_value: HashSet::new(),
+        dn_ancestors: Vec::new(),
+        dn_return_arg_offsets: HashSet::new(),
+        dn_pending_define_method: None,
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),
