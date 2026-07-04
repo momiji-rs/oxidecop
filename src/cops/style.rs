@@ -21664,3 +21664,244 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((call_start, range_end, replacement.into_bytes()));
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/IfInsideElse — an `if` that is the SOLE statement of an `else`
+    /// block gets converted to `elsif`. Ported from `on_if`: prism's
+    /// `subsequent()` chain already distinguishes an `elsif` continuation
+    /// (a further `IfNode` directly, whose own `if_keyword_loc` reads
+    /// "elsif") from a genuine `else` clause (an `ElseNode`) the way
+    /// upstream's `else_branch.if_type? && else_branch.if?` does — an
+    /// `elsif` never reaches here at all, so there's no need to inspect the
+    /// nested if's own keyword text for that distinction.
+    pub(crate) fn check_if_inside_else(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/IfInsideElse";
+        if !self.on(COP) {
+            return;
+        }
+        // `node.ternary?`: a ternary has no `if`/`unless` keyword at all.
+        if node.if_keyword_loc().is_none() {
+            return;
+        }
+        let Some(subsequent) = node.subsequent() else { return };
+        let Some(else_node) = subsequent.as_else_node() else { return };
+        let Some(stmts) = else_node.statements() else { return };
+        let body = stmts.body();
+        if body.len() != 1 {
+            return;
+        }
+        let Some(nested_if) = body.iter().next().and_then(|n| n.as_if_node()) else { return };
+        // `else_branch.if?` (`keyword == 'if'`): a ternary's `keyword` is
+        // `''`, so a ternary as the else's sole statement is exempt too.
+        if nested_if.if_keyword_loc().is_none() {
+            return;
+        }
+
+        let modifier_form = nested_if.end_keyword_loc().is_none();
+        if modifier_form {
+            // `allow_if_modifier_in_else_branch?`
+            if self.cfg.get(COP, "AllowIfModifier") == Some("true") {
+                return;
+            }
+        } else {
+            // `comments_between_else_and_if?` — bypassed entirely for a
+            // modifier-form nested `if` (upstream returns `false` outright).
+            let else_end = else_node.else_keyword_loc().end_offset();
+            let if_begin = nested_if
+                .if_keyword_loc()
+                .expect("checked non-ternary above")
+                .start_offset();
+            if self.comments.iter().any(|&(_, s, _)| s > else_end && s < if_begin) {
+                return;
+            }
+        }
+
+        let kw = nested_if.if_keyword_loc().expect("checked non-ternary above");
+        self.push(kw.start_offset(), COP, true, "Convert `if` nested inside `else` to `elsif`.".to_string());
+
+        // `ignore_node`/`part_of_ignored_node?`: once an outer `if` here has
+        // been autocorrected, a further if/else structure fully nested
+        // inside its (pre-correction) range still gets an offense on its
+        // own account, but never a second, conflicting autocorrect.
+        let node_loc = node.location();
+        let (node_start, node_end) = (node_loc.start_offset(), node_loc.end_offset());
+        if self.if_inside_else_ignored.iter().any(|&(s, e)| node_start >= s && node_end <= e) {
+            return;
+        }
+
+        if nested_if.then_keyword_loc().is_some() {
+            // `node.then?`: correct the `then` form first (`IfThenCorrector`)
+            // and defer the `else`->`elsif` conversion to a later pass.
+            self.iie_correct_then_form(&nested_if);
+        } else if modifier_form {
+            self.iie_correct_modifier_form(&else_node, &nested_if);
+        } else {
+            self.iie_correct_if_inside_else_form(&else_node, &nested_if);
+        }
+
+        self.if_inside_else_ignored.push((node_start, node_end));
+    }
+
+    /// `IfThenCorrector.new(node, indentation: 0).call(corrector)` — the
+    /// `indentation: 0` override makes `branch_body_indentation` (used for
+    /// EVERY then/else body line in the reconstruction, at every nesting
+    /// level) an empty string. Deliberately NOT reusing the similar shared
+    /// `olc_multiline_if` builder (used by other, already-verified cops):
+    /// that helper always prefixes a bare closing `end` (no `else`/`elsif`
+    /// at all) with `indentation`, but upstream's `rewrite_else_branch`
+    /// returns the literal string `'end'` with NO indentation in that case
+    /// (only the `else`/`elsif`-clause branches are indentation-prefixed) —
+    /// a real (if visually misaligned) quirk of the corrector that the
+    /// fixture pins down, so it needs its own, deliberately-diverging copy.
+    fn iie_correct_then_form(&mut self, nested_if: &ruby_prism::IfNode) {
+        let loc = nested_if.location();
+        let (_, col) = self.idx.loc(loc.start_offset());
+        let indentation = " ".repeat(col - 1);
+        let replacement = iie_multiline_if(self, nested_if, b"if", false, &indentation);
+        self.fixes.push((loc.start_offset(), loc.end_offset(), replacement));
+    }
+
+    /// `correct_to_elsif_from_modifier_form`: replace the outer `else`
+    /// keyword with `elsif <condition>`, then delete the trailing
+    /// `<space>if <condition>` left dangling after the modifier's body.
+    fn iie_correct_modifier_form(&mut self, else_node: &ruby_prism::ElseNode, nested_if: &ruby_prism::IfNode) {
+        let else_kw = else_node.else_keyword_loc();
+        let condition = nested_if.predicate();
+        let mut replacement = b"elsif ".to_vec();
+        replacement.extend_from_slice(self.node_src(&condition));
+        self.fixes.push((else_kw.start_offset(), else_kw.end_offset(), replacement));
+
+        let if_branch_end =
+            nested_if.statements().map(|s| s.location().end_offset()).expect("modifier `if`'s body is never empty");
+        let condition_end = condition.location().end_offset();
+        self.fixes.push((if_branch_end, condition_end, Vec::new()));
+    }
+
+    /// `correct_to_elsif_from_if_inside_else_form`: replace the outer
+    /// `else` keyword with `elsif <condition>`; move the nested if's own
+    /// then-branch (with any directly-associated comments) up to where the
+    /// nested `if <condition>` text was, deleting the branch's original
+    /// lines and the nested if's own trailing `end` line. (The upstream
+    /// `corrector.remove(condition)` step is always a strict sub-range of
+    /// an edit already made above, so it never changes the result and is
+    /// omitted here.)
+    fn iie_correct_if_inside_else_form(&mut self, else_node: &ruby_prism::ElseNode, nested_if: &ruby_prism::IfNode) {
+        let else_kw = else_node.else_keyword_loc();
+        let condition = nested_if.predicate();
+        let mut replacement = b"elsif ".to_vec();
+        replacement.extend_from_slice(self.node_src(&condition));
+        self.fixes.push((else_kw.start_offset(), else_kw.end_offset(), replacement));
+
+        let if_kw = nested_if.if_keyword_loc().expect("checked non-ternary in caller");
+        let if_cond_start = if_kw.start_offset();
+        let cond_end = condition.location().end_offset();
+
+        match nested_if.statements() {
+            Some(if_branch) => {
+                let ib_start = if_branch.location().start_offset();
+                let ib_end = if_branch.location().end_offset();
+                let (rc_start, rc_end) = self.iie_range_with_comments(ib_start, ib_end, cond_end);
+                let branch_src = self.src[rc_start..rc_end].to_vec();
+                self.fixes.push((if_cond_start, cond_end, branch_src));
+                let (rm_start, rm_end) = self.iie_whole_lines(rc_start, rc_end);
+                self.fixes.push((rm_start, rm_end, Vec::new()));
+            }
+            None => {
+                let (rm_start, rm_end) = self.iie_whole_lines(if_cond_start, cond_end);
+                self.fixes.push((rm_start, rm_end, Vec::new()));
+            }
+        }
+
+        let end_kw = nested_if.end_keyword_loc().expect("non-modifier, non-then `if` always has an `end`");
+        let (rm_start, rm_end) = self.iie_whole_lines(end_kw.start_offset(), end_kw.end_offset());
+        self.fixes.push((rm_start, rm_end, Vec::new()));
+    }
+
+    /// `range_with_comments(if_branch)`: extend `[start, end)` to also cover
+    /// a directly-preceding comment run (upstream's "preceding comment"
+    /// case — anything between the nested if's own condition and the
+    /// branch) and a trailing comment sharing the branch's own last line
+    /// (upstream's "decorating comment" case). A comment strictly *inside*
+    /// the branch (upstream's "sparse comment" case) never widens these
+    /// bounds, so it's not considered.
+    fn iie_range_with_comments(&self, start: usize, end: usize, lower_bound: usize) -> (usize, usize) {
+        let mut lo = start;
+        let mut hi = end;
+        let last_line = self.idx.loc(end.saturating_sub(1)).0;
+        for &(line, s, e) in self.comments {
+            if s > lower_bound && e <= start {
+                lo = lo.min(s);
+            }
+            if s >= end && line == last_line {
+                hi = hi.max(e);
+            }
+        }
+        (lo, hi)
+    }
+
+    /// `range_by_whole_lines(range, include_final_newline: true)`.
+    fn iie_whole_lines(&self, start: usize, end: usize) -> (usize, usize) {
+        let mut s = start;
+        while s > 0 && self.src[s - 1] != b'\n' {
+            s -= 1;
+        }
+        let mut e = end;
+        while e < self.src.len() && self.src[e] != b'\n' {
+            e += 1;
+        }
+        if e < self.src.len() && self.src[e] == b'\n' {
+            e += 1;
+        }
+        (s, e)
+    }
+}
+
+/// `IfThenCorrector#replacement`/`#rewrite_else_branch`, with `indentation:
+/// 0` baked in (`branch_body_indentation` is always `""`). Unlike the
+/// similarly-shaped shared `olc_multiline_if` (used elsewhere with a real
+/// indentation width), a bare closing `end` — `node.else_branch` is
+/// `nil`, i.e. no `else`/`elsif` at all — gets NO `indentation` prefix,
+/// matching upstream's `rewrite_else_branch` returning the literal string
+/// `'end'` in that branch only; the `elsif`-recursion and real-`else`
+/// branches ARE indentation-prefixed, same as upstream.
+fn iie_multiline_if(
+    cops: &super::Cops,
+    node: &ruby_prism::IfNode,
+    root_keyword: &[u8],
+    is_elsif: bool,
+    indentation: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    if is_elsif {
+        out.extend_from_slice(indentation.as_bytes());
+    }
+    out.extend_from_slice(root_keyword);
+    out.push(b' ');
+    out.extend_from_slice(cops.node_src(&node.predicate()));
+    out.push(b'\n');
+    out.extend_from_slice(indentation.as_bytes());
+    let then_src = node.statements().map(|s| cops.node_src(&s.as_node()));
+    out.extend_from_slice(then_src.unwrap_or(b"nil"));
+    out.push(b'\n');
+    match node.subsequent() {
+        None => {
+            out.extend_from_slice(b"end");
+        }
+        Some(sub) => {
+            if let Some(elsif) = sub.as_if_node() {
+                out.extend_from_slice(&iie_multiline_if(cops, &elsif, b"elsif", true, indentation));
+            } else if let Some(else_node) = sub.as_else_node() {
+                out.extend_from_slice(indentation.as_bytes());
+                out.extend_from_slice(b"else\n");
+                out.extend_from_slice(indentation.as_bytes());
+                let else_src = else_node.statements().map(|s| cops.node_src(&s.as_node())).unwrap_or(b"");
+                out.extend_from_slice(else_src);
+                out.push(b'\n');
+                out.extend_from_slice(indentation.as_bytes());
+                out.extend_from_slice(b"end");
+            }
+        }
+    }
+    out
+}

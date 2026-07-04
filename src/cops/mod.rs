@@ -368,7 +368,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse",
 ];
 
 impl Engine {
@@ -695,6 +695,11 @@ pub(crate) struct Cops<'a> {
     // conditional fully inside an outer one's replaced range only gets an
     // offense (rubocop's `ignore_node`/`part_of_ignored_node?`).
     pub(crate) one_line_cond_spans: Vec<(usize, usize)>,
+    // Style/IfInsideElse: spans of outer `if` nodes already autocorrected —
+    // a further nested if/else structure fully inside one of these ranges
+    // only gets an offense, never a second (conflicting) autocorrect
+    // (rubocop's `ignore_node`/`part_of_ignored_node?`).
+    pub(crate) if_inside_else_ignored: Vec<(usize, usize)>,
     // Style/IfWithSemicolon: spans of already-flagged if/unless nodes
     // (rubocop's `ignore_node`) — a node whose start falls inside one is
     // `part_of_ignored_node?` and skipped entirely (no offense at all).
@@ -2024,6 +2029,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_comparable_clamp_if(node);
         self.check_case_like_if(node);
         self.check_empty_else_if(node);
+        self.check_if_inside_else(node);
         self.check_one_line_conditional_if(node);
         self.check_if_with_semicolon(node);
         self.check_safe_navigation_with_empty(&node.predicate());
@@ -4318,6 +4324,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         stmts_stack: Vec::new(),
         unless_else_spans: Vec::new(),
         one_line_cond_spans: Vec::new(),
+        if_inside_else_ignored: Vec::new(),
         if_semicolon_spans: Vec::new(),
         if_semicolon_suppressed: HashSet::new(),
         ll_active: false,
