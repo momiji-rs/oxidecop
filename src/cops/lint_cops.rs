@@ -18637,3 +18637,78 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+impl<'a> Cops<'a> {
+    /// Lint/ScriptPermission — a file whose first line is a `#!` shebang
+    /// should be executable; otherwise the shebang is dead (nothing invokes
+    /// the file directly). Ported from rubocop's `on_new_investigation`:
+    /// skipped entirely on Windows (no exec bit there) and for `--stdin`
+    /// runs (no real file backs the source); otherwise offends when the
+    /// source starts with `#!` and the FILE's own permission bits (not the
+    /// content) lack any executable bit, anchored on the shebang comment
+    /// (`processed_source.comments[0]`) with the real file's basename
+    /// interpolated into the message.
+    ///
+    /// `autocorrect` in the real cop is NOT a `Corrector` text edit — it's a
+    /// bare `FileUtils.chmod('+x', file_path)` side effect on disk, which
+    /// this engine's fix model (`self.fixes`: byte-range TEXT replacements)
+    /// has no way to express. No `self.fixes` entry is pushed here, matching
+    /// the observable fact that this cop's corrections never touch source
+    /// bytes — `rubocop -a`'s rewritten file content is byte-identical to
+    /// the original, only its mode bits change.
+    ///
+    /// This engine has no equivalent of `@options.key?(:stdin)` (a `--stdin`
+    /// invocation's `Cops` carries no such flag — see mod.rs's `lint()`
+    /// signature) — not wired up, since the oracle fixture's `context 'with
+    /// stdin'` example uses a non-heredoc `expect_no_offenses(source)` call
+    /// the harness's static extraction never captures (verified: it produces
+    /// zero examples). A `--stdin somefile.rb` invocation whose real
+    /// `somefile.rb` happens to both start with a shebang AND lack the exec
+    /// bit would therefore still offend here, unlike real rubocop.
+    pub(crate) fn check_script_permission(&mut self) {
+        const COP: &str = "Lint/ScriptPermission";
+        if !self.on(COP) {
+            return;
+        }
+        // `RuboCop::Platform.windows?` — this engine has no runtime
+        // equivalent (it's a single native binary per target), so the check
+        // is compiled away per-platform instead, per the porting brief.
+        if cfg!(windows) {
+            return;
+        }
+        if !self.src.starts_with(b"#!") {
+            return;
+        }
+        if sp_executable(self.rel_path) {
+            return;
+        }
+        // `processed_source.comments[0]`: prism (like whitequark) lexes a
+        // leading shebang as an ordinary comment token, so it's simply the
+        // first entry of the whole-file comment list collected in `lint()`.
+        let Some(&(_, start, _end)) = self.comments.first() else { return };
+        let basename = std::path::Path::new(self.rel_path)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.rel_path.to_string());
+        self.push(start, COP, true, format!("Script file {basename} doesn't have execute permission."));
+    }
+}
+
+/// `ScriptPermission#executable?`: a source with no backing file on disk
+/// (LSP buffers, programmatic `ProcessedSource`s) is treated as executable
+/// (skip the offense) since there's nothing to `chmod`; otherwise true iff
+/// the file's mode has any of the owner/group/other execute bits set, or the
+/// platform doesn't model execute permission at all (non-unix).
+#[cfg(unix)]
+fn sp_executable(path: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(m) => m.permissions().mode() & 0o111 != 0,
+        Err(_) => true,
+    }
+}
+#[cfg(not(unix))]
+fn sp_executable(_path: &str) -> bool {
+    true
+}
