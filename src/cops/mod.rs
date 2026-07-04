@@ -240,7 +240,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
-    "Gemspec/RubyVersionGlobalsUsage",
+    "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment",
 ];
 
 impl Engine {
@@ -3173,6 +3173,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     cops.check_double_cop_disable_directive();
     cops.check_missing_cop_enable_directive();
     cops.check_commented_keyword();
+    cops.check_duplicated_assignment(&result.node());
     let t = tick(&T_VISIT, t);
 
     let mut offenses = cops.offenses;

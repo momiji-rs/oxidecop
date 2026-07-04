@@ -248,6 +248,7 @@ COPS = {
   'Bundler/DuplicatedGem'            => 'bundler/duplicated_gem',
   'Bundler/GemFilename'              => 'bundler/gem_filename',
   'Gemspec/RubyVersionGlobalsUsage'  => 'gemspec/ruby_version_globals_usage',
+  'Gemspec/DuplicatedAssignment'     => 'gemspec/duplicated_assignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
