@@ -1768,6 +1768,14 @@ pub(crate) struct Cops<'a> {
     // rescue clause, else Ensure if it has an ensure clause) and separately
     // around its ensure clause (always Ensure).
     pub(crate) dm_rescue_scope: Vec<lint_cops::DmScope>,
+    // Lint/DuplicateMethods: direct-statement start offsets of every
+    // rescue/ensure-wrapped body currently open — a `Class.new do` block
+    // whose owning call is one of these has a whitequark parent chain of
+    // (begin ->) rescue/ensure, which is NOT in `anon_block_scope_id`'s
+    // parent whitelist: its scope id is nil and same-named keys COLLIDE
+    // (rails enum_test: `def self.name` across sibling test-with-ensure
+    // blocks).
+    pub(crate) dm_rescue_direct: Vec<Vec<usize>>,
     // `@scopes`: per rescue/ensure-scope-kind, the definition keys already
     // silently re-baselined once inside that kind of scope — a SECOND
     // redefinition of the same key within the SAME scope kind is a real
@@ -3577,9 +3585,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let _own_block = it.next();
             it.next().map(|c| c.start)
         };
+        let dm_owning_direct_under_rescue = dm_owning_call_start.is_some_and(|cs| {
+            self.dm_rescue_direct.last().is_some_and(|starts| starts.contains(&cs))
+        });
         let dm_scope_id: Option<lint_cops::DmScopeId> =
             if let Some((r, m)) = self.dm_named_recv.get(&dm_start).cloned() {
                 Some(lint_cops::DmScopeId::Recv(r, m))
+            } else if dm_owning_direct_under_rescue {
+                None
             } else {
                 let mut it = self.rp_ancestors.iter().rev().filter_map(|k| k.as_ref());
                 let _own_block = it.next();
@@ -4046,7 +4059,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.dm_rescue_scope.push(sc);
         }
         if let Some(st) = node.statements() {
-            self.visit_statements_node(&st);
+            if dm_main_scope.is_some() {
+                self.dm_rescue_direct
+                    .push(st.body().iter().map(|n| n.location().start_offset()).collect());
+                self.visit_statements_node(&st);
+                self.dm_rescue_direct.pop();
+            } else {
+                self.visit_statements_node(&st);
+            }
         }
         if let Some(rc) = node.rescue_clause() {
             self.visit_rescue_node(&rc);
@@ -5793,6 +5813,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         sigex_custom_fail_defined: false,
         dm_if_depth: 0,
         dm_rescue_scope: Vec::new(),
+        dm_rescue_direct: Vec::new(),
         dm_scope_seen: HashMap::new(),
         dm_definitions: HashMap::new(),
         dm_ns_stack: Vec::new(),
