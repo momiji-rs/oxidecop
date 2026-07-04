@@ -370,7 +370,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
-    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant",
+    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
 ];
 
 impl Engine {
@@ -1373,6 +1373,22 @@ pub(crate) struct Cops<'a> {
     // being visited (pushed on entry), so a lookup climbs from index
     // `len - 2` downward.
     pub(crate) sak_ancestors: Vec<u8>,
+    // Style/InverseMethods: a PARALLEL generic ancestor stack (same
+    // `visit_branch_node_enter`/`_leave` + `visit_leaf_node_enter`/`_leave`
+    // hooks as `sak_ancestors` above) recording, for every node currently
+    // open, whether it is a `!`-named `CallNode` — this is upstream's
+    // `node.parent.method?(:!)` (`negated?`), which prism gives no parent
+    // pointer for. TOP entry is the node being visited (pushed on entry), so
+    // `negated?(self)` reads index `len - 2`, `negated?(self.parent)` reads
+    // `len - 3`.
+    pub(crate) im_ancestors: Vec<bool>,
+    // Style/InverseMethods: byte ranges `ignore_node`-registered by an
+    // `on_block` inverse-blocks offense (the block's own trailing negation
+    // candidate, e.g. the `!(key =~ /c\d/)` in `y.reject { |k,_| !(key
+    // =~ /c\d/) }`) — consulted by `check_inverse_send`'s
+    // `part_of_ignored_node?` guard so the SAME nested `!` doesn't also fire
+    // a separate `on_send` offense.
+    pub(crate) im_ignored: Vec<(usize, usize)>,
     // Layout/SpaceAroundKeyword: start offsets of `end` keywords already
     // checked — an `elsif` chain's nested `IfNode`s (and `UnlessNode`'s
     // `else_clause` chain) all report the SAME `end_keyword_loc` in prism;
@@ -4525,6 +4541,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_debugger(node);
         self.check_stderr_puts(node);
         self.check_not(node);
+        self.check_inverse_send(node);
         self.check_duplicate_require(node);
         self.check_redundant_require_statement(node);
         // Style/RedundantReturn also fires for method-defining blocks
@@ -4771,6 +4788,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_next_block(node, &bn);
                 self.check_guard_clause_block(node, &bn);
                 self.check_useless_access_modifier_block(node, &bn);
+                self.check_inverse_block(node, &bn);
             }
             // Lint/NonLocalExitFromIterator: stash this call's shape
             // (`send_node.method?(:lambda)`, `define_method?`,
@@ -4886,15 +4904,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     // `Cops::sak_preceded_by_operator` in layout.rs.
     fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
         self.sak_ancestors.push(Self::sak_classify(&node));
+        self.im_ancestors.push(style::im_is_bang(&node));
     }
     fn visit_branch_node_leave(&mut self) {
         self.sak_ancestors.pop();
+        self.im_ancestors.pop();
     }
     fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
         self.sak_ancestors.push(Self::sak_classify(&node));
+        self.im_ancestors.push(style::im_is_bang(&node));
     }
     fn visit_leaf_node_leave(&mut self) {
         self.sak_ancestors.pop();
+        self.im_ancestors.pop();
     }
 }
 
@@ -5107,6 +5129,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         ms_block_stack: Vec::new(),
         ms_pending_block: None,
         sak_ancestors: Vec::new(),
+        im_ancestors: Vec::new(),
+        im_ignored: Vec::new(),
         sak_end_seen: HashSet::new(),
         eba_pending: None,
         eba_def_stack: Vec::new(),

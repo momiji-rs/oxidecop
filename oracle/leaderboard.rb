@@ -334,6 +334,7 @@ COPS = {
   'Lint/UselessAccessModifier'       => 'lint/useless_access_modifier',
   'Style/HashEachMethods'            => 'style/hash_each_methods',
   'Style/MutableConstant'            => 'style/mutable_constant',
+  'Style/InverseMethods'             => 'style/inverse_methods',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

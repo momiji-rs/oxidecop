@@ -29052,3 +29052,302 @@ fn scv_value(line: &str) -> Option<String> {
             .map(|c| c[1].to_string())
     }
 }
+
+
+// ---- Style/InverseMethods ----
+//
+// rubocop's `InverseMethods`/`InverseBlocks` are Hash-shaped cop_config
+// params (`InverseMethods: {any?: :none?, ...}` in default.yml). Nested
+// hashes aren't captured by `tools/gen_schema.rb` (the same ARRAY-default
+// gap `Style/WordArray::wa_word_regex` documents for a `Regexp` default), so
+// `schema_gen.rs` carries NO params at all for this cop. On top of that, the
+// oracle harness's `parse_val` only recognizes flat QUOTED-string hash
+// literals (`'a' => 'b'`); a `{any?: :none?}` Ruby-symbol-shorthand hash (the
+// only form rubocop's own default.yml — and this cop's fixture — ever uses)
+// matches none of its regexes and collapses to an empty array, which then
+// round-trips through `emit_pairs` as `InverseMethods: []`. So `self.cfg.get`
+// never yields a usable hash for THIS fixture; `im_lookup` below still makes
+// a best-effort attempt to parse a real `{...}` flow-hash (for genuine
+// hand-written `.rubocop.yml` overrides, which our OWN `Config::parse` keeps
+// as one un-split scalar string), falling back to rubocop's actual
+// default.yml table — hardcoded — whenever that fails, per the brief's HARD
+// RULE 4.
+const IM_DEFAULT_METHODS: &[(&str, &str)] = &[
+    ("any?", "none?"),
+    ("none?", "any?"),
+    ("even?", "odd?"),
+    ("odd?", "even?"),
+    ("==", "!="),
+    ("!=", "=="),
+    ("=~", "!~"),
+    ("!~", "=~"),
+    ("<", ">="),
+    (">=", "<"),
+    (">", "<="),
+    ("<=", ">"),
+];
+const IM_DEFAULT_BLOCKS: &[(&str, &str)] = &[
+    ("select", "reject"),
+    ("reject", "select"),
+    ("select!", "reject!"),
+    ("reject!", "select!"),
+];
+// `CLASS_COMPARISON_METHODS`.
+const IM_CLASS_COMPARISON: &[&[u8]] = &[b"<=", b">=", b"<", b">"];
+// `SAFE_NAVIGATION_INCOMPATIBLE_METHODS` = `CLASS_COMPARISON_METHODS + %i[any? none?]`.
+const IM_SAFE_NAV_INCOMPATIBLE: &[&[u8]] = &[b"<=", b">=", b"<", b">", b"any?", b"none?"];
+// `EQUALITY_METHODS`.
+const IM_EQUALITY: &[&[u8]] = &[b"==", b"!=", b"=~", b"!~", b"<=", b">=", b"<", b">"];
+
+/// `visit_branch_node_enter`/`_leave`'s per-node tag for `im_ancestors`: is
+/// this node a `!`-named `CallNode` (covers both `!x` and the `not x`
+/// keyword spelling — both compile to the same `CallNode`, see `check_not`)?
+pub(crate) fn im_is_bang(node: &ruby_prism::Node) -> bool {
+    node.as_call_node().is_some_and(|c| c.name().as_slice() == b"!")
+}
+
+/// Best-effort parse of a `{key: val, ...}` / `{'key' => 'val', ...}` flow
+/// hash's TEXT (as `Config::get` would hand back a hand-written
+/// `.rubocop.yml`'s un-split scalar value) into `(key, value)` pairs, with
+/// leading `:` symbol markers and quotes stripped from both sides. `None`
+/// for anything that doesn't look like a non-empty `{...}` — in particular
+/// the oracle's `[]` stand-in for an unrepresentable Hash (see the module
+/// doc above), which must fall through to the hardcoded default.
+fn im_parse_hash(text: &str) -> Option<Vec<(String, String)>> {
+    let t = text.trim();
+    let inner = t.strip_prefix('{')?.strip_suffix('}')?;
+    if inner.trim().is_empty() {
+        return None;
+    }
+    let clean = |s: &str| s.trim().trim_start_matches(':').trim_matches(|c| c == '\'' || c == '"').to_string();
+    let mut out = Vec::new();
+    for pair in inner.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = if let Some(idx) = pair.find("=>") {
+            (&pair[..idx], &pair[idx + 2..])
+        } else {
+            pair.split_once(':')?
+        };
+        let (k, v) = (clean(k), clean(v));
+        if k.is_empty() || v.is_empty() {
+            return None;
+        }
+        out.push((k, v));
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// `CAMEL_CASE = /[A-Z]+[a-z]+/` matched against a `const_type?` node's own
+/// source text (`possible_class_hierarchy_check?`'s `camel_case_constant?`).
+fn im_camel_case_constant(node: &ruby_prism::Node, src: &[u8]) -> bool {
+    if node.as_constant_read_node().is_none() && node.as_constant_path_node().is_none() {
+        return false;
+    }
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"[A-Z]+[a-z]+").unwrap());
+    let l = node.location();
+    re.is_match(&String::from_utf8_lossy(&src[l.start_offset()..l.end_offset()]))
+}
+
+/// `node.each_node(:next).any?` — does `node`'s subtree contain a `next`
+/// ANYWHERE (nested blocks/defs included), with no scope boundary.
+fn im_contains_next(node: &ruby_prism::Node) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
+            self.found = true;
+            ruby_prism::visit_next_node(self, node);
+        }
+    }
+    let mut f = Finder { found: false };
+    use ruby_prism::Visit;
+    f.visit(node);
+    f.found
+}
+
+/// The block-body's LAST statement, matching `inverse_block?`'s trailing
+/// alternation — a `!`-call, a `!=`/`!~` comparison, or either of those one
+/// level deep inside a redundant `(...)` wrapper. Returns the matched call's
+/// own (whole-node, selector, dot) locations plus whether it's the
+/// `!=`/`!~` (vs. plain `!`) shape.
+struct ImNeg {
+    range: (usize, usize),
+    selector: (usize, usize),
+    dot: Option<(usize, usize)>,
+    negated_equality: bool,
+}
+fn im_block_last_negation<'pr>(block: &ruby_prism::BlockNode<'pr>) -> Option<ImNeg> {
+    let mut last = block.body()?.as_statements_node()?.body().iter().last()?;
+    if let Some(p) = last.as_parentheses_node() {
+        last = p.body()?.as_statements_node()?.body().iter().last()?;
+    }
+    let call = last.as_call_node()?;
+    let negated_equality = matches!(call.name().as_slice(), b"!=" | b"!~");
+    if !negated_equality && call.name().as_slice() != b"!" {
+        return None;
+    }
+    let msel = call.message_loc()?;
+    let l = call.location();
+    Some(ImNeg {
+        range: (l.start_offset(), l.end_offset()),
+        selector: (msel.start_offset(), msel.end_offset()),
+        dot: call.call_operator_loc().map(|d| (d.start_offset(), d.end_offset())),
+        negated_equality,
+    })
+}
+
+impl<'a> super::Cops<'a> {
+    /// Resolve the configured `InverseMethods`/`InverseBlocks` mapping for
+    /// `method` — a genuine (if unusual) `.rubocop.yml` override when
+    /// `self.cfg.get` hands back a parseable `{...}` hash, else rubocop's
+    /// own default.yml table (see the module doc above for why the oracle's
+    /// fixture always takes the latter path).
+    fn im_lookup(&self, key: &str, default: &[(&str, &str)], method: &[u8]) -> Option<String> {
+        let method = String::from_utf8_lossy(method);
+        if let Some(v) = self.cfg.get("Style/InverseMethods", key) {
+            if let Some(pairs) = im_parse_hash(v) {
+                for (k, val) in &pairs {
+                    if k == &*method {
+                        return Some(val.clone());
+                    }
+                    if val == &*method {
+                        return Some(k.clone());
+                    }
+                }
+                return None;
+            }
+        }
+        default.iter().find(|(k, _)| *k == method).map(|(_, v)| (*v).to_string())
+    }
+
+    /// `negated?(x)`: is the ancestor `depth` levels up from `x` itself
+    /// (1 = `x`'s own parent, 2 = its grandparent) a `!`-named `CallNode`?
+    /// `im_ancestors`' TOP entry is always `x` itself (pushed on entry by
+    /// `visit_branch_node_enter`/`_leave`), so this reads `len - 1 - depth`.
+    fn im_ancestor_is_bang(&self, depth: usize) -> bool {
+        let n = self.im_ancestors.len();
+        n > depth && self.im_ancestors[n - 1 - depth]
+    }
+
+    /// `part_of_ignored_node?`: is `[start, end)` the SAME node (or nested
+    /// inside) a range an `on_block` inverse-blocks offense already
+    /// `ignore_node`-registered?
+    fn im_part_of_ignored(&self, start: usize, end: usize) -> bool {
+        self.im_ignored.iter().any(|&(b, e)| b <= start && e >= end)
+    }
+
+    /// Style/InverseMethods `on_send`/`on_csend` — `!method_call` (bare
+    /// `!`/`not`, a plain predicate call OR one with a symbol-proc/block
+    /// attached, OR the same wrapped in one layer of redundant `(...)`).
+    pub(crate) fn check_inverse_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/InverseMethods";
+        if !self.on(COP) || node.name().as_slice() != b"!" {
+            return;
+        }
+        let Some(recv) = node.receiver() else { return };
+        let (call, wrapped_in_parens) = if let Some(p) = recv.as_parentheses_node() {
+            let Some(inner) = (|| p.body()?.as_statements_node()?.body().iter().last())() else { return };
+            let Some(c) = inner.as_call_node() else { return };
+            // whitequark's `(begin ... (call ...))` excludes `:block` nodes —
+            // but a `&:sym`/`&blk` pass-through lives in the SAME `.block()`
+            // slot as a real block in prism, as a `BlockArgumentNode` (NOT a
+            // `BlockNode`), so it must NOT be excluded here.
+            if c.block().is_some_and(|b| b.as_block_node().is_some()) {
+                return;
+            }
+            (c, true)
+        } else if let Some(c) = recv.as_call_node() {
+            (c, false)
+        } else {
+            return;
+        };
+        let Some(lhs) = call.receiver() else { return };
+        let method = call.name();
+        let Some(inverse) = self.im_lookup("InverseMethods", IM_DEFAULT_METHODS, method.as_slice()) else {
+            return;
+        };
+        if self.im_ancestor_is_bang(1) {
+            return;
+        }
+        if call.is_safe_navigation() && IM_SAFE_NAV_INCOMPATIBLE.contains(&method.as_slice()) {
+            return;
+        }
+        let node_loc = node.location();
+        if self.im_part_of_ignored(node_loc.start_offset(), node_loc.end_offset()) {
+            return;
+        }
+        let rhs: Vec<ruby_prism::Node> =
+            call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if IM_CLASS_COMPARISON.contains(&method.as_slice())
+            && (im_camel_case_constant(&lhs, self.src)
+                || (rhs.len() == 1 && im_camel_case_constant(&rhs[0], self.src)))
+        {
+            return;
+        }
+        let msg = format!(
+            "Use `{inverse}` instead of inverting `{}`.",
+            String::from_utf8_lossy(method.as_slice())
+        );
+        self.push(node_loc.start_offset(), COP, true, msg);
+        // `not_to_receiver`: from the `!`/`not` selector's START through the
+        // method call's own START (swallows any `(`/whitespace in between).
+        let Some(bang_sel) = node.message_loc() else { return };
+        let Some(call_sel) = call.message_loc() else { return };
+        self.fixes.push((bang_sel.start_offset(), call.location().start_offset(), Vec::new()));
+        self.fixes.push((call_sel.start_offset(), call_sel.end_offset(), inverse.into_bytes()));
+        // `remove_end_parenthesis`: only for comparison operators or when
+        // the call itself sat inside a `(...)` wrapper we're now stripping.
+        if IM_EQUALITY.contains(&method.as_slice()) || wrapped_in_parens {
+            self.fixes.push((call.location().end_offset(), node_loc.end_offset(), Vec::new()));
+        }
+    }
+
+    /// Style/InverseMethods `on_block`/`on_numblock`/`on_itblock` — a call
+    /// whose method is in `InverseBlocks` (`select`/`reject`/… by default)
+    /// and whose block's last statement negates its result.
+    pub(crate) fn check_inverse_block(&mut self, node: &ruby_prism::CallNode, block: &ruby_prism::BlockNode) {
+        const COP: &str = "Style/InverseMethods";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(msel) = node.message_loc() else { return };
+        let method = node.name();
+        let Some(inverse) = self.im_lookup("InverseBlocks", IM_DEFAULT_BLOCKS, method.as_slice()) else {
+            return;
+        };
+        let Some(neg) = im_block_last_negation(block) else { return };
+        // `return if negated?(node) && negated?(node.parent)` — the
+        // double-negation guard (`!!foo.reject { |e| !e }`), NOT a plain
+        // single `!foo.reject { |e| !e }` (which still gets corrected).
+        if self.im_ancestor_is_bang(1) && self.im_ancestor_is_bang(2) {
+            return;
+        }
+        if let Some(body) = block.body() {
+            if im_contains_next(&body) {
+                return;
+            }
+        }
+        self.im_ignored.push(neg.range);
+        let msg = format!(
+            "Use `{inverse}` instead of inverting `{}`.",
+            String::from_utf8_lossy(method.as_slice())
+        );
+        self.push(node.location().start_offset(), COP, true, msg);
+        self.fixes.push((msel.start_offset(), msel.end_offset(), inverse.into_bytes()));
+        if neg.negated_equality {
+            // `!=` -> `==`, `!~` -> `=~`: replace just the leading `!`.
+            self.fixes.push((neg.selector.0, neg.selector.0 + 1, b"=".to_vec()));
+        } else {
+            if let Some(dot) = neg.dot {
+                self.fixes.push((dot.0, neg.range.1, Vec::new()));
+            } else {
+                self.fixes.push((neg.selector.0, neg.selector.1, Vec::new()));
+            }
+        }
+    }
+}
