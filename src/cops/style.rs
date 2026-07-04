@@ -14793,3 +14793,123 @@ fn cl_block_param_key(block: &ruby_prism::BlockNode, src: &[u8]) -> Vec<u8> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/SlicingWithRange — `ary[0..-1]` / `ary[0..nil]` / `ary[0...nil]`
+    /// are a no-op slice: drop the whole `[...]` (or `.[](...)` / `&.[](...)`)
+    /// call, leaving just the receiver. `ary[1..-1]` / `ary[1..nil]` /
+    /// `ary[1...nil]` prefer the endless form `ary[1..]` / `ary[1...]`
+    /// (Ruby 2.6+), and `ary[nil..42]` prefers the beginless form `ary[..42]`
+    /// (Ruby 2.7+).
+    ///
+    /// Ported from RuboCop::Cop::Style::SlicingWithRange. Its three
+    /// `def_node_matcher` patterns translate to prism's
+    /// `RangeNode#left`/`#right` as follows: `None` means the endpoint is
+    /// OMITTED (already the good endless/beginless form — upstream's bare
+    /// `nil` pattern atom only matches a *node* of type `:nil`, never a
+    /// missing child, so an omitted endpoint never satisfies it), while an
+    /// explicit `nil` literal is a `NilNode`.
+    pub(crate) fn check_slicing_with_range(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/SlicingWithRange";
+        if !self.on(COP) || self.cfg.target_ruby() < 2.6 {
+            return;
+        }
+        if node.name().as_slice() != b"[]" {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let arg_list = args.arguments();
+        if arg_list.len() != 1 {
+            return;
+        }
+        let Some(arg) = arg_list.iter().next() else { return };
+        let Some(range_node) = arg.as_range_node() else { return };
+
+        let left = range_node.left();
+        let right = range_node.right();
+        let exclude_end = range_node.is_exclude_end();
+
+        // `range_from_zero_till_minus_one?` / `range_till_minus_one?` share
+        // the SAME end-check: `{(int -1) nil}` for `..`, bare `nil` (a
+        // literal `nil` node) for `...` — only the begin-check differs
+        // (exactly `(int 0)` vs. merely present/`!nil?`).
+        let end_matches = |r: &ruby_prism::Node| {
+            if exclude_end {
+                r.as_nil_node().is_some()
+            } else {
+                swr_int_eq(r, -1) || r.as_nil_node().is_some()
+            }
+        };
+        let useless = left.as_ref().is_some_and(|l| swr_int_eq(l, 0))
+            && right.as_ref().is_some_and(end_matches);
+        let endless_candidate =
+            !useless && left.is_some() && right.as_ref().is_some_and(end_matches);
+        // `range_from_zero?` — irange only, and only from Ruby 2.7 on.
+        let beginless_candidate = !useless
+            && !endless_candidate
+            && !exclude_end
+            && self.cfg.target_ruby() >= 2.7
+            && left.as_ref().is_some_and(|l| l.as_nil_node().is_some())
+            && right.is_some();
+
+        if !useless && !endless_candidate && !beginless_candidate {
+            return;
+        }
+
+        let has_dot = node.call_operator_loc().is_some();
+        let offense_range: (usize, usize) = if has_dot {
+            (node.call_operator_loc().unwrap().start_offset(), node.location().end_offset())
+        } else {
+            let Some(ml) = node.message_loc() else { return };
+            (ml.start_offset(), ml.end_offset())
+        };
+        let offense_src =
+            String::from_utf8_lossy(&self.src[offense_range.0..offense_range.1]).into_owned();
+
+        let (message, removal_range): (String, (usize, usize)) = if useless {
+            (format!("Remove the useless `{offense_src}`."), offense_range)
+        } else {
+            let operator = String::from_utf8_lossy(range_node.operator_loc().as_slice()).into_owned();
+            let (prefer, removal) = if endless_candidate {
+                let left_node = left.as_ref().unwrap();
+                let left_src = String::from_utf8_lossy(self.node_src(left_node)).into_owned();
+                let right_loc = right.as_ref().unwrap().location();
+                (format!("{left_src}{operator}"), (right_loc.start_offset(), right_loc.end_offset()))
+            } else {
+                let right_node = right.as_ref().unwrap();
+                let right_src = String::from_utf8_lossy(self.node_src(right_node)).into_owned();
+                let left_loc = left.as_ref().unwrap().location();
+                (format!("{operator}{right_src}"), (left_loc.start_offset(), left_loc.end_offset()))
+            };
+            let current = if has_dot {
+                String::from_utf8_lossy(self.node_src(&arg)).into_owned()
+            } else {
+                offense_src.clone()
+            };
+            let prefer = if has_dot { prefer } else { format!("[{prefer}]") };
+            (format!("Prefer `{prefer}` over `{current}`."), removal)
+        };
+
+        // Changing to a beginless/endless range when the `[]` call has a dot
+        // but no parens would change the semantics of the surrounding code
+        // (e.g. `ary.[] 1..-1` -> `ary.[] 1..` parses differently), so such a
+        // partial (non-"useless") correction is not considered an offense.
+        if removal_range != offense_range {
+            let parenthesized = node.opening_loc().is_some_and(|o| o.as_slice() == b"(");
+            if has_dot && !parenthesized {
+                return;
+            }
+        }
+
+        self.push(offense_range.0, COP, true, message);
+        self.fixes.push((removal_range.0, removal_range.1, Vec::new()));
+    }
+}
+
+/// Is `node` an `IntegerNode` literal whose (arbitrary-precision) value
+/// equals `value`? Mirrors upstream's `(int -1)` / `(int 0)` node-pattern
+/// literals, which match by exact numeric value on an `:int` node only.
+fn swr_int_eq(node: &ruby_prism::Node, value: i32) -> bool {
+    node.as_integer_node().is_some_and(|i| matches!(TryInto::<i32>::try_into(i.value()), Ok(v) if v == value))
+}

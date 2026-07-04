@@ -242,7 +242,7 @@ const IMPLEMENTED: &[&str] = &[
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
-    "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops",
+    "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops", "Style/SlicingWithRange",
 ];
 
 impl Engine {
@@ -2835,6 +2835,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.symbol_proc_fix(node, &msg);
             self.push(off, "Style/SymbolProc", true, msg);
         }
+        self.check_slicing_with_range(node);
         // recurse into children (we've overridden the default walk). Push this
         // call's name SPAN so descendants can see it as an ancestor.
         let name_span = node
