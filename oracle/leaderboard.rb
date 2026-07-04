@@ -232,6 +232,7 @@ COPS = {
   'Style/RedundantSort'              => 'style/redundant_sort',
   'Style/FloatDivision'              => 'style/float_division',
   'Style/EachWithObject'             => 'style/each_with_object',
+  'Style/CaseLikeIf'                 => 'style/case_like_if',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

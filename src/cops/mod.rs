@@ -231,7 +231,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException",
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
-    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject",
+    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf",
 ];
 
 impl Engine {
@@ -1337,6 +1337,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_duplicate_elsif_condition(node);
         self.check_empty_conditional_body(node);
         self.check_comparable_clamp_if(node);
+        self.check_case_like_if(node);
         self.check_empty_else_if(node);
         self.check_one_line_conditional_if(node);
         self.check_if_with_semicolon(node);

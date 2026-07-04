@@ -12866,3 +12866,504 @@ fn ewo_line_bounds(src: &[u8], start: usize, end: usize) -> (usize, usize, usize
     let e_incl = if e < src.len() { e + 1 } else { e };
     (s, e, e_incl)
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/CaseLikeIf — an `if`/`elsif` chain where every branch condition
+    /// compares the SAME target expression (`==`/`eql?`/`equal?` against a
+    /// literal or SCREAMING_CASE constant, `===`, `is_a?`, `match?`/`match`/
+    /// `=~` against a regexp, `include?`/`cover?` against a range literal —
+    /// any of these OR'd together within a branch) is rewritten to
+    /// `case`/`when`. Ports rubocop's `CaseLikeIf` + its `MinBranchesCount`
+    /// mixin. Key pieces, transliterated from the Ruby source (comments
+    /// below cite the corresponding private method name there):
+    ///
+    ///   - `should_check?`: a real `if` (not ternary/modifier-form), not
+    ///     itself an `elsif` (only the HEAD of the chain fires — an `elsif`
+    ///     IfNode is visited independently by the traversal, via its own
+    ///     nested `visit_if_node` call, and must bail immediately, exactly
+    ///     like upstream's `!node.elsif?` guard), has at least one `elsif`
+    ///     (`elsif_conditional?`), and the if/elsif branch count meets
+    ///     `MinBranchesCount` (default 3 — see `min_branches_count?`; a
+    ///     trailing plain `else`, if present, never counts as a branch).
+    ///     `unless` never reaches here at all: prism gives it a wholly
+    ///     separate `UnlessNode` type that this cop never hooks.
+    ///   - `find_target`: derives the "subject" expression from the FIRST
+    ///     branch's condition only.
+    ///   - `collect_conditions`/`condition_from_send_node` (run once per
+    ///     branch condition, including every sub-condition OR'd together
+    ///     within a single branch): rewrites each into the `when`-clause
+    ///     fragment that would follow `target === `, or fails the WHOLE cop
+    ///     (no offense at all, not just that branch) the moment any single
+    ///     branch's condition isn't one of the recognized shapes.
+    ///   - `regexp_with_working_captures?`: a `.match` call (not `match?`,
+    ///     not `=~`) against a regexp with named captures on either side, OR
+    ///     a literal-regexp-on-the-LHS `=~` with named captures (prism's
+    ///     `MatchWriteNode`, upstream's `match_with_lvasgn`) blocks the
+    ///     ENTIRE conversion outright — the auto-vivified local variable(s)
+    ///     can't survive becoming a `case`/`when`.
+    ///
+    /// Node-equality (`lhs == target` etc. in the Ruby source — a structural
+    /// `AST::Node#==` that ignores location) is approximated here as raw
+    /// byte-source comparison of the two spans (`cli_node_eq`): exact for
+    /// every fixture case (every repeat of the shared subject is spelled
+    /// identically) but not a true structural comparator — see the final
+    /// report's risk note for what that could miss on real-world code.
+    ///
+    /// Autocorrect folds rubocop's two same-start-boundary Corrector ops for
+    /// the FIRST branch (`insert_before(node, "case TARGET\n<indent>")` +
+    /// `replace(correction_range(first_branch), "when ...")`) into one
+    /// replacement spanning their combined range, exactly like
+    /// `check_comparable_clamp_if` above — our `Fix` model (a flat
+    /// non-overlapping byte-range replace list) can't otherwise represent
+    /// two edits that share a start offset.
+    pub(crate) fn check_case_like_if<'pr>(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        const COP: &str = "Style/CaseLikeIf";
+        if !self.on(COP) {
+            return;
+        }
+        if !cli_should_check(node) {
+            return;
+        }
+        let min_branches = self
+            .cfg
+            .get(COP, "MinBranchesCount")
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(3) as usize;
+        let chain = cli_branch_chain(node);
+        if chain.len() < min_branches {
+            return;
+        }
+
+        let Some(target) = cli_find_target(&chain[0].0) else { return };
+
+        let mut per_branch: Vec<Vec<ruby_prism::Node<'pr>>> = Vec::with_capacity(chain.len());
+        for (cond, _kw_start) in &chain {
+            if cli_regexp_with_working_captures(cond, self.src) {
+                return;
+            }
+            let mut conds = Vec::new();
+            if !cli_collect_conditions(cond, &target, self.src, &mut conds) {
+                return;
+            }
+            per_branch.push(conds);
+        }
+
+        let start = node.location().start_offset();
+        self.push(start, COP, true, "Convert `if-elsif` to `case-when`.");
+
+        let target_src = self.node_src(&target).to_vec();
+        let indent_n = self.idx.loc(start).1.saturating_sub(1);
+        let indent = " ".repeat(indent_n);
+
+        for (i, ((cond, kw_start), conds)) in chain.iter().zip(per_branch.iter()).enumerate() {
+            let cond_end = cond.location().end_offset();
+            let mut when_text = b"when ".to_vec();
+            for (j, c) in conds.iter().enumerate() {
+                if j > 0 {
+                    when_text.extend_from_slice(b", ");
+                }
+                when_text.extend_from_slice(self.node_src(c));
+            }
+            if i == 0 {
+                let mut rep = Vec::new();
+                rep.extend_from_slice(b"case ");
+                rep.extend_from_slice(&target_src);
+                rep.push(b'\n');
+                rep.extend_from_slice(indent.as_bytes());
+                rep.extend_from_slice(&when_text);
+                self.fixes.push((*kw_start, cond_end, rep));
+            } else {
+                self.fixes.push((*kw_start, cond_end, when_text));
+            }
+        }
+    }
+}
+
+/// `should_check?`: real `if` (excludes ternary — no `if_keyword_loc` at
+/// all), not a modifier-form (`end_keyword_loc` present), not itself an
+/// `elsif` (keyword text must be exactly `if`), and `elsif_conditional?`
+/// (its `subsequent` is itself an `elsif`-keyword IfNode).
+fn cli_should_check(node: &ruby_prism::IfNode) -> bool {
+    let Some(kw) = node.if_keyword_loc() else { return false };
+    if kw.as_slice() != b"if" {
+        return false;
+    }
+    if node.end_keyword_loc().is_none() {
+        return false;
+    }
+    let Some(sub) = node.subsequent() else { return false };
+    let Some(elsif) = sub.as_if_node() else { return false };
+    elsif.if_keyword_loc().is_some_and(|k| k.as_slice() == b"elsif")
+}
+
+/// `branch_conditions`/`if_conditional_branches` combined: walks the
+/// `if`/`elsif` chain (never descending into a trailing plain `else`),
+/// pairing each level's own condition with the byte offset of ITS `if`/
+/// `elsif` keyword — upstream's `node.parent.loc.keyword.begin_pos` in
+/// `correction_range`, captured here instead of re-derived from a parent
+/// pointer prism doesn't give us.
+fn cli_branch_chain<'pr>(first: &ruby_prism::IfNode<'pr>) -> Vec<(ruby_prism::Node<'pr>, usize)> {
+    let mut out = Vec::new();
+    let Some(kw) = first.if_keyword_loc() else { return out };
+    out.push((first.predicate(), kw.start_offset()));
+    let mut cur = first.subsequent();
+    while let Some(n) = cur {
+        let Some(elsif) = n.as_if_node() else { break };
+        let Some(kw) = elsif.if_keyword_loc() else { break };
+        out.push((elsif.predicate(), kw.start_offset()));
+        cur = elsif.subsequent();
+    }
+    out
+}
+
+/// `find_target`: derives the shared "subject" from the first branch's raw
+/// condition node.
+fn cli_find_target<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(p) = node.as_parentheses_node() {
+        let first = p.body().and_then(|b| b.as_statements_node()).and_then(|s| s.body().iter().next())?;
+        return cli_find_target(&first);
+    }
+    if let Some(o) = node.as_or_node() {
+        let left = o.left();
+        return cli_find_target(&left);
+    }
+    if let Some(mw) = node.as_match_write_node() {
+        let call = mw.call();
+        let lhs = call.receiver()?;
+        let rhs = first_call_arg(&call)?;
+        return if cli_is_regexp(&lhs) {
+            Some(rhs)
+        } else if cli_is_regexp(&rhs) {
+            Some(lhs)
+        } else {
+            None
+        };
+    }
+    if let Some(call) = node.as_call_node() {
+        return cli_find_target_in_call(&call);
+    }
+    None
+}
+
+fn cli_find_target_in_call<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    match call.name().as_slice() {
+        b"is_a?" => call.receiver(),
+        b"==" | b"eql?" | b"equal?" => cli_find_target_in_equality(call),
+        b"===" => first_call_arg(call),
+        b"include?" | b"cover?" => cli_find_target_in_include_or_cover(call),
+        b"match" | b"match?" | b"=~" => cli_find_target_in_match(call),
+        _ => None,
+    }
+}
+
+fn cli_find_target_in_equality<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    let argument = first_call_arg(call)?;
+    let receiver = call.receiver()?;
+    if cli_is_literal(&argument) || cli_const_reference(&argument) {
+        Some(receiver)
+    } else if cli_is_literal(&receiver) || cli_const_reference(&receiver) {
+        Some(argument)
+    } else {
+        None
+    }
+}
+
+fn cli_find_target_in_include_or_cover<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    let receiver = call.receiver()?;
+    if cli_deparen(receiver).as_range_node().is_some() {
+        first_call_arg(call)
+    } else {
+        None
+    }
+}
+
+fn cli_find_target_in_match<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    let receiver = call.receiver()?;
+    let argument = first_call_arg(call);
+    if cli_is_regexp(&receiver) {
+        argument
+    } else if argument.as_ref().is_some_and(cli_is_regexp) {
+        Some(receiver)
+    } else {
+        None
+    }
+}
+
+/// `collect_conditions`: run per branch condition. Recurses through
+/// parenthesized groups and `||`, pushing one rewritten `when`-fragment node
+/// per leaf onto `out`; returns `false` (leaving `out` partially filled, same
+/// as upstream — the caller always discards it on failure) the moment any
+/// leaf isn't one of the recognized comparison shapes.
+fn cli_collect_conditions<'pr>(
+    node: &ruby_prism::Node<'pr>,
+    target: &ruby_prism::Node<'pr>,
+    src: &[u8],
+    out: &mut Vec<ruby_prism::Node<'pr>>,
+) -> bool {
+    if let Some(p) = node.as_parentheses_node() {
+        let Some(first) = p.body().and_then(|b| b.as_statements_node()).and_then(|s| s.body().iter().next())
+        else {
+            return false;
+        };
+        return cli_collect_conditions(&first, target, src, out);
+    }
+    if let Some(o) = node.as_or_node() {
+        let left = o.left();
+        let right = o.right();
+        return cli_collect_conditions(&left, target, src, out) && cli_collect_conditions(&right, target, src, out);
+    }
+    let condition = if let Some(mw) = node.as_match_write_node() {
+        let call = mw.call();
+        match (call.receiver(), first_call_arg(&call)) {
+            (Some(lhs), Some(rhs)) => cli_condition_from_binary_op(lhs, rhs, target, src),
+            _ => None,
+        }
+    } else if let Some(call) = node.as_call_node() {
+        cli_condition_from_call(&call, target, src)
+    } else {
+        None
+    };
+    match condition {
+        Some(c) => {
+            out.push(c);
+            true
+        }
+        None => false,
+    }
+}
+
+fn cli_condition_from_call<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+    target: &ruby_prism::Node<'pr>,
+    src: &[u8],
+) -> Option<ruby_prism::Node<'pr>> {
+    match call.name().as_slice() {
+        b"is_a?" => {
+            let receiver = call.receiver()?;
+            if cli_node_eq(&receiver, target, src) { first_call_arg(call) } else { None }
+        }
+        b"==" | b"eql?" | b"equal?" => cli_condition_from_equality(call, target, src),
+        b"=~" | b"match" | b"match?" => cli_condition_from_match(call, target, src),
+        b"===" => {
+            let arg = first_call_arg(call)?;
+            if cli_node_eq(&arg, target, src) { call.receiver() } else { None }
+        }
+        b"include?" | b"cover?" => cli_condition_from_include_or_cover(call, target, src),
+        _ => None,
+    }
+}
+
+fn cli_condition_from_equality<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+    target: &ruby_prism::Node<'pr>,
+    src: &[u8],
+) -> Option<ruby_prism::Node<'pr>> {
+    let receiver = call.receiver()?;
+    let argument = first_call_arg(call)?;
+    let condition = cli_condition_from_binary_op(receiver, argument, target, src)?;
+    if cli_class_reference(&condition) { None } else { Some(condition) }
+}
+
+fn cli_condition_from_match<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+    target: &ruby_prism::Node<'pr>,
+    src: &[u8],
+) -> Option<ruby_prism::Node<'pr>> {
+    let receiver = call.receiver()?;
+    let argument = first_call_arg(call)?;
+    cli_condition_from_binary_op(receiver, argument, target, src)
+}
+
+fn cli_condition_from_include_or_cover<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+    target: &ruby_prism::Node<'pr>,
+    src: &[u8],
+) -> Option<ruby_prism::Node<'pr>> {
+    let receiver = call.receiver()?;
+    let deparenthesized = cli_deparen(receiver);
+    let argument = first_call_arg(call)?;
+    if deparenthesized.as_range_node().is_some() && cli_node_eq(&argument, target, src) {
+        Some(deparenthesized)
+    } else {
+        None
+    }
+}
+
+/// `condition_from_binary_op`: deparenthesize both operands, then return
+/// whichever one ISN'T the target (the one that becomes a `when` value).
+fn cli_condition_from_binary_op<'pr>(
+    lhs: ruby_prism::Node<'pr>,
+    rhs: ruby_prism::Node<'pr>,
+    target: &ruby_prism::Node<'pr>,
+    src: &[u8],
+) -> Option<ruby_prism::Node<'pr>> {
+    let lhs = cli_deparen(lhs);
+    let rhs = cli_deparen(rhs);
+    if cli_node_eq(&lhs, target, src) {
+        Some(rhs)
+    } else if cli_node_eq(&rhs, target, src) {
+        Some(lhs)
+    } else {
+        None
+    }
+}
+
+/// `deparenthesize`: unwrap nested parenthesized groups, taking the LAST
+/// statement of each (matching upstream's `node.children.last`) — bails out
+/// (returning what it has so far) on a syntactically-empty `()`, which
+/// upstream can't reach here either (it would raise on a nil child).
+fn cli_deparen(mut node: ruby_prism::Node) -> ruby_prism::Node {
+    while let Some(p) = node.as_parentheses_node() {
+        match p.body().and_then(|b| b.as_statements_node()).and_then(|s| s.body().iter().last()) {
+            Some(inner) => node = inner,
+            None => break,
+        }
+    }
+    node
+}
+
+/// Approximates upstream's structural `AST::Node#==` (ignores source
+/// location) via raw byte-source comparison of the two nodes' own spans —
+/// see the doc comment on `check_case_like_if` for the fidelity caveat.
+fn cli_node_eq(a: &ruby_prism::Node, b: &ruby_prism::Node, src: &[u8]) -> bool {
+    let al = a.location();
+    let bl = b.location();
+    src[al.start_offset()..al.end_offset()] == src[bl.start_offset()..bl.end_offset()]
+}
+
+fn cli_is_regexp(node: &ruby_prism::Node) -> bool {
+    node.as_regular_expression_node().is_some() || node.as_interpolated_regular_expression_node().is_some()
+}
+
+/// `literal?` (rubocop-ast `Node::LITERALS`): str/dstr/xstr/int/float/sym/
+/// dsym/array/hash/regexp/true/irange/erange/complex/rational/false/nil.
+fn cli_is_literal(node: &ruby_prism::Node) -> bool {
+    node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_rational_node().is_some()
+        || node.as_imaginary_node().is_some()
+        || node.as_string_node().is_some()
+        || node.as_interpolated_string_node().is_some()
+        || node.as_x_string_node().is_some()
+        || node.as_interpolated_x_string_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_interpolated_symbol_node().is_some()
+        || node.as_array_node().is_some()
+        || node.as_hash_node().is_some()
+        || node.as_range_node().is_some()
+        || cli_is_regexp(node)
+        || node.as_nil_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+}
+
+/// The constant's own (last-segment, for a scoped `Foo::BAR`) name bytes,
+/// for both a bare `ConstantReadNode` and a scoped `ConstantPathNode`.
+fn cli_const_name<'pr>(node: &ruby_prism::Node<'pr>) -> Option<&'pr [u8]> {
+    if let Some(c) = node.as_constant_read_node() {
+        Some(c.name().as_slice())
+    } else if let Some(c) = node.as_constant_path_node() {
+        c.name().map(|n| n.as_slice())
+    } else {
+        None
+    }
+}
+
+/// `const_reference?`: a constant whose name is more than one character and
+/// entirely non-lowercase (upstream's `name.length > 1 && name == name.upcase`).
+fn cli_const_reference(node: &ruby_prism::Node) -> bool {
+    match cli_const_name(node) {
+        Some(name) => name.len() > 1 && !name.iter().any(u8::is_ascii_lowercase),
+        None => false,
+    }
+}
+
+/// `class_reference?`: a constant whose name contains any lowercase letter
+/// (a heuristic for "this reads as a class/module name", regardless of
+/// length — unlike `const_reference?` above).
+fn cli_class_reference(node: &ruby_prism::Node) -> bool {
+    match cli_const_name(node) {
+        Some(name) => name.iter().any(u8::is_ascii_lowercase),
+        None => false,
+    }
+}
+
+/// `regexp_with_working_captures?`: blocks the WHOLE conversion (called on
+/// the raw, un-deparenthesized branch condition, matching upstream exactly —
+/// a `(foo =~ /(?<n>x)/)` wrapped in parens, or one side of an `||`, is NOT
+/// recognized here, same as upstream's plain `case node.type` dispatch).
+fn cli_regexp_with_working_captures(node: &ruby_prism::Node, src: &[u8]) -> bool {
+    if let Some(mw) = node.as_match_write_node() {
+        let call = mw.call();
+        if call.name().as_slice() != b"=~" {
+            return false;
+        }
+        return call.receiver().is_some_and(|lhs| cli_regexp_has_named_captures(&lhs, src));
+    }
+    if let Some(call) = node.as_call_node() {
+        if call.name().as_slice() != b"match" {
+            return false;
+        }
+        let recv_named = call.receiver().is_some_and(|r| cli_regexp_has_named_captures(&r, src));
+        let arg_named = first_call_arg(&call).is_some_and(|a| cli_regexp_has_named_captures(&a, src));
+        return recv_named || arg_named;
+    }
+    false
+}
+
+/// `regexp_with_named_captures?`: `node.regexp_type? && node.each_capture(named:
+/// true).any?`. Only a plain (non-interpolated) `RegularExpressionNode` is
+/// handled — the fixture never exercises a named capture inside an
+/// interpolated regexp literal here, and parsing one properly needs a real
+/// regex-engine walk (see `scan_regexp_captures` in `lint_cops.rs` for the
+/// numbered+named variant `Lint/MixedRegexpCaptureTypes` needs).
+fn cli_regexp_has_named_captures(node: &ruby_prism::Node, src: &[u8]) -> bool {
+    let Some(re) = node.as_regular_expression_node() else { return false };
+    let content_loc = re.content_loc();
+    let content = &src[content_loc.start_offset()..content_loc.end_offset()];
+    cli_scan_named_capture(content)
+}
+
+/// Small purpose-built scanner (see `scan_regexp_captures` in
+/// `lint_cops.rs` for the fuller sibling this is trimmed from) that only
+/// needs to answer "does this pattern contain at least one named capturing
+/// group" — `(?<name>...)` or `(?'name'...)`, excluding lookbehind
+/// `(?<=`/`(?<!`. Skips backslash escapes and `[...]` character classes
+/// (where `(`/`)` are literal) so it doesn't misfire inside them.
+fn cli_scan_named_capture(src: &[u8]) -> bool {
+    let n = src.len();
+    let mut i = 0usize;
+    let mut class_depth: u32 = 0;
+    while i < n {
+        let b = src[i];
+        if b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if class_depth > 0 {
+            match b {
+                b'[' => class_depth += 1,
+                b']' => class_depth -= 1,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'[' {
+            class_depth = 1;
+            i += 1;
+            continue;
+        }
+        if b == b'(' && i + 1 < n && src[i + 1] == b'?' {
+            match src.get(i + 2) {
+                Some(b'<') if !matches!(src.get(i + 3), Some(b'=') | Some(b'!')) => return true,
+                Some(b'\'') => return true,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    false
+}
