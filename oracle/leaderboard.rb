@@ -306,6 +306,7 @@ COPS = {
   'Lint/RedundantSplatExpansion'     => 'lint/redundant_splat_expansion',
   'Style/DoubleNegation'             => 'style/double_negation',
   'Naming/VariableNumber'            => 'naming/variable_number',
+  'Style/CommandLiteral'             => 'style/command_literal',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

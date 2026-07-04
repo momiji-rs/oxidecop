@@ -368,7 +368,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral",
 ];
 
 impl Engine {
@@ -1790,6 +1790,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.interpolated_node_depth -= 1;
     }
     fn visit_interpolated_x_string_node(&mut self, node: &ruby_prism::InterpolatedXStringNode<'pr>) {
+        self.check_command_literal_ixstr(node);
         self.check_space_inside_percent_literal_delimiters_ixstr(node);
         self.check_percent_literal_delimiters_ixstr(node);
         self.check_lii_ixstr(node);
@@ -1818,6 +1819,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.xstr_interp_base.pop();
     }
     fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
+        self.check_command_literal_xstr(node);
         self.check_heredoc_delimiter_naming(Some(node.opening_loc()), Some(node.closing_loc()));
         self.check_heredoc_delimiter_case(Some(node.opening_loc()), Some(node.closing_loc()));
         self.check_closing_heredoc_indentation(Some(node.opening_loc()), Some(node.closing_loc()));

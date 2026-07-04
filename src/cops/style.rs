@@ -21123,3 +21123,136 @@ impl<'a> super::Cops<'a> {
         self.dn_classify_raw(n)
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Style/CommandLiteral
+//
+// Ported from rubocop's `Style::CommandLiteral`. Fires on `on_xstr`
+// (backtick / `%x` command literals — both plain `XStringNode` and
+// `InterpolatedXStringNode`), skipping heredoc command literals
+// (`<<\`ID\` ... ID`) entirely, same as upstream's `node.heredoc?` guard.
+//
+// EnforcedStyle: backticks (default) flags `%x` (unless the body itself
+// contains a disallowed inner backtick, in which case backticks are
+// REQUIRED instead); percent_x flags backticks unconditionally; mixed wants
+// backticks for single-line literals and `%x` for multiline ones (with the
+// same inner-backtick override in both directions).
+//
+// `AllowInnerBackticks` (false by default) gates whether an UNESCAPED
+// backtick inside the command body disqualifies the backtick form. Autocorrect
+// additionally refuses to touch a body that contains ANY literal backtick
+// (regardless of `AllowInnerBackticks`) since swapping delimiters around such
+// content would change its meaning — this mirrors upstream's own
+// `autocorrect`'s unconditional `return if contains_backtick?(node)` guard,
+// which is separate from (and stricter than) the `AllowInnerBackticks`-gated
+// offense decision above it.
+// ---------------------------------------------------------------------------
+impl<'a> super::Cops<'a> {
+    /// `on_xstr` for a plain (non-interpolated) command literal.
+    pub(crate) fn check_command_literal_xstr(&mut self, node: &ruby_prism::XStringNode) {
+        let l = node.location();
+        let opening = node.opening_loc();
+        let closing = node.closing_loc();
+        self.check_command_literal(
+            l.start_offset(),
+            l.end_offset(),
+            opening.start_offset(),
+            opening.end_offset(),
+            closing.start_offset(),
+            closing.end_offset(),
+        );
+    }
+
+    /// `on_xstr` for an interpolated command literal (`%x(...#{...}...)` /
+    /// `` `...#{...}` ``). `node_body` is a plain source slice between the
+    /// delimiters in upstream too — interpolation parts don't change that.
+    pub(crate) fn check_command_literal_ixstr(&mut self, node: &ruby_prism::InterpolatedXStringNode) {
+        let l = node.location();
+        let opening = node.opening_loc();
+        let closing = node.closing_loc();
+        self.check_command_literal(
+            l.start_offset(),
+            l.end_offset(),
+            opening.start_offset(),
+            opening.end_offset(),
+            closing.start_offset(),
+            closing.end_offset(),
+        );
+    }
+
+    fn check_command_literal(
+        &mut self,
+        node_start: usize,
+        node_end: usize,
+        open_start: usize,
+        open_end: usize,
+        close_start: usize,
+        close_end: usize,
+    ) {
+        const COP: &str = "Style/CommandLiteral";
+        if !self.on(COP) {
+            return;
+        }
+        let opening_src = &self.src[open_start..open_end];
+        // `node.heredoc?`: a `<<\`ID\``-style heredoc command literal is
+        // never touched by this cop.
+        if opening_src.starts_with(b"<<") {
+            return;
+        }
+        let is_backtick_literal = opening_src == b"`";
+        let body = &self.src[open_end..close_start];
+        let contains_backtick = body.contains(&b'`');
+        let allow_inner_backticks = self.cfg.get(COP, "AllowInnerBackticks") == Some("true");
+        let contains_disallowed_backtick = !allow_inner_backticks && contains_backtick;
+        let multiline = self.idx.loc(node_start).0 != self.idx.loc(node_end.saturating_sub(1)).0;
+        let style = self.cfg.enforced_style(COP);
+
+        if is_backtick_literal {
+            // `allowed_backtick_literal?`
+            let allowed = match style {
+                "backticks" => !contains_disallowed_backtick,
+                "mixed" => !multiline && !contains_disallowed_backtick,
+                _ => false, // "percent_x" (and anything else): never allowed
+            };
+            if allowed {
+                return;
+            }
+            self.push(node_start, COP, true, "Use `%x` around command string.");
+            if contains_backtick {
+                return; // `autocorrect`'s own unconditional guard
+            }
+            let (open_c, close_c) = self.cl_preferred_delimiter();
+            self.fixes.push((open_start, open_end, vec![b'%', b'x', open_c]));
+            self.fixes.push((close_start, close_end, vec![close_c]));
+        } else {
+            // `allowed_percent_x_literal?`
+            let allowed = match style {
+                "backticks" => contains_disallowed_backtick,
+                "mixed" => multiline || contains_disallowed_backtick,
+                "percent_x" => true,
+                _ => false,
+            };
+            if allowed {
+                return;
+            }
+            self.push(node_start, COP, true, "Use backticks around command string.");
+            if contains_backtick {
+                return;
+            }
+            self.fixes.push((open_start, open_end, vec![b'`']));
+            self.fixes.push((close_start, close_end, vec![b'`']));
+        }
+    }
+
+    /// `PreferredDelimiters.new('%x', ...).delimiters` — `Style/
+    /// PercentLiteralDelimiters`'s `PreferredDelimiters['%x']` else
+    /// `['default']`, resolved through the same per-type lookup the
+    /// `Style/PercentLiteralDelimiters` cop itself uses (`pld_preferred`
+    /// handles the nested `'%x':`/`default:` keys and the default.yml
+    /// table; `%x` isn't a bracket-defaulted type, so the ultimate
+    /// fallback is `()`).
+    fn cl_preferred_delimiter(&self) -> (u8, u8) {
+        self.pld_preferred("%x")
+    }
+}
