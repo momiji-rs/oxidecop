@@ -11818,3 +11818,251 @@ fn shx_find_shadowing(groups: &[Vec<Option<&[u8]>>]) -> Option<usize> {
     }
     None
 }
+
+
+// ---- Lint/SafeNavigationChain ----
+//
+// Upstream (`lib/rubocop/cop/lint/safe_navigation_chain.rb` + the `NilMethods`
+// mixin): flags an ORDINARY (non safe-nav) method call chained directly onto
+// a safe-navigated (`&.`) receiver — `x&.foo.bar` raises `NoMethodError`
+// whenever `x` is nil, since `x&.foo` short-circuits to `nil` and the
+// trailing `.bar` isn't itself guarded.
+//
+// `on_send` fires for every plain `send` node (never `csend` — this cop has
+// no `alias on_csend on_send`). Per node:
+//   1. `bad_method?`: this call's receiver must be, directly, a safe-nav
+//      (`csend`) call — OR a `(csend ...)` parenthesized single-statement
+//      group (prism: `ParenthesesNode` wrapping a one-statement
+//      `StatementsNode`). A call-WITH-BLOCK collapses into the plain-csend
+//      case in prism (the block lives on the very same `CallNode` — unlike
+//      whitequark's separate wrapping `block` node), so upstream's third
+//      pattern alternative (`send $(any_block (csend ...) ...) $_`) needs no
+//      separate handling here: `x&.select { ... }.bar`'s receiver IS the
+//      csend `CallNode`, block and all.
+//   2. `nil_methods.include?(method) || PLUS_MINUS_METHODS.include?(method)`:
+//      exempt when the OUTER call's own method is one nil itself responds to
+//      (`snc_is_builtin_nil_method`, shared with the sibling
+//      SafeNavigationConsistency cop above), the cop's configured
+//      `AllowedMethods` (default `present?`/`blank?`/`presence`/`try`/
+//      `try!`/`in?`, via `self.allowed`), or unary `+@`/`-@` — prism parses
+//      `+str&.to_i` as `(+@ (csend str to_i))` (unary +/- binds LOOSER than
+//      the safe-nav call), so unary +/- is always the OUTER node checked
+//      here, never something nested inside the receiver.
+//   3. `ternary_safe_navigation?`: exempt when this call is the THEN-branch
+//      of a ternary (`?:` — a real `if`/`unless` statement's branch is a
+//      `StatementsNode`, never a bare expression, so this can only be a
+//      ternary) whose CONDITION has the same source text as the captured
+//      safe-nav receiver (`foo&.bar ? foo&.bar - 1 : baz` — the true branch
+//      is instead `Lint/RedundantSafeNavigation`'s territory).
+//   4. `require_safe_navigation?`: upstream's one PARENT-aware guard —
+//      exempts a call that is the RHS of an `&&`/`and` (`and_type?`, which
+//      covers BOTH surface spellings identically) node whose LHS's receiver
+//      has the SAME source text as this call's own receiver
+//      (`x&.foo&.bar && x&.foo.baz`: the `.baz` call is exempt, having
+//      already been "guarded" by the `&&`'s LHS). `||`/`or` never gets this
+//      exemption — only `and_type?` is checked upstream. Source-text
+//      equality (rather than true structural AST equality, which upstream
+//      actually uses) mirrors the same simplification the sibling
+//      SafeNavigationConsistency cop's `receiver_key` already makes; not
+//      exercised differently by the fixture.
+//
+// None of these 4 checks can see rubocop's `node.parent` directly (prism
+// nodes carry no parent pointer). `snav_parent` (see its own doc, and the
+// `visit_and_node`/`visit_or_node`/`visit_if_node`/`visit_array_node`/
+// `visit_assoc_node`/`visit_call_node` populators in `mod.rs`) reconstructs
+// exactly the parent facts steps 3-4 (and, further below, autocorrection's
+// `require_parentheses?`) need, keyed by the candidate node's own start
+// offset.
+//
+// The offense range starts at this call's own dot (`.` — never `&.`, since a
+// safe-nav receiver was already ruled out for THIS call itself) if it has
+// one, else at the end of the safe-nav receiver (an operator-method call or
+// `[]`/`[]=` has no dot), and always ends at this call's own end (its
+// arguments/block included, so e.g. `.bar(y)` or `{ |x| ... }` extend the
+// range).
+//
+// `ternary_else_branch?` (the ELSE-branch symmetric case to step 3) still
+// registers the offense but WITHOUT autocorrection ("the receiver in the
+// else branch may be nil... autocorrection is not possible as the intent is
+// ambiguous") — ported as `push(.., correctable: false, ..)` with no
+// `self.fixes` entry, same idiom SafeNavigationConsistency uses for its own
+// uncorrectable (operator-method) case.
+//
+// Autocorrection (`add_safe_navigation_operator`): replaces the offense
+// range with `&` prepended (plus a `.` too, unless the range's own text
+// already starts with one) to itself — EXCEPT a `[]`/`[]=` call, rewritten
+// as `&.[](args)`/`&.[]=(args)` (bracket syntax has no dot to turn into
+// `&.`). `require_parentheses?` additionally wraps the WHOLE outer call in
+// `(...)` when: it's an element/key/value of an array or hash-pair literal
+// AND has no dot of its own (`operator_inside_collection_literal?`); or its
+// own method is a comparison operator (`==`/`===`/`!=`/`<=`/`>=`/`>`/`<`)
+// AND its immediate parent is either an `&&`/`||` — NOT the `and`/`or`
+// keyword spelling; `logical_operator?` checks the actual OPERATOR TOKEN,
+// unlike `require_safe_navigation?`'s `and_type?` which doesn't care — or
+// another comparison-method call (as one of ITS arguments).
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_safe_navigation_chain(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/SafeNavigationChain";
+        if !self.on(COP) {
+            return;
+        }
+        if node.is_safe_navigation() {
+            return; // upstream's `on_send`, never `on_csend`
+        }
+        let Some(receiver) = node.receiver() else { return };
+        let safe_nav = if let Some(c) = receiver.as_call_node() {
+            if !c.is_safe_navigation() {
+                return;
+            }
+            c
+        } else if let Some(p) = receiver.as_parentheses_node() {
+            // `(begin (csend ...))`: exactly one statement, itself a csend.
+            let Some(body) = p.body() else { return };
+            let Some(stmts) = body.as_statements_node() else { return };
+            let mut it = stmts.body().iter();
+            let Some(only) = it.next() else { return };
+            if it.next().is_some() {
+                return;
+            }
+            let Some(c) = only.as_call_node() else { return };
+            if !c.is_safe_navigation() {
+                return;
+            }
+            c
+        } else {
+            return;
+        };
+
+        let method = node.name().as_slice();
+        if snc_is_builtin_nil_method(method) || self.allowed(COP, method) {
+            return;
+        }
+        if method == b"+@" || method == b"-@" {
+            return;
+        }
+
+        let node_start = node.location().start_offset();
+        let parent = self.snav_parent.get(&node_start).copied();
+
+        // `ternary_safe_navigation?`
+        if let Some(SnavParent::TernaryBranch { is_then: true, condition }) = parent {
+            if condition == self.node_src(&safe_nav.as_node()) {
+                return;
+            }
+        }
+
+        // `require_safe_navigation?`
+        if let Some(SnavParent::LogicalOperand { is_and: true, is_rhs: true, lhs_receiver, .. }) = parent {
+            let rhs_receiver = node.receiver().map(|r| self.node_src(&r));
+            if lhs_receiver == rhs_receiver {
+                return;
+            }
+        }
+
+        let is_ternary_else = matches!(
+            parent,
+            Some(SnavParent::TernaryBranch { is_then: false, condition })
+                if condition == self.node_src(&safe_nav.as_node())
+        );
+
+        let node_end = node.location().end_offset();
+        let (offense_start, has_dot) = match node.call_operator_loc() {
+            Some(d) => (d.start_offset(), true),
+            None => (safe_nav.location().end_offset(), false),
+        };
+
+        const MSG: &str = "Do not chain ordinary method call after safe navigation operator.";
+        if is_ternary_else {
+            self.push(offense_start, COP, false, MSG);
+            return;
+        }
+        self.push(offense_start, COP, true, MSG);
+
+        // ---- autocorrect ----
+        let is_brackets = method == b"[]" || method == b"[]=";
+        let replacement: Vec<u8> = if is_brackets {
+            let mut inner = Vec::new();
+            inner.extend_from_slice(method);
+            inner.push(b'(');
+            if let Some(args) = node.arguments() {
+                for (i, a) in args.arguments().iter().enumerate() {
+                    if i > 0 {
+                        inner.extend_from_slice(b", ");
+                    }
+                    inner.extend_from_slice(self.node_src(&a));
+                }
+            }
+            inner.push(b')');
+            let mut out = Vec::with_capacity(inner.len() + 2);
+            out.push(b'&');
+            out.push(b'.');
+            out.extend_from_slice(&inner);
+            out
+        } else {
+            let text = &self.src[offense_start..node_end];
+            let mut out = Vec::with_capacity(text.len() + 2);
+            out.push(b'&');
+            if !text.starts_with(b".") {
+                out.push(b'.');
+            }
+            out.extend_from_slice(text);
+            out
+        };
+        self.fixes.push((offense_start, node_end, replacement));
+
+        if self.snav_requires_parens(node, has_dot, parent) {
+            self.fixes.push((node_start, node_start, b"(".to_vec()));
+            self.fixes.push((node_end, node_end, b")".to_vec()));
+        }
+    }
+
+    /// `require_parentheses?`.
+    fn snav_requires_parens(&self, node: &ruby_prism::CallNode, has_dot: bool, parent: Option<SnavParent>) -> bool {
+        // `operator_inside_collection_literal?`
+        if !has_dot && matches!(parent, Some(SnavParent::CollectionLiteral)) {
+            return true;
+        }
+        const COMPARISON: &[&[u8]] = &[b"==", b"===", b"!=", b"<=", b">=", b">", b"<"];
+        if !COMPARISON.contains(&node.name().as_slice()) {
+            return false;
+        }
+        match parent {
+            Some(SnavParent::LogicalOperand { is_symbol_op, .. }) => is_symbol_op,
+            Some(SnavParent::ComparisonCallArg) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Lint/SafeNavigationChain: immediate-parent context for a candidate node,
+/// keyed by that node's own start offset in `Cops::snav_parent` — see
+/// `check_safe_navigation_chain`'s doc comment for the full mapping to
+/// upstream's `node.parent`-based predicates, and `mod.rs`'s
+/// `visit_and_node`/`visit_or_node`/`visit_if_node`/`visit_array_node`/
+/// `visit_assoc_node`/`visit_call_node` for where each variant is populated.
+#[derive(Clone, Copy)]
+pub(crate) enum SnavParent<'a> {
+    /// Immediate parent is an `and`/`or` node. `is_and` distinguishes an
+    /// `and`/`&&`-node parent (relevant to `require_safe_navigation?`) from
+    /// an `or`/`||`-node one (never exempted there); `is_symbol_op` is the
+    /// operator TOKEN actually used (`&&`/`||` vs the `and`/`or` keyword) —
+    /// feeds `require_parentheses?`'s `logical_operator?`, which checks the
+    /// token, not the node type. `lhs_receiver` is only meaningful when
+    /// `is_and && is_rhs`: the LHS's receiver's own source text (`None` = a
+    /// receiver-less/bare call, or the LHS isn't itself a call at all).
+    LogicalOperand { is_and: bool, is_rhs: bool, is_symbol_op: bool, lhs_receiver: Option<&'a [u8]> },
+    /// Immediate parent is a ternary (`?:`) `if` node's then/else branch.
+    /// `is_then` picks `ternary_safe_navigation?` (the if-branch, exempted
+    /// entirely) vs `ternary_else_branch?` (the else-branch: offense
+    /// registered, but never corrected). `condition` is the ternary's own
+    /// predicate's source text, compared against the candidate's captured
+    /// safe-nav receiver's source text.
+    TernaryBranch { is_then: bool, condition: &'a [u8] },
+    /// Immediate parent is an array or hash-pair literal (element, or pair
+    /// key/value) — `operator_inside_collection_literal?`.
+    CollectionLiteral,
+    /// Immediate parent is a `send`/`csend` node (as one of its arguments)
+    /// whose OWN method is a comparison operator — the second
+    /// `require_parentheses?` disjunct.
+    ComparisonCallArg,
+}

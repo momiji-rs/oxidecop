@@ -369,7 +369,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
-    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException",
+    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain",
 ];
 
 impl Engine {
@@ -1379,6 +1379,15 @@ pub(crate) struct Cops<'a> {
     // (mirroring `sak_end_seen` above) is equivalent to upstream's
     // full-range identity check.
     pub(crate) snc_offended: HashSet<usize>,
+    // Lint/SafeNavigationChain: immediate-parent context for a node, keyed
+    // by that node's own start offset — populated pre-order in the handful
+    // of visit_* overrides whose children can be the cop's candidate
+    // "ordinary send after safe-navigation" node, since prism nodes carry
+    // no parent pointer (unlike whitequark's `node.parent`). Consumed (and
+    // left in place — a start offset is only ever queried once) by
+    // `check_safe_navigation_chain`. See that function's doc comment for
+    // the full mapping to upstream's `parent`-based predicates.
+    pub(crate) snav_parent: HashMap<usize, lint_cops::SnavParent<'a>>,
     // Layout/ArrayAlignment: start offsets of bracketless `ArrayNode`s that
     // are the `value` of a `MultiWriteNode` — rubocop's `node.parent&
     // .masgn_type?` early return in `on_array` (a mass-assignment's bare
@@ -2085,10 +2094,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // having it for a parent (a nested ternary in the else-branch, e.g.
         // `cond_a? ? foo : cond_b? ? bar : baz`), then check this node itself.
         if node.if_keyword_loc().is_none() {
+            // Lint/SafeNavigationChain: `ternary_safe_navigation?`/
+            // `ternary_else_branch?` — a REAL if/unless statement's branch is
+            // a `StatementsNode`, never a bare expression, so only a ternary
+            // `?:` (no `if`/`then`/`end` keywords) can put a candidate call
+            // node directly in this position.
+            let snc_condition = if self.on("Lint/SafeNavigationChain") {
+                Some(self.node_src(&node.predicate()))
+            } else {
+                None
+            };
             if let Some(stmts) = node.statements() {
                 if let Some(only) = stmts.body().iter().next() {
                     self.mto_note_child(&only, node.location().start_offset(), false);
                     self.ra_needs_parens.insert(only.location().start_offset());
+                    if let Some(condition) = snc_condition {
+                        self.snav_parent.insert(
+                            only.location().start_offset(),
+                            lint_cops::SnavParent::TernaryBranch { is_then: true, condition },
+                        );
+                    }
                 }
             }
             if let Some(else_stmts) =
@@ -2097,6 +2122,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 if let Some(only) = else_stmts.body().iter().next() {
                     self.mto_note_child(&only, node.location().start_offset(), false);
                     self.ra_needs_parens.insert(only.location().start_offset());
+                    if let Some(condition) = snc_condition {
+                        self.snav_parent.insert(
+                            only.location().start_offset(),
+                            lint_cops::SnavParent::TernaryBranch { is_then: false, condition },
+                        );
+                    }
                 }
             }
         }
@@ -3310,6 +3341,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.check_array_alignment(node);
+        // Lint/SafeNavigationChain: `operator_inside_collection_literal?`'s
+        // `type?(:array, :pair)` — the array-literal half.
+        if self.on("Lint/SafeNavigationChain") {
+            for e in node.elements().iter() {
+                self.snav_parent.insert(e.location().start_offset(), lint_cops::SnavParent::CollectionLiteral);
+            }
+        }
         let wa_matrix = self.wa_matrix_complex(node);
         self.wa_matrix_stack.push(wa_matrix);
         // Lint/RedundantSplatExpansion: covers BOTH a real `[...]`/percent
@@ -3362,6 +3400,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.ll_str_skip.insert(node.value().location().start_offset());
         }
         self.check_space_after_colon_pair(node);
+        // Lint/SafeNavigationChain: `operator_inside_collection_literal?`'s
+        // `type?(:array, :pair)` — the hash-pair half (key and value alike,
+        // for symmetry; only a value ever appears in the fixture).
+        if self.on("Lint/SafeNavigationChain") {
+            self.snav_parent.insert(node.key().location().start_offset(), lint_cops::SnavParent::CollectionLiteral);
+            self.snav_parent.insert(node.value().location().start_offset(), lint_cops::SnavParent::CollectionLiteral);
+        }
         // Style/DoubleNegation: `find_parent_not_enumerable`'s `pair_type?`.
         self.dn_ancestors.push(DnFrame::Enumerable {
             start: node.location().start_offset(),
@@ -3816,6 +3861,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if op.as_slice() == b"and" {
             self.sak_check(op.start_offset(), op.end_offset(), b"and");
         }
+        if self.on("Lint/SafeNavigationChain") {
+            let is_symbol_op = op.as_slice() == b"&&";
+            let left = node.left();
+            let right = node.right();
+            let lhs_receiver = left.as_call_node().and_then(|c| c.receiver()).map(|r| self.node_src(&r));
+            self.snav_parent.insert(
+                left.location().start_offset(),
+                lint_cops::SnavParent::LogicalOperand { is_and: true, is_rhs: false, is_symbol_op, lhs_receiver: None },
+            );
+            self.snav_parent.insert(
+                right.location().start_offset(),
+                lint_cops::SnavParent::LogicalOperand { is_and: true, is_rhs: true, is_symbol_op, lhs_receiver },
+            );
+        }
         ruby_prism::visit_and_node(self, node);
     }
     fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
@@ -3828,6 +3887,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ra_needs_parens.insert(node.right().location().start_offset());
         if op.as_slice() == b"or" {
             self.sak_check(op.start_offset(), op.end_offset(), b"or");
+        }
+        if self.on("Lint/SafeNavigationChain") {
+            let is_symbol_op = op.as_slice() == b"||";
+            self.snav_parent.insert(
+                node.left().location().start_offset(),
+                lint_cops::SnavParent::LogicalOperand { is_and: false, is_rhs: false, is_symbol_op, lhs_receiver: None },
+            );
+            self.snav_parent.insert(
+                node.right().location().start_offset(),
+                lint_cops::SnavParent::LogicalOperand { is_and: false, is_rhs: true, is_symbol_op, lhs_receiver: None },
+            );
         }
         ruby_prism::visit_or_node(self, node);
     }
@@ -4073,6 +4143,23 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_slicing_with_range(node);
         self.check_empty_lines_around_arguments(node);
         self.check_format_parameter_mismatch(node);
+        // Lint/SafeNavigationChain: the main per-node check (see its doc
+        // comment for why this must run BEFORE this call's own arguments are
+        // visited below, and how it reads `snav_parent` entries left by
+        // ANCESTOR nodes already visited on the way down here).
+        self.check_safe_navigation_chain(node);
+        // Lint/SafeNavigationChain's `require_parentheses?` 2nd disjunct:
+        // mark this call's own arguments when THIS call's method is itself a
+        // comparison operator, BEFORE they're visited below.
+        if self.on("Lint/SafeNavigationChain")
+            && matches!(node.name().as_slice(), b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<")
+        {
+            if let Some(args) = node.arguments() {
+                for a in args.arguments().iter() {
+                    self.snav_parent.insert(a.location().start_offset(), lint_cops::SnavParent::ComparisonCallArg);
+                }
+            }
+        }
         // recurse into children (we've overridden the default walk). Push this
         // call's name SPAN so descendants can see it as an ancestor.
         let name_span = node
@@ -4586,6 +4673,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         eba_def_fixed: HashSet::new(),
         rescue_mod_parens: HashMap::new(),
         snc_offended: HashSet::new(),
+        snav_parent: HashMap::new(),
         aa_masgn_rhs: HashSet::new(),
         aa_unbracketed_rhs_parent: HashMap::new(),
         aa_registered_ranges: Vec::new(),
