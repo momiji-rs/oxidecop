@@ -307,7 +307,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
     "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
     "Style/ExplicitBlockArgument",
-    "Style/RescueModifier", "Layout/FirstParameterIndentation",
+    "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup",
 ];
 
 impl Engine {
@@ -2632,6 +2632,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
         self.check_duplicated_gem(node);
+        self.check_duplicated_group(node);
         self.check_mixin_usage(&node.statements().as_node());
         self.class_children_stack.push(Self::direct_child_classes(&Some(node.statements().as_node())));
         self.exception_siblings_stack.push(Self::direct_child_defs(&Some(node.statements().as_node())));

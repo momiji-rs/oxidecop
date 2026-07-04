@@ -561,3 +561,227 @@ impl<'a> Cops<'a> {
 fn og_line_end_incl_nl(idx: &super::LineIndex, src: &[u8], line: usize) -> usize {
     idx.starts.get(line).copied().unwrap_or(src.len())
 }
+
+
+
+impl<'a> Cops<'a> {
+    /// Bundler/DuplicatedGroup — a `group :x[, :y, ...]` (or `group(*expr)`)
+    /// declaration whose ARGUMENT SET repeats elsewhere in the same Gemfile,
+    /// unless the surrounding `source`/`git`/`platforms`/`path` block differs.
+    /// Unlike `DuplicatedGem` (see above), upstream's `on_new_investigation`
+    /// has NO conditional-branch exemption here — every repeat is flagged,
+    /// full stop (confirmed by reading rubocop 1.88.0's actual
+    /// `duplicated_group.rb`: no `conditional_declaration?` call exists in
+    /// this cop, unlike its sibling).
+    ///
+    /// rubocop's `duplicated_group_nodes`:
+    ///   group_declarations(ast).group_by { |node|
+    ///     "#{find_source_key(node)}#{group_attributes(node).sort.join}"
+    ///   }.values.select { |nodes| nodes.size > 1 }
+    ///
+    /// `find_source_key` walks `node.each_ancestor(:block)` (nearest first)
+    /// for the first block whose call is named `source`/`git`/`platforms`/
+    /// `path`, keyed as `"#{method_name}#{first_arg&.source}"` — so a
+    /// `group` nested under an unrelated block (e.g. a `foo do ... end`) that
+    /// itself sits under a `source do ... end` still finds the `source` key,
+    /// skipping over the irrelevant intermediate block. Prism has no parent
+    /// pointers, so `DgpFinder` below tracks a real ancestor stack of every
+    /// call-with-a-genuine-block (pushed in `visit_call_node` before
+    /// recursing, popped after) — a block-PASS argument (`&:sym`, `&blk`)
+    /// is a `BlockArgumentNode`, not a `BlockNode`, so `.as_block_node()`
+    /// naturally excludes it, matching rubocop-ast's `:block`-type-only
+    /// `each_ancestor(:block)`.
+    ///
+    /// `group_attributes(node)`: each argument becomes ONE string — a
+    /// hash-typed argument (explicit `{...}` or bare trailing keywords, both
+    /// `hash_type?` in the whitequark/prism-translated AST) becomes its
+    /// pairs' own source texts, SORTED and comma-joined; anything with a
+    /// `#value` (symbol/string literals) becomes that value's string form
+    /// (`:development` and `'development'` collapse to the same key,
+    /// `development`); anything else (splats, etc.) falls back to its raw
+    /// source. The per-node array is then itself sorted and joined with NO
+    /// separator to form (with the source key prefix) the final grouping
+    /// key — order-of-declaration and keyword-argument order are both
+    /// irrelevant to whether two `group` calls collide.
+    ///
+    /// The offense MESSAGE, by contrast, always uses each argument's raw,
+    /// UNSORTED `source` text (`node.arguments.map(&:source).join(', ')`) —
+    /// from the DUPLICATE node, not the first — so it shows exactly what was
+    /// written, keyword order included.
+    pub(crate) fn check_duplicated_group(&mut self, node: &ruby_prism::ProgramNode) {
+        const COP: &str = "Bundler/DuplicatedGroup";
+        if !self.on(COP) {
+            return;
+        }
+        let mut finder = DgpFinder { src: self.src, block_stack: Vec::new(), matches: Vec::new() };
+        use ruby_prism::Visit;
+        finder.visit(&node.as_node());
+        if finder.matches.len() < 2 {
+            return;
+        }
+        // Group by key, preserving first-occurrence order — `group_by`'s
+        // Hash iteration order upstream. Within a group, later-encountered
+        // nodes (source order, since `def_node_search`'s preorder traversal
+        // matches source order for this non-overlapping node shape) each get
+        // their own offense citing the group's first member's line.
+        let mut order: Vec<Vec<u8>> = Vec::new();
+        let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for (i, m) in finder.matches.iter().enumerate() {
+            groups
+                .entry(m.key.clone())
+                .or_insert_with(|| {
+                    order.push(m.key.clone());
+                    Vec::new()
+                })
+                .push(i);
+        }
+        for key in &order {
+            let idxs = &groups[key];
+            if idxs.len() < 2 {
+                continue;
+            }
+            let first = &finder.matches[idxs[0]];
+            let (first_line, _) = self.idx.loc(first.start);
+            for &i in &idxs[1..] {
+                let m = &finder.matches[i];
+                let group_name = String::from_utf8_lossy(&m.group_name);
+                let message = format!(
+                    "Gem group `{group_name}` already defined on line {first_line} of the Gemfile."
+                );
+                self.push(m.start, COP, false, message);
+            }
+        }
+    }
+}
+
+/// One `group(...)` call site found anywhere in the file.
+struct DgpMatch {
+    // The `group` send node's own start offset — both the offense anchor
+    // and (for the group's first occurrence) the source of
+    // `line_of_first_occurrence`.
+    start: usize,
+    // `"#{find_source_key(node)}#{group_attributes(node).sort.join}"` —
+    // the grouping key two `group` calls must share to collide.
+    key: Vec<u8>,
+    // `node.arguments.map(&:source).join(', ')` — used verbatim in the
+    // message ONLY when this match turns out to be a later occurrence in
+    // its group (never computed-then-discarded any differently upstream;
+    // rubocop calls `.source` here regardless of argument shape).
+    group_name: Vec<u8>,
+}
+
+/// Collects every `(send nil? :group ...)` in the tree, alongside the
+/// ancestor-block stack needed to answer `find_source_key` at each one.
+struct DgpFinder<'a> {
+    src: &'a [u8],
+    // (method_name, first_argument's raw source or None) — one entry per
+    // active CallNode ancestor that owns a genuine `BlockNode` (a
+    // block-pass argument like `&blk` is a different node type and never
+    // pushes here). Nearest ancestor is the LAST element.
+    block_stack: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    matches: Vec<DgpMatch>,
+}
+
+impl<'pr, 'a> ruby_prism::Visit<'pr> for DgpFinder<'a> {
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if node.receiver().is_none() && node.name().as_slice() == b"group" {
+            let attrs = dgp_group_attributes(self.src, node);
+            let mut sorted = attrs;
+            sorted.sort();
+            let mut key = dgp_source_key(&self.block_stack).unwrap_or_default();
+            key.extend(sorted.into_iter().flatten());
+            self.matches.push(DgpMatch {
+                start: node.location().start_offset(),
+                key,
+                group_name: dgp_group_name(self.src, node),
+            });
+        }
+        // `.block()` is a generic `Node` on a CallNode — it holds a
+        // `BlockNode` for `do...end`/`{}` blocks but a `BlockArgumentNode`
+        // for `&blk`/`&:sym` block-PASS args; only the former counts as a
+        // `:block`-type ancestor upstream.
+        let has_real_block = node.block().and_then(|b| b.as_block_node()).is_some();
+        if has_real_block {
+            let method_name = node.name().as_slice().to_vec();
+            let first_arg = node
+                .arguments()
+                .and_then(|a| a.arguments().iter().next())
+                .map(|n| dgp_source_bytes(self.src, &n));
+            self.block_stack.push((method_name, first_arg));
+        }
+        ruby_prism::visit_call_node(self, node);
+        if has_real_block {
+            self.block_stack.pop();
+        }
+    }
+}
+
+/// Raw source bytes of any node's own location.
+fn dgp_source_bytes(src: &[u8], node: &ruby_prism::Node) -> Vec<u8> {
+    let l = node.location();
+    src[l.start_offset()..l.end_offset()].to_vec()
+}
+
+/// One `group_attributes` array entry for a single argument — `hash_type?`
+/// pairs (sorted, comma-joined) / a literal's `#value` string form /
+/// otherwise the argument's raw source.
+fn dgp_group_attribute(src: &[u8], arg: &ruby_prism::Node) -> Vec<u8> {
+    if let Some(h) = arg.as_hash_node() {
+        return dgp_hash_key(src, h.elements());
+    }
+    if let Some(h) = arg.as_keyword_hash_node() {
+        return dgp_hash_key(src, h.elements());
+    }
+    if let Some(s) = arg.as_symbol_node() {
+        return s.unescaped().to_vec();
+    }
+    if let Some(s) = arg.as_string_node() {
+        return s.unescaped().to_vec();
+    }
+    // Everything else (splats, numeric/rational/complex literals, dstrs,
+    // ...) — rubocop calls `.source` when the node doesn't `respond_to?
+    // (:value)`. Numeric-literal `#value.to_s` re-renders the canonical
+    // decimal form rather than the written source; not exercised by the
+    // fixture, so left as the (slightly more common) source fallback.
+    dgp_source_bytes(src, arg)
+}
+
+/// `argument.pairs.map(&:source).sort.join(', ')` for a hash-typed argument
+/// (either an explicit `{...}` literal or a bare trailing keyword list —
+/// both `hash_type?` in the translated AST).
+fn dgp_hash_key(src: &[u8], elements: ruby_prism::NodeList) -> Vec<u8> {
+    let mut parts: Vec<Vec<u8>> = elements.iter().map(|n| dgp_source_bytes(src, &n)).collect();
+    parts.sort();
+    parts.join(", ".as_bytes())
+}
+
+/// `group_attributes(node)` — one entry per argument, in argument order
+/// (sorting happens at the call site, matching upstream's separate
+/// `.sort.join` step).
+fn dgp_group_attributes(src: &[u8], node: &ruby_prism::CallNode) -> Vec<Vec<u8>> {
+    let Some(args) = node.arguments() else { return Vec::new() };
+    args.arguments().iter().map(|a| dgp_group_attribute(src, &a)).collect()
+}
+
+/// `node.arguments.map(&:source).join(', ')` — the message's `group_name`,
+/// always raw source, never sorted or value-normalized.
+fn dgp_group_name(src: &[u8], node: &ruby_prism::CallNode) -> Vec<u8> {
+    let Some(args) = node.arguments() else { return Vec::new() };
+    let parts: Vec<Vec<u8>> = args.arguments().iter().map(|a| dgp_source_bytes(src, &a)).collect();
+    parts.join(", ".as_bytes())
+}
+
+/// `find_source_key`: nearest ancestor block (top of stack first) whose
+/// call is named `source`/`git`/`platforms`/`path`, keyed as
+/// `"#{method_name}#{first_arg&.source}"` (a missing first arg contributes
+/// nothing, like `nil.to_s` in the original interpolation).
+fn dgp_source_key(block_stack: &[(Vec<u8>, Option<Vec<u8>>)]) -> Option<Vec<u8>> {
+    const NAMES: [&[u8]; 4] = [b"source", b"git", b"platforms", b"path"];
+    block_stack.iter().rev().find(|(name, _)| NAMES.contains(&name.as_slice())).map(|(name, arg)| {
+        let mut key = name.clone();
+        if let Some(a) = arg {
+            key.extend_from_slice(a);
+        }
+        key
+    })
+}
