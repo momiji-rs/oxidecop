@@ -1289,3 +1289,355 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+use super::LineIndex;
+
+// ---------------------------------------------------------------------------
+// Metrics/ModuleLength — ports rubocop's `CodeLength` mixin (shared with the
+// not-yet-implemented Metrics/ClassLength) restricted to what a `module`
+// definition needs: a real `module ... end` node, and the `Foo = Module.new
+// do ... end`/`Foo = ::Module.new do ... end` casgn form (`module_definition?`
+// node-pattern). Extending this to Metrics/ClassLength later mainly means
+// adding a `class`-node entry point that reuses `ml_classlike_length`
+// (already generic over module/class) and a casgn matcher for
+// `Class.new(...) do ... end`.
+//
+// Known gaps (none exercised by the spec fixture):
+//  - `omit_length` (the hash-without-braces/parenthesized-call correction to
+//    a folded `method_call`) isn't replicated — folding a bare-hash-argument
+//    method call under `CountAsOne: [method_call]` may be off by 1-2 lines.
+//  - `source_from_node_with_heredoc` (the casgn/`Module.new` body-length
+//    special case for a body that CONTAINS a heredoc, where the body node's
+//    own `source` text doesn't reach through the heredoc's closing
+//    delimiter) isn't replicated — we just use the body node's own text
+//    span. rubocop's whitequark AST needs this because a heredoc node's own
+//    `source_range` stops at the opening line; if prism's heredoc node
+//    ranges already extend through the closing delimiter (unverified here),
+//    this gap is moot in practice.
+// ---------------------------------------------------------------------------
+
+/// `CodeLengthCalculator::FOLDABLE_TYPES` as a config-resolved bitset —
+/// `CountAsOne`'s default is `[]` (NOT the four-way list; that's just the
+/// menu of valid values), so folding is opt-in per cop config.
+#[derive(Default, Clone, Copy)]
+struct MlFoldableTypes {
+    array: bool,
+    hash: bool,
+    heredoc: bool,
+    method_call: bool,
+}
+
+impl MlFoldableTypes {
+    fn from_list(list: &[String]) -> Self {
+        let mut f = MlFoldableTypes::default();
+        for s in list {
+            match s.as_str() {
+                "array" => f.array = true,
+                "hash" => f.hash = true,
+                "heredoc" => f.heredoc = true,
+                "method_call" => f.method_call = true,
+                _ => {}
+            }
+        }
+        f
+    }
+    fn any(&self) -> bool {
+        self.array || self.hash || self.heredoc || self.method_call
+    }
+}
+
+fn ml_is_classlike(node: &ruby_prism::Node) -> bool {
+    node.as_module_node().is_some() || node.as_class_node().is_some()
+}
+
+/// rubocop's `String#blank?` (empty OR whitespace-only — NOT the strict
+/// `String#empty?` some other cops' "blank line" helpers use) combined with
+/// `comment_line?` (entire line, ignoring leading whitespace, starts with
+/// `#`) — `CodeLength#irrelevant_line`.
+fn ml_irrelevant_line_text(bytes: &[u8], count_comments: bool) -> bool {
+    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return true;
+    }
+    if count_comments {
+        return false;
+    }
+    bytes.iter().find(|b| !b.is_ascii_whitespace()).is_some_and(|&b| b == b'#')
+}
+
+/// Ruby's `String#lines` split (keep-newline semantics, but we only need the
+/// segment COUNT/content so the `\n` itself is dropped) applied to an
+/// arbitrary byte slice — a plain string never yields a synthetic trailing
+/// empty element the way a naive `split('\n')` would.
+fn ml_count_text_fragment(bytes: &[u8], count_comments: bool) -> i64 {
+    let mut count = 0i64;
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            if !ml_irrelevant_line_text(&bytes[start..i], count_comments) {
+                count += 1;
+            }
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() && !ml_irrelevant_line_text(&bytes[start..], count_comments) {
+        count += 1;
+    }
+    count
+}
+
+/// `(any_block (send (const {nil? cbase} :Module) :new) ...)` —
+/// `module_definition?`. Matches bare `Module.new`/`::Module.new` (no
+/// arguments) followed by a literal block (do/end or `{}`; a block-PASS
+/// doesn't produce this shape at all in rubocop's AST).
+fn ml_module_new_block<'pr>(value: &ruby_prism::Node<'pr>) -> Option<ruby_prism::BlockNode<'pr>> {
+    let call = value.as_call_node()?;
+    if call.name().as_slice() != b"new" {
+        return None;
+    }
+    if call.arguments().is_some_and(|a| a.arguments().iter().count() > 0) {
+        return None;
+    }
+    let recv = call.receiver()?;
+    let is_module = recv.as_constant_read_node().is_some_and(|c| c.location().as_slice() == b"Module")
+        || recv
+            .as_constant_path_node()
+            .is_some_and(|cp| cp.parent().is_none() && cp.name_loc().as_slice() == b"Module");
+    if !is_module {
+        return None;
+    }
+    call.block()?.as_block_node()
+}
+
+/// Records the full (inclusive) line range of every `module`/`class`
+/// descendant reached from a classlike node's body — `classlike_code_length`
+/// excludes ALL of a nested module/class's lines wholesale (its own length
+/// was/will be scored separately when `on_module`/`on_class` visits it).
+struct MlInnerClasslikeCollector<'a> {
+    idx: &'a LineIndex,
+    lines: HashSet<usize>,
+}
+impl<'a, 'pr> Visit<'pr> for MlInnerClasslikeCollector<'a> {
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        self.record(&node.as_node());
+        ruby_prism::visit_module_node(self, node);
+    }
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        self.record(&node.as_node());
+        ruby_prism::visit_class_node(self, node);
+    }
+}
+impl<'a> MlInnerClasslikeCollector<'a> {
+    fn record(&mut self, node: &ruby_prism::Node) {
+        let l = node.location();
+        let first = self.idx.loc(l.start_offset()).0;
+        let last = self.idx.loc(l.end_offset().saturating_sub(1)).0;
+        for line in first..=last {
+            self.lines.insert(line);
+        }
+    }
+}
+
+/// `each_top_level_descendant`: walks every child reached from a node,
+/// stopping at (and never descending into) a classlike node OR a node
+/// matching one of the configured foldable types — the matched node itself
+/// is recorded but not explored further (its own nested foldables are
+/// irrelevant; it folds to a single line as a whole).
+struct MlFoldWalker<'pr> {
+    foldable: MlFoldableTypes,
+    matches: Vec<ruby_prism::Node<'pr>>,
+}
+impl<'pr> Visit<'pr> for MlFoldWalker<'pr> {
+    fn visit_module_node(&mut self, _node: &ruby_prism::ModuleNode<'pr>) {}
+    fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {}
+    fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+        if self.foldable.array {
+            self.matches.push(node.as_node());
+        } else {
+            ruby_prism::visit_array_node(self, node);
+        }
+    }
+    fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
+        if self.foldable.hash {
+            self.matches.push(node.as_node());
+        } else {
+            ruby_prism::visit_hash_node(self, node);
+        }
+    }
+    fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
+        if self.foldable.heredoc && super::breakable::is_heredoc_node(&node.as_node()) {
+            self.matches.push(node.as_node());
+        }
+        // A plain `StringNode` has no child nodes to recurse into either way.
+    }
+    fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
+        if self.foldable.heredoc && super::breakable::is_heredoc_node(&node.as_node()) {
+            self.matches.push(node.as_node());
+        } else {
+            ruby_prism::visit_interpolated_string_node(self, node);
+        }
+    }
+    fn visit_x_string_node(&mut self, node: &ruby_prism::XStringNode<'pr>) {
+        if self.foldable.heredoc && super::breakable::is_heredoc_node(&node.as_node()) {
+            self.matches.push(node.as_node());
+        }
+    }
+    fn visit_interpolated_x_string_node(&mut self, node: &ruby_prism::InterpolatedXStringNode<'pr>) {
+        if self.foldable.heredoc && super::breakable::is_heredoc_node(&node.as_node()) {
+            self.matches.push(node.as_node());
+        } else {
+            ruby_prism::visit_interpolated_x_string_node(self, node);
+        }
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if self.foldable.method_call {
+            self.matches.push(node.as_node());
+        } else {
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+}
+
+impl<'a> Cops<'a> {
+    fn ml_irrelevant_file_line(&self, line: usize, count_comments: bool) -> bool {
+        let s = self.idx.starts[line - 1];
+        let e = self.line_end(line);
+        ml_irrelevant_line_text(&self.src[s..e], count_comments)
+    }
+
+    /// `code_length` for an arbitrary node via its OWN literal source text
+    /// (the `else` branch's default `extract_body(node) == node` case) —
+    /// used both for the casgn/`Module.new` body and for a folded
+    /// array/hash/method-call descendant.
+    fn ml_node_own_length(&self, node: &ruby_prism::Node, count_comments: bool) -> i64 {
+        let l = node.location();
+        ml_count_text_fragment(&self.src[l.start_offset()..l.end_offset()], count_comments)
+    }
+
+    /// `heredoc_length`: the heredoc's own body content (between the opener
+    /// and the closing delimiter line), non-irrelevant lines, `+ 2` for the
+    /// (unconditionally counted) opener/closer lines themselves.
+    fn ml_heredoc_length(&self, node: &ruby_prism::Node, count_comments: bool) -> i64 {
+        let range = if let Some(n) = node.as_string_node() {
+            let c = n.content_loc();
+            Some((c.start_offset(), c.end_offset()))
+        } else if let Some(n) = node.as_interpolated_string_node() {
+            n.opening_loc().map(|o| o.end_offset()).zip(n.closing_loc().map(|c| c.start_offset()))
+        } else if let Some(n) = node.as_x_string_node() {
+            let c = n.content_loc();
+            Some((c.start_offset(), c.end_offset()))
+        } else if let Some(n) = node.as_interpolated_x_string_node() {
+            Some((n.opening_loc().end_offset(), n.closing_loc().start_offset()))
+        } else {
+            None
+        };
+        let body_count = match range {
+            Some((s, e)) if e > s => ml_count_text_fragment(&self.src[s..e], count_comments),
+            _ => 0,
+        };
+        body_count + 2
+    }
+
+    /// `classlike_code_length` — real `module`/`class` node form.
+    fn ml_classlike_length(&self, node: &ruby_prism::Node, count_comments: bool) -> i64 {
+        let body = match node.as_module_node() {
+            Some(m) => m.body(),
+            None => node.as_class_node().and_then(|c| c.body()),
+        };
+        // `namespace_module?`: a module/class whose ENTIRE body is a single
+        // nested module/class definition scores 0 (pure namespace).
+        if body.as_ref().is_some_and(ml_is_classlike) {
+            return 0;
+        }
+        let l = node.location();
+        let first = self.idx.loc(l.start_offset()).0;
+        let last = self.idx.loc(l.end_offset().saturating_sub(1)).0;
+        let mut excluded = MlInnerClasslikeCollector { idx: self.idx, lines: HashSet::new() };
+        if let Some(b) = &body {
+            excluded.visit(b);
+        }
+        let mut length = 0i64;
+        // Interior lines only — excludes the node's own first (`module Foo`)
+        // and last (`end`) line. An empty `(first+1)..=(last-1)` range (e.g.
+        // `module Foo\nend`) simply iterates zero times.
+        for line in (first + 1)..=last.saturating_sub(1) {
+            if excluded.lines.contains(&line) {
+                continue;
+            }
+            if !self.ml_irrelevant_file_line(line, count_comments) {
+                length += 1;
+            }
+        }
+        length
+    }
+
+    /// Applies `CountAsOne` folding to a base length, walking `start`'s
+    /// children (NOT `start` itself — `each_top_level_descendant` never
+    /// tests the top node for classlike-ness/type membership, only its
+    /// descendants) via `walk`, which must invoke the matching
+    /// `ruby_prism::visit_*_node` default-traversal free function for
+    /// `start`'s own node type so the walker sees exactly `start`'s direct
+    /// children.
+    fn ml_apply_folding(&self, mut length: i64, matches: Vec<ruby_prism::Node>, count_comments: bool) -> i64 {
+        for m in matches {
+            let descendant_length = if super::breakable::is_heredoc_node(&m) {
+                self.ml_heredoc_length(&m, count_comments)
+            } else {
+                self.ml_node_own_length(&m, count_comments)
+            };
+            length = length - descendant_length + 1;
+        }
+        length
+    }
+
+    fn ml_config(&self, cop: &'static str) -> (i64, bool, MlFoldableTypes) {
+        let max = self.cfg.get(cop, "Max").and_then(|v| v.parse().ok()).unwrap_or(100);
+        let count_comments = self.cfg.get(cop, "CountComments") == Some("true");
+        let count_as_one =
+            self.cfg.get(cop, "CountAsOne").map(crate::config::parse_allowed_list).unwrap_or_default();
+        (max, count_comments, MlFoldableTypes::from_list(&count_as_one))
+    }
+
+    /// `on_module` — a real `module Foo ... end` definition.
+    pub(crate) fn check_module_length_module(&mut self, node: &ruby_prism::ModuleNode) {
+        const COP: &str = "Metrics/ModuleLength";
+        if !self.on(COP) {
+            return;
+        }
+        let (max, count_comments, foldable) = self.ml_config(COP);
+        let mut length = self.ml_classlike_length(&node.as_node(), count_comments);
+        if foldable.any() {
+            let mut walker = MlFoldWalker { foldable, matches: Vec::new() };
+            ruby_prism::visit_module_node(&mut walker, node);
+            length = self.ml_apply_folding(length, walker.matches, count_comments);
+        }
+        if length > max {
+            let msg = format!("Module has too many lines. [{length}/{max}]");
+            self.push(node.location().start_offset(), COP, false, msg);
+        }
+    }
+
+    /// `on_casgn` guarded by `module_definition?` — `Foo = Module.new do
+    /// ... end` / `Foo = ::Module.new do ... end`. Anchored at `node.loc.name`
+    /// (just `Foo`), matching `CodeLength#location`'s casgn branch.
+    pub(crate) fn check_module_length_casgn(&mut self, node: &ruby_prism::ConstantWriteNode) {
+        const COP: &str = "Metrics/ModuleLength";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(block) = ml_module_new_block(&node.value()) else { return };
+        let (max, count_comments, foldable) = self.ml_config(COP);
+        let mut length = match block.body() {
+            Some(b) => self.ml_node_own_length(&b, count_comments),
+            None => 0,
+        };
+        if foldable.any() {
+            let mut walker = MlFoldWalker { foldable, matches: Vec::new() };
+            ruby_prism::visit_constant_write_node(&mut walker, node);
+            length = self.ml_apply_folding(length, walker.matches, count_comments);
+        }
+        if length > max {
+            let msg = format!("Module has too many lines. [{length}/{max}]");
+            self.push(node.name_loc().start_offset(), COP, false, msg);
+        }
+    }
+}

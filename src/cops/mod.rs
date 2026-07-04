@@ -310,7 +310,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
     "Style/MethodCallWithoutArgsParentheses", "Style/Alias", "Style/RaiseArgs", "Style/MethodDefParentheses",
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
-    "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral",
+    "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
 ];
 
 impl Engine {
@@ -1660,6 +1660,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
         let v = node.value();
+        self.check_module_length_casgn(node);
         // Style/Alias's `alias_method_value_used?`: `node.parent&.assignment?`
         // — `NAME = alias_method :a, :b`.
         self.alias_value_offsets.insert(v.location().start_offset());
@@ -2887,6 +2888,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.leave_namespace();
     }
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        self.check_module_length_module(node);
         self.check_ascii_module(node);
         self.check_trailing_body_on_module(node);
         self.check_class_methods(&node.constant_path(), node.body());
