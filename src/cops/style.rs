@@ -30640,3 +30640,1121 @@ fn cmc_sub_first(hay: &[u8], needle: &[u8]) -> Vec<u8> {
         hay.to_vec()
     }
 }
+
+
+#[derive(Clone, Copy)]
+enum IumMsg {
+    UseModifier,
+    UseNormal,
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/IfUnlessModifier — the general `StatementModifier` port: a
+    /// full-form `if`/`unless` whose single-line body would still fit on one
+    /// line as `body keyword cond` (favor modifier form), OR an existing
+    /// modifier `body keyword cond` whose line is too long per
+    /// `Layout/LineLength` (favor normal form instead). Ported from
+    /// `on_if`/`message`/`StatementModifier#single_line_as_modifier?` and
+    /// `too_long_due_to_modifier?`.
+    ///
+    /// Called for EVERY real `if`/`elsif`/`unless` (never a ternary — see
+    /// the call sites in `mod.rs`, which only invoke this when a genuine
+    /// `if`/`elsif`/`unless` keyword is present). An `elsif` or a node with
+    /// an `else`/further-`elsif` branch (`has_subsequent`, upstream's
+    /// `else?` — true for either, a documented legacy quirk) can only ever
+    /// hit the "too long modifier" branch (both are structurally never
+    /// `modifier_form?`), so `non_simple_if_unless?` only actually needs
+    /// checking on the full-form side — see `ium_message_normal_form`.
+    ///
+    /// `node`'s own byte range anchors both `chained?` (a forward scan from
+    /// `node_end` — see `ium_is_chained`) and the eventual autocorrect
+    /// replacement; `keyword_loc` anchors the offense location
+    /// (`node.loc.keyword`) and, for a full-form node, equals `node`'s own
+    /// start (a modifier node's location begins at its BODY instead, which
+    /// is why `keyword_loc` is threaded through separately rather than
+    /// re-derived from `node`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn check_if_unless_modifier<'pr>(
+        &mut self,
+        node: &ruby_prism::Node<'pr>,
+        keyword_loc: ruby_prism::Location<'pr>,
+        keyword: &'static str,
+        is_elsif: bool,
+        predicate: ruby_prism::Node<'pr>,
+        statements: Option<ruby_prism::StatementsNode<'pr>>,
+        else_branch: Option<ruby_prism::Node<'pr>>,
+        end_keyword_loc: Option<ruby_prism::Location<'pr>>,
+    ) {
+        const COP: &str = "Style/IfUnlessModifier";
+        if !self.on(COP) {
+            return;
+        }
+
+        let node_loc = node.location();
+        let node_start = node_loc.start_offset();
+        let node_end = node_loc.end_offset();
+        let is_modifier_form = end_keyword_loc.is_none();
+        let has_subsequent = else_branch.is_some();
+        // `Location` isn't `Clone`/`Copy`; extract its two offsets up front
+        // so they can be threaded through (and reused) as plain `usize`s.
+        let end_kw_offsets: Option<(usize, usize)> =
+            end_keyword_loc.as_ref().map(|l| (l.start_offset(), l.end_offset()));
+
+        let body_list: Vec<ruby_prism::Node<'pr>> =
+            statements.as_ref().map(|s| s.body().iter().collect()).unwrap_or_default();
+
+        // `endless_method?(node.body)`: `node.body` is `node_parts[1]` — a
+        // >1-statement body is a synthetic wrapper (never itself a `def`),
+        // so only the single-statement case can possibly match.
+        if body_list.len() == 1 {
+            if let Some(d) = body_list[0].as_def_node() {
+                if d.equal_loc().is_some() {
+                    return;
+                }
+            }
+        }
+        // `node.ancestors.any?(&:dstr_type?)`
+        if self.ium_dstr_depth > 0 {
+            return;
+        }
+        // `defined_nodes(condition).any? { defined_argument_is_undefined? }`
+        if ium_defined_argument_blocks(&predicate, node_start, &self.ium_left_siblings) {
+            return;
+        }
+        // `pattern_matching_nodes(condition).any?`
+        if ium_has_pattern_match(&predicate) {
+            return;
+        }
+
+        let if_branch_node = statements.as_ref().map(|s| s.as_node());
+        let msg_kind = if !is_modifier_form {
+            self.ium_message_normal_form(
+                node_start,
+                node_end,
+                is_elsif,
+                has_subsequent,
+                keyword,
+                &predicate,
+                &body_list,
+                if_branch_node,
+                else_branch,
+                end_kw_offsets,
+            )
+        } else if self.ium_too_long_due_to_modifier(node_start, node_end) {
+            Some(IumMsg::UseNormal)
+        } else {
+            None
+        };
+        let Some(kind) = msg_kind else { return };
+
+        let offense_msg = match kind {
+            IumMsg::UseModifier => format!(
+                "Favor modifier `{keyword}` usage when having a single-line body. Another good \
+                 alternative is the usage of control flow `&&`/`||`."
+            ),
+            IumMsg::UseNormal => format!("Modifier form of `{keyword}` makes the line too long."),
+        };
+        self.push(keyword_loc.start_offset(), COP, true, offense_msg);
+
+        // `part_of_ignored_node?(node)` — no fix once an ancestor's fix
+        // already claims (contains) this node's range.
+        if self.ium_ignored_ranges.iter().any(|&(s, e)| node_start >= s && node_end <= e) {
+            return;
+        }
+        // `another_modifier_if_on_same_line?(node)` — only consulted on the
+        // "too long modifier" path (upstream calls it unconditionally, but
+        // it can only ever be true for a `modifier_form?` node — a
+        // full-form node is never itself `sibling.modifier_form?`... upstream
+        // checks THIS node's own line against OTHER modifier siblings, so
+        // restricting to the modifier-form message is behaviorally
+        // equivalent and avoids a needless lookup on the common path).
+        if matches!(kind, IumMsg::UseNormal) {
+            let node_line = self.idx.loc(node_start).0;
+            if self.ium_another_modifier_if_on_same_line(node_start, node_line) {
+                return;
+            }
+        }
+
+        if is_modifier_form {
+            self.ium_replacement_for_modifier_form(node_start, node_end, keyword, &predicate, &body_list);
+        } else {
+            // `non_eligible_body?` (checked inside `ium_message_normal_form`)
+            // already guarantees exactly one body statement here.
+            let replacement = self.ium_to_modifier_form(node_start, node_end, keyword, &predicate, &body_list);
+            self.fixes.push((node_start, node_end, replacement));
+        }
+        self.ium_ignored_ranges.push((node_start, node_end));
+    }
+
+    /// `message(node)`'s `single_line_as_modifier?(node) &&
+    /// !named_capture_in_condition?(node)` branch — only ever reached for a
+    /// full-form (non-modifier) node. Ports `StatementModifier#non_eligible_node?`
+    /// (inlined: `node.modifier_form?` is always false here, so that arm of
+    /// upstream's `||` chain is skipped) plus `IfUnlessModifier`'s own
+    /// override (`non_simple_if_unless?`, `chained?`, `nested_conditional?`,
+    /// `multiline_inside_collection?`), then `non_eligible_body?`,
+    /// `non_eligible_condition?`, `modifier_fits_on_single_line?`, and
+    /// finally `named_capture_in_condition?`.
+    #[allow(clippy::too_many_arguments)]
+    fn ium_message_normal_form<'pr>(
+        &self,
+        node_start: usize,
+        node_end: usize,
+        is_elsif: bool,
+        has_subsequent: bool,
+        keyword: &str,
+        predicate: &ruby_prism::Node<'pr>,
+        body_list: &[ruby_prism::Node<'pr>],
+        if_branch_node: Option<ruby_prism::Node<'pr>>,
+        else_branch: Option<ruby_prism::Node<'pr>>,
+        end_kw_offsets: Option<(usize, usize)>,
+    ) -> Option<IumMsg> {
+        // non_simple_if_unless?: ternary? (excluded by the caller already —
+        // no keyword means we're never called), elsif?, else?
+        if is_elsif || has_subsequent {
+            return None;
+        }
+        if self.ium_is_chained(node_end) {
+            return None;
+        }
+        if ium_nested_conditional([if_branch_node, else_branch]) {
+            return None;
+        }
+        let (first_line, _) = self.idx.loc(node_start);
+        let (last_line, _) = self.idx.loc(node_end.saturating_sub(1));
+        if self.ium_multiline_inside_collection(node_start, first_line, last_line) {
+            return None;
+        }
+        if wum_nonempty_line_count(&self.src[node_start..node_end]) > 3 {
+            return None;
+        }
+        if self.comments.iter().any(|(l, _, _)| *l == last_line) {
+            return None;
+        }
+        if self.wum_first_line_comment(first_line).is_some() {
+            if let Some((cs, ce)) = end_kw_offsets {
+                if self.ium_code_after(cs, ce).is_some() {
+                    return None;
+                }
+            }
+        }
+        // non_eligible_body?
+        if self.ium_non_eligible_body(body_list) {
+            return None;
+        }
+        // non_eligible_condition?
+        if wum_condition_has_lvasgn(predicate) {
+            return None;
+        }
+        // modifier_fits_on_single_line?
+        if !self.ium_modifier_fits(node_start, node_end, end_kw_offsets, keyword, predicate, &body_list[0]) {
+            return None;
+        }
+        // named_capture_in_condition?
+        if predicate.as_match_write_node().is_some() {
+            return None;
+        }
+        Some(IumMsg::UseModifier)
+    }
+
+    /// `too_long_due_to_modifier?`: `node.modifier_form?` (guaranteed true
+    /// by the caller) `&& too_long_single_line?(node) &&
+    /// !another_statement_on_same_line?(node)`.
+    fn ium_too_long_due_to_modifier(&self, node_start: usize, node_end: usize) -> bool {
+        if !self.ium_too_long_single_line(node_start, node_end) {
+            return false;
+        }
+        let (last_line, _) = self.idx.loc(node_end.saturating_sub(1));
+        if let Some(&sib_line) = self.ium_right_sibling_line.get(&node_start) {
+            if sib_line == last_line {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `too_long_single_line?`: single-physical-line node (heredoc bodies
+    /// are displaced elsewhere so a modifier-if with a heredoc argument is
+    /// still "single line" here — matches prism's own displaced `Location`),
+    /// `Layout/LineLength` administratively enabled at that line (comment
+    /// directives), and over `Max` — then the exemption ladder.
+    fn ium_too_long_single_line(&self, node_start: usize, node_end: usize) -> bool {
+        let Some(max) = self.wum_max_line_length() else { return false };
+        let (first_line, _) = self.idx.loc(node_start);
+        let (last_line, _) = self.idx.loc(node_end.saturating_sub(1));
+        if first_line != last_line {
+            return false;
+        }
+        if self.ium_ll_disabled_at(first_line) {
+            return false;
+        }
+        let line = self.ium_line_bytes(first_line);
+        if self.wum_line_length(line) <= max {
+            return false;
+        }
+        let line_str = String::from_utf8_lossy(line);
+        self.ium_too_long_line_based_on_config(&line_str, first_line, max)
+    }
+
+    /// `too_long_line_based_on_config?`: allowed-pattern exemption, then the
+    /// cop-directive re-measurement (a DEFINITE answer when it applies),
+    /// then the `AllowURI` exemption.
+    fn ium_too_long_line_based_on_config(&self, line: &str, line_no: usize, max: usize) -> bool {
+        if self.allowed("Layout/LineLength", line.as_bytes()) {
+            return false;
+        }
+        if let Some(v) = self.ium_too_long_based_on_directives(line_no, max) {
+            return v;
+        }
+        self.ium_too_long_based_on_uri(line, max)
+    }
+
+    /// `too_long_line_based_on_allow_cop_directives?`: when there's a REAL
+    /// `# rubocop:disable/todo/enable ...` comment on the line and
+    /// `AllowCopDirectives` applies, the verdict is the re-measured length
+    /// (line up to the directive marker, right-stripped) versus `Max` —
+    /// definitive either way. `None` when no directive comment sits there
+    /// (or the config disallows the exemption) — the caller falls through
+    /// to the URI check.
+    fn ium_too_long_based_on_directives(&self, line_no: usize, max: usize) -> Option<bool> {
+        if !self.ium_allow_cop_directives() {
+            return None;
+        }
+        let &(_, cs, ce) = self.comments.iter().find(|(l, _, _)| *l == line_no)?;
+        let marker = ium_directive_marker_offset(&self.src[cs..ce])?;
+        let ls = self.idx.starts[line_no - 1];
+        let prefix = String::from_utf8_lossy(&self.src[ls..cs + marker]);
+        let len = prefix.trim_end().chars().count();
+        Some(len > max)
+    }
+
+    /// `config.for_cop('Layout/LineLength')['AllowCopDirectives']`, honoring
+    /// the deprecated `IgnoreCopDirectives` override — verbatim from
+    /// `LineLengthHelp#allow_cop_directives?`.
+    fn ium_allow_cop_directives(&self) -> bool {
+        match self.cfg.param("Layout/LineLength", "IgnoreCopDirectives") {
+            Some("true") => true,
+            Some("false") => false,
+            _ => self.cfg.get("Layout/LineLength", "AllowCopDirectives") == Some("true"),
+        }
+    }
+
+    /// `too_long_line_based_on_allow_uri?`: with `AllowURI`, the LAST URI
+    /// match on the line is exempt only when it starts before `Max` and
+    /// runs to the line's own end (`allowed_position?`).
+    fn ium_too_long_based_on_uri(&self, line: &str, max: usize) -> bool {
+        if self.cfg.get("Layout/LineLength", "AllowURI") == Some("true") {
+            let schemes = self.cfg.param("Layout/LineLength", "URISchemes");
+            let re = ium_uri_regex(schemes);
+            let m = ium_uri_match_ranges(line, &re).last().copied();
+            let indent_diff = self.wum_indentation_difference(line.as_bytes());
+            if let Some(range) = ium_find_excessive_range(line, m, indent_diff, max) {
+                if range.0 < max && range.1 == self.wum_line_length(line.as_bytes()) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// `processed_source.comment_config.cop_enabled_at_line?('Layout/LineLength',
+    /// line)`'s negation folded in by the caller — is `Layout/LineLength`
+    /// (or its `Layout` department, or `all`) currently disabled at `line`
+    /// via `# rubocop:disable`/`:todo` .. `:enable` comment directives
+    /// (block or same-line)? Mirrors `apply_disable_directives`'s range
+    /// construction (mod.rs), scoped to a single cop query since this cop
+    /// needs the answer mid-traversal rather than as a final offense filter.
+    fn ium_ll_disabled_at(&self, line: usize) -> bool {
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = RE.get_or_init(|| {
+            regex::Regex::new(r"^#\s*rubocop\s*:\s*(disable|todo|enable)\s+(\S.*?)\s*$").unwrap()
+        });
+        let covers = |entry: &str| entry == "Layout/LineLength" || entry == "Layout" || entry == "all";
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut open: Option<usize> = None;
+        let eof = self.idx.starts.len();
+        for (cline, off, end) in self.comments {
+            let t = String::from_utf8_lossy(&self.src[*off..*end]);
+            let Some(c) = re.captures(&t) else { continue };
+            let cops_part = c[2].split(" -- ").next().unwrap_or(&c[2]).trim();
+            if !cops_part.split(',').any(|s| covers(s.trim())) {
+                continue;
+            }
+            let standalone =
+                self.src[self.idx.starts[*cline - 1]..*off].iter().all(|b| b.is_ascii_whitespace());
+            match &c[1] {
+                "enable" => {
+                    if let Some(from) = open.take() {
+                        ranges.push((from, *cline));
+                    }
+                }
+                _ => {
+                    if standalone {
+                        open = Some(*cline);
+                    } else {
+                        ranges.push((*cline, *cline));
+                    }
+                }
+            }
+        }
+        if let Some(from) = open {
+            ranges.push((from, eof));
+        }
+        ranges.iter().any(|&(f, t)| line >= f && line <= t)
+    }
+
+    /// Byte slice of 1-based `line`, excluding its terminator.
+    fn ium_line_bytes(&self, line: usize) -> &'a [u8] {
+        &self.src[self.idx.starts[line - 1]..self.line_end(line)]
+    }
+
+    /// `non_eligible_body?`: no body, a multi-statement (synthetic `begin`)
+    /// body, an empty-source body, or a body whose line range contains a
+    /// comment (`contains_comment?`, checked by LINE like upstream's
+    /// `each_comment_in_lines`).
+    fn ium_non_eligible_body<'pr>(&self, body_list: &[ruby_prism::Node<'pr>]) -> bool {
+        if body_list.len() != 1 {
+            return true;
+        }
+        let loc = body_list[0].location();
+        if loc.start_offset() == loc.end_offset() {
+            return true;
+        }
+        let (fl, _) = self.idx.loc(loc.start_offset());
+        let (ll, _) = self.idx.loc(loc.end_offset().saturating_sub(1));
+        (fl..=ll).any(|l| self.comments.iter().any(|(cl, _, _)| *cl == l))
+    }
+
+    /// `modifier_fits_on_single_line?`: render the hypothetical modifier
+    /// form in place on the keyword's own physical line (`code_before` +
+    /// `to_modifier_form` + `code_after`) and compare its rubocop `line_length`
+    /// (chars + tab surcharge) against `Layout/LineLength`'s `Max`.
+    fn ium_modifier_fits<'pr>(
+        &self,
+        node_start: usize,
+        node_end: usize,
+        end_kw_offsets: Option<(usize, usize)>,
+        keyword: &str,
+        predicate: &ruby_prism::Node<'pr>,
+        body: &ruby_prism::Node<'pr>,
+    ) -> bool {
+        let Some(max) = self.wum_max_line_length() else { return true };
+        let (line, _) = self.idx.loc(node_start);
+        let line_start = self.idx.starts[line - 1];
+        let mut full = self.src[line_start..node_start].to_vec();
+        full.extend_from_slice(&self.ium_to_modifier_form(
+            node_start,
+            node_end,
+            keyword,
+            predicate,
+            std::slice::from_ref(body),
+        ));
+        if let Some((cs, ce)) = end_kw_offsets {
+            if let Some(ca) = self.ium_code_after(cs, ce) {
+                full.extend_from_slice(ca);
+            }
+        }
+        self.wum_line_length(&full) <= max
+    }
+
+    /// `code_after`: whatever remains on the `end` keyword's own physical
+    /// line after it — plain-offset equivalent of `WhileUntilModifier`'s
+    /// `wum_code_after` (kept separate rather than reused directly: this
+    /// cop only ever has the closing keyword's two offsets on hand, having
+    /// already unpacked them out of a non-`Clone`/`Copy` `Location`).
+    fn ium_code_after(&self, closing_start: usize, closing_end: usize) -> Option<&'a [u8]> {
+        let (line, _) = self.idx.loc(closing_start);
+        let line_end = self.wum_line_end_offset(line);
+        if closing_end >= line_end {
+            return None;
+        }
+        let code = &self.src[closing_end..line_end];
+        if code.is_empty() { None } else { Some(code) }
+    }
+
+    /// `to_modifier_form`: `if_body_source(body) keyword condition.source`,
+    /// parenthesized when dropping it in place unparenthesized would change
+    /// the surrounding expression's meaning, plus a preserved first-line
+    /// comment (unless the whole node spans >1 physical line — a comment
+    /// "on node's line" then means the LAST line, not this one, which
+    /// `wum_first_line_comment` correctly keys off `node_start`'s line only
+    /// when the two coincide, i.e. exactly the single-physical-line case
+    /// this method is ever invoked for).
+    fn ium_to_modifier_form<'pr>(
+        &self,
+        node_start: usize,
+        node_end: usize,
+        keyword: &str,
+        predicate: &ruby_prism::Node<'pr>,
+        body_list: &[ruby_prism::Node<'pr>],
+    ) -> Vec<u8> {
+        let body_src = self.ium_if_body_source(&body_list[0]);
+        let mut expr = body_src;
+        expr.push(b' ');
+        expr.extend_from_slice(keyword.as_bytes());
+        expr.push(b' ');
+        expr.extend_from_slice(self.node_src(predicate));
+        let mut out = if self.ium_parenthesize(node_start, node_end) {
+            let mut v = Vec::with_capacity(expr.len() + 2);
+            v.push(b'(');
+            v.extend(expr);
+            v.push(b')');
+            v
+        } else {
+            expr
+        };
+        let (line, _) = self.idx.loc(node_start);
+        if let Some(c) = self.wum_first_line_comment(line) {
+            out.push(b' ');
+            out.extend_from_slice(c);
+        }
+        out
+    }
+
+    /// `if_body_source`: rewrites `obj.method arg:` (an implicit trailing
+    /// hash whose last pair uses value-omission shorthand) to
+    /// `obj.method(arg:)` — required because dropping the braceless hash
+    /// into modifier position unparenthesized would otherwise be ambiguous.
+    /// Every other body renders as plain `body.source`.
+    fn ium_if_body_source<'pr>(&self, body: &ruby_prism::Node<'pr>) -> Vec<u8> {
+        if let Some(call) = body.as_call_node() {
+            if call.name().as_slice() != b"[]=" && ium_omitted_value_in_last_hash_arg(&call) {
+                let mut out = self.ium_method_source(&call);
+                out.push(b'(');
+                if let Some(args) = call.arguments() {
+                    for (i, a) in args.arguments().iter().enumerate() {
+                        if i > 0 {
+                            out.extend_from_slice(b", ");
+                        }
+                        out.extend_from_slice(self.node_src(&a));
+                    }
+                }
+                out.push(b')');
+                return out;
+            }
+        }
+        self.node_src(body).to_vec()
+    }
+
+    /// `method_source`: the call's own text from its start through either
+    /// the selector token (a named call, `obj.method`) or the call
+    /// operator's end (`obj.` / `obj&.` — an implicit `.()` call).
+    fn ium_method_source<'pr>(&self, call: &ruby_prism::CallNode<'pr>) -> Vec<u8> {
+        let start = call.location().start_offset();
+        let end = if call.message_loc().is_none() {
+            call.call_operator_loc().map(|l| l.end_offset()).unwrap_or(start)
+        } else {
+            call.message_loc().unwrap().end_offset()
+        };
+        self.src[start..end].to_vec()
+    }
+
+    /// `parenthesize?`: would dropping the corrected expression in place,
+    /// unparenthesized, change the meaning of its surrounding expression?
+    /// Ported without a real AST-parent chain (none is tracked by this
+    /// visitor) via a best-effort scan of the raw source immediately
+    /// surrounding the node, mirroring `WhileUntilModifier`'s
+    /// `wum_parenthesize` (see its doc for the caveat) plus a hash-pair-value
+    /// case (`x: if a ... end` -> `x: (b if a)`) that `parenthesize?` also
+    /// covers (`parent.type == :pair`) but `WhileUntilModifier` never
+    /// needed.
+    fn ium_parenthesize(&self, node_start: usize, node_end: usize) -> bool {
+        if self.src[node_end..].starts_with(b"&.") {
+            return true;
+        }
+        if self.src[node_end..].starts_with(b".") && !self.src[node_end..].starts_with(b"..") {
+            return true;
+        }
+        let mut i = node_start;
+        while i > 0 && matches!(self.src[i - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            i -= 1;
+        }
+        if i == 0 {
+            return false;
+        }
+        let before = &self.src[..i];
+        for op in
+            [&b"&&="[..], b"||=", b"**=", b"<<=", b">>=", b"+=", b"-=", b"*=", b"/=", b"%=", b"&=", b"|=", b"^="]
+        {
+            if before.ends_with(op) {
+                return true;
+            }
+        }
+        if before.ends_with(b"=")
+            && !before.ends_with(b"==")
+            && !before.ends_with(b"!=")
+            && !before.ends_with(b"<=")
+            && !before.ends_with(b">=")
+            && !before.ends_with(b"=>")
+        {
+            return true;
+        }
+        if before.ends_with(b"&&") || before.ends_with(b"||") {
+            return true;
+        }
+        if wum_ends_with_word(before, b"and") || wum_ends_with_word(before, b"or") {
+            return true;
+        }
+        if before.ends_with(b",") || before.ends_with(b"[") {
+            return true;
+        }
+        // hash pair value: `key:` immediately before (whitespace already skipped)
+        if before.ends_with(b":") && !before.ends_with(b"::") {
+            return true;
+        }
+        if before.ends_with(b"(") {
+            let paren_at = before.len() - 1;
+            return paren_at > 0
+                && matches!(before[paren_at - 1],
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b']' | b')' | b'?' | b'!');
+        }
+        false
+    }
+
+    /// `chained?`: is this node the RECEIVER of an enclosing call (a
+    /// trailing `.`/`&.` chain, or a binary-operator call like `end + 2`)?
+    /// Ported via a forward source scan from `node_end` (no parent chain is
+    /// tracked) — same-line-only for the operator case, since Ruby doesn't
+    /// continue an unparenthesized expression as a binary-operator operand
+    /// across a bare newline.
+    fn ium_is_chained(&self, node_end: usize) -> bool {
+        let rest = &self.src[node_end..];
+        let mut i = 0;
+        while i < rest.len() && matches!(rest[i], b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        }
+        let after_ws = &rest[i..];
+        if after_ws.starts_with(b"&.") {
+            return true;
+        }
+        if after_ws.starts_with(b".") && !after_ws.starts_with(b"..") {
+            return true;
+        }
+        let mut j = 0;
+        while j < rest.len() && matches!(rest[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let same_line = &rest[j..];
+        for op in [
+            &b"<=>"[..], b"===", b"**", b"<<", b">>", b"==", b"!=", b"<=", b">=", b"&&", b"||", b"=~", b"!~",
+            b"+", b"-", b"*", b"/", b"%", b"&", b"|", b"^", b"<", b">",
+        ] {
+            if same_line.starts_with(op) {
+                let after = &same_line[op.len()..];
+                if after.first() == Some(&b'=') && !matches!(op, b"==" | b"!=" | b"<=" | b">=") {
+                    continue; // `+=`, `-=`, ... — an op-assign, not a binary operand
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `multiline_inside_collection?`: any DIRECT sibling in the same
+    /// array/call/hash collection (after unwrapping one layer of
+    /// parens/pair) that unwraps to a non-ternary `if`/`unless` sharing a
+    /// physical line with this node — see `ium_collection_info`'s doc for
+    /// how the sibling list is gathered ahead of time.
+    fn ium_multiline_inside_collection(&self, node_start: usize, node_first_line: usize, node_last_line: usize) -> bool {
+        self.ium_collection_info.get(&node_start).is_some_and(|(direct, _)| {
+            direct.iter().any(|&(_, fl, ll)| fl == node_last_line || ll == node_first_line)
+        })
+    }
+
+    /// `another_modifier_if_on_same_line?`: any OTHER modifier-form
+    /// `if`/`unless` anywhere in the same containing collection's subtree
+    /// (full recursive descent) that starts on this node's own line.
+    fn ium_another_modifier_if_on_same_line(&self, node_start: usize, node_line: usize) -> bool {
+        self.ium_collection_info.get(&node_start).is_some_and(|(_, mod_lines)| {
+            mod_lines.iter().any(|&(off, l)| off != node_start && l == node_line)
+        })
+    }
+
+    /// Populates `ium_collection_info` for every eligible DIRECT child of an
+    /// array literal / call's argument list / hash literal (`children`),
+    /// pre-order (before the caller recurses into them) — see the field's
+    /// own doc for what's gathered and why.
+    pub(crate) fn ium_register_collection<'pr>(
+        &mut self,
+        coll: &ruby_prism::Node<'pr>,
+        children: Vec<ruby_prism::Node<'pr>>,
+    ) {
+        if !self.on("Style/IfUnlessModifier") {
+            return;
+        }
+        let mut direct: Vec<(usize, usize, usize)> = Vec::new();
+        for child in children {
+            let Some(inner) = ium_unwrap_collection_child(child) else { continue };
+            if !ium_is_if_or_unless_nonternary(&inner) {
+                continue;
+            }
+            let loc = inner.location();
+            let fl = self.idx.loc(loc.start_offset()).0;
+            let ll = self.idx.loc(loc.end_offset().saturating_sub(1)).0;
+            direct.push((loc.start_offset(), fl, ll));
+        }
+        if direct.is_empty() {
+            return;
+        }
+        let mod_lines = ium_collect_modifier_lines(coll, self.idx);
+        for &(key, ..) in &direct {
+            self.ium_collection_info.insert(key, (direct.clone(), mod_lines.clone()));
+        }
+    }
+
+    /// `replacement_for_modifier_form` (upstream): the node is already
+    /// modifier-form and too long — either move a too-long trailing comment
+    /// above (keeping modifier form), extract a heredoc-argument body into
+    /// normal form, or just convert to plain normal form.
+    fn ium_replacement_for_modifier_form<'pr>(
+        &mut self,
+        node_start: usize,
+        node_end: usize,
+        keyword: &str,
+        predicate: &ruby_prism::Node<'pr>,
+        body_list: &[ruby_prism::Node<'pr>],
+    ) {
+        let node_line = self.idx.loc(node_start).0;
+        let indent_col = self.idx.loc(node_start).1 - 1;
+        let comment_range = self.comments.iter().find(|(l, _, _)| *l == node_line).map(|&(_, s, e)| (s, e));
+
+        if let Some((cs, ce)) = comment_range {
+            if self.ium_too_long_due_to_comment_after_modifier(node_line, cs, ce) {
+                let ls = self.idx.starts[node_line - 1];
+                let mut rs = cs;
+                while rs > ls && matches!(self.src[rs - 1], b' ' | b'\t') {
+                    rs -= 1;
+                }
+                self.fixes.push((rs, ce, Vec::new()));
+                let replacement =
+                    self.ium_to_modifier_form_with_move_comment(indent_col, keyword, predicate, &body_list[0], cs, ce);
+                self.fixes.push((node_start, node_end, replacement));
+                return;
+            }
+        }
+
+        let body = &body_list[0];
+        if let Some(call) = body.as_call_node() {
+            if let Some(args) = call.arguments() {
+                if let Some(last_arg) = args.arguments().iter().last() {
+                    if let Some((hb_start, hb_end, close_start, close_end)) = ium_heredoc_ranges(&last_arg) {
+                        self.ium_remove_heredoc_lines(hb_start, close_end);
+                        let replacement = self.ium_to_normal_form_with_heredoc(
+                            indent_col, keyword, predicate, body, hb_start, hb_end, close_start, close_end,
+                        );
+                        self.fixes.push((node_start, node_end, replacement));
+                        return;
+                    }
+                }
+            }
+        }
+
+        let replacement = self.ium_to_normal_form(indent_col, keyword, predicate, body);
+        self.fixes.push((node_start, node_end, replacement));
+    }
+
+    /// `too_long_due_to_comment_after_modifier?`: is the trailing comment
+    /// alone (its own char length) enough to blame for the line exceeding
+    /// `Max` — i.e. would removing exactly that many characters bring the
+    /// line's length down to at-or-below `Max`?
+    fn ium_too_long_due_to_comment_after_modifier(&self, line_no: usize, cs: usize, ce: usize) -> bool {
+        let Some(max) = self.wum_max_line_length() else { return false };
+        let line_bytes = self.ium_line_bytes(line_no);
+        let source_length = String::from_utf8_lossy(line_bytes).chars().count();
+        let comment_len = String::from_utf8_lossy(&self.src[cs..ce]).chars().count();
+        let lower = source_length.saturating_sub(comment_len);
+        max >= lower && max <= source_length
+    }
+
+    /// `to_modifier_form_with_move_comment`: the comment hoisted to its own
+    /// line above, then the UNMODIFIED modifier statement (`node.body.source`
+    /// — no hash-omission rewrite here, unlike `to_modifier_form`) re-indented
+    /// to the node's own original column.
+    fn ium_to_modifier_form_with_move_comment<'pr>(
+        &self,
+        indent_col: usize,
+        keyword: &str,
+        predicate: &ruby_prism::Node<'pr>,
+        body: &ruby_prism::Node<'pr>,
+        cs: usize,
+        ce: usize,
+    ) -> Vec<u8> {
+        let mut out = self.src[cs..ce].to_vec();
+        out.push(b'\n');
+        out.extend(std::iter::repeat_n(b' ', indent_col));
+        out.extend_from_slice(self.node_src(body));
+        out.push(b' ');
+        out.extend_from_slice(keyword.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(self.node_src(predicate));
+        out
+    }
+
+    /// `to_normal_form`: `keyword condition.source`, then the body
+    /// re-indented two spaces past the node's own column (hardcoded — NOT
+    /// `Layout/IndentationWidth`), then a matching `end` back at the node's
+    /// own column.
+    fn ium_to_normal_form<'pr>(
+        &self,
+        indent_col: usize,
+        keyword: &str,
+        predicate: &ruby_prism::Node<'pr>,
+        body: &ruby_prism::Node<'pr>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(keyword.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(self.node_src(predicate));
+        out.push(b'\n');
+        out.extend(std::iter::repeat_n(b' ', indent_col + 2));
+        out.extend_from_slice(self.node_src(body));
+        out.push(b'\n');
+        out.extend(std::iter::repeat_n(b' ', indent_col));
+        out.extend_from_slice(b"end");
+        out
+    }
+
+    /// `to_normal_form_with_heredoc`: like `to_normal_form`, but with the
+    /// heredoc's own body and terminator lines (extracted from their
+    /// displaced original position, `chomp`ed) re-inserted right after the
+    /// call statement, at the same re-indented column.
+    #[allow(clippy::too_many_arguments)]
+    fn ium_to_normal_form_with_heredoc<'pr>(
+        &self,
+        indent_col: usize,
+        keyword: &str,
+        predicate: &ruby_prism::Node<'pr>,
+        body: &ruby_prism::Node<'pr>,
+        hb_start: usize,
+        hb_end: usize,
+        close_start: usize,
+        close_end: usize,
+    ) -> Vec<u8> {
+        fn chomp(mut v: Vec<u8>) -> Vec<u8> {
+            if v.last() == Some(&b'\n') {
+                v.pop();
+                if v.last() == Some(&b'\r') {
+                    v.pop();
+                }
+            }
+            v
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(keyword.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(self.node_src(predicate));
+        out.push(b'\n');
+        out.extend(std::iter::repeat_n(b' ', indent_col + 2));
+        out.extend_from_slice(self.node_src(body));
+        out.push(b'\n');
+        out.extend(std::iter::repeat_n(b' ', indent_col + 2));
+        out.extend_from_slice(&chomp(self.src[hb_start..hb_end].to_vec()));
+        out.push(b'\n');
+        out.extend(std::iter::repeat_n(b' ', indent_col + 2));
+        out.extend_from_slice(&chomp(self.src[close_start..close_end].to_vec()));
+        out.push(b'\n');
+        out.extend(std::iter::repeat_n(b' ', indent_col));
+        out.extend_from_slice(b"end");
+        out
+    }
+
+    /// `remove_heredoc`: delete the heredoc's own displaced physical lines
+    /// (body through terminator) wholesale, including their trailing
+    /// newline — they're being relocated into the normal-form replacement.
+    fn ium_remove_heredoc_lines(&mut self, hb_start: usize, close_end: usize) {
+        let l1 = self.idx.loc(hb_start).0;
+        let l2 = self.idx.loc(close_end.saturating_sub(1)).0;
+        let del_start = self.idx.starts[l1 - 1];
+        let del_end = self.idx.starts.get(l2).copied().unwrap_or(self.src.len());
+        self.fixes.push((del_start, del_end, Vec::new()));
+    }
+}
+
+/// `defined_nodes(condition).any? { defined_argument_is_undefined? }`: find
+/// every `defined?(...)` call anywhere in `predicate`'s subtree (including
+/// `predicate` itself), and for each check whether its argument is "not
+/// (yet) assigned at this point" — the ONLY case where converting to
+/// modifier form would visibly change behavior on Ruby's real block-scoping
+/// semantics.
+///
+/// `defined_argument.type?(:lvar, :send)` splits into: a prism
+/// `LocalVariableReadNode` (a name the parser already resolved as a known
+/// local by this point) is "undefined" unless some earlier statement in the
+/// SAME statement list assigns that exact name (`ium_left_siblings`); any
+/// `CallNode` argument (an unresolved bare identifier, OR any real method
+/// call with/without a receiver) is ALWAYS "undefined" here — upstream's own
+/// `defined_argument.node_parts[0]` for a `:send` node is its RECEIVER
+/// (`nil` for an implicit call), which can never equal a sibling's `lvasgn`
+/// NAME (a `Symbol`), so the `left_siblings.none?` check is unconditionally
+/// true for every non-`lvar` case. Anything else (`yield`, `super`, a
+/// literal, ...) returns `false` immediately, matching upstream's own early
+/// `return false unless type?(:lvar, :send)`.
+fn ium_defined_argument_blocks<'pr>(
+    predicate: &ruby_prism::Node<'pr>,
+    node_start: usize,
+    left_siblings: &std::collections::HashMap<usize, std::collections::HashSet<Vec<u8>>>,
+) -> bool {
+    struct Finder<'pr> {
+        out: Vec<ruby_prism::Node<'pr>>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder<'pr> {
+        fn visit_defined_node(&mut self, node: &ruby_prism::DefinedNode<'pr>) {
+            self.out.push(node.value());
+            ruby_prism::visit_defined_node(self, node);
+        }
+    }
+    let mut f: Finder<'pr> = Finder { out: Vec::new() };
+    use ruby_prism::Visit;
+    f.visit(predicate);
+    if f.out.is_empty() {
+        return false;
+    }
+    let empty = std::collections::HashSet::new();
+    let siblings = left_siblings.get(&node_start).unwrap_or(&empty);
+    f.out.iter().any(|arg| {
+        if let Some(lvar) = arg.as_local_variable_read_node() {
+            !siblings.contains(lvar.name().as_slice())
+        } else {
+            arg.as_call_node().is_some()
+        }
+    })
+}
+
+/// `pattern_matching_nodes(condition).any?`: any one-line `expr in pattern`
+/// (prism's `MatchPredicateNode`) anywhere in `predicate`'s subtree,
+/// including `predicate` itself.
+fn ium_has_pattern_match(predicate: &ruby_prism::Node) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_match_predicate_node(&mut self, node: &ruby_prism::MatchPredicateNode<'pr>) {
+            self.found = true;
+            ruby_prism::visit_match_predicate_node(self, node);
+        }
+    }
+    let mut f = Finder { found: false };
+    use ruby_prism::Visit;
+    f.visit(predicate);
+    f.found
+}
+
+/// `IfNode#nested_conditional?`: does either branch's subtree (full
+/// recursive descent — upstream's `each_node(:if)` crosses into nested
+/// `def`s, blocks, everything) contain an `if`/`unless`/ternary that ISN'T
+/// itself part of THIS node's own `elsif` chain? A ternary is, under
+/// prism's own translation, an `IfNode` with no `if_keyword_loc` — matching
+/// `nested.elsif?`'s `false` for it, so it always counts as "nested" too
+/// (verified against real rubocop's `nested_conditional?`).
+fn ium_nested_conditional(branches: [Option<ruby_prism::Node>; 2]) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+            if node.if_keyword_loc().as_ref().map(|k| k.as_slice()) != Some(&b"elsif"[..]) {
+                self.found = true;
+            }
+            ruby_prism::visit_if_node(self, node);
+        }
+        fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+            self.found = true;
+            ruby_prism::visit_unless_node(self, node);
+        }
+    }
+    let mut f = Finder { found: false };
+    use ruby_prism::Visit;
+    for b in branches.into_iter().flatten() {
+        f.visit(&b);
+    }
+    f.found
+}
+
+/// `omitted_value_in_last_hash_arg?`: the call's last argument is a hash
+/// literal (braced or an implicit trailing `KeywordHashNode`) whose LAST
+/// pair uses value-omission shorthand (`foo:`, prism's `AssocNode` whose
+/// `value` is an `ImplicitNode`).
+fn ium_omitted_value_in_last_hash_arg(call: &ruby_prism::CallNode) -> bool {
+    let Some(args) = call.arguments() else { return false };
+    let list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+    let Some(last) = list.last() else { return false };
+    let elements = if let Some(h) = last.as_hash_node() {
+        h.elements()
+    } else if let Some(h) = last.as_keyword_hash_node() {
+        h.elements()
+    } else {
+        return false;
+    };
+    let elems: Vec<ruby_prism::Node> = elements.iter().collect();
+    let Some(last_pair) = elems.last() else { return false };
+    last_pair.as_assoc_node().is_some_and(|a| a.value().as_implicit_node().is_some())
+}
+
+/// `unwrap_begin` (+ the pair-unwrap `unwrap_begin` itself performs first):
+/// a hash's element is an `AssocNode` — swap to its VALUE first — then strip
+/// exactly one layer of literal parens (prism's `ParenthesesNode`) or an
+/// explicit `begin...end` (`BeginNode`), taking the sole inner statement.
+/// Anything else (including a >1-statement `begin`, which has no single
+/// "first" to sensibly unwrap to for this purpose but is vanishingly rare
+/// as a bare collection element) passes through unchanged via `Some(c)`.
+fn ium_unwrap_collection_child<'pr>(child: ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    // `Node` has no `Clone`/`Copy` impl — take ownership instead (the
+    // caller already holds an owned `Vec<Node>` it can move out of) so the
+    // pass-through branches below can hand the (possibly re-pointed) value
+    // straight back without ever needing to duplicate it.
+    let c = if let Some(assoc) = child.as_assoc_node() { assoc.value() } else { child };
+    if let Some(p) = c.as_parentheses_node() {
+        let body = p.body()?;
+        if let Some(stmts) = body.as_statements_node() {
+            return stmts.body().iter().next();
+        }
+        return Some(body);
+    }
+    if let Some(b) = c.as_begin_node() {
+        return b.statements().and_then(|s| s.body().iter().next());
+    }
+    Some(c)
+}
+
+/// `if_type? && !ternary?` — for `unless` there's no ternary form so
+/// presence alone suffices.
+fn ium_is_if_or_unless_nonternary(n: &ruby_prism::Node) -> bool {
+    if let Some(i) = n.as_if_node() {
+        return i.if_keyword_loc().is_some();
+    }
+    n.as_unless_node().is_some()
+}
+
+/// Every modifier-form (`end_keyword_loc().is_none()`) `if`/`unless`
+/// anywhere in `node`'s subtree (full recursive descent — upstream's
+/// `each_descendant(:if)`), as `(start_offset, line)`.
+fn ium_collect_modifier_lines(node: &ruby_prism::Node, idx: &super::LineIndex) -> Vec<(usize, usize)> {
+    struct Finder<'i> {
+        idx: &'i super::LineIndex,
+        out: Vec<(usize, usize)>,
+    }
+    impl<'pr, 'i> ruby_prism::Visit<'pr> for Finder<'i> {
+        fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+            if node.if_keyword_loc().is_some() && node.end_keyword_loc().is_none() {
+                let off = node.location().start_offset();
+                self.out.push((off, self.idx.loc(off).0));
+            }
+            ruby_prism::visit_if_node(self, node);
+        }
+        fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+            if node.end_keyword_loc().is_none() {
+                let off = node.location().start_offset();
+                self.out.push((off, self.idx.loc(off).0));
+            }
+            ruby_prism::visit_unless_node(self, node);
+        }
+    }
+    let mut f = Finder { idx, out: Vec::new() };
+    use ruby_prism::Visit;
+    f.visit(node);
+    f.out
+}
+
+/// `extract_heredoc_from` + the heredoc-ness test (`respond_to?(:heredoc?)
+/// && heredoc?`) folded in: `Some((body_start, body_end, closing_start,
+/// closing_end))` only for a `StringNode`/`InterpolatedStringNode` whose
+/// `opening_loc` starts with `<<` (a heredoc marker, static or interpolated).
+fn ium_heredoc_ranges(arg: &ruby_prism::Node) -> Option<(usize, usize, usize, usize)> {
+    if let Some(s) = arg.as_string_node() {
+        let opening = s.opening_loc()?;
+        if !opening.as_slice().starts_with(b"<<") {
+            return None;
+        }
+        let closing = s.closing_loc()?;
+        let content = s.content_loc();
+        Some((content.start_offset(), closing.start_offset(), closing.start_offset(), closing.end_offset()))
+    } else if let Some(s) = arg.as_interpolated_string_node() {
+        let opening = s.opening_loc()?;
+        if !opening.as_slice().starts_with(b"<<") {
+            return None;
+        }
+        let closing = s.closing_loc()?;
+        let first = s.parts().iter().next()?.location().start_offset();
+        Some((first, closing.start_offset(), closing.start_offset(), closing.end_offset()))
+    } else {
+        None
+    }
+}
+
+/// Byte offset of the `# rubocop:` directive marker inside a comment —
+/// duplicated from `Layout/LineLength`'s own (private, other-module) copy,
+/// see this cop's top-level doc for why it's self-contained here instead of
+/// shared.
+fn ium_directive_marker_offset(comment: &[u8]) -> Option<usize> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"#\s*rubocop\s*:\s*(?:disable|todo|enable)\b").unwrap())
+        .find(&String::from_utf8_lossy(comment))
+        .map(|m| m.start())
+}
+
+/// `URI::RFC2396_PARSER.make_regexp(schemes)` — duplicated from
+/// `Layout/LineLength`'s own copy (see `ium_directive_marker_offset`'s doc).
+fn ium_uri_regex(schemes: Option<&str>) -> regex::Regex {
+    let schemes: Vec<String> = schemes
+        .map(crate::config::parse_allowed_list)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec!["http".into(), "https".into()])
+        .iter()
+        .map(|s| regex::escape(s))
+        .collect();
+    regex::Regex::new(&format!(
+        r#"(?i)\b(?:{}):(?://)?[^\s<>"{{}}|\\^\x60\[\]?#]*(?:\?[^\s<>"{{}}|\\^\x60#]*)?(?:#[^\s<>"{{}}|\\^\x60]*)?"#,
+        schemes.join("|")
+    ))
+    .unwrap()
+}
+
+/// The practical slice of `URI.parse` (RFC3986) — see `Layout/LineLength`'s
+/// own copy for the reasoning.
+fn ium_valid_uri(s: &str) -> bool {
+    let Some(first) = s.find(['[', ']']) else { return true };
+    let Some(auth) = s.find("//") else { return false };
+    if first != auth + 2 || !s[first..].starts_with('[') {
+        return false;
+    }
+    match s[first + 1..].find([']', '/', '?', '#']) {
+        Some(p) if s.as_bytes()[first + 1 + p] == b']' => !s[first + 2 + p..].contains(['[', ']']),
+        _ => false,
+    }
+}
+
+/// URI candidates on the line, as byte ranges — see `Layout/LineLength`'s
+/// own copy.
+fn ium_uri_match_ranges(line: &str, re: &regex::Regex) -> Vec<(usize, usize)> {
+    re.find_iter(line)
+        .filter(|m| m.as_str().split_once(':').is_none_or(|(_, rest)| !rest.starts_with(':')))
+        .filter(|m| ium_valid_uri(m.as_str()))
+        .map(|m| (m.start(), m.end()))
+        .collect()
+}
+
+/// `find_excessive_range` — see `Layout/LineLength`'s own copy for the
+/// brace/trailing-word extension logic.
+fn ium_find_excessive_range(
+    line: &str,
+    m: Option<(usize, usize)>,
+    indent_diff: usize,
+    max: usize,
+) -> Option<(usize, usize)> {
+    let (mstart, mend) = m?;
+    let begin = line[..mstart].chars().count() + indent_diff;
+    let mut end = begin - indent_diff + line[mstart..mend].chars().count();
+    let chars: Vec<char> = line.chars().collect();
+    static BRACE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if BRACE.get_or_init(|| regex::Regex::new(r"\{[\s\S]*\}$").unwrap()).is_match(line) {
+        if let Some(p) = chars[end.min(chars.len())..].iter().rposition(|c| *c == '}') {
+            end += p + 1;
+        }
+    }
+    end += chars[end.min(chars.len())..].iter().take_while(|c| !c.is_whitespace()).count();
+    end += indent_diff;
+    if begin < max && end < max {
+        return None;
+    }
+    Some((begin, end))
+}

@@ -340,6 +340,7 @@ COPS = {
   'Style/ClassAndModuleChildren'     => 'style/class_and_module_children',
   'Lint/DuplicateMethods'            => 'lint/duplicate_methods',
   'Lint/UselessAssignment'           => 'lint/useless_assignment',
+  'Style/IfUnlessModifier'           => 'style/if_unless_modifier',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
