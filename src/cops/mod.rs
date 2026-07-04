@@ -240,7 +240,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
-    "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment",
+    "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion",
 ];
 
 impl Engine {
@@ -853,6 +853,11 @@ pub(crate) struct Cops<'a> {
     // (`Ruby::VERSION::FOO = 1` — the inner `Ruby::VERSION` scope IS still
     // flagged by upstream) and must not be swallowed by the skip.
     pub(crate) rvgu_write_target_skip: HashSet<(usize, usize)>,
+    // Gemspec/RequiredRubyVersion: has a `xxx.required_ruby_version = ...`
+    // send been seen anywhere in the file? Set while visiting call nodes;
+    // consulted once at the end of `visit_program_node` (rubocop's
+    // `def_node_search` existence scan over the whole AST).
+    pub(crate) grrv_seen: bool,
     // Layout/MultilineArrayBraceLayout / MultilineHashBraceLayout: start
     // offsets of array/hash LITERALS that are either the RECEIVER of an
     // enclosing call (any flavor, incl. safe-navigation — rubocop's
@@ -2298,6 +2303,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_program_node(self, node);
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
+        // Gemspec/RequiredRubyVersion's `on_new_investigation`: after the
+        // whole file has been walked (populating `grrv_seen` via any
+        // `required_ruby_version=` send visited above), fire the
+        // missing-version offense if none was ever seen; blank sources
+        // mirror rubocop's `processed_source.ast` nil-check.
+        let has_code = node.statements().body().iter().next().is_some();
+        self.check_required_ruby_version_missing(has_code);
     }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
         self.check_ascii_class(node);
@@ -2703,6 +2715,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_lambda_call(node);
         self.check_unreachable_loop_call(node);
         self.check_insecure_protocol_source(node);
+        self.check_required_ruby_version(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
         let n = node.as_node();
@@ -3102,6 +3115,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         metrics_in_struct_data_define_block: Vec::new(),
         gss_gvasgn_skip: HashSet::new(),
         rvgu_write_target_skip: HashSet::new(),
+        grrv_seen: false,
         mlbl_call_child: HashSet::new(),
         dea_ignored: HashSet::new(),
         dea_parent: HashMap::new(),

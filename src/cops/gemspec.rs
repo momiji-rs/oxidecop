@@ -1,5 +1,5 @@
 //! Gemspec department: cops that flag risky patterns inside `.gemspec` files.
-use super::Cops;
+use super::{Cops, Offense};
 use ruby_prism::Visit;
 
 impl<'a> Cops<'a> {
@@ -434,4 +434,229 @@ impl<'a> super::Cops<'a> {
             }
         }
     }
+}
+
+
+impl<'a> Cops<'a> {
+    /// Gemspec/RequiredRubyVersion's `on_send` — fires for every
+    /// `xxx.required_ruby_version = value` call (RESTRICT_ON_SEND matches
+    /// the method name only, any receiver). Also marks `grrv_seen` so
+    /// `check_required_ruby_version_missing` (called once, after the whole
+    /// file is walked) knows whether the file had one at all.
+    pub(crate) fn check_required_ruby_version(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Gemspec/RequiredRubyVersion";
+        if !self.on(COP) {
+            return;
+        }
+        if node.name().as_slice() != b"required_ruby_version=" {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let arg_nodes: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        if arg_nodes.len() != 1 {
+            return;
+        }
+        // Structural match for rubocop's `required_ruby_version?` def_node_search
+        // (`(send _ :required_ruby_version= _)`) — existence only, independent
+        // of whether the value is dynamic/unparsable.
+        self.grrv_seen = true;
+
+        let version_def = &arg_nodes[0];
+        if grrv_dynamic_version(version_def) {
+            return;
+        }
+        let ruby_version = grrv_extract_ruby_version(grrv_defined_ruby_version(version_def));
+        let target = grrv_float_to_s(self.cfg.target_ruby());
+        if ruby_version.as_deref() == Some(target.as_str()) {
+            return;
+        }
+        let loc = version_def.location();
+        self.push(
+            loc.start_offset(),
+            COP,
+            false,
+            format!(
+                "`required_ruby_version` and `TargetRubyVersion` ({target}, which may be \
+                 specified in .rubocop.yml) should be equal."
+            ),
+        );
+    }
+
+    /// Gemspec/RequiredRubyVersion's `on_new_investigation`: a global,
+    /// file-start offense when no `required_ruby_version=` send exists
+    /// anywhere in the file (rubocop's `def_node_search` over the whole AST).
+    /// Gated on *.gemspec files, mirroring the cop's default.yml
+    /// `Include: **/*.gemspec` (the not-equal check above is exercised by
+    /// specs without a gemspec filename, so it stays ungated — rubocop's
+    /// spec DSL bypasses Include filtering entirely).
+    ///
+    /// `has_code`: does the program have any statement? rubocop's
+    /// `processed_source.ast` is nil for blank source, and the spec DSL
+    /// renders a global offense on an empty file as an annotation BEFORE any
+    /// source line — which the oracle scores as line 0 (with code, the `^{}`
+    /// annotation under line 1 scores as 1:1, which `push(0)` yields).
+    pub(crate) fn check_required_ruby_version_missing(&mut self, has_code: bool) {
+        const COP: &str = "Gemspec/RequiredRubyVersion";
+        if !self.on(COP) || !self.rel_path.ends_with(".gemspec") {
+            return;
+        }
+        if !self.grrv_seen {
+            let msg = "`required_ruby_version` should be specified.";
+            if has_code {
+                self.push(0, COP, false, msg);
+            } else {
+                self.offenses.push(Offense {
+                    line: 0,
+                    col: 1,
+                    cop: COP,
+                    correctable: false,
+                    message: msg.to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// rubocop's `dynamic_version?`: true when the value can't be reasoned about
+/// statically — a receiver-less method call, a variable read, or anything
+/// with such a node ANYWHERE in its subtree (e.g. `[lowest_version,
+/// highest_version]`, an array of local-variable reads).
+fn grrv_dynamic_version(node: &ruby_prism::Node) -> bool {
+    if let Some(call) = node.as_call_node() {
+        if call.receiver().is_none() {
+            return true;
+        }
+    }
+    if node.as_local_variable_read_node().is_some()
+        || node.as_instance_variable_read_node().is_some()
+        || node.as_global_variable_read_node().is_some()
+        || node.as_class_variable_read_node().is_some()
+    {
+        return true;
+    }
+    grrv_contains_dynamic_descendant(node)
+}
+
+/// `node.each_descendant(:send, *RuboCop::AST::Node::VARIABLES).any?` — a
+/// PROPER descendant (never `node` itself) that's a call or a variable read.
+/// Uses prism's generic branch/leaf enter hooks (fired for every node type)
+/// with a depth counter so the root's own type never counts, only nested
+/// occurrences reached via recursion into children.
+fn grrv_contains_dynamic_descendant(node: &ruby_prism::Node) -> bool {
+    struct Finder {
+        depth: u32,
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+            if self.depth > 0 && node.as_call_node().is_some() {
+                self.found = true;
+            }
+            self.depth += 1;
+        }
+        fn visit_branch_node_leave(&mut self) {
+            self.depth -= 1;
+        }
+        fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+            if self.depth > 0
+                && (node.as_local_variable_read_node().is_some()
+                    || node.as_instance_variable_read_node().is_some()
+                    || node.as_global_variable_read_node().is_some()
+                    || node.as_class_variable_read_node().is_some())
+            {
+                self.found = true;
+            }
+        }
+    }
+    let mut f = Finder { depth: 0, found: false };
+    use ruby_prism::Visit;
+    f.visit(node);
+    f.found
+}
+
+/// The shapes rubocop's `defined_ruby_version` node-matcher recognizes.
+enum GrrvDefined<'pr> {
+    /// `$(str _)` — a single plain string.
+    Single(ruby_prism::StringNode<'pr>),
+    /// `$(array (str _) (str _))` — an array of EXACTLY two strings.
+    Array(Vec<ruby_prism::StringNode<'pr>>),
+    /// `(send (const (const nil? :Gem) :Requirement) :new $str+)` — one or
+    /// more string arguments to `Gem::Requirement.new`.
+    ReqNew(Vec<ruby_prism::StringNode<'pr>>),
+}
+
+/// rubocop's `defined_ruby_version` node_matcher pattern, verbatim.
+fn grrv_defined_ruby_version<'pr>(node: &ruby_prism::Node<'pr>) -> Option<GrrvDefined<'pr>> {
+    if let Some(s) = node.as_string_node() {
+        return Some(GrrvDefined::Single(s));
+    }
+    if let Some(arr) = node.as_array_node() {
+        let elems: Vec<ruby_prism::Node> = arr.elements().iter().collect();
+        if elems.len() == 2 {
+            if let (Some(a), Some(b)) = (elems[0].as_string_node(), elems[1].as_string_node()) {
+                return Some(GrrvDefined::Array(vec![a, b]));
+            }
+        }
+        return None;
+    }
+    let call = node.as_call_node()?;
+    if call.name().as_slice() != b"new" {
+        return None;
+    }
+    let recv = call.receiver()?;
+    if !grrv_is_gem_requirement_const(&recv) {
+        return None;
+    }
+    let args = call.arguments()?;
+    let arg_nodes: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+    if arg_nodes.is_empty() {
+        return None;
+    }
+    let mut strs = Vec::with_capacity(arg_nodes.len());
+    for a in &arg_nodes {
+        strs.push(a.as_string_node()?);
+    }
+    Some(GrrvDefined::ReqNew(strs))
+}
+
+/// Is `node` the constant path `Gem::Requirement` (bare, no leading `::`)?
+/// Mirrors `(const (const nil? :Gem) :Requirement)`.
+fn grrv_is_gem_requirement_const(node: &ruby_prism::Node) -> bool {
+    let Some(path) = node.as_constant_path_node() else { return false };
+    if path.name().is_none_or(|n| n.as_slice() != b"Requirement") {
+        return false;
+    }
+    let Some(parent) = path.parent() else { return false };
+    if let Some(cr) = parent.as_constant_read_node() {
+        cr.name().as_slice() == b"Gem"
+    } else {
+        false
+    }
+}
+
+/// rubocop's `extract_ruby_version`: pick the qualifying string (for arrays/
+/// `Gem::Requirement.new`, the first whose content has a `>` or `=`; for a
+/// plain string, itself), then join its first two scanned digit characters
+/// with a dot (matching `str.scan(/\d/).first(2).join('.')` exactly,
+/// including the "just one digit" -> no-dot and "no digits" -> "" cases).
+fn grrv_extract_ruby_version(defined: Option<GrrvDefined>) -> Option<String> {
+    let chosen = match defined? {
+        GrrvDefined::Single(s) => s,
+        GrrvDefined::Array(v) | GrrvDefined::ReqNew(v) => v
+            .into_iter()
+            .find(|s| {
+                let content = String::from_utf8_lossy(s.unescaped());
+                content.contains('>') || content.contains('=')
+            })?,
+    };
+    let content = String::from_utf8_lossy(chosen.unescaped());
+    let digits: Vec<String> = content.chars().filter(char::is_ascii_digit).map(|c| c.to_string()).take(2).collect();
+    Some(digits.join("."))
+}
+
+/// `target_ruby_version.to_s` — Ruby's Float#to_s always keeps at least one
+/// fractional digit (`3.0.to_s == "3.0"`).
+fn grrv_float_to_s(value: f64) -> String {
+    let s = format!("{value}");
+    if s.contains('.') { s } else { format!("{s}.0") }
 }
