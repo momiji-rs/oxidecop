@@ -297,6 +297,7 @@ COPS = {
   'Layout/SpaceAroundMethodCallOperator' => 'layout/space_around_method_call_operator',
   'Style/WordArray'                  => 'style/word_array',
   'Layout/SpaceAroundBlockParameters' => 'layout/space_around_block_parameters',
+  'Style/TrailingCommaInArguments'   => 'style/trailing_comma_in_arguments',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

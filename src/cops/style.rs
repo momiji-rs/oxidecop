@@ -20257,3 +20257,269 @@ fn wa_build_bracketed_array(
     out
 }
 
+
+
+// Style/TrailingCommaInArguments --------------------------------------------
+
+impl<'a> super::Cops<'a> {
+    /// Style/TrailingCommaInArguments — ported from the shared `TrailingComma`
+    /// mixin (see `check_trailing_comma_in_hash_literal` above for the
+    /// mixin's general shape). Unlike the hash-literal port, `on_send`'s node
+    /// IS call-type, so the mixin branches that were dead there are LIVE
+    /// here:
+    ///   - `elements(node)`: a multiline braceless keyword-hash LAST argument
+    ///     (prism `KeywordHashNode`, which is always braceless by
+    ///     construction — a braced hash is a distinct `HashNode`) is promoted
+    ///     to its individual pairs for `no_elements_on_same_line?` and
+    ///     `allowed_multiline_argument?`.
+    ///   - `method_name_and_arguments_on_same_line?`: participates in
+    ///     `consistent_comma`'s `should_have_comma?`.
+    /// `node.arguments? && (node.parenthesized? || node.method?(:[]))`:
+    /// `parenthesized?` is `loc.end.is?(')')` — literally the closing token
+    /// being `)`, NOT merely "some bracket is present" (a `[]` call's closing
+    /// token is `]`, hence the separate `method?(:[])` disjunct).
+    pub(crate) fn check_trailing_comma_in_arguments(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/TrailingCommaInArguments";
+        if !self.on(COP) {
+            return;
+        }
+        // Upstream's whitequork AST has no separate "block" slot: `&block`
+        // forwarding is just the LAST child of the send node's own argument
+        // list, so `node.arguments`/`node.last_argument` include it. Prism
+        // instead carves `&block` out into the `CallNode`'s own `block`
+        // field (a `BlockArgumentNode`, sharing that field with a literal
+        // `{ }`/`do...end` block, which — unlike `&block` — is genuinely NOT
+        // part of the argument list either way). Re-append it here so the
+        // rest of this port can treat `items` exactly like upstream's
+        // `node.arguments`.
+        let mut items: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if let Some(block) = node.block() {
+            if block.as_block_argument_node().is_some() {
+                items.push(block);
+            }
+        }
+        if items.is_empty() {
+            return;
+        }
+        let Some(close) = node.closing_loc() else { return };
+        let parenthesized = close.as_slice() == b")";
+        if !parenthesized && node.name().as_slice() != b"[]" {
+            return;
+        }
+
+        let last = items.last().expect("checked non-empty above");
+        let last_end = last.location().end_offset();
+        let close_start = close.start_offset();
+
+        let style = self.cfg.get(COP, "EnforcedStyleForMultiline").unwrap_or("no_comma");
+        let elements = self.tcia_elements(&items);
+        let should_have_comma = self.tcia_should_have_comma(style, node, &close, &items, &elements);
+
+        // `comma_offset`: is there a `,` between the last (top-level)
+        // argument and the closing bracket, reachable only through
+        // whitespace? Heredoc arguments switch to the no-newline-skipping
+        // pattern, same as the hash-literal port (`tcihl_comma_offset`,
+        // reused as-is — it operates on raw bytes only).
+        let gap = &self.src[last_end..close_start];
+        let heredoc_mode = items.iter().any(tcihl_heredoc);
+        let comma_rel = tcihl_comma_offset(gap, heredoc_mode);
+
+        // `inside_comment?`: a same-line comment starting before the comma
+        // position means this isn't really a trailing comma.
+        let (gap_line, _) = self.idx.loc(last_end);
+        let comma_abs = comma_rel.map(|rel| last_end + rel).filter(|&pos| {
+            !self.comments.iter().any(|&(l, s, _)| l == gap_line && s < pos)
+        });
+
+        match comma_abs {
+            Some(pos) => {
+                if !should_have_comma {
+                    self.tcia_avoid_comma(COP, style, pos);
+                }
+            }
+            None => {
+                if should_have_comma {
+                    self.tcia_put_comma(COP, last);
+                }
+            }
+        }
+    }
+
+    /// `elements(node)` when `node.call_type?` (always true here): promote a
+    /// multiline braceless keyword-hash argument to its individual elements;
+    /// every other argument (including a braced hash, a plain value, a splat,
+    /// or a block-pass) passes through unchanged. `argument.multiline?` here
+    /// is the raw `Node#multiline?` (first line != last line of the
+    /// argument's OWN span) — not the mixin's carve-out `multiline?(node)`
+    /// used elsewhere, a genuinely different method despite the shared name.
+    /// Returns `(start_offset, end_offset)` pairs rather than nodes — the
+    /// only things callers need — so promoted `KeywordHashNode` pairs (owned
+    /// values from a fresh `NodeList` iteration) and passed-through `items`
+    /// (borrowed from the caller's already-owned `Vec`) can share one
+    /// `Vec` without requiring `Node` to be `Clone`.
+    fn tcia_elements(&self, items: &[ruby_prism::Node]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for item in items {
+            if let Some(kw) = item.as_keyword_hash_node() {
+                let loc = kw.location();
+                let first_line = self.idx.loc(loc.start_offset()).0;
+                let last_line = self.idx.loc(loc.end_offset().saturating_sub(1)).0;
+                if first_line != last_line {
+                    out.extend(
+                        kw.elements().iter().map(|e| (e.location().start_offset(), e.location().end_offset())),
+                    );
+                    continue;
+                }
+            }
+            out.push((item.location().start_offset(), item.location().end_offset()));
+        }
+        out
+    }
+
+    fn tcia_should_have_comma(
+        &self,
+        style: &str,
+        node: &ruby_prism::CallNode,
+        close: &ruby_prism::Location,
+        items: &[ruby_prism::Node],
+        elements: &[(usize, usize)],
+    ) -> bool {
+        match style {
+            "comma" => {
+                self.tcia_multiline(node, close, elements) && self.tcia_no_elements_on_same_line(close, elements)
+            }
+            "consistent_comma" => {
+                self.tcia_multiline(node, close, elements)
+                    && !self.tcia_method_name_and_args_on_same_line(node, close, items)
+            }
+            "diff_comma" => {
+                self.tcia_multiline(node, close, elements) && tcia_last_item_precedes_newline(self.src, node, items)
+            }
+            _ => false,
+        }
+    }
+
+    /// `multiline?`: the call's OWN span — receiver through its closing
+    /// bracket, deliberately NOT including a trailing block, which prism
+    /// folds into the same `CallNode`'s overall `location()` but which
+    /// whitequork's `send` node (what upstream's `node.multiline?` actually
+    /// measures) never included — spans more than one line, minus the
+    /// `allowed_multiline_argument?` single-element carve-out.
+    fn tcia_multiline(
+        &self,
+        node: &ruby_prism::CallNode,
+        close: &ruby_prism::Location,
+        elements: &[(usize, usize)],
+    ) -> bool {
+        let first_line = self.idx.loc(node.location().start_offset()).0;
+        let last_line = self.idx.loc(close.start_offset()).0;
+        if first_line == last_line {
+            return false;
+        }
+        let allowed = elements.len() == 1 && !self.tcihl_begins_its_line(close.start_offset());
+        !allowed
+    }
+
+    /// `no_elements_on_same_line?`: every (promoted) element, plus the
+    /// closing bracket as a final sentinel, starts on a line strictly after
+    /// the previous one's last line.
+    fn tcia_no_elements_on_same_line(&self, close: &ruby_prism::Location, elements: &[(usize, usize)]) -> bool {
+        let mut ranges: Vec<(usize, usize)> = elements.to_vec();
+        ranges.push((close.start_offset(), close.end_offset()));
+        ranges.windows(2).all(|w| {
+            let a_last_line = self.idx.loc(w[0].1.saturating_sub(1)).0;
+            let b_line = self.idx.loc(w[1].0).0;
+            a_last_line != b_line
+        })
+    }
+
+    /// `method_name_and_arguments_on_same_line?`: only reachable for
+    /// call-type nodes (always true here, so the ruby original's early
+    /// `!node.call_type?` guard is omitted). `node.last_line`/`last_line` use
+    /// the call's own closing bracket, never a trailing block. A braced hash
+    /// (`HashNode`; a braceless one is a distinct `KeywordHashNode`) as the
+    /// top-level last argument always counts as "on the same line" outright.
+    fn tcia_method_name_and_args_on_same_line(
+        &self,
+        node: &ruby_prism::CallNode,
+        close: &ruby_prism::Location,
+        items: &[ruby_prism::Node],
+    ) -> bool {
+        let Some(last_arg) = items.last() else { return false };
+        let node_last_line = self.idx.loc(close.start_offset()).0;
+        let arg_last_line = self.idx.loc(last_arg.location().end_offset().saturating_sub(1)).0;
+        if node_last_line != arg_last_line {
+            return false;
+        }
+        if last_arg.as_hash_node().is_some() {
+            return true;
+        }
+        let selector_line = node
+            .message_loc()
+            .map(|m| self.idx.loc(m.start_offset()).0)
+            .unwrap_or_else(|| self.idx.loc(node.location().start_offset()).0);
+        selector_line == arg_last_line
+    }
+
+    fn tcia_avoid_comma(&mut self, cop: &'static str, style: &str, comma_pos: usize) {
+        let extra = match style {
+            "comma" => ", unless each item is on its own line",
+            "consistent_comma" => ", unless items are split onto multiple lines",
+            "diff_comma" => ", unless that item immediately precedes a newline",
+            _ => "",
+        };
+        self.push(comma_pos, cop, true, format!("Avoid comma after the last parameter of a method call{extra}."));
+        self.fixes.push((comma_pos, comma_pos + 1, Vec::new()));
+    }
+
+    /// `put_comma`/`autocorrect_range`: the range from the start of the last
+    /// (top-level) argument's OWN final source line (skipping leading
+    /// indentation) through its end, with the fix inserting `,` immediately
+    /// after it. Skipped outright (no offense, no autocorrect) when that
+    /// argument is a block-pass (`&block`).
+    fn tcia_put_comma(&mut self, cop: &'static str, last: &ruby_prism::Node) {
+        if last.as_block_argument_node().is_some() {
+            return;
+        }
+        let loc = last.location();
+        let item_start = loc.start_offset();
+        let item_end = loc.end_offset();
+        let text = &self.src[item_start..item_end];
+        let ix = text.iter().rposition(|&b| b == b'\n').unwrap_or(0);
+        let rest = &text[ix..];
+        let non_ws =
+            rest.iter().position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)).unwrap_or(0);
+        let range_start = item_start + ix + non_ws;
+        self.push(range_start, cop, true, "Put a comma after the last parameter of a multiline method call.");
+        self.fixes.push((item_end, item_end, b",".to_vec()));
+    }
+}
+
+/// `last_item_precedes_newline?` for `TrailingCommaInArguments`: same shape
+/// as `tcihl_last_item_precedes_newline`, but measured from the top-level
+/// last ARGUMENT (not a promoted element) through the CALL's own end (its
+/// closing bracket — never a trailing block).
+fn tcia_last_item_precedes_newline(src: &[u8], node: &ruby_prism::CallNode, items: &[ruby_prism::Node]) -> bool {
+    let Some(last) = items.last() else { return false };
+    let start = last.location().end_offset();
+    let Some(close) = node.closing_loc() else { return false };
+    let end = close.end_offset();
+    if start > end {
+        return false;
+    }
+    let mut text = &src[start..end];
+    if text.first() == Some(&b',') {
+        text = &text[1..];
+    }
+    let mut i = 0;
+    while i < text.len() && matches!(text[i], b' ' | b'\t' | b'\r' | 0x0c | 0x0b) {
+        i += 1;
+    }
+    if i < text.len() && text[i] == b'#' {
+        while i < text.len() && text[i] != b'\n' {
+            i += 1;
+        }
+    }
+    i < text.len() && text[i] == b'\n'
+}
