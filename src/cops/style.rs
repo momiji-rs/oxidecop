@@ -32838,7 +32838,10 @@ impl<'a> Cops<'a> {
     /// and check whether `lhs + longest_line` would overflow `Max`.
     fn ca_correction_exceeds_line_limit(&self, node_start: usize, node_end: usize, lhs: &[u8]) -> bool {
         const LL: &str = "Layout/LineLength";
-        if self.cfg.get(LL, "Enabled") == Some("false") {
+        // the REAL enablement resolution (DisabledByDefault turns LineLength
+        // off for a --only run; the schema default alone says "true") —
+        // rails corpus false negatives on long assignment branches.
+        if !self.cfg.enabled(LL) {
             return false;
         }
         let max = self.cfg.get(LL, "Max").and_then(|v| v.parse::<usize>().ok()).unwrap_or(120);
