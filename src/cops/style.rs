@@ -24197,6 +24197,19 @@ impl<'a> super::Cops<'a> {
         if let Some(lm) = node.as_lambda_node() {
             return self.rb_scan_collapse(rb_collapse_body(lm.body()), RbCtx::Other);
         }
+        // class/module/sclass bodies are plain containers: a kwbegin inside
+        // goes through the generic `on_kwbegin` path with a non-special
+        // parent (mastodon parity — the walker originally stopped at these,
+        // missing every `x = begin ... end` inside a class-wrapped method).
+        if let Some(c) = node.as_class_node() {
+            return self.rb_scan_collapse(rb_collapse_body(c.body()), RbCtx::Other);
+        }
+        if let Some(m) = node.as_module_node() {
+            return self.rb_scan_collapse(rb_collapse_body(m.body()), RbCtx::Other);
+        }
+        if let Some(sc) = node.as_singleton_class_node() {
+            return self.rb_scan_collapse(rb_collapse_body(sc.body()), RbCtx::Other);
+        }
         if let Some(iff) = node.as_if_node() {
             return self.rb_handle_if(&iff);
         }
