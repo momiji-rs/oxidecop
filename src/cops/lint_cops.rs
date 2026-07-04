@@ -7921,6 +7921,34 @@ impl<'pr> ruby_prism::Visit<'pr> for UpvCollector {
 }
 
 
+
+
+/// Upstream DirectiveComment#initialize rejects a directive whose pre-match
+/// is exactly `#` + whitespace — a commented-OUT directive
+/// (`#   # rubocop:disable X` in doc examples) is no directive at all.
+fn directive_commented_out(pre: &str) -> bool {
+    let mut chars = pre.chars();
+    chars.next() == Some('#') && chars.all(|c| c.is_whitespace())
+}
+
+/// Upstream COPS_PATTERN prefix parse over a directive tail: the literal
+/// `all`, or comma-separated cop names (`(?:[A-Za-z]\w*/)*[A-Za-z]\w*`),
+/// matched from the START of the tail. Space-separated junk after the valid
+/// prefix (malformed directives, embedded second directives, prose) is NOT
+/// part of the list; a tail with no leading valid name yields None and the
+/// whole directive is ignored (upstream's nil `cop_names`).
+fn directive_cops_prefix(s: &str) -> Option<&str> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"^(?:all\b|(?:[A-Za-z]\w*/)*[A-Za-z]\w*(?:\s*,\s*(?:[A-Za-z]\w*/)*[A-Za-z]\w*)*)",
+        )
+        .unwrap()
+    });
+    re.find(s).map(|m| m.as_str())
+}
+
 /// Per-cop tracking state for `Lint/MissingCopEnableDirective`, mirroring
 /// rubocop's `CommentConfig::CopAnalysis` (`line_ranges`, `start_line_number`).
 /// Line numbers are `f64` so `-Infinity`/`Infinity` (config-disabled cops /
@@ -8077,7 +8105,10 @@ impl<'a> Cops<'a> {
         }
         static RE: OnceLock<regex::Regex> = OnceLock::new();
         let re = RE.get_or_init(|| {
-            regex::Regex::new(r"^#\s*rubocop\s*:\s*(disable|todo|enable|push|pop)\b\s*(.*)$").unwrap()
+            // UNANCHORED like upstream's DIRECTIVE_COMMENT_REGEXP: the marker may
+            // sit mid-comment (even inside doc-example text), and such a match
+            // REALLY toggles the cop — rubocop-src's own files rely on it.
+            regex::Regex::new(r"#\s*rubocop\s*:\s*(disable|todo|enable|push|pop)\b\s*(.*)$").unwrap()
         });
 
         // Ruby Hashes preserve insertion order; a handful of entries at most
@@ -8088,23 +8119,48 @@ impl<'a> Cops<'a> {
         for &(line, start, end) in self.comments {
             let text = String::from_utf8_lossy(&self.src[start..end]);
             let Some(caps) = re.captures(&text) else { continue };
+            if directive_commented_out(&text[..caps.get(0).unwrap().start()]) {
+                continue;
+            }
             let mode = caps.get(1).unwrap().as_str();
             let rest = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
             let line_f = line as f64;
             // `comment_only_line?`: nothing but whitespace precedes the `#`
-            // on this physical line (a directive sharing its line with real
-            // code is a `analyze_single_line` trailing directive instead).
-            let standalone =
-                self.src[self.idx.starts[line - 1]..start].iter().all(u8::is_ascii_whitespace);
+            // on this physical line, AND the directive marker sits at the
+            // very start of the comment (upstream's `single_line?` treats a
+            // mid-comment marker — doc-example text, `#   # rubocop:...` —
+            // as a trailing single-line directive that never opens a range).
+            let standalone = caps.get(0).unwrap().start() == 0
+                && self.src[self.idx.starts[line - 1]..start].iter().all(u8::is_ascii_whitespace);
 
             match mode {
                 "push" => {
+                    // upstream's PUSH_POP_ARGS_PATTERN: a prefix of valid
+                    // `[+-]Cop/Name` tokens; none valid => the directive has
+                    // no cop list and is ignored entirely (no restore point).
+                    let toks: Vec<(char, String)> = rest
+                        .split_whitespace()
+                        .map_while(|tok| {
+                            let mut chars = tok.chars();
+                            let op = chars.next().filter(|c| matches!(c, '+' | '-'))?;
+                            let name: String = chars.collect();
+                            let valid = !name.is_empty()
+                                && name.split('/').all(|seg| {
+                                    let mut cs = seg.chars();
+                                    cs.next().is_some_and(|c| c.is_ascii_alphabetic())
+                                        && cs.all(|c| c.is_alphanumeric() || c == '_')
+                                });
+                            valid.then(|| (op, name))
+                        })
+                        .collect();
+                    // a BARE `# rubocop:push` (no args) is valid; only a
+                    // push WITH args where none parse is ignored.
+                    if toks.is_empty() && !rest.trim().is_empty() {
+                        continue;
+                    }
                     stack.push(analyses.clone());
-                    for tok in rest.split_whitespace() {
-                        let mut chars = tok.chars();
-                        let Some(op @ ('+' | '-')) = chars.next() else { continue };
-                        let cop_name: String = chars.collect();
-                        if !cop_name.is_empty() {
+                    for (op, cop_name) in toks {
+                        {
                             mced_apply_op(&mut analyses, self.cfg, op, &cop_name, line_f);
                         }
                     }
@@ -8118,6 +8174,7 @@ impl<'a> Cops<'a> {
                     let disabling = mode != "enable";
                     // a ` -- reason` trailer is prose, not part of the cop list
                     let cops_part = rest.split(" -- ").next().unwrap_or(rest).trim();
+                    let Some(cops_part) = directive_cops_prefix(cops_part) else { continue };
                     if cops_part == "all" {
                         if !disabling && standalone {
                             // `# rubocop:enable all`: close every open entry.
@@ -9819,7 +9876,8 @@ impl<'a> Cops<'a> {
 
         static RE: OnceLock<regex::Regex> = OnceLock::new();
         let re = RE.get_or_init(|| {
-            regex::Regex::new(r"^#\s*rubocop\s*:\s*(disable|todo|enable|push|pop)\b\s*(.*)$")
+            // unanchored — see the twin regex in check_missing_cop_enable_directive
+            regex::Regex::new(r"#\s*rubocop\s*:\s*(disable|todo|enable|push|pop)\b\s*(.*)$")
                 .unwrap()
         });
 
@@ -9843,6 +9901,9 @@ impl<'a> Cops<'a> {
         for &(line, start, end) in self.comments {
             let text = String::from_utf8_lossy(&self.src[start..end]);
             let Some(caps) = re.captures(&text) else { continue };
+            if directive_commented_out(&text[..caps.get(0).unwrap().start()]) {
+                continue;
+            }
             let mode = caps.get(1).unwrap().as_str();
             if mode == "push" || mode == "pop" {
                 continue;
@@ -9860,6 +9921,7 @@ impl<'a> Cops<'a> {
             let rest = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
             // a ` -- reason` trailer is prose, not part of the cop list
             let cops_part = rest.split(" -- ").next().unwrap_or(rest).trim();
+            let Some(cops_part) = directive_cops_prefix(cops_part) else { continue };
             let disabling = mode == "disable" || mode == "todo";
 
             if cops_part == "all" {
