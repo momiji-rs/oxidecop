@@ -233,7 +233,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
-    "Lint/RedundantRequireStatement",
+    "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument",
 ];
 
 impl Engine {
@@ -2620,6 +2620,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_sort_by(node);
         self.check_redundant_sort(node);
         self.check_ambiguous_block_association(node);
+        self.check_send_with_mixin_argument(node);
         self.check_space_before_first_arg(node);
         self.check_redundant_string_coercion_in_call(node);
         self.check_each_for_simple_loop(node);

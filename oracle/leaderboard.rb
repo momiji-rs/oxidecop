@@ -240,6 +240,7 @@ COPS = {
   'Style/OrAssignment'               => 'style/or_assignment',
   'Style/EmptyMethod'                => 'style/empty_method',
   'Lint/RedundantRequireStatement'   => 'lint/redundant_require_statement',
+  'Lint/SendWithMixinArgument'       => 'lint/send_with_mixin_argument',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

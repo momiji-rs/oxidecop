@@ -9039,3 +9039,89 @@ fn rrs_space_right(src: &[u8], mut end: usize) -> usize {
     end
 }
 
+
+/// A `(const _ _)` node-pattern match at ANY nesting depth — both a bare
+/// `Foo` (`ConstantReadNode`) and a namespaced `A::B` / top-level `::Foo`
+/// (`ConstantPathNode`) satisfy it, since prism's `const` node type covers
+/// both and the pattern's `_ _` wildcards accept any namespace/name shape.
+fn swma_is_const(n: &ruby_prism::Node) -> bool {
+    n.as_constant_read_node().is_some() || n.as_constant_path_node().is_some()
+}
+
+impl<'a> super::Cops<'a> {
+    /// Lint/SendWithMixinArgument — `Foo.send(:include, Bar)` (also
+    /// `public_send`/`__send__`, symbol or string method name) should be
+    /// `Foo.include Bar`. Mirrors rubocop's `send_with_mixin_argument?`
+    /// node-matcher verbatim:
+    ///   (send
+    ///     {nil? self (const _ _)} {:send :public_send :__send__}
+    ///     ({sym str} $#mixin_method?)
+    ///       $(const _ _)+)
+    /// — receiver must be implicit, `self`, or a const (any nesting);
+    /// safe-navigation sends never match (rubocop's `(send ...)` pattern
+    /// excludes `csend`); the first argument must be a *literal* symbol or
+    /// string (no interpolation) naming `include`/`prepend`/`extend`; every
+    /// remaining argument must be a const (any nesting) and there must be at
+    /// least one. The offense range and the autocorrect both span from the
+    /// `send`/`public_send`/`__send__` selector through the end of the whole
+    /// call (rubocop's `range_between(loc.selector.begin_pos,
+    /// loc.expression.end_pos)`), so the receiver itself is never touched.
+    pub(crate) fn check_send_with_mixin_argument(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/SendWithMixinArgument";
+        if !self.on(COP) || node.is_safe_navigation() {
+            return;
+        }
+        let name = node.name();
+        let name = name.as_slice();
+        if name != b"send" && name != b"public_send" && name != b"__send__" {
+            return;
+        }
+        match node.receiver() {
+            None => {}
+            Some(r) => {
+                if r.as_self_node().is_none() && !swma_is_const(&r) {
+                    return;
+                }
+            }
+        }
+        let Some(args) = node.arguments() else { return };
+        let args: Vec<_> = args.arguments().iter().collect();
+        let Some((first, rest)) = args.split_first() else { return };
+        if rest.is_empty() {
+            return;
+        }
+        let method_bytes: Vec<u8> = if let Some(sym) = first.as_symbol_node() {
+            sym.unescaped().to_vec()
+        } else if let Some(st) = first.as_string_node() {
+            st.unescaped().to_vec()
+        } else {
+            return;
+        };
+        if method_bytes != b"include" && method_bytes != b"prepend" && method_bytes != b"extend" {
+            return;
+        }
+        if !rest.iter().all(swma_is_const) {
+            return;
+        }
+        let Some(sel) = node.message_loc() else { return };
+        let bad_start = sel.start_offset();
+        let bad_end = node.location().end_offset();
+        let method_str = String::from_utf8_lossy(&method_bytes);
+        let module_names_source = rest
+            .iter()
+            .map(|m| String::from_utf8_lossy(self.node_src(m)).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let bad_method = String::from_utf8_lossy(&self.src[bad_start..bad_end]).into_owned();
+        let message = format!(
+            "Use `{method_str} {module_names_source}` instead of `{bad_method}`."
+        );
+        self.push(bad_start, COP, true, message);
+        self.fixes.push((
+            bad_start,
+            bad_end,
+            format!("{method_str} {module_names_source}").into_bytes(),
+        ));
+    }
+}
+
