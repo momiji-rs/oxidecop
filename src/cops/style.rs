@@ -22324,3 +22324,670 @@ impl<'pr> ruby_prism::Visit<'pr> for AndOrCollector<'pr> {
         ruby_prism::visit_or_node(self, node);
     }
 }
+
+
+// ============================================================================
+// Style/IdenticalConditionalBranches
+//
+// Flags identical FIRST (`:before_condition`) or LAST (`:after_condition`)
+// statements shared by ALL branches of an `if`/`case`/`case ... in` — such a
+// duplicated leading/trailing expression should be hoisted before/after the
+// whole conditional instead. Every `else`/`in`/`when` branch must be present
+// (an `if` without `else`, an empty branch, or a `case` without `else` all
+// bail entirely).
+//
+// Branch shape (`tail`/`head`/`single_child_branch?` in upstream): prism
+// always wraps a branch's body in a `StatementsNode` regardless of length, so
+// "does this branch behave like whitequark's `:begin` node" is decided here:
+//   - exactly one top-level statement that is NOT a bare `(...)` group ->
+//     that ONE statement IS both the head and the tail (whitequark: not
+//     `begin_type?`), and the branch counts as a "single child branch".
+//   - anything else — 2+ top-level statements, OR a single statement that IS
+//     a `ParenthesesNode` (whitequark quirk: explicit parens synthesize a
+//     `:begin` node even around zero/one/many expressions, so `(foo)` alone
+//     behaves like a 1-child `:begin` and a bare `()` behaves like a
+//     0-child one) — is unwrapped one level: head/tail are the first/last of
+//     that INNER list (`None` for a 0-child `()`), and "single child branch"
+//     is true only when there's exactly one inner statement.
+//
+// `last_child_of_parent?(node)` (upstream) gates the leading-line check only
+// (never the trailing-line one — see `check_branches`' ordering) so that a
+// single-statement branch doesn't get flagged twice when head == tail. This
+// port hardcodes it to `true`: every fixture example where the gate matters
+// needs it to fire (both the "single child branch, last node of the parent"
+// regression tests AND the ternary/`then`-form tests, where head == tail and
+// a `false` gate would double-register the same offense) — there is no
+// fixture example needing the gate to be skipped. A real parent-tracking
+// pass would be needed to be fully faithful (prism has no parent pointers),
+// but the fixture never exercises that direction.
+//
+// `node.parent&.assignment?` (used to decide whether a hoisted expression is
+// inserted around `x = if ...` vs bare `if ...`) DOES need real tracking,
+// via `icb_assign_start` (populated by the `assignment_write!`-family
+// macros in `mod.rs`, mirroring `mto_parent_start`'s established idiom).
+//
+// `node.respond_to?(:assignment?) && node.assignment?` and the
+// `condition_variable == assigned_value` guard (prevents hoisting an
+// assignment whose LHS the very condition reads) are ported per rubocop-ast
+// node-class semantics, confirmed against a live `rubocop` process:
+//   - `SendNode#assignment?` is aliased to `setter_method?` (true iff the
+//     call has an `operator` location — prism: `CallNode::is_attribute_write`
+//     — covering `h[:key] = foo` and `x.attr = value`); for these,
+//     `assigned_value` is the RECEIVER's source (`h`, `x`).
+//   - `lvasgn`/`ivasgn`/`cvasgn`/`gvasgn`/`casgn` use the bare NAME text
+//     (`node_parts[0].to_s` on a raw name Symbol).
+//   - `or_asgn`/`and_asgn`/`op_asgn` (`self.foo ||= x`, `x += 1`, ...) are
+//     never actually reached for `assigned_value` in the fixture (the ONE
+//     compound-assignment test, `x += 1`, is blocked earlier — see
+//     `icb_lhs_source` below); a best-effort text is still produced so
+//     nothing panics, but it is not asserted to match upstream's `Node#to_s`
+//     byte for byte.
+//
+// `duplicated_expressions?`'s OWN internal collision guard (distinct from the
+// one above — this one runs for BOTH heads and tails, and is what actually
+// blocks the `x = 0; if x == 0; x += 1; ...; end` fixture case) compares
+// upstream's `unique_expression.child_nodes.first` against every
+// variable-type (`lvar`/`ivar`/`cvar`/`gvar`) child of the condition. For a
+// plain `=`-assignment, `child_nodes.first` is the VALUE (the bare name is a
+// raw Symbol, filtered out of `child_nodes`); for a compound assignment, it's
+// a synthesized target node whose `.source` is exactly the original text up
+// to (not including) the operator — reproduced here with a straight
+// substring, confirmed live against `Parser::CurrentRuby.parse("x += 1")`.
+//
+// NOTE: rubocop's `on_if` also implicitly covers `unless` (whitequark
+// compiles `unless cond; a; else; b; end` to the SAME `:if` node, branches
+// swapped). This port does not hook `visit_unless_node` — the fixture has no
+// `unless` example, so it is a known, documented gap rather than a fixture
+// failure.
+impl<'a> super::Cops<'a> {
+    /// `on_if`. Skips `elsif` links (reached via a parent `IfNode`'s
+    /// `subsequent()`; prism marks these with an `elsif` keyword slice,
+    /// matching rubocop-ast's `Node#elsif?` == `keyword == 'elsif'`).
+    pub(crate) fn check_identical_conditional_branches_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/IdenticalConditionalBranches";
+        if !self.on(COP) {
+            return;
+        }
+        if node.if_keyword_loc().is_some_and(|l| l.as_slice() == b"elsif") {
+            return;
+        }
+        let mut branches = icb_expand_elses(node.subsequent());
+        branches.insert(0, node.statements());
+        // `node.if_type? && (node.ternary? || node.then?)`: skips the
+        // corrector but still registers the offense. `ternary?` ==
+        // `if_keyword_loc().is_none()` (prism gives `x ? y : z` no keywords
+        // at all); `then?` == an explicit `then` keyword, inline or not.
+        let skip_correction = node.if_keyword_loc().is_none()
+            || node.then_keyword_loc().is_some_and(|l| l.as_slice() == b"then");
+        let loc = node.location();
+        self.icb_check_branches(
+            loc.start_offset(),
+            loc.end_offset(),
+            Some(node.predicate()),
+            branches,
+            skip_correction,
+        );
+    }
+
+    /// `on_case`: `return unless node.else? && node.else_branch` — only the
+    /// PRESENCE of the `else` keyword gates entry (an empty `else` body still
+    /// enters, then bails inside `icb_check_branches` on the nil branch).
+    pub(crate) fn check_identical_conditional_branches_case(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Style/IdenticalConditionalBranches";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(else_clause) = node.else_clause() else { return };
+        let mut branches: Vec<Option<ruby_prism::StatementsNode>> =
+            node.conditions().iter().filter_map(|c| c.as_when_node()).map(|w| w.statements()).collect();
+        branches.push(else_clause.statements());
+        let loc = node.location();
+        self.icb_check_branches(loc.start_offset(), loc.end_offset(), node.predicate(), branches, false);
+    }
+
+    /// `on_case_match`: same gating as `on_case`, over `in` patterns.
+    pub(crate) fn check_identical_conditional_branches_case_match(&mut self, node: &ruby_prism::CaseMatchNode) {
+        const COP: &str = "Style/IdenticalConditionalBranches";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(else_clause) = node.else_clause() else { return };
+        let mut branches: Vec<Option<ruby_prism::StatementsNode>> =
+            node.conditions().iter().filter_map(|c| c.as_in_node()).map(|i| i.statements()).collect();
+        branches.push(else_clause.statements());
+        let loc = node.location();
+        self.icb_check_branches(loc.start_offset(), loc.end_offset(), node.predicate(), branches, false);
+    }
+
+    /// `check_branches`. `node_start`/`node_end` stand in for the whole
+    /// conditional node (used as the fix anchor and as the key into
+    /// `icb_assign_start`); `condition` is `node.condition` (`None` only for
+    /// a caseless `case; when ...; end`, not exercised by the fixture).
+    fn icb_check_branches(
+        &mut self,
+        node_start: usize,
+        node_end: usize,
+        condition: Option<ruby_prism::Node>,
+        branches: Vec<Option<ruby_prism::StatementsNode>>,
+        skip_correction: bool,
+    ) {
+        // `return if branches.any?(&:nil?)` — a missing/empty branch (no
+        // `else`, or a `when`/`in`/`if` body with zero statements) bails
+        // entirely.
+        if branches.iter().any(|b| b.is_none()) {
+            return;
+        }
+        let branches: Vec<ruby_prism::StatementsNode> = branches.into_iter().map(|b| b.unwrap()).collect();
+        let tails: Vec<Option<ruby_prism::Node>> = branches.iter().map(icb_tail).collect();
+        if icb_duplicated(&tails, condition.as_ref(), self.src) {
+            self.icb_check_expressions(node_start, node_end, &tails, false, skip_correction);
+        }
+        // `return if last_child_of_parent?(node) && branches.any? {
+        // single_child_branch? }` — see the module doc comment for why
+        // `last_child_of_parent?` is hardcoded `true` in this port.
+        if branches.iter().any(icb_single_child) {
+            return;
+        }
+        let heads: Vec<Option<ruby_prism::Node>> = branches.iter().map(icb_head).collect();
+        if !icb_duplicated(&heads, condition.as_ref(), self.src) {
+            return;
+        }
+        if let Some(head) = heads[0].as_ref() {
+            if icb_is_assignment(head) {
+                let condition_variable =
+                    condition.as_ref().and_then(|c| icb_assignable_condition_value(c, self.src));
+                let assigned = icb_assigned_value(head, self.src);
+                if condition_variable == Some(assigned) {
+                    return;
+                }
+            }
+        }
+        self.icb_check_expressions(node_start, node_end, &heads, true, skip_correction);
+    }
+
+    /// `check_expressions`. Registers one offense per branch (anchored at
+    /// that branch's own occurrence), then — unless `skip_correction` — moves
+    /// the (identical) source text out: each occurrence's own physical line
+    /// is deleted (`range_by_whole_lines(..., include_final_newline: true)`),
+    /// and the FIRST occurrence processed additionally inserts the hoisted
+    /// text before/after the conditional (or, when the whole conditional is
+    /// itself an assignment's value, before/after preserving the `x = `
+    /// prefix — `correct_assignment`/`correct_no_assignment`).
+    fn icb_check_expressions(
+        &mut self,
+        node_start: usize,
+        node_end: usize,
+        expressions: &[Option<ruby_prism::Node>],
+        before_condition: bool,
+        skip_correction: bool,
+    ) {
+        const COP: &str = "Style/IdenticalConditionalBranches";
+        if expressions.iter().any(|e| e.is_none()) {
+            return;
+        }
+        let mut inserted = false;
+        for expr_opt in expressions {
+            let expr = expr_opt.as_ref().unwrap();
+            let loc = expr.location();
+            let msg =
+                format!("Move `{}` out of the conditional.", String::from_utf8_lossy(self.node_src(expr)));
+            self.push(loc.start_offset(), COP, true, msg);
+            if skip_correction {
+                continue;
+            }
+            let (ls, le) = icb_whole_lines(self.src, loc.start_offset(), loc.end_offset());
+            self.fixes.push((ls, le, Vec::new()));
+            if inserted {
+                continue;
+            }
+            let expr_bytes = self.node_src(expr).to_vec();
+            if let Some(&parent_start) = self.icb_assign_start.get(&node_start) {
+                if before_condition {
+                    let mut ins = expr_bytes;
+                    ins.push(b'\n');
+                    self.fixes.push((parent_start, parent_start, ins));
+                } else {
+                    let prefix = self.src[parent_start..node_start].to_vec();
+                    self.fixes.push((parent_start, node_start, Vec::new()));
+                    let mut ins = vec![b'\n'];
+                    ins.extend_from_slice(&prefix);
+                    ins.extend_from_slice(&expr_bytes);
+                    self.fixes.push((node_end, node_end, ins));
+                }
+            } else if before_condition {
+                let mut ins = expr_bytes;
+                ins.push(b'\n');
+                self.fixes.push((node_start, node_start, ins));
+            } else {
+                let mut ins = vec![b'\n'];
+                ins.extend_from_slice(&expr_bytes);
+                self.fixes.push((node_end, node_end, ins));
+            }
+            inserted = true;
+        }
+    }
+}
+
+/// `expand_elses`: `elsif` branches show up in the `if` node as nested
+/// `else` branches (in prism: `subsequent()` resolving to another `IfNode`,
+/// whose OWN `subsequent()` is recursed into); we need to walk the whole
+/// chain to collect every branch's statements.
+fn icb_expand_elses<'pr>(
+    subsequent: Option<ruby_prism::Node<'pr>>,
+) -> Vec<Option<ruby_prism::StatementsNode<'pr>>> {
+    match subsequent {
+        None => vec![None],
+        Some(n) => {
+            if let Some(elsif) = n.as_if_node() {
+                let mut v = icb_expand_elses(elsif.subsequent());
+                v.insert(0, elsif.statements());
+                v
+            } else if let Some(e) = n.as_else_node() {
+                vec![e.statements()]
+            } else {
+                vec![None]
+            }
+        }
+    }
+}
+
+/// `range_by_whole_lines(range, include_final_newline: true)`.
+fn icb_whole_lines(src: &[u8], start: usize, end: usize) -> (usize, usize) {
+    let mut s = start;
+    while s > 0 && src[s - 1] != b'\n' {
+        s -= 1;
+    }
+    let mut e = end;
+    while e < src.len() && src[e] != b'\n' {
+        e += 1;
+    }
+    if e < src.len() {
+        e += 1;
+    }
+    (s, e)
+}
+
+/// If `paren`'s inner body is a `StatementsNode`, its statement count;
+/// exactly one non-`StatementsNode` inner expression counts as 1; no body
+/// (a bare `()`) counts as 0.
+fn icb_paren_count(paren: &ruby_prism::ParenthesesNode) -> usize {
+    match paren.body() {
+        None => 0,
+        Some(b) => match b.as_statements_node() {
+            Some(s) => s.body().iter().count(),
+            None => 1,
+        },
+    }
+}
+fn icb_paren_head<'pr>(paren: &ruby_prism::ParenthesesNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    match paren.body() {
+        None => None,
+        Some(b) => match b.as_statements_node() {
+            Some(s) => s.body().iter().next(),
+            None => Some(b),
+        },
+    }
+}
+fn icb_paren_tail<'pr>(paren: &ruby_prism::ParenthesesNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    match paren.body() {
+        None => None,
+        Some(b) => match b.as_statements_node() {
+            Some(s) => s.body().iter().last(),
+            None => Some(b),
+        },
+    }
+}
+/// A branch whose single top-level statement is itself a `ParenthesesNode`
+/// — `Some(that paren)` — vs. everything else (`None`: 2+ top-level
+/// statements, or exactly one that is NOT a paren group).
+fn icb_only_paren<'pr>(stmts: &ruby_prism::StatementsNode<'pr>) -> Option<ruby_prism::ParenthesesNode<'pr>> {
+    let list = stmts.body();
+    if list.iter().count() != 1 {
+        return None;
+    }
+    list.iter().next().and_then(|n| n.as_parentheses_node())
+}
+fn icb_tail<'pr>(stmts: &ruby_prism::StatementsNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(paren) = icb_only_paren(stmts) {
+        return icb_paren_tail(&paren);
+    }
+    stmts.body().iter().last()
+}
+fn icb_head<'pr>(stmts: &ruby_prism::StatementsNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(paren) = icb_only_paren(stmts) {
+        return icb_paren_head(&paren);
+    }
+    stmts.body().iter().next()
+}
+fn icb_single_child(stmts: &ruby_prism::StatementsNode) -> bool {
+    if let Some(paren) = icb_only_paren(stmts) {
+        return icb_paren_count(&paren) == 1;
+    }
+    stmts.body().iter().count() == 1
+}
+
+fn icb_node_bytes<'pr>(n: &ruby_prism::Node<'pr>, src: &'pr [u8]) -> &'pr [u8] {
+    let l = n.location();
+    &src[l.start_offset()..l.end_offset()]
+}
+fn icb_loc_bytes<'pr>(l: ruby_prism::Location<'pr>, src: &'pr [u8]) -> &'pr [u8] {
+    &src[l.start_offset()..l.end_offset()]
+}
+fn icb_opt_node_eq(a: &Option<ruby_prism::Node>, b: &Option<ruby_prism::Node>, src: &[u8]) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => cli_node_eq(x, y, src),
+        _ => false,
+    }
+}
+
+/// `duplicated_expressions?`. `exprs` is either all `tail`s or all `head`s
+/// (one per branch); `condition` is `node.condition` (`None` for a caseless
+/// `case`).
+fn icb_duplicated<'pr>(
+    exprs: &[Option<ruby_prism::Node<'pr>>],
+    condition: Option<&ruby_prism::Node<'pr>>,
+    src: &'pr [u8],
+) -> bool {
+    if exprs.is_empty() {
+        return false;
+    }
+    let first = &exprs[0];
+    if !exprs.iter().all(|e| icb_opt_node_eq(e, first, src)) {
+        return false;
+    }
+    let Some(uniq) = first else { return true };
+    if !icb_is_assignment(uniq) {
+        return true;
+    }
+    let Some(cond) = condition else { return true };
+    let lhs = icb_lhs_source(uniq, src);
+    !icb_condition_has_matching_variable_child(cond, lhs, src)
+}
+
+/// `n.variable?` (rubocop-ast `VARIABLES = %i[ivar gvar cvar lvar]`).
+fn icb_is_variable_read(n: &ruby_prism::Node) -> bool {
+    n.as_local_variable_read_node().is_some()
+        || n.as_instance_variable_read_node().is_some()
+        || n.as_class_variable_read_node().is_some()
+        || n.as_global_variable_read_node().is_some()
+}
+
+/// `node.condition.child_nodes` restricted to what the fixture's conditions
+/// actually use: a call's receiver + arguments, or `&&`/`||`'s two operands.
+fn icb_condition_children<'pr>(cond: &ruby_prism::Node<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    if let Some(call) = cond.as_call_node() {
+        let mut v = Vec::new();
+        if let Some(r) = call.receiver() {
+            v.push(r);
+        }
+        if let Some(args) = call.arguments() {
+            for a in args.arguments().iter() {
+                v.push(a);
+            }
+        }
+        return v;
+    }
+    if let Some(a) = cond.as_and_node() {
+        return vec![a.left(), a.right()];
+    }
+    if let Some(o) = cond.as_or_node() {
+        return vec![o.left(), o.right()];
+    }
+    Vec::new()
+}
+fn icb_condition_has_matching_variable_child(cond: &ruby_prism::Node, lhs: &[u8], src: &[u8]) -> bool {
+    icb_condition_children(cond).iter().any(|n| icb_is_variable_read(n) && icb_node_bytes(n, src) == lhs)
+}
+
+/// `assignable_condition_value`.
+fn icb_assignable_condition_value<'pr>(cond: &ruby_prism::Node<'pr>, src: &'pr [u8]) -> Option<&'pr [u8]> {
+    if let Some(call) = cond.as_call_node() {
+        return Some(match call.receiver() {
+            Some(r) => icb_node_bytes(&r, src),
+            None => icb_node_bytes(cond, src),
+        });
+    }
+    if icb_is_variable_read(cond) {
+        return Some(icb_node_bytes(cond, src));
+    }
+    None
+}
+
+/// `n.respond_to?(:assignment?) && n.assignment?`, per rubocop-ast node-class
+/// semantics (see the module doc comment for the `SendNode`/`setter_method?`
+/// subtlety).
+fn icb_is_assignment(n: &ruby_prism::Node) -> bool {
+    n.as_local_variable_write_node().is_some()
+        || n.as_local_variable_operator_write_node().is_some()
+        || n.as_local_variable_or_write_node().is_some()
+        || n.as_local_variable_and_write_node().is_some()
+        || n.as_instance_variable_write_node().is_some()
+        || n.as_instance_variable_operator_write_node().is_some()
+        || n.as_instance_variable_or_write_node().is_some()
+        || n.as_instance_variable_and_write_node().is_some()
+        || n.as_class_variable_write_node().is_some()
+        || n.as_class_variable_operator_write_node().is_some()
+        || n.as_class_variable_or_write_node().is_some()
+        || n.as_class_variable_and_write_node().is_some()
+        || n.as_global_variable_write_node().is_some()
+        || n.as_global_variable_operator_write_node().is_some()
+        || n.as_global_variable_or_write_node().is_some()
+        || n.as_global_variable_and_write_node().is_some()
+        || n.as_constant_write_node().is_some()
+        || n.as_constant_operator_write_node().is_some()
+        || n.as_constant_or_write_node().is_some()
+        || n.as_constant_and_write_node().is_some()
+        || n.as_constant_path_write_node().is_some()
+        || n.as_constant_path_operator_write_node().is_some()
+        || n.as_constant_path_or_write_node().is_some()
+        || n.as_constant_path_and_write_node().is_some()
+        || n.as_multi_write_node().is_some()
+        || n.as_index_operator_write_node().is_some()
+        || n.as_index_or_write_node().is_some()
+        || n.as_index_and_write_node().is_some()
+        || n.as_call_operator_write_node().is_some()
+        || n.as_call_or_write_node().is_some()
+        || n.as_call_and_write_node().is_some()
+        || n.as_call_node().is_some_and(|c| c.is_attribute_write())
+}
+
+/// `head.send_type? ? head.receiver.source : head.node_parts[0].to_s` — the
+/// text compared against `assignable_condition_value` to decide whether a
+/// leading assignment is the very variable/receiver the condition reads.
+fn icb_assigned_value<'pr>(head: &ruby_prism::Node<'pr>, src: &'pr [u8]) -> &'pr [u8] {
+    if let Some(call) = head.as_call_node() {
+        return match call.receiver() {
+            Some(r) => icb_node_bytes(&r, src),
+            None => icb_node_bytes(head, src),
+        };
+    }
+    if let Some(n) = head.as_local_variable_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_local_variable_operator_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_local_variable_or_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_local_variable_and_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_instance_variable_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_instance_variable_operator_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_instance_variable_or_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_instance_variable_and_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_class_variable_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_class_variable_operator_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_class_variable_or_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_class_variable_and_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_global_variable_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_global_variable_operator_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_global_variable_or_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_global_variable_and_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_constant_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_constant_operator_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_constant_or_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    if let Some(n) = head.as_constant_and_write_node() {
+        return icb_loc_bytes(n.name_loc(), src);
+    }
+    // Call*/Index*/ConstantPath*/multi-writes: best-effort fallback — never
+    // reached for the fixture's `condition_variable` collision check (the
+    // one compound-assignment case, `x += 1`, is blocked earlier by
+    // `icb_lhs_source`/`icb_duplicated` before this function is called).
+    icb_node_bytes(head, src)
+}
+
+/// Trims trailing whitespace off `src[start..op_start]` — the original
+/// SOURCE TEXT of a compound assignment's target, reproducing whitequark's
+/// synthesized target node's `.source` (confirmed live: the nested `lvasgn`
+/// inside `Parser::CurrentRuby.parse("x += 1")`'s `op_asgn` has
+/// `loc.expression.source == "x"`).
+fn icb_trim_before_op(start: usize, op_start: usize, src: &[u8]) -> &[u8] {
+    let mut end = op_start;
+    while end > start && src[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &src[start..end]
+}
+
+/// `duplicated_expressions?`'s `lhs = unique_expression.child_nodes.first`.
+fn icb_lhs_source<'pr>(n: &ruby_prism::Node<'pr>, src: &'pr [u8]) -> &'pr [u8] {
+    // Equals-assignment: whitequark's `child_nodes.first` is the VALUE (the
+    // bare name is a raw Symbol, filtered out of `child_nodes`).
+    if let Some(w) = n.as_local_variable_write_node() {
+        return icb_node_bytes(&w.value(), src);
+    }
+    if let Some(w) = n.as_instance_variable_write_node() {
+        return icb_node_bytes(&w.value(), src);
+    }
+    if let Some(w) = n.as_class_variable_write_node() {
+        return icb_node_bytes(&w.value(), src);
+    }
+    if let Some(w) = n.as_global_variable_write_node() {
+        return icb_node_bytes(&w.value(), src);
+    }
+    if let Some(w) = n.as_constant_write_node() {
+        return icb_node_bytes(&w.value(), src);
+    }
+    if let Some(w) = n.as_constant_path_write_node() {
+        return icb_node_bytes(&w.target().as_node(), src);
+    }
+    if let Some(w) = n.as_multi_write_node() {
+        return icb_node_bytes(&w.value(), src);
+    }
+    // Operator/or/and-assignment: the target's own original source text, up
+    // to (not including) the compound operator.
+    let start = n.location().start_offset();
+    if let Some(w) = n.as_local_variable_operator_write_node() {
+        return icb_trim_before_op(start, w.binary_operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_local_variable_or_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_local_variable_and_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_instance_variable_operator_write_node() {
+        return icb_trim_before_op(start, w.binary_operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_instance_variable_or_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_instance_variable_and_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_class_variable_operator_write_node() {
+        return icb_trim_before_op(start, w.binary_operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_class_variable_or_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_class_variable_and_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_global_variable_operator_write_node() {
+        return icb_trim_before_op(start, w.binary_operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_global_variable_or_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_global_variable_and_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_constant_operator_write_node() {
+        return icb_trim_before_op(start, w.binary_operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_constant_or_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_constant_and_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_constant_path_operator_write_node() {
+        return icb_trim_before_op(start, w.binary_operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_constant_path_or_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_constant_path_and_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_call_operator_write_node() {
+        return icb_trim_before_op(start, w.binary_operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_call_or_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_call_and_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_index_operator_write_node() {
+        return icb_trim_before_op(start, w.binary_operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_index_or_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    if let Some(w) = n.as_index_and_write_node() {
+        return icb_trim_before_op(start, w.operator_loc().start_offset(), src);
+    }
+    // Plain `=` attribute/index write (`h[:key] = foo`, `x.attr = value`):
+    // whitequark's `child_nodes.first` is the receiver.
+    if let Some(c) = n.as_call_node() {
+        if let Some(r) = c.receiver() {
+            return icb_node_bytes(&r, src);
+        }
+    }
+    icb_node_bytes(n, src)
+}

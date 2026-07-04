@@ -368,7 +368,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
 ];
 
 impl Engine {
@@ -814,6 +814,14 @@ pub(crate) struct Cops<'a> {
     // ternary instead of expanding to `if`/`else`.
     pub(crate) mto_parent_start: HashMap<usize, usize>,
     pub(crate) mto_single_line: HashSet<usize>,
+    // Style/IdenticalConditionalBranches: mirrors `mto_parent_start` above —
+    // keyed by an `if`/`case`/`case_match` node's own start offset, holding
+    // the start offset of an ENCLOSING plain/compound assignment node when
+    // that conditional is directly the assignment's value (`x = if foo ...
+    // end`). Stands in for rubocop-ast's `node.parent&.assignment?` (prism
+    // has no parent pointers), populated by the `assignment_write!`-family
+    // macros before they recurse into the value.
+    pub(crate) icb_assign_start: HashMap<usize, usize>,
     // Style/MultilineTernaryOperator: byte ranges of ternaries already
     // corrected in THIS pass — a nested ternary whose range falls inside one
     // of these is `part_of_ignored_node?` upstream: still gets an offense, but
@@ -1534,6 +1542,15 @@ impl<'a> Cops<'a> {
             self.mto_single_line.insert(off);
         }
     }
+    /// Style/IdenticalConditionalBranches parent-tracking (see the
+    /// `icb_assign_start` field doc comment): if `value` is directly an
+    /// `if`/`case`/`case_match` node, remember that its enclosing assignment
+    /// starts at `lhs_start`.
+    pub(crate) fn icb_note_assignment_value(&mut self, lhs_start: usize, value: &ruby_prism::Node) {
+        if value.as_if_node().is_some() || value.as_case_node().is_some() || value.as_case_match_node().is_some() {
+            self.icb_assign_start.insert(value.location().start_offset(), lhs_start);
+        }
+    }
     /// Autocorrects for DECLARATIVE-table cops (the one thing a pattern row
     /// can't express). Returns whether a fix was produced.
     fn decl_fix(&mut self, cop: &str, node: &ruby_prism::CallNode) -> bool {
@@ -1671,6 +1688,7 @@ macro_rules! assignment_write {
         let op_end = $node.operator_loc().end_offset();
         $self.aa_note_unbracketed_rhs(lhs_start, &$node.value());
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+        $self.icb_note_assignment_value(lhs_start, &$node.value());
     }};
 }
 macro_rules! assignment_operator_write {
@@ -1679,6 +1697,7 @@ macro_rules! assignment_operator_write {
         let op_end = $node.binary_operator_loc().end_offset();
         $self.aa_note_unbracketed_rhs(lhs_start, &$node.value());
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+        $self.icb_note_assignment_value(lhs_start, &$node.value());
     }};
 }
 macro_rules! assignment_path_write {
@@ -1686,6 +1705,7 @@ macro_rules! assignment_path_write {
         let lhs_start = $node.target().location().start_offset();
         let op_end = $node.operator_loc().end_offset();
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+        $self.icb_note_assignment_value(lhs_start, &$node.value());
     }};
 }
 macro_rules! assignment_path_operator_write {
@@ -1693,6 +1713,7 @@ macro_rules! assignment_path_operator_write {
         let lhs_start = $node.target().location().start_offset();
         let op_end = $node.binary_operator_loc().end_offset();
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
+        $self.icb_note_assignment_value(lhs_start, &$node.value());
     }};
 }
 
@@ -2041,6 +2062,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_if_with_semicolon(node);
         self.check_safe_navigation_with_empty(&node.predicate());
         self.check_or_assignment_if(node);
+        self.check_identical_conditional_branches_if(node);
         if let Some(kw) = node.if_keyword_loc() {
             if matches!(kw.as_slice(), b"if" | b"elsif") {
                 let kw_text = if kw.as_slice() == b"elsif" { "elsif" } else { "if" };
@@ -2482,6 +2504,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_else_case(node);
         self.check_hash_like_case(node);
         self.check_empty_case_condition(node);
+        self.check_identical_conditional_branches_case(node);
         {
             let kw = node.case_keyword_loc();
             self.sak_check(kw.start_offset(), kw.end_offset(), b"case");
@@ -2498,6 +2521,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
         self.check_case_match_indentation(node);
+        self.check_identical_conditional_branches_case_match(node);
         {
             let kw = node.case_keyword_loc();
             self.sak_check(kw.start_offset(), kw.end_offset(), b"case");
@@ -4373,6 +4397,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         nested_ternary_reported: HashSet::new(),
         mto_parent_start: HashMap::new(),
         mto_single_line: HashSet::new(),
+        icb_assign_start: HashMap::new(),
         mto_fixed_ranges: Vec::new(),
         nested_modifier_ignored: Vec::new(),
         assignment_leftmost: HashMap::new(),
