@@ -25780,3 +25780,249 @@ fn nx_end_followed_by_whitespace_only(src: &[u8], end_pos: usize) -> bool {
     }
     true
 }
+
+
+// ---- Style/RegexpLiteral ----
+//
+// Ports `on_regexp` (+ `ConfigurableEnforcedStyle`'s `style`) verbatim.
+// `node.content` == `children.select(&:str_type?).map(&:str_content).join`
+// — for a regexp, a `str` child's "content" IS its raw source (regex
+// escapes are never cooked by the parser) — so it's ported as `body_str`:
+// the concatenation of only the literal (`StringNode`) parts, in source
+// order. `node_body(node, include_begin_nodes: true)` (used only for
+// `correct_inner_slashes`'s index search) additionally includes each
+// `#{...}` interpolation's OWN raw source (opening `#{` through closing
+// `}` inclusive — confirmed live: a whitequark `begin` child's `.source`
+// spans the full `#{...}`, not just the inner expression) — ported as
+// `body_full`. A braceless shorthand interpolation (`#@ivar`/`#$gvar`)
+// becomes a bare `ivar`/`gvar` child in whitequark (never wrapped in
+// `begin`), so `node_body`'s `%i[str begin]` type filter — even with
+// `include_begin_nodes: true` — excludes it entirely from BOTH `body_str`
+// and `body_full`; ported as `EmbeddedVariableNode` parts contributing
+// nothing to either buffer (matches prism's dedicated node for that
+// shorthand — see `check_variable_interpolation`'s doc). This one quirk
+// means a slash sitting after a shorthand interpolation gets the WRONG
+// byte offset from `correct_inner_slashes`'s index math — a pre-existing
+// upstream displacement, reproduced here bug-for-bug rather than fixed,
+// since the fixture never exercises it.
+impl<'a> super::Cops<'a> {
+    /// `on_regexp` for a non-interpolated `//`/`%r{}` literal: the single
+    /// implicit `str` child is exactly `content_loc`'s raw bytes, used for
+    /// both `body_str` and `body_full` (no interpolation exists to diverge
+    /// them).
+    pub(crate) fn check_regexp_literal(&mut self, node: &ruby_prism::RegularExpressionNode) {
+        if !self.on("Style/RegexpLiteral") {
+            return;
+        }
+        let content = node.content_loc();
+        let body = self.src[content.start_offset()..content.end_offset()].to_vec();
+        let loc = node.location();
+        self.rl_check(
+            loc.start_offset(),
+            loc.end_offset(),
+            node.opening_loc(),
+            node.closing_loc(),
+            &body,
+            &body,
+        );
+    }
+
+    /// `on_regexp` for an interpolated `/.../#{...}/` or `%r{...#{...}...}`
+    /// literal. `parts()` mirrors whitequark's `children`: a `StringNode`
+    /// contributes its raw text to BOTH buffers; an `EmbeddedStatementsNode`
+    /// (`#{...}`) contributes its own raw source (delimiters included) to
+    /// `body_full` only; an `EmbeddedVariableNode` (`#@ivar`-style
+    /// shorthand) contributes to neither — see this section's header doc.
+    pub(crate) fn check_regexp_literal_interpolated(
+        &mut self,
+        node: &ruby_prism::InterpolatedRegularExpressionNode,
+    ) {
+        if !self.on("Style/RegexpLiteral") {
+            return;
+        }
+        let mut body_str: Vec<u8> = Vec::new();
+        let mut body_full: Vec<u8> = Vec::new();
+        for part in node.parts().iter() {
+            if let Some(s) = part.as_string_node() {
+                let bytes = self.node_src(&s.as_node());
+                body_str.extend_from_slice(bytes);
+                body_full.extend_from_slice(bytes);
+            } else if let Some(es) = part.as_embedded_statements_node() {
+                let l = es.location();
+                body_full.extend_from_slice(&self.src[l.start_offset()..l.end_offset()]);
+            }
+            // `EmbeddedVariableNode` (and anything else): contributes to
+            // neither buffer, matching whitequark's `%i[str begin]` filter.
+        }
+        let loc = node.location();
+        self.rl_check(
+            loc.start_offset(),
+            loc.end_offset(),
+            node.opening_loc(),
+            node.closing_loc(),
+            &body_str,
+            &body_full,
+        );
+    }
+
+    /// Shared core for both node kinds above. `body_str` is the literal-only
+    /// content (drives `contains_slash?`/`percent_r_delimiters_conflict?`/
+    /// `node.content.start_with?`); `body_full` additionally includes
+    /// interpolation source (drives `correct_inner_slashes`'s index search).
+    /// `node_start`/`node_end` are the WHOLE node's span (offense anchor +
+    /// `single_line?`/`multiline?`, computed here as "does the node's raw
+    /// source contain a newline", equivalent to whitequark's
+    /// `loc.first_line == loc.last_line` over the same span).
+    fn rl_check(
+        &mut self,
+        node_start: usize,
+        node_end: usize,
+        opening: ruby_prism::Location,
+        closing: ruby_prism::Location,
+        body_str: &[u8],
+        body_full: &[u8],
+    ) {
+        const COP: &str = "Style/RegexpLiteral";
+        let opening_bytes = opening.as_slice();
+        let is_slash = opening_bytes == b"/";
+
+        // `PreferredDelimiters.new('%r', ...).delimiters` — consulted both
+        // by `percent_r_delimiters_conflict?` (slash literals only) and by
+        // `calculate_replacement` (slash -> `%r` correction).
+        let (pref_open, pref_close) = self.pld_preferred("%r");
+
+        // `percent_r_delimiters_conflict?`: only the 4 bracket-pair
+        // delimiters have a `PAIR_DELIMITER_PATTERNS` entry; any other
+        // preferred delimiter (`//`, `||`, ...) never conflicts.
+        if is_slash
+            && matches!(
+                (pref_open, pref_close),
+                (b'(', b')') | (b'[', b']') | (b'{', b'}') | (b'<', b'>')
+            )
+            && !Self::rl_balanced(body_str, pref_open, pref_close)
+        {
+            return;
+        }
+
+        let style = self.cfg.get(COP, "EnforcedStyle").unwrap_or("slashes");
+        let allow_inner_slashes = self.cfg.get(COP, "AllowInnerSlashes") == Some("true");
+        // `contains_disallowed_slash?`: `!allow_inner_slashes? && contains_slash?`.
+        let contains_disallowed_slash = !allow_inner_slashes && body_str.contains(&b'/');
+        // `single_line?`/`multiline?` over the whole node's source range.
+        let is_multiline = self.src[node_start..node_end].contains(&b'\n');
+
+        let message: &'static str;
+        if is_slash {
+            // `allowed_slash_literal?`: `(style==:slashes && !disallowed) ||
+            // allowed_mixed_slash?` where `allowed_mixed_slash? == style==
+            // :mixed && single_line? && !disallowed`.
+            let allowed = (style == "slashes" && !contains_disallowed_slash)
+                || (style == "mixed" && !is_multiline && !contains_disallowed_slash);
+            if allowed {
+                return;
+            }
+            message = "Use `%r` around regular expression.";
+        } else {
+            // `allowed_omit_parentheses_with_percent_r_literal?`: only
+            // reachable when this `%r` node is a direct receiver/argument of
+            // SOME call (parenthesized or not — `rl_call_child` mirrors
+            // `node.parent&.call_type?`, not "is an unparenthesized arg").
+            let allowed_omit = self.rl_call_child.contains(&node_start)
+                && (body_str.starts_with(b" ")
+                    || body_str.starts_with(b"=")
+                    || self
+                        .cfg
+                        .get("Style/MethodCallWithArgsParentheses", "EnforcedStyle")
+                        .unwrap_or("require_parentheses")
+                        == "omit_parentheses");
+            // `allowed_percent_r_literal?`: `(style==:slashes && disallowed)
+            // || style==:percent_r || allowed_mixed_percent_r? ||
+            // allowed_omit_parentheses...` where `allowed_mixed_percent_r? ==
+            // (style==:mixed && multiline?) || disallowed` — the bare
+            // `disallowed` disjunct there subsumes the first clause above
+            // for ANY style, so it's ORed in unconditionally here.
+            let allowed = contains_disallowed_slash
+                || style == "percent_r"
+                || (style == "mixed" && is_multiline)
+                || allowed_omit;
+            if allowed {
+                return;
+            }
+            message = "Use `//` around regular expression.";
+        }
+
+        self.push(node_start, COP, true, message);
+
+        // `correct_delimiters`: replace the WHOLE opening delimiter and only
+        // the FIRST byte of the closing delimiter (this engine's
+        // `closing_loc`, unlike whitequark's `loc.end`, swallows trailing
+        // regopt flags as one span — see `check_percent_literal_delimiters_
+        // regexp`'s doc for the same quirk) with `calculate_replacement`.
+        let new_opening: Vec<u8> = if is_slash {
+            vec![b'%', b'r', pref_open]
+        } else {
+            vec![b'/']
+        };
+        let new_close: u8 = if is_slash { pref_close } else { b'/' };
+        self.fixes.push((opening.start_offset(), opening.end_offset(), new_opening.clone()));
+        let cs = closing.start_offset();
+        self.fixes.push((cs, cs + 1, vec![new_close]));
+
+        // `correct_inner_slashes`/`inner_slash_indices`/`inner_slash_for`:
+        // `/` or `%r/` opening/replacement delimiters need their inner
+        // slashes escaped/unescaped across the delimiter swap.
+        let is_slash_delim = |b: &[u8]| b == b"/" || b == b"%r/";
+        let before: &[u8] = if is_slash_delim(opening_bytes) { b"\\/" } else { b"/" };
+        let after: &[u8] = if is_slash_delim(&new_opening) { b"\\/" } else { b"/" };
+
+        let content_start = opening.end_offset();
+        let mut from = 0usize;
+        while let Some(rel) = Self::rl_find(body_full, before, from) {
+            let start = content_start + rel;
+            self.fixes.push((start, start + before.len(), after.to_vec()));
+            from = rel + 1;
+        }
+    }
+
+    /// `balanced_delimiters?`: scans `text` for `/\\.|[opening|closing]/`
+    /// matches — an escaped char (`\\` + any byte) is consumed as one
+    /// 2-byte match and never changes `depth`; an unescaped `opening` byte
+    /// increments it, an unescaped `closing` byte decrements it (bailing
+    /// `false` the instant it goes negative). A trailing lone `\\` (no
+    /// following byte) matches neither alternative in Ruby's regex (`.`
+    /// excludes end-of-string) — consuming it 1 byte at a time here has the
+    /// same net effect, since a lone `\\` is never itself `opening`/`closing`.
+    fn rl_balanced(text: &[u8], opening: u8, closing: u8) -> bool {
+        let mut depth: i32 = 0;
+        let mut i = 0;
+        while i < text.len() {
+            let c = text[i];
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == opening {
+                depth += 1;
+            } else if c == closing {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            i += 1;
+        }
+        depth == 0
+    }
+
+    /// `text.index(pattern, from)`: first occurrence of `needle` in
+    /// `haystack` at or after byte offset `from` (plain substring search,
+    /// not a regex — `inner_slash_indices` re-searches from `index + 1` each
+    /// time, so overlapping occurrences of the 2-byte `\/` pattern remain
+    /// possible, matching Ruby's `String#index`).
+    fn rl_find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+        if from > haystack.len() {
+            return None;
+        }
+        haystack[from..].windows(needle.len()).position(|w| w == needle).map(|p| p + from)
+    }
+}

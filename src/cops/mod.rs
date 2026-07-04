@@ -369,7 +369,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
-    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next",
+    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral",
 ];
 
 impl Engine {
@@ -686,6 +686,14 @@ pub(crate) struct Cops<'a> {
     // literal block (`foo ["a", "b"] do ... end`) — converting to %w/%i
     // there is ambiguous, so the brackets->percent direction never offends.
     pub(crate) pa_invalid_ctx: HashSet<usize>,
+    // Style/RegexpLiteral's `allowed_omit_parentheses_with_percent_r_literal?`
+    // needs `node.parent&.call_type?` — prism gives no parent pointer, so
+    // `visit_call_node` marks the start offsets of its receiver and each
+    // argument (before descending) when they are regexp literals; a `%r`
+    // node found in this set was a direct receiver/argument of SOME `send`/
+    // `csend` call (parens or not — matches whitequark's `call_type?`, which
+    // doesn't care whether the call itself is parenthesized).
+    pub(crate) rl_call_child: HashSet<usize>,
     // Inner `File.dirname` calls claimed by an outer chain (NestedFileDirname).
     pub(crate) dirname_ignore: Vec<usize>,
     // Innermost statement-list span starts — Lint/DuplicateRequire scopes by it.
@@ -1854,6 +1862,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     ) {
         self.check_lii_iregexp(node);
         self.check_percent_literal_delimiters_iregexp(node);
+        self.check_regexp_literal_interpolated(node);
         self.interpolated_node_depth += 1;
         let prev_brace_eligible = self.sgv_brace_eligible;
         self.sgv_brace_eligible = true;
@@ -2065,6 +2074,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_regular_expression_node(&mut self, node: &ruby_prism::RegularExpressionNode<'pr>) {
         self.check_mixed_regexp_capture_types(node);
         self.check_percent_literal_delimiters_regexp(node);
+        self.check_regexp_literal(node);
         ruby_prism::visit_regular_expression_node(self, node);
     }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
@@ -3821,6 +3831,25 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_or_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        // Style/RegexpLiteral: mark a receiver/argument regexp literal as a
+        // direct child of THIS call (`node.parent&.call_type?`), before
+        // descending — see `rl_call_child`'s doc.
+        if let Some(r) = node.receiver() {
+            if r.as_regular_expression_node().is_some()
+                || r.as_interpolated_regular_expression_node().is_some()
+            {
+                self.rl_call_child.insert(r.location().start_offset());
+            }
+        }
+        if let Some(args) = node.arguments() {
+            for a in args.arguments().iter() {
+                if a.as_regular_expression_node().is_some()
+                    || a.as_interpolated_regular_expression_node().is_some()
+                {
+                    self.rl_call_child.insert(a.location().start_offset());
+                }
+            }
+        }
         // PercentArray#invalid_percent_array_context?: mark array-literal
         // arguments of an unparenthesized call with a literal block BEFORE
         // descending — see `pa_invalid_ctx`'s doc.
@@ -4423,6 +4452,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         percent_arr_spans: Vec::new(),
         wa_matrix_stack: Vec::new(),
         pa_invalid_ctx: HashSet::new(),
+        rl_call_child: HashSet::new(),
         dirname_ignore: Vec::new(),
         stmts_stack: Vec::new(),
         unless_else_spans: Vec::new(),

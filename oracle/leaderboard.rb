@@ -317,6 +317,7 @@ COPS = {
   'Style/RedundantBegin'             => 'style/redundant_begin',
   'Style/SoleNestedConditional'      => 'style/sole_nested_conditional',
   'Style/Next'                       => 'style/next',
+  'Style/RegexpLiteral'              => 'style/regexp_literal',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
