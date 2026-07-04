@@ -26740,3 +26740,698 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// ---- Style/GuardClause ----
+//
+// Ports `on_def`/`on_defs` (aliased, since prism's `DefNode` already unifies
+// both instance and singleton defs — see `visit_def_node`'s
+// `check_guard_clause_def` call), `on_block`/`on_numblock`/`on_itblock`
+// (aliased too — prism gives all three the same `BlockNode` shape, so
+// `check_guard_clause_block` needs no special-casing beyond the attached
+// call's name), and `on_if` verbatim, plus the `MinBodyLength` and
+// `StatementModifier` mixins (only the latter's `max_line_length` — routed
+// through `wum_max_line_length`, already shared with Style/WhileUntilModifier
+// — is actually reachable; `single_line_as_modifier?` itself is never called
+// anywhere in the upstream cop body despite the `include`).
+//
+// whitequark folds `if`/`unless` into one `:if` node type and NORMALIZES
+// `if_branch`/`else_branch` to always mean "the branch physically written
+// right after the condition" / "the branch physically written after `else`"
+// — regardless of `if?`/`unless?` (confirmed live against the real parser:
+// `unless c; A; else; B; end`'s `if_branch` is `A`, not the semantically-true
+// `B`). Prism keeps `IfNode`/`UnlessNode` as distinct types but already
+// exposes exactly that same physical split per-type (`statements()` is
+// always the then-slot, `subsequent()`/`else_clause()` the else-slot), so
+// `gc_statements`/`gc_else_stmts` need no swap logic at all — a plain
+// per-type dispatch matches whitequark's already-normalized accessors
+// directly.
+//
+// A branch is represented as `Option<StatementsNode>` throughout (prism
+// always wraps a then/else body in one, even for a single statement, unlike
+// whitequark which leaves a lone statement unwrapped and only introduces a
+// `:begin` node at 2+ statements) — `gc_guard_clause_branch`/`gc_trivial`/
+// `find_heredoc_argument`'s port special-case the 1-statement case
+// accordingly to reproduce whitequark's unwrapped-vs-`:begin` distinction.
+//
+// `node.parent&.assignment?` (`accepted_form?`) has no AST parent chain to
+// walk in prism; `gc_assignment_value_starts` (populated by the same
+// `assignment_write!`-family macros `Style/IdenticalConditionalBranches`
+// already hooks) stands in for it — see that field's doc comment. Only
+// direct `if`/`unless` RHS values are tracked (not `masgn`/`MultiWriteNode`
+// targets, which rubocop-ast's `ASSIGNMENTS` set also includes); this is
+// unexercised by the fixture.
+//
+// `guard_clause_source`/`and_or_guard_clause?`: upstream captures either the
+// branch itself (`self`) or, when the branch is an `and`/`or` node, its RHS
+// (`work || raise(...)` -> the `raise(...)` call) via `node_pattern`'s `$`
+// capture, then re-derives the ORIGINAL branch's full source either way
+// (`guard_clause.source` when self, `guard_clause.parent.source` when the
+// and/or's rhs — `.parent` there is the and/or node itself, i.e. the
+// original branch again). Both paths always resolve to the SAME text: the
+// full source of the matched branch. `gc_guard_clause_branch` exploits this
+// to skip tracking the actual captured node entirely, returning only
+// `Option<bool>` — `Some(was_and_or)` when the branch qualifies as a guard
+// clause, with `was_and_or` feeding `guard = nil if and_or_guard_clause?`
+// (which suppresses autocorrection when an else branch is present, per the
+// `|| raise`/`and return` fixture examples using `expect_no_corrections`).
+//
+// Heredoc handling (`find_heredoc_argument`/`autocorrect_heredoc_argument`):
+// a heredoc STRING node's own `source`/location never includes its body
+// (which sits later in the file, after the enclosing statement) — only the
+// opening `<<~ID` declaration on the call-site line. `closing_loc` (prism)
+// spans the closing delimiter's OWN LINE including leading indentation and
+// trailing newline; `gc_heredoc_closing_end` trims that trailing `\n`(`\r`)
+// to land `insert_after`-equivalent inserts immediately after the bare
+// delimiter text, matching whitequark's `loc.heredoc_end` — verified against
+// real `rubocop -A` output for several fixture examples during porting.
+impl<'a> super::Cops<'a> {
+    /// `on_def`/`on_defs`.
+    pub(crate) fn check_guard_clause_if(&mut self, node: &ruby_prism::IfNode) {
+        self.gc_on_if(&node.as_node());
+    }
+
+    /// `on_if`'s `unless` half (whitequark has no distinct `unless` node —
+    /// see the cop-level doc comment).
+    pub(crate) fn check_guard_clause_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        self.gc_on_if(&node.as_node());
+    }
+
+    /// `on_def`/`on_defs`: `body = node.body; return unless body;
+    /// check_ending_body(body)`. A `rescue`/`ensure` body is a `BeginNode`
+    /// in prism (never a `StatementsNode`) — `as_statements_node` naturally
+    /// excludes it, matching whitequark's body there being a `:rescue`/
+    /// `:ensure` type body never `begin_type?`/`if_type?` either (the
+    /// "def-with-rescue" trap: never mistake it for a normal statement
+    /// list).
+    pub(crate) fn check_guard_clause_def(&mut self, body: Option<ruby_prism::Node>) {
+        if !self.on("Style/GuardClause") {
+            return;
+        }
+        let Some(stmts) = body.and_then(|b| b.as_statements_node()) else { return };
+        self.gc_check_ending_body(Some(stmts));
+    }
+
+    /// `on_block`/`on_numblock`/`on_itblock`: `return unless
+    /// node.method?(:define_method) || node.method?(:define_singleton_method)`.
+    pub(crate) fn check_guard_clause_block(&mut self, call: &ruby_prism::CallNode, block: &ruby_prism::BlockNode) {
+        if !self.on("Style/GuardClause") {
+            return;
+        }
+        if !matches!(call.name().as_slice(), b"define_method" | b"define_singleton_method") {
+            return;
+        }
+        let Some(stmts) = block.body().and_then(|b| b.as_statements_node()) else { return };
+        self.gc_check_ending_body(Some(stmts));
+    }
+
+    /// `on_if`: guard-clause detection via `if_branch`/`else_branch`,
+    /// dispatching to `register_offense` with the matched branch's own kw
+    /// (literal for an `if_branch` match, inverse for an `else_branch`
+    /// match) — see `and_or_guard_clause?` in the cop-level doc comment for
+    /// `was_and_or`.
+    fn gc_on_if(&mut self, node: &ruby_prism::Node) {
+        const COP: &str = "Style/GuardClause";
+        if !self.on(COP) {
+            return;
+        }
+        if self.gc_accepted_form(node, false) {
+            return;
+        }
+        let if_stmts = gc_statements(node);
+        if let Some(was_and_or) = self.gc_guard_clause_branch(&if_stmts) {
+            let Some(kw_loc) = gc_keyword_loc(node) else { return };
+            let kw = String::from_utf8_lossy(kw_loc.as_slice()).into_owned();
+            let src = self.gc_branch_full_source(&if_stmts);
+            let guard = if was_and_or { None } else { Some(GcGuard::If) };
+            self.gc_register_offense(node, src, kw, guard);
+            return;
+        }
+        let else_stmts = gc_else_stmts(node);
+        if let Some(was_and_or) = self.gc_guard_clause_branch(&else_stmts) {
+            let kw = gc_inverse_keyword(node).to_string();
+            let src = self.gc_branch_full_source(&else_stmts);
+            let guard = if was_and_or { None } else { Some(GcGuard::Else) };
+            self.gc_register_offense(node, src, kw, guard);
+        }
+    }
+
+    /// `check_ending_body`: uniformly a `StatementsNode`'s last element in
+    /// prism (both the "single unwrapped statement" and ":begin type" cases
+    /// whitequark special-cases collapse into one shape here — see the
+    /// cop-level doc comment).
+    fn gc_check_ending_body(&mut self, stmts: Option<ruby_prism::StatementsNode>) {
+        let Some(stmts) = stmts else { return };
+        let nodes: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        let Some(last) = nodes.last() else { return };
+        if !gc_is_if_or_unless(last) {
+            return;
+        }
+        // `consecutive_conditionals?`: is the immediately preceding sibling
+        // (if any) itself an if/unless? (Style/Next's `AllowConsecutiveConditionals`
+        // handling uses the identical list-position idiom.)
+        let preceded_by_if = nodes.len() > 1 && gc_is_if_or_unless(&nodes[nodes.len() - 2]);
+        self.gc_check_ending_if(last, preceded_by_if);
+    }
+
+    /// `check_ending_if`.
+    fn gc_check_ending_if(&mut self, node: &ruby_prism::Node, preceded_by_if: bool) {
+        const COP: &str = "Style/GuardClause";
+        if self.gc_accepted_form(node, true) {
+            return;
+        }
+        if !self.gc_min_body_length(node) {
+            return;
+        }
+        let allow_consecutive = self.cfg.get(COP, "AllowConsecutiveConditionals") == Some("true");
+        if allow_consecutive && preceded_by_if {
+            return;
+        }
+        self.gc_register_offense(node, b"return".to_vec(), gc_inverse_keyword(node).to_string(), None);
+        self.gc_check_ending_body(gc_statements(node));
+    }
+
+    /// `node.if_branch&.guard_clause?`/`node.else_branch&.guard_clause?`:
+    /// `Some(was_and_or)` when `stmts` is exactly one statement matching
+    /// `match_guard_clause?` (directly, or through an `and`/`or` wrapper's
+    /// RHS) — `None` (never an offense) otherwise. A 2+ statement branch can
+    /// never match (whitequark's pattern only matches `send`/`return`/
+    /// `break`/`next` types, never `:begin`).
+    fn gc_guard_clause_branch(&self, stmts: &Option<ruby_prism::StatementsNode>) -> Option<bool> {
+        let nodes: Vec<ruby_prism::Node> = stmts.as_ref()?.body().iter().collect();
+        if nodes.len() != 1 {
+            return None;
+        }
+        let branch = &nodes[0];
+        if let Some(op) = branch.as_and_node() {
+            return if self.gc_matches_guard_target(&op.right()) { Some(true) } else { None };
+        }
+        if let Some(op) = branch.as_or_node() {
+            return if self.gc_matches_guard_target(&op.right()) { Some(true) } else { None };
+        }
+        if self.gc_matches_guard_target(branch) { Some(false) } else { None }
+    }
+
+    /// `match_guard_clause?`: `[${(send nil? {:raise :fail} ...) return break
+    /// next} single_line?]` — a bare (no-receiver) `raise`/`fail` call, or a
+    /// `return`/`break`/`next`, that fits on one line.
+    fn gc_matches_guard_target(&self, n: &ruby_prism::Node) -> bool {
+        if !self.gc_single_line(n) {
+            return false;
+        }
+        if n.as_return_node().is_some() || n.as_break_node().is_some() || n.as_next_node().is_some() {
+            return true;
+        }
+        if let Some(call) = n.as_call_node() {
+            return call.receiver().is_none() && matches!(call.name().as_slice(), b"raise" | b"fail");
+        }
+        false
+    }
+
+    fn gc_single_line(&self, n: &ruby_prism::Node) -> bool {
+        let l = n.location();
+        self.idx.loc(l.start_offset()).0 == self.idx.loc(l.end_offset().saturating_sub(1)).0
+    }
+
+    /// `guard_clause_source`: always the matched branch's own full source —
+    /// see the cop-level doc comment on why the `and`/`or`-wrapper case
+    /// resolves to the same text as the direct-match case.
+    fn gc_branch_full_source(&self, stmts: &Option<ruby_prism::StatementsNode>) -> Vec<u8> {
+        let nodes: Vec<ruby_prism::Node> = stmts.as_ref().unwrap().body().iter().collect();
+        self.node_src(&nodes[0]).to_vec()
+    }
+
+    /// `accepted_form?`/`accepted_if?` combined (pure predicate — order
+    /// among the ORed conditions doesn't matter).
+    fn gc_accepted_form(&self, node: &ruby_prism::Node, ending: bool) -> bool {
+        if gc_modifier_form(node)
+            || gc_is_ternary(node)
+            || gc_elsif_conditional(node)
+            || self.gc_assigned_lvar_used_in_if_branch(node)
+        {
+            return true;
+        }
+        let ending_check =
+            if ending { gc_has_else(node) } else { !gc_has_else(node) || gc_is_elsif(node) };
+        if ending_check {
+            return true;
+        }
+        if let Some(cond) = gc_predicate(node) {
+            if self.gc_multiline(&cond) {
+                return true;
+            }
+        }
+        self.gc_assignment_value_starts.contains(&node.location().start_offset())
+    }
+
+    fn gc_multiline(&self, n: &ruby_prism::Node) -> bool {
+        let l = n.location();
+        self.idx.loc(l.start_offset()).0 != self.idx.loc(l.end_offset().saturating_sub(1)).0
+    }
+
+    /// `assigned_lvar_used_in_if_branch?`: any local var assigned anywhere
+    /// in the condition is later READ anywhere in the if_branch subtree.
+    fn gc_assigned_lvar_used_in_if_branch(&self, node: &ruby_prism::Node) -> bool {
+        let Some(if_stmts) = gc_statements(node) else { return false };
+        let Some(condition) = gc_predicate(node) else { return false };
+        let mut ac = GcLvasgnCollector::default();
+        ac.visit(&condition);
+        if ac.names.is_empty() {
+            return false;
+        }
+        let mut uc = GcLvarCollector::default();
+        uc.visit(&if_stmts.as_node());
+        ac.names.iter().any(|n| uc.names.contains(n))
+    }
+
+    /// `MinBodyLength#min_body_length?`. Upstream `raise`s a runtime error
+    /// for a non-positive configured value ("Invalid MinBodyLength" fixture
+    /// context); ported as a silent fallback to the default (1) instead,
+    /// matching this codebase's existing `Style/Next` `MinBodyLength`
+    /// port — that spec example isn't a representable `expect_offense`/
+    /// `expect_no_offenses` case for the oracle anyway.
+    fn gc_min_body_length(&self, node: &ruby_prism::Node) -> bool {
+        const COP: &str = "Style/GuardClause";
+        let min_body_length = self
+            .cfg
+            .get(COP, "MinBodyLength")
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1);
+        let (Some(end_kw), Some(kw)) = (gc_end_keyword_loc(node), gc_keyword_loc(node)) else {
+            return false;
+        };
+        let end_line = self.idx.loc(end_kw.start_offset()).0;
+        let kw_line = self.idx.loc(kw.start_offset()).0;
+        (end_line as i64 - kw_line as i64) > min_body_length
+    }
+
+    /// `register_offense`.
+    fn gc_register_offense(
+        &mut self,
+        node: &ruby_prism::Node,
+        scope_exiting_keyword: Vec<u8>,
+        conditional_keyword: String,
+        guard: Option<GcGuard>,
+    ) {
+        const COP: &str = "Style/GuardClause";
+        let Some(condition) = gc_predicate(node) else { return };
+        let cond_src = self.node_src(&condition).to_vec();
+        let sek = String::from_utf8_lossy(&scope_exiting_keyword).into_owned();
+        let cond_str = String::from_utf8_lossy(&cond_src).into_owned();
+        let example_default = format!("{sek} {conditional_keyword} {cond_str}");
+        let mut message_example = example_default.clone();
+        let mut fix_text: Vec<u8> = example_default.clone().into_bytes();
+        if self.gc_too_long(node, &example_default) {
+            if self.gc_trivial(node) {
+                return;
+            }
+            message_example = format!("{conditional_keyword} {cond_str}; {sek}; end");
+            fix_text = format!("{conditional_keyword} {cond_str}\n  {sek}\nend").into_bytes();
+        }
+        let Some(kw_loc) = gc_keyword_loc(node) else { return };
+        let msg = format!(
+            "Use a guard clause (`{message_example}`) instead of wrapping the code inside a conditional expression."
+        );
+        self.push(kw_loc.start_offset(), COP, true, msg);
+        if gc_has_else(node) && guard.is_none() {
+            // `next if node.else? && guard.nil?`: offense still registered,
+            // but no correction (the `|| raise`/`and return` fixture
+            // examples using `expect_no_corrections`).
+            return;
+        }
+        self.gc_autocorrect(node, &condition, fix_text, guard);
+    }
+
+    /// `too_long_for_single_line?`.
+    fn gc_too_long(&self, node: &ruby_prism::Node, example: &str) -> bool {
+        let Some(max) = self.wum_max_line_length() else { return false };
+        let Some(kw) = gc_keyword_loc(node) else { return false };
+        let col = self.idx.loc(kw.start_offset()).1 - 1;
+        col + example.len() > max
+    }
+
+    /// `trivial?`: only reachable (can be `true`) via `check_ending_if`'s
+    /// no-else path — an else-having node's `branches` array always has 2+
+    /// entries, so `branches.one?` (and thus `trivial?`) is unconditionally
+    /// `false` there.
+    fn gc_trivial(&self, node: &ruby_prism::Node) -> bool {
+        let Some(if_stmts) = gc_statements(node) else { return false };
+        if gc_has_else(node) {
+            return false;
+        }
+        let nodes: Vec<ruby_prism::Node> = if_stmts.body().iter().collect();
+        let is_if_type = nodes.len() == 1 && gc_is_if_or_unless(&nodes[0]);
+        let is_begin_type = nodes.len() > 1;
+        !is_if_type && !is_begin_type
+    }
+
+    /// `autocorrect`.
+    fn gc_autocorrect(
+        &mut self,
+        node: &ruby_prism::Node,
+        condition: &ruby_prism::Node,
+        fix_text: Vec<u8>,
+        guard: Option<GcGuard>,
+    ) {
+        let Some(kw_loc) = gc_keyword_loc(node) else { return };
+        let cond_end = condition.location().end_offset();
+        self.fixes.push((kw_loc.start_offset(), cond_end, fix_text));
+        // `corrector.replace(node.loc.begin, "\n") if node.then?`.
+        if let Some(then_kw) = gc_then_keyword_loc(node) {
+            if then_kw.as_slice() == b"then" {
+                self.fixes.push((then_kw.start_offset(), then_kw.end_offset(), b"\n".to_vec()));
+            }
+        }
+        let if_stmts = gc_statements(node);
+        let else_stmts = gc_else_stmts(node);
+        if let Some(if_heredoc) = gc_find_heredoc_argument(&if_stmts) {
+            self.gc_autocorrect_heredoc(node, &if_heredoc, &else_stmts, guard);
+        } else if let Some(else_heredoc) = gc_find_heredoc_argument(&else_stmts) {
+            self.gc_autocorrect_heredoc(node, &else_heredoc, &if_stmts, guard);
+        } else {
+            let Some(end_kw) = gc_end_keyword_loc(node) else { return };
+            self.fixes.push((end_kw.start_offset(), end_kw.end_offset(), Vec::new()));
+            if !gc_has_else(node) {
+                return;
+            }
+            if let Some(else_kw) = gc_else_keyword_loc(node) {
+                self.fixes.push((else_kw.start_offset(), else_kw.end_offset(), Vec::new()));
+            }
+            if let Some((bs, be)) = self.gc_range_of_branch_to_remove(node, guard) {
+                self.fixes.push((bs, be, Vec::new()));
+            }
+        }
+    }
+
+    /// `autocorrect_heredoc_argument`. All three removals here expand to
+    /// their WHOLE containing line (`remove_whole_lines`), unlike the
+    /// plain-`autocorrect` else-branch above, which removes only the exact
+    /// token/branch text.
+    fn gc_autocorrect_heredoc(
+        &mut self,
+        node: &ruby_prism::Node,
+        heredoc_node: &ruby_prism::Node,
+        leave_stmts: &Option<ruby_prism::StatementsNode>,
+        guard: Option<GcGuard>,
+    ) {
+        if let Some(end_kw) = gc_end_keyword_loc(node) {
+            let (s, e) = gc_whole_lines(self.src, end_kw.start_offset(), end_kw.end_offset());
+            self.fixes.push((s, e, Vec::new()));
+        }
+        if !gc_has_else(node) {
+            return;
+        }
+        if let Some(leave) = leave_stmts {
+            let nodes: Vec<ruby_prism::Node> = leave.body().iter().collect();
+            if let (Some(first), Some(last)) = (nodes.first(), nodes.last()) {
+                let ls = first.location().start_offset();
+                let le = last.location().end_offset();
+                let (ws, we) = gc_whole_lines(self.src, ls, le);
+                self.fixes.push((ws, we, Vec::new()));
+                let leave_src = self.src[ls..le].to_vec();
+                let insert_at = self.gc_heredoc_closing_end(heredoc_node);
+                let mut ins = Vec::with_capacity(leave_src.len() + 1);
+                ins.push(b'\n');
+                ins.extend_from_slice(&leave_src);
+                self.fixes.push((insert_at, insert_at, ins));
+            }
+        }
+        if let Some(else_kw) = gc_else_keyword_loc(node) {
+            let (s, e) = gc_whole_lines(self.src, else_kw.start_offset(), else_kw.end_offset());
+            self.fixes.push((s, e, Vec::new()));
+        }
+        if let Some((bs, be)) = self.gc_range_of_branch_to_remove(node, guard) {
+            let (s, e) = gc_whole_lines(self.src, bs, be);
+            self.fixes.push((s, e, Vec::new()));
+        }
+    }
+
+    /// `range_of_branch_to_remove`.
+    fn gc_range_of_branch_to_remove(
+        &self,
+        node: &ruby_prism::Node,
+        guard: Option<GcGuard>,
+    ) -> Option<(usize, usize)> {
+        let stmts = match guard {
+            Some(GcGuard::If) => gc_statements(node),
+            Some(GcGuard::Else) => gc_else_stmts(node),
+            None => None,
+        }?;
+        let nodes: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        let first = nodes.first()?;
+        let last = nodes.last()?;
+        Some((first.location().start_offset(), last.location().end_offset()))
+    }
+
+    /// `heredoc_node.loc.heredoc_end`'s end offset: prism's `closing_loc`
+    /// spans the whole closing-delimiter LINE (leading indentation through a
+    /// trailing `\n`); trimming that trailing newline (and a preceding `\r`)
+    /// lands right after the bare delimiter text, matching whitequark's
+    /// `heredoc_end` — confirmed against real `rubocop -A` output.
+    fn gc_heredoc_closing_end(&self, node: &ruby_prism::Node) -> usize {
+        let closing = if let Some(n) = node.as_string_node() {
+            n.closing_loc()
+        } else if let Some(n) = node.as_interpolated_string_node() {
+            n.closing_loc()
+        } else if let Some(n) = node.as_x_string_node() {
+            Some(n.closing_loc())
+        } else if let Some(n) = node.as_interpolated_x_string_node() {
+            Some(n.closing_loc())
+        } else {
+            None
+        };
+        let Some(c) = closing else { return node.location().end_offset() };
+        let mut end = c.end_offset();
+        if end > 0 && self.src[end - 1] == b'\n' {
+            end -= 1;
+            if end > 0 && self.src[end - 1] == b'\r' {
+                end -= 1;
+            }
+        }
+        end
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GcGuard {
+    If,
+    Else,
+}
+
+fn gc_is_if_or_unless(n: &ruby_prism::Node) -> bool {
+    n.as_if_node().is_some() || n.as_unless_node().is_some()
+}
+
+/// `node.ternary?` — only `IfNode` can be one (no `if_keyword_loc`).
+fn gc_is_ternary(n: &ruby_prism::Node) -> bool {
+    n.as_if_node().is_some_and(|i| i.if_keyword_loc().is_none())
+}
+
+/// `modifier_form?` (normalized across `if`/`unless`): no real `end`.
+fn gc_modifier_form(n: &ruby_prism::Node) -> bool {
+    gc_end_keyword_loc(n).is_none()
+}
+
+fn gc_keyword_loc<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Location<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return i.if_keyword_loc();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return Some(u.keyword_loc());
+    }
+    None
+}
+
+fn gc_end_keyword_loc<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Location<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return i.end_keyword_loc();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return u.end_keyword_loc();
+    }
+    None
+}
+
+fn gc_then_keyword_loc<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Location<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return i.then_keyword_loc();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return u.then_keyword_loc();
+    }
+    None
+}
+
+/// The condition (`node.condition`/`node_parts.first`).
+fn gc_predicate<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return Some(i.predicate());
+    }
+    if let Some(u) = n.as_unless_node() {
+        return Some(u.predicate());
+    }
+    None
+}
+
+/// `if_branch` (normalized, as a `StatementsNode` — see the cop-level doc
+/// comment on why prism needs no if/unless swap here, unlike whitequark).
+fn gc_statements<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::StatementsNode<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return i.statements();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return u.statements();
+    }
+    None
+}
+
+/// The else-slot's raw node — an `ElseNode` (final else) or, for `IfNode`,
+/// possibly a nested `elsif` `IfNode` (only relevant to `elsif_conditional?`;
+/// by the time `else_branch`'s STATEMENTS are actually used elsewhere,
+/// `accepted_form?` has already excluded that case — see the cop-level doc
+/// comment).
+fn gc_subsequent_node<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return i.subsequent();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return u.else_clause().map(|e| e.as_node());
+    }
+    None
+}
+
+/// `else_branch` (normalized, as a `StatementsNode`).
+fn gc_else_stmts<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::StatementsNode<'pr>> {
+    gc_subsequent_node(n).and_then(|s| s.as_else_node().and_then(|e| e.statements()))
+}
+
+fn gc_else_keyword_loc<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Location<'pr>> {
+    gc_subsequent_node(n).and_then(|s| s.as_else_node().map(|e| e.else_keyword_loc()))
+}
+
+/// `node.else?` (normalized — "returns true for an elsif clause too", per
+/// rubocop-ast's own doc, matches: any `subsequent`/`else_clause` present).
+fn gc_has_else(n: &ruby_prism::Node) -> bool {
+    gc_subsequent_node(n).is_some()
+}
+
+/// `node.elsif?`: only an `IfNode`'s chained clause carries the literal
+/// `elsif` keyword text.
+fn gc_is_elsif(n: &ruby_prism::Node) -> bool {
+    n.as_if_node().and_then(|i| i.if_keyword_loc()).is_some_and(|l| l.as_slice() == b"elsif")
+}
+
+/// `elsif_conditional?`: `else_branch&.if_type? && else_branch.elsif?`.
+fn gc_elsif_conditional(n: &ruby_prism::Node) -> bool {
+    gc_subsequent_node(n).is_some_and(|s| gc_is_elsif(&s))
+}
+
+/// `inverse_keyword` (never called on a ternary, always excluded earlier).
+fn gc_inverse_keyword(n: &ruby_prism::Node) -> &'static str {
+    if n.as_unless_node().is_some() { "if" } else { "unless" }
+}
+
+/// `find_heredoc_argument`: only the FIRST statement of a branch is ever
+/// examined — upstream's `while node.begin_type?; node = node.children.first;
+/// end` unwrap loop only ever runs (at most) once for a flat multi-statement
+/// `:begin` branch (its first child is never itself another `:begin`), so a
+/// 2+ statement branch's LATER statements are never reachable here even when
+/// they'd contain the heredoc — reproduced verbatim (confirmed against the
+/// "heredoc in `else` branch and `then` branch has multiple expressions"
+/// fixture example, whose OTHER multi-statement branch's first statement,
+/// not its heredoc-argument-bearing statement, is what gets examined).
+fn gc_find_heredoc_argument<'pr>(
+    stmts: &Option<ruby_prism::StatementsNode<'pr>>,
+) -> Option<ruby_prism::Node<'pr>> {
+    let nodes: Vec<ruby_prism::Node> = stmts.as_ref()?.body().iter().collect();
+    gc_find_heredoc_in_node(nodes.into_iter().next()?)
+}
+
+/// Prism's accessors (`as_call_node`, `receiver`, `arguments`, ...) all
+/// construct a fresh OWNED `Node` from the underlying pointer on every call
+/// (there's no borrowed-reference relationship to a parent), so this takes
+/// `node` by value throughout rather than needing a `Clone` impl that
+/// doesn't exist on the generated `Node` enum.
+fn gc_find_heredoc_in_node<'pr>(node: ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if super::breakable::is_heredoc_node(&node) {
+        return Some(node);
+    }
+    let call = node.as_call_node()?;
+    if let Some(args) = call.arguments() {
+        let arglist: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        for arg in arglist.into_iter().rev() {
+            if let Some(found) = gc_find_heredoc_in_node(arg) {
+                return Some(found);
+            }
+        }
+    }
+    let recv = call.receiver()?;
+    gc_find_heredoc_in_node(recv)
+}
+
+/// `range_by_whole_lines(range, include_final_newline: true)`.
+fn gc_whole_lines(src: &[u8], start: usize, end: usize) -> (usize, usize) {
+    let mut s = start;
+    while s > 0 && src[s - 1] != b'\n' {
+        s -= 1;
+    }
+    let mut e = end;
+    while e < src.len() && src[e] != b'\n' {
+        e += 1;
+    }
+    if e < src.len() {
+        e += 1;
+    }
+    (s, e)
+}
+
+/// `each_descendant(:lvasgn)` within the condition — all local-variable
+/// ASSIGNMENT-shaped nodes (plain, `&&=`/`||=`/op-compound, and destructured
+/// `masgn` targets — whitequark represents each of those as containing a
+/// genuine nested `:lvasgn`).
+#[derive(Default)]
+struct GcLvasgnCollector {
+    names: Vec<Vec<u8>>,
+}
+impl<'pr> ruby_prism::Visit<'pr> for GcLvasgnCollector {
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.names.push(node.name().as_slice().to_vec());
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        self.names.push(node.name().as_slice().to_vec());
+        ruby_prism::visit_local_variable_and_write_node(self, node);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        self.names.push(node.name().as_slice().to_vec());
+        ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_local_variable_operator_write_node(
+        &mut self,
+        node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>,
+    ) {
+        self.names.push(node.name().as_slice().to_vec());
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
+    }
+    fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        for t in node.lefts().iter().chain(node.rights().iter()) {
+            if let Some(lv) = t.as_local_variable_target_node() {
+                self.names.push(lv.name().as_slice().to_vec());
+            }
+        }
+        ruby_prism::visit_multi_write_node(self, node);
+    }
+}
+
+/// `each_descendant(:lvar)` — plain local-variable READS.
+#[derive(Default)]
+struct GcLvarCollector {
+    names: Vec<Vec<u8>>,
+}
+impl<'pr> ruby_prism::Visit<'pr> for GcLvarCollector {
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.names.push(node.name().as_slice().to_vec());
+        ruby_prism::visit_local_variable_read_node(self, node);
+    }
+}

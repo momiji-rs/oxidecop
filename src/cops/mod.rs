@@ -370,7 +370,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
-    "Style/Lambda",
+    "Style/Lambda", "Style/GuardClause",
 ];
 
 impl Engine {
@@ -842,6 +842,14 @@ pub(crate) struct Cops<'a> {
     // has no parent pointers), populated by the `assignment_write!`-family
     // macros before they recurse into the value.
     pub(crate) icb_assign_start: HashMap<usize, usize>,
+    // Style/GuardClause: mirrors `icb_assign_start` — start offsets of
+    // `if`/`unless` nodes that sit directly as the VALUE of an assignment
+    // (`result = if something ... end`), populated by the same
+    // `assignment_write!`-family macros. Stands in for rubocop-ast's
+    // `node.parent&.assignment?` (prism has no parent pointers). A plain
+    // `HashSet` suffices — unlike `icb_assign_start`, `accepted_form?` only
+    // ever needs the yes/no fact, never the enclosing assignment's location.
+    pub(crate) gc_assignment_value_starts: HashSet<usize>,
     // Style/MultilineTernaryOperator: byte ranges of ternaries already
     // corrected in THIS pass — a nested ternary whose range falls inside one
     // of these is `part_of_ignored_node?` upstream: still gets an offense, but
@@ -1649,6 +1657,15 @@ impl<'a> Cops<'a> {
             self.icb_assign_start.insert(value.location().start_offset(), lhs_start);
         }
     }
+    /// Style/GuardClause parent-tracking (see the `gc_assignment_value_starts`
+    /// field doc comment): if `value` is directly an `if`/`unless` node,
+    /// remember that it sits as an assignment's RHS — `accepted_form?`'s
+    /// `node.parent&.assignment?` guard.
+    pub(crate) fn gc_note_assignment_value(&mut self, value: &ruby_prism::Node) {
+        if value.as_if_node().is_some() || value.as_unless_node().is_some() {
+            self.gc_assignment_value_starts.insert(value.location().start_offset());
+        }
+    }
     /// Autocorrects for DECLARATIVE-table cops (the one thing a pattern row
     /// can't express). Returns whether a fix was produced.
     fn decl_fix(&mut self, cop: &str, node: &ruby_prism::CallNode) -> bool {
@@ -1787,6 +1804,7 @@ macro_rules! assignment_write {
         $self.aa_note_unbracketed_rhs(lhs_start, &$node.value());
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
+        $self.gc_note_assignment_value(&$node.value());
     }};
 }
 macro_rules! assignment_operator_write {
@@ -1796,6 +1814,7 @@ macro_rules! assignment_operator_write {
         $self.aa_note_unbracketed_rhs(lhs_start, &$node.value());
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
+        $self.gc_note_assignment_value(&$node.value());
     }};
 }
 macro_rules! assignment_path_write {
@@ -1804,6 +1823,7 @@ macro_rules! assignment_path_write {
         let op_end = $node.operator_loc().end_offset();
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
+        $self.gc_note_assignment_value(&$node.value());
     }};
 }
 macro_rules! assignment_path_operator_write {
@@ -1812,6 +1832,7 @@ macro_rules! assignment_path_operator_write {
         let op_end = $node.binary_operator_loc().end_offset();
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
+        $self.gc_note_assignment_value(&$node.value());
     }};
 }
 
@@ -2190,6 +2211,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_or_assignment_if(node);
         self.check_identical_conditional_branches_if(node);
         self.check_sole_nested_conditional(&node.as_node());
+        self.check_guard_clause_if(node);
         if let Some(kw) = node.if_keyword_loc() {
             if matches!(kw.as_slice(), b"if" | b"elsif") {
                 let kw_text = if kw.as_slice() == b"elsif" { "elsif" } else { "if" };
@@ -2273,6 +2295,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_if_with_semicolon_unless(node);
         self.check_or_assignment_unless(node);
         self.check_sole_nested_conditional(&node.as_node());
+        self.check_guard_clause_unless(node);
         self.check_multiline_if_then(
             node.then_keyword_loc(),
             node.end_keyword_loc(),
@@ -3696,6 +3719,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_missing_super(node);
         self.check_method_def_parentheses(node);
         self.check_memoized_ivar_def(node);
+        self.check_guard_clause_def(node.body());
         // Default walk (receiver, params, body) one def level deeper — matches
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
         // parameter default values, which a body-only walk silently skipped.
@@ -4457,6 +4481,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_empty_lines_around_exception_handling_keywords_block(node, &bn);
                 self.check_block_length(node, &bn);
                 self.check_next_block(node, &bn);
+                self.check_guard_clause_block(node, &bn);
             }
             // Lint/NonLocalExitFromIterator: stash this call's shape
             // (`send_node.method?(:lambda)`, `define_method?`,
@@ -4683,6 +4708,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         mto_parent_start: HashMap::new(),
         mto_single_line: HashSet::new(),
         icb_assign_start: HashMap::new(),
+        gc_assignment_value_starts: HashSet::new(),
         mto_fixed_ranges: Vec::new(),
         nested_modifier_ignored: Vec::new(),
         snc_ignored: Vec::new(),
