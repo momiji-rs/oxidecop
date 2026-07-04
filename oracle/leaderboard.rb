@@ -331,6 +331,7 @@ COPS = {
   'Style/HashSyntax'                 => 'style/hash_syntax',
   'Lint/UnusedBlockArgument'         => 'lint/unused_block_argument',
   'Lint/UnusedMethodArgument'        => 'lint/unused_method_argument',
+  'Lint/UselessAccessModifier'       => 'lint/useless_access_modifier',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

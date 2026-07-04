@@ -370,7 +370,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
-    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument",
+    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier",
 ];
 
 impl Engine {
@@ -3787,6 +3787,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_unused_block_argument(node);
         self.check_unused_method_argument(node);
         self.check_space_inside_parens(node);
+        self.check_useless_access_modifier_top_level(&node.statements());
         ruby_prism::visit_program_node(self, node);
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
@@ -3810,6 +3811,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_camel_case_name(&node.constant_path());
         self.check_inherit_exception_class(node);
         self.check_ineffective_access_modifier(node.body());
+        self.check_useless_access_modifier_scope(node.body());
         self.check_bisected_attr_accessor(node.body());
         self.check_mixin_grouping(node.body());
         self.check_accessor_grouping(node.body());
@@ -3867,6 +3869,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_module_function(node);
         self.check_empty_lines_around_module_body(node);
         self.check_ineffective_access_modifier(node.body());
+        self.check_useless_access_modifier_scope(node.body());
         self.check_bisected_attr_accessor(node.body());
         self.check_mixin_grouping(node.body());
         self.check_accessor_grouping(node.body());
@@ -4165,6 +4168,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(), node.body().is_some(), false, true);
         self.check_trailing_body_on_class(node.class_keyword_loc().start_offset(), l.end_offset(), node.body());
+        self.check_useless_access_modifier_scope(node.body());
         self.check_bisected_attr_accessor(node.body());
         self.check_accessor_grouping(node.body());
         // Layout/EmptyLinesAroundAccessModifier's `@class_or_module_def_first_line`
@@ -4761,6 +4765,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_block_length(node, &bn);
                 self.check_next_block(node, &bn);
                 self.check_guard_clause_block(node, &bn);
+                self.check_useless_access_modifier_block(node, &bn);
             }
             // Lint/NonLocalExitFromIterator: stash this call's shape
             // (`send_node.method?(:lambda)`, `define_method?`,

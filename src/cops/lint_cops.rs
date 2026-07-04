@@ -14918,3 +14918,469 @@ impl<'pr> ruby_prism::Visit<'pr> for UmaCollector {
         ruby_prism::visit_call_node(self, node);
     }
 }
+
+use ruby_prism::Visit;
+
+/// Lint/UselessAccessModifier — a bare `public`/`private`/`protected`/
+/// `module_function` (or a no-arg `private_class_method`) that has no
+/// effect: repeated, leading-and-unused, top-level, or followed by nothing
+/// that actually defines a method.
+///
+/// Upstream's algorithm threads a `(cur_vis, unused)` pair through a
+/// recursive `child_nodes` walk of a class/module/sclass/qualifying-block
+/// body, where `unused` is the most recent modifier not yet known to guard a
+/// real method def. Three shapes are ported separately here because prism's
+/// tree shape differs from whitequark's in ways that change which branch of
+/// upstream's `check_node`/`on_begin` actually fires:
+///
+/// 1. **Top level** (`check_useless_access_modifier_top_level`) — upstream's
+///    `on_begin` fires ONLY for whitequark's implicit multi-statement
+///    `:begin` (2+ raw top-level statements; a single top-level statement is
+///    never wrapped, so `on_begin` never runs for it). It does a SHALLOW,
+///    unconditional scan: every direct-child bare modifier or no-arg
+///    `private_class_method` is flagged, full stop — no def-tracking, no
+///    recursion. Since prism's `ProgramNode` always wraps in a
+///    `StatementsNode` even for a single statement, we gate on
+///    `body.len() >= 2` ourselves to reproduce the "never wraps a lone
+///    statement" cutoff.
+///
+/// 2. **Single-statement scope body** — for the SAME reason (prism always
+///    wraps a class/module/sclass/block body in a `StatementsNode`, even
+///    with exactly one statement, where whitequark would hand `check_node`
+///    the bare inner node directly), a body with exactly one statement gets
+///    upstream's OTHER `check_node` branch: flag it if-and-only-if it is
+///    itself a bare modifier (`node.send_type? && node.bare_access_modifier?`
+///    — deliberately NOT `access_modifier?`, so a lone `private_class_method`
+///    with nothing else in the body is never flagged; confirmed against the
+///    real cop). Nothing else about a single-statement body is inspected —
+///    not method defs, not nested scopes — matching upstream's `check_node`
+///    being a strict `begin_type? || bare_access_modifier?` dispatch with no
+///    third branch for a single statement that only "kind of" contains a
+///    modifier (e.g. `class A; begin; private; end; end` is NEVER flagged
+///    upstream even though the `private` has nothing after it, because the
+///    class's only statement is a bare `kwbegin`, which is neither
+///    `begin_type?` nor `bare_access_modifier?`).
+///
+/// 3. **Multi-statement scope body** (`UamFold`, `>= 2` statements) —
+///    upstream's real `check_child_nodes` fold. Ported as a dedicated
+///    `ruby_prism::Visit` walker (not the shared `Cops` visitor) so that
+///    "recurse generically into whatever this arbitrary node is" falls out
+///    of the crate's own default per-type descent — we only need to override
+///    the handful of node kinds upstream special-cases (`def`, `class`,
+///    `module`, `sclass`, and — the bulk of the logic — `call`, since a
+///    call's optional attached block is a FIELD in prism rather than an
+///    outer wrapper node like whitequark's `:block`).
+///
+/// `check_useless_access_modifier_scope` is shared by cases 2 and 3, and is
+/// called from `on_class`/`on_module`/`on_sclass`'s single top-level dispatch
+/// point in `mod.rs`, plus `check_useless_access_modifier_block` for
+/// qualifying blocks (`eval_call?`/`included_block?`).
+impl<'a> Cops<'a> {
+    /// `on_begin`: only the OUTERMOST top-level statement list, and only when
+    /// it has 2+ statements (see the module-level doc for why). Every direct
+    /// child that is a bare modifier or no-arg `private_class_method` is
+    /// flagged unconditionally — this deliberately does NOT recurse or track
+    /// def-usage; upstream's `on_begin` doesn't either.
+    pub(crate) fn check_useless_access_modifier_top_level(&mut self, stmts: &ruby_prism::StatementsNode) {
+        const COP: &str = "Lint/UselessAccessModifier";
+        if !self.on(COP) {
+            return;
+        }
+        let body = stmts.body();
+        if body.len() < 2 {
+            return;
+        }
+        for child in body.iter() {
+            let Some(call) = child.as_call_node() else { continue };
+            // A block-attached call is never `send_type?` in whitequark, so
+            // `on_begin`'s direct `child_nodes` scan would never reach it.
+            if call.block().is_some() {
+                continue;
+            }
+            if let Some(vis) = uam_bare_modifier_name(&call) {
+                let l = call.location();
+                self.uam_emit(l.start_offset(), l.end_offset(), vis);
+            } else if call.name().as_slice() == b"private_class_method" && call.arguments().is_none() {
+                let l = call.location();
+                self.uam_emit(l.start_offset(), l.end_offset(), "private_class_method");
+            }
+        }
+    }
+
+    /// `on_block`: `eval_call?(node) || included_block?(node)` — called from
+    /// `visit_call_node` for every call that has an attached block. Only
+    /// `class_eval`/`instance_eval` (any receiver), a `Class`/`Module`/
+    /// `Struct.new`/`Data.define` block, a configured `ContextCreatingMethods`
+    /// block (receiver nil or a constant), or (when
+    /// `ActiveSupportExtensionsEnabled`) an `included` block qualify.
+    pub(crate) fn check_useless_access_modifier_block(
+        &mut self,
+        call: &ruby_prism::CallNode,
+        block: &ruby_prism::BlockNode,
+    ) {
+        const COP: &str = "Lint/UselessAccessModifier";
+        if !self.on(COP) {
+            return;
+        }
+        let name = call.name().as_slice();
+        let eligible = (self.cfg.active_support() && name == b"included")
+            || matches!(name, b"class_eval" | b"instance_eval")
+            || is_class_constructor(call, self.src)
+            || (uam_recv_nil_or_const(call) && self.uam_ctx_creating_methods().iter().any(|m| m.as_slice() == name));
+        if !eligible {
+            return;
+        }
+        self.check_useless_access_modifier_scope(block.body());
+    }
+
+    /// `on_class`/`on_module`/`on_sclass`'s shared `check_node(node.body)`,
+    /// plus the body of a qualifying block reached via
+    /// `check_useless_access_modifier_block`. See the module-level doc for
+    /// why the single-statement and 2+-statement cases are handled
+    /// differently.
+    pub(crate) fn check_useless_access_modifier_scope(&mut self, body: Option<ruby_prism::Node>) {
+        const COP: &str = "Lint/UselessAccessModifier";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body) = body else { return };
+        // A body that reduces to a bare `BeginNode` (an explicit `begin..end`
+        // with no other sibling statements, or a class/module/sclass with a
+        // directly-attached `rescue`/`ensure`) is whitequark's `kwbegin` —
+        // neither `begin_type?` nor `bare_access_modifier?` — so upstream's
+        // `check_node` does nothing at all (verified against the real cop).
+        let Some(stmts) = body.as_statements_node() else { return };
+        let elems = stmts.body();
+        if elems.len() < 2 {
+            // Exactly one statement: upstream hands `check_node` that bare
+            // node directly (prism always wraps in a `StatementsNode`, even
+            // for one statement) — only its OWN bare-modifier-ness matters;
+            // nothing else is inspected, no matter what it is.
+            if let Some(call) = elems.iter().next().and_then(|n| n.as_call_node()) {
+                if let Some(vis) = uam_bare_modifier_name(&call) {
+                    let l = call.location();
+                    self.uam_emit(l.start_offset(), l.end_offset(), vis);
+                }
+            }
+            return;
+        }
+        let mut fold = UamFold {
+            src: self.src,
+            ctx_methods: self.uam_ctx_creating_methods(),
+            method_methods: self.uam_method_creating_methods(),
+            active_support: self.cfg.active_support(),
+            cur_vis: Some("public"),
+            unused: None,
+            out: Vec::new(),
+        };
+        fold.visit(&stmts.as_node());
+        // `check_scope`'s final `return unless unused; add_offense(unused, ...)`
+        // — a modifier still pending at the end of the scope is useless too.
+        if let Some((us, ue, un)) = fold.unused {
+            fold.out.push((us, ue, un));
+        }
+        for (start, end, name) in fold.out {
+            self.uam_emit(start, end, name);
+        }
+    }
+
+    /// `cop_config.fetch('ContextCreatingMethods', [])`, with `"included"`
+    /// pre-filtered out (upstream skips it in the loop to avoid redefining
+    /// its own `included_block?` matcher). Absent from the generated schema
+    /// since its default is the array `[]`.
+    fn uam_ctx_creating_methods(&self) -> Vec<Vec<u8>> {
+        self.cfg
+            .get("Lint/UselessAccessModifier", "ContextCreatingMethods")
+            .map(crate::config::parse_allowed_list)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m != "included")
+            .map(String::into_bytes)
+            .collect()
+    }
+    /// `cop_config.fetch('MethodCreatingMethods', [])`, same "included"
+    /// pre-filter and same absent-array-default reasoning as above.
+    fn uam_method_creating_methods(&self) -> Vec<Vec<u8>> {
+        self.cfg
+            .get("Lint/UselessAccessModifier", "MethodCreatingMethods")
+            .map(crate::config::parse_allowed_list)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m != "included")
+            .map(String::into_bytes)
+            .collect()
+    }
+
+    /// Shared offense+autocorrect emission: `add_offense(node, message:
+    /// format(MSG, current: name))` with `autocorrect` = `range_by_whole_lines
+    /// (node.source_range, include_final_newline: true)` then `corrector.remove`.
+    fn uam_emit(&mut self, start: usize, end: usize, name: &str) {
+        const COP: &str = "Lint/UselessAccessModifier";
+        self.push(start, COP, true, format!("Useless `{name}` access modifier."));
+        let (rs, re) = uam_whole_lines(self.src, start, end);
+        self.fixes.push((rs, re, Vec::new()));
+    }
+}
+
+/// `bare_access_modifier?`, restricted to the exact 4 macro names upstream's
+/// `bare_access_modifier_declaration?` matches (`public`/`private`/
+/// `protected`/`module_function`) — deliberately excludes
+/// `private_class_method`, which is a separate check
+/// (`access_modifier?`'s OTHER disjunct) with different call-site rules.
+/// Callers are responsible for confirming there's no attached block first
+/// (a block-attached call is never whitequark's bare `:send` shape).
+fn uam_bare_modifier_name(call: &ruby_prism::CallNode) -> Option<&'static str> {
+    if call.receiver().is_some() || call.arguments().is_some() {
+        return None;
+    }
+    match call.name().as_slice() {
+        b"public" => Some("public"),
+        b"private" => Some("private"),
+        b"protected" => Some("protected"),
+        b"module_function" => Some("module_function"),
+        _ => None,
+    }
+}
+
+/// `{nil? const}` — used by `any_context_creating_methods?`'s receiver guard.
+/// Prism splits whitequark's single `:const` type into `ConstantReadNode`
+/// (`Foo`) and `ConstantPathNode` (`Foo::Bar`, `::Foo`); both count.
+fn uam_recv_nil_or_const(call: &ruby_prism::CallNode) -> bool {
+    match call.receiver() {
+        None => true,
+        Some(r) => r.as_constant_read_node().is_some() || r.as_constant_path_node().is_some(),
+    }
+}
+
+/// `RangeHelp#range_by_whole_lines(range, include_final_newline: true)`.
+fn uam_whole_lines(src: &[u8], start: usize, end: usize) -> (usize, usize) {
+    let mut s = start;
+    while s > 0 && src[s - 1] != b'\n' {
+        s -= 1;
+    }
+    let mut e = end;
+    while e < src.len() && src[e] != b'\n' {
+        e += 1;
+    }
+    if e < src.len() {
+        e += 1;
+    }
+    (s, e)
+}
+
+/// The outcome of classifying a call node's own name/receiver/arguments,
+/// deliberately IGNORING any attached block — see `UamFold::classify_bare`'s
+/// doc for why this "as if bare" view is exactly what upstream's recursion
+/// into an unmatched block's wrapped inner `send` amounts to.
+enum UamBare {
+    /// A bare `public`/`private`/`protected`/`module_function` macro call.
+    Modifier(&'static str),
+    /// A no-arg `private_class_method` — always an immediate offense.
+    PcmImmediate,
+    /// `private_class_method` WITH arguments — upstream's `check_send_node`
+    /// falls through neither branch and (being called via Ruby multiple
+    /// assignment on a `nil` return) resets `cur_vis`/`unused` to `nil` as a
+    /// side effect. Reproduced faithfully; see `UamFold::apply_bare`.
+    PcmCorrupt,
+    /// `static_method_definition?` (`attr`/`attr_reader`/`attr_writer`/
+    /// `attr_accessor`, or a bare `def`, handled separately in
+    /// `UamFold::visit_def_node`), `dynamic_method_definition?`'s bare
+    /// `define_method` alt, or a configured `MethodCreatingMethods` name.
+    MethodDef,
+    /// `class_constructor?`'s bare-send alt (`Class.new` etc. with no
+    /// block) — inert in practice (no body to scan) but still a boundary.
+    ScopeBoundary,
+    /// None of the above: upstream's generic
+    /// `check_child_nodes(child, unused, cur_vis)` recursion into whatever
+    /// this node's own children are.
+    Nothing,
+}
+
+/// Lint/UselessAccessModifier's `check_child_nodes` fold for a 2+-statement
+/// scope body, as a standalone `ruby_prism::Visit` walker — see the
+/// module-level doc above `check_useless_access_modifier_top_level` for why
+/// this is a separate visitor rather than hooking the shared `Cops` one.
+struct UamFold<'s> {
+    src: &'s [u8],
+    /// `ContextCreatingMethods`, "included" pre-filtered out.
+    ctx_methods: Vec<Vec<u8>>,
+    /// `MethodCreatingMethods`, "included" pre-filtered out.
+    method_methods: Vec<Vec<u8>>,
+    active_support: bool,
+    /// `cur_vis` — `None` only ever means upstream's `nil`-corruption case
+    /// (see `UamBare::PcmCorrupt`), never a real "no visibility yet" state
+    /// (the fold always starts at `Some("public")`).
+    cur_vis: Option<&'static str>,
+    /// `unused` — the most recent modifier not yet known to guard a def,
+    /// as `(start_offset, end_offset, name)` of its own `source_range`.
+    unused: Option<(usize, usize, &'static str)>,
+    /// Offenses found so far, as `(start, end, name)` — `start`/`end` double
+    /// as both the offense anchor and the autocorrect's own node range.
+    out: Vec<(usize, usize, &'static str)>,
+}
+
+impl<'s> UamFold<'s> {
+    fn flag(&mut self, start: usize, end: usize, name: &'static str) {
+        self.out.push((start, end, name));
+    }
+
+    /// `check_new_visibility`: a NEW distinct modifier flushes the
+    /// previously-pending one (if any) as useless; a REPEATED modifier
+    /// (same as `cur_vis`) is immediately useless itself, and does NOT
+    /// disturb whatever was already pending.
+    fn note_new_vis(&mut self, name: &'static str, start: usize, end: usize) {
+        if self.cur_vis == Some(name) {
+            self.flag(start, end, name);
+        } else {
+            if let Some((us, ue, un)) = self.unused.take() {
+                self.flag(us, ue, un);
+            }
+            self.cur_vis = Some(name);
+            self.unused = Some((start, end, name));
+        }
+    }
+
+    /// `access_modifier?`/`method_definition?`/`start_of_new_scope?`
+    /// classification of `call`'s own name/receiver/arguments, ignoring any
+    /// attached block entirely. This is exactly what upstream's generic
+    /// recursion into an unmatched with-block child (whitequark's outer
+    /// `:block` node) finds when it reaches that block's wrapped inner
+    /// `send` as one of ITS children — the block was already peeled away
+    /// structurally by that point. Prism keeps the block as a field on the
+    /// same `CallNode` rather than wrapping it as a separate outer node, so
+    /// `UamFold::handle_call` re-derives the same "as if bare" view directly
+    /// instead of relying on a second, differently-shaped node to recurse
+    /// into.
+    fn classify_bare(&self, call: &ruby_prism::CallNode) -> UamBare {
+        let name = call.name().as_slice();
+        let no_recv = call.receiver().is_none();
+        if no_recv && call.arguments().is_none() {
+            match name {
+                b"public" => return UamBare::Modifier("public"),
+                b"private" => return UamBare::Modifier("private"),
+                b"protected" => return UamBare::Modifier("protected"),
+                b"module_function" => return UamBare::Modifier("module_function"),
+                _ => {}
+            }
+        }
+        if name == b"private_class_method" {
+            return if call.arguments().is_none() { UamBare::PcmImmediate } else { UamBare::PcmCorrupt };
+        }
+        if no_recv && matches!(name, b"attr" | b"attr_reader" | b"attr_writer" | b"attr_accessor") {
+            return UamBare::MethodDef;
+        }
+        if no_recv && name == b"define_method" {
+            return UamBare::MethodDef;
+        }
+        if no_recv && self.method_methods.iter().any(|m| m.as_slice() == name) {
+            return UamBare::MethodDef;
+        }
+        if is_class_constructor(call, self.src) {
+            return UamBare::ScopeBoundary;
+        }
+        UamBare::Nothing
+    }
+
+    /// Applies `classify_bare`'s verdict: a matched leaf never recurses
+    /// further (matching upstream, where a matched `child` never falls to
+    /// the generic-recursion `elsif`); only `Nothing` recurses into the
+    /// call's own receiver/arguments.
+    fn apply_bare(&mut self, call: &ruby_prism::CallNode) {
+        match self.classify_bare(call) {
+            UamBare::Modifier(vis) => {
+                let l = call.location();
+                self.note_new_vis(vis, l.start_offset(), l.end_offset());
+            }
+            UamBare::PcmImmediate => {
+                let l = call.location();
+                self.flag(l.start_offset(), l.end_offset(), "private_class_method");
+            }
+            UamBare::PcmCorrupt => {
+                self.cur_vis = None;
+                self.unused = None;
+            }
+            UamBare::MethodDef => {
+                self.unused = None;
+            }
+            UamBare::ScopeBoundary => {}
+            UamBare::Nothing => {
+                if let Some(r) = call.receiver() {
+                    self.visit(&r);
+                }
+                if let Some(a) = call.arguments() {
+                    for arg in a.arguments().iter() {
+                        self.visit(&arg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `child.send_type? && access_modifier?(child)` /
+    /// `child.block_type? && included_block?(child)` / `method_definition?`
+    /// (`any_block` define_method alt) / `start_of_new_scope?`'s `eval_call?`
+    /// disjuncts that require a block (`class_or_instance_eval?`,
+    /// `class_constructor?`'s any_block alt, `any_context_creating_methods?`)
+    /// — checked FIRST, since these consume the whole call+block as one
+    /// indivisible leaf with no further recursion at all. Anything else
+    /// falls through to `apply_bare` (the "as if bare" retry) plus a
+    /// separate, unconditional scan of the block's own body — matching
+    /// upstream's generic recursion into the wrapping `:block` node's
+    /// [inner-send, params, body] children.
+    fn handle_call(&mut self, call: &ruby_prism::CallNode) {
+        if let Some(block_arg) = call.block() {
+            if let Some(bn) = block_arg.as_block_node() {
+                let name = call.name().as_slice();
+                if self.active_support && name == b"included" {
+                    return;
+                }
+                if call.receiver().is_none() && name == b"define_method" {
+                    self.unused = None;
+                    return;
+                }
+                if matches!(name, b"class_eval" | b"instance_eval") {
+                    return;
+                }
+                if is_class_constructor(call, self.src) {
+                    return;
+                }
+                if uam_recv_nil_or_const(call) && self.ctx_methods.iter().any(|m| m.as_slice() == name) {
+                    return;
+                }
+                self.apply_bare(call);
+                if let Some(body) = bn.body() {
+                    self.visit(&body);
+                }
+                return;
+            }
+            // `&:sym` block-pass args aren't block nodes — treat as bare.
+        }
+        self.apply_bare(call);
+    }
+}
+
+impl<'pr, 's> ruby_prism::Visit<'pr> for UamFold<'s> {
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        // `static_method_definition?`'s bare `def` alt matches ANY `def`
+        // type (i.e. whitequark's receiver-less `:def`, never `:defs`) —
+        // `node.receiver()` is prism's equivalent of that type distinction.
+        // Either way, a def's body is never recursed into (a method body is
+        // its own visibility scope), and a `defs` (explicit receiver) is a
+        // complete no-op, exactly like upstream's `!child.defs_type?` guard.
+        if node.receiver().is_none() {
+            self.unused = None;
+        }
+    }
+    fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {
+        // `start_of_new_scope?`: a boundary, handled independently by its
+        // own top-level `visit_class_node` dispatch in `mod.rs` — recursing
+        // here too would be upstream's own redundant-but-deduped
+        // `check_scope(child)` double-visit (`add_offense` dedupes by exact
+        // range), so we simply don't bother.
+    }
+    fn visit_module_node(&mut self, _node: &ruby_prism::ModuleNode<'pr>) {}
+    fn visit_singleton_class_node(&mut self, _node: &ruby_prism::SingletonClassNode<'pr>) {}
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        self.handle_call(node);
+    }
+}
