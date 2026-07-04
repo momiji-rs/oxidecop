@@ -35327,10 +35327,18 @@ impl<'a> super::Cops<'a> {
         }
         // `like_method_argument_parentheses?`: `type?(:send, :super,
         // :yield)` — a plain array-inclusion check on the RAW type, so
-        // `:csend` (safe nav) is excluded, unlike the `:call` GROUP.
+        // `:csend` (safe nav) is excluded, unlike the `:call` GROUP. The
+        // parens must BE the call's FIRST ARGUMENT (`node.first_argument.
+        // begin_type?`) — parens in RECEIVER position (`(foo.bar)[0]`,
+        // rails corpus) are a plain redundant-method-call offense.
         let is_send_super_yield =
             (p.tag == RpTag::Call && !p.is_safe_nav) || matches!(p.tag, RpTag::Super | RpTag::Yield);
-        if is_send_super_yield && p.arg_count == 1 && !p.parenthesized && !p.operator_method {
+        if is_send_super_yield
+            && p.arg_count == 1
+            && !p.parenthesized
+            && !p.operator_method
+            && self.rp_self_frame().is_some_and(|b| p.first_arg_start == Some(b.start))
+        {
             return true;
         }
         // `multiline_control_flow_statements?`.
@@ -35557,9 +35565,26 @@ impl<'a> super::Cops<'a> {
         close_e: usize,
         children: &[ruby_prism::Node<'_>],
     ) {
-        if rp_unary_operation(node, self.src) {
-            self.rp_check_unary(node, open_s, open_e, close_s, close_e, children);
-            return;
+        // whitequark folds a numeric literal's sign into the literal token
+        // (`(+ 1)` IS an int node — 'a literal'; `(+ 1.second)` a plain
+        // send chain on that int — 'a method call'); prism keeps an
+        // explicit `+@`/`-@` CallNode (rails corpus). Reclassify to the
+        // whitequark shape before the unary dispatch.
+        match rp_wq_sign_absorbed(node, self.src) {
+            Some(false) => {
+                let anchor = self.rp_self_frame().map(|k| k.start).unwrap_or(open_s);
+                self.rp_offense(anchor, open_s, open_e, close_s, close_e, children, "a literal");
+                return;
+            }
+            Some(true) => {
+                // fall through to the plain method-call path below
+            }
+            None => {
+                if rp_unary_operation(node, self.src) {
+                    self.rp_check_unary(node, open_s, open_e, close_s, close_e, children);
+                    return;
+                }
+            }
         }
         if !self.rp_method_call_with_redundant_parentheses(node) {
             return;
@@ -35901,6 +35926,44 @@ fn rp_square_brackets(node: &ruby_prism::Node, _src: &[u8]) -> bool {
         return true;
     }
     recv.as_call_node().is_some_and(|rc| rc.receiver().is_some())
+}
+
+/// whitequark's numeric-sign absorption: a prefix `+`/`-` unary call whose
+/// receiver chain is rooted at a NUMERIC literal folds the sign into the
+/// literal token upstream. `Some(false)` = the receiver IS the numeric
+/// (whitequark: a signed literal); `Some(true)` = a call chain hangs off it
+/// (whitequark: a plain send). `None` = no absorption (normal unary).
+fn rp_wq_sign_absorbed(node: &ruby_prism::Node, src: &[u8]) -> Option<bool> {
+    let c = node.as_call_node()?;
+    let msg = c.message_loc()?;
+    let m = &src[msg.start_offset()..msg.end_offset()];
+    if m != b"+" && m != b"-" {
+        return None;
+    }
+    if node.location().start_offset() != msg.start_offset() {
+        return None;
+    }
+    if c.arguments().is_some() || c.opening_loc().is_some() {
+        return None;
+    }
+    let recv = c.receiver()?;
+    if rp_is_numeric_literal(&recv) {
+        return Some(false);
+    }
+    let mut cur = recv;
+    loop {
+        let Some(cc) = cur.as_call_node() else { break };
+        let Some(r) = cc.receiver() else { break };
+        cur = r;
+    }
+    if rp_is_numeric_literal(&cur) { Some(true) } else { None }
+}
+
+fn rp_is_numeric_literal(node: &ruby_prism::Node) -> bool {
+    node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_rational_node().is_some()
+        || node.as_imaginary_node().is_some()
 }
 
 fn rp_unary_operation(node: &ruby_prism::Node, src: &[u8]) -> bool {
