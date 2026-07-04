@@ -9205,3 +9205,173 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Lint/MissingSuper — a bare `def initialize` inside a class (or
+    /// `Class.new` block) with a "stateful" parent (anything but
+    /// `Object`/`BasicObject`/`AllowedParentClasses`) that never calls
+    /// `super`, OR a lifecycle-callback method (`MS_CALLBACKS` below)
+    /// defined anywhere inside a class/module/`sclass` body without
+    /// `super`. See the `ms_scope_depth`/`ms_class_stack`/`ms_block_stack`
+    /// field docs in `mod.rs` for how the three ancestor lookups this needs
+    /// (`each_ancestor(:class, :sclass, :module)`, `each_ancestor
+    /// (:any_block)`, `each_ancestor(:class)`) are tracked without real
+    /// parent pointers. `method_missing`/`respond_to_missing?` are
+    /// deliberately excluded from `MS_CALLBACKS` — upstream's own doc
+    /// comment: "this cop does not consider `method_missing`...". No
+    /// autocorrector — upstream's own doc comment: "the position of `super`
+    /// cannot be determined automatically."
+    pub(crate) fn check_missing_super(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Lint/MissingSuper";
+        const CONSTRUCTOR_MSG: &str = "Call `super` to initialize state of the parent class.";
+        const CALLBACK_MSG: &str = "Call `super` to invoke callback defined in the parent class.";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        // `callback_method_def?`: `CALLBACKS.include?(node.method_name)` and
+        // `node.each_ancestor(:class, :sclass, :module).first` — the LATTER
+        // is a pure existence check (any such ancestor at all, wherever it
+        // is), so `ms_scope_depth > 0` suffices.
+        let is_callback = MS_CALLBACKS.contains(&name) && self.ms_scope_depth > 0;
+        let start = node.location().start_offset();
+        if node.receiver().is_some() {
+            // `on_defs` — upstream never looks at `method?(:initialize)`
+            // here, so only the callback branch ever applies.
+            if is_callback && !ms_contains_super(&node.as_node()) {
+                self.push(start, COP, false, CALLBACK_MSG);
+            }
+            return;
+        }
+        // `on_def`'s `offender?`: (`initialize` or callback) and no `super`
+        // anywhere in the def's subtree (verified live against the real gem:
+        // a `super` inside a NESTED `def`, several levels down, still counts
+        // — `each_descendant(:super, :zsuper)` has no def/block scope
+        // awareness here, unlike some of this cop's siblings).
+        let is_initialize = name == b"initialize";
+        if !(is_initialize || is_callback) || ms_contains_super(&node.as_node()) {
+            return;
+        }
+        if is_initialize {
+            if self.ms_inside_stateful_parent() {
+                self.push(start, COP, false, CONSTRUCTOR_MSG);
+            }
+        } else {
+            self.push(start, COP, false, CALLBACK_MSG);
+        }
+    }
+
+    /// `inside_class_with_stateful_parent?` — the nearest `any_block`
+    /// ancestor (however far out) takes priority over any `class` ancestor:
+    /// only a `Class.new(x)`-shaped one with a disallowed `x` counts, and
+    /// any OTHER kind of block always means "no offense", full stop (a
+    /// live-verified upstream quirk: a plain block between the def and an
+    /// otherwise-stateful outer class suppresses the offense entirely).
+    /// With no block ancestor at all, fall back to the nearest REAL `class`
+    /// ancestor's own superclass verdict (`false` with no `class` ancestor
+    /// either — e.g. a bare `def initialize` inside a `module`).
+    fn ms_inside_stateful_parent(&self) -> bool {
+        match self.ms_block_stack.last() {
+            Some(frame) => frame.unwrap_or(false),
+            None => self.ms_class_stack.last().copied().unwrap_or(false),
+        }
+    }
+
+    /// A `class` node's own "stateful parent" verdict, for `ms_class_stack`:
+    /// `class_node.parent_class && !allowed_class?(class_node.parent_class)`.
+    pub(crate) fn ms_has_stateful_parent(&self, superclass: Option<&ruby_prism::Node>) -> bool {
+        let Some(sc) = superclass else { return false };
+        match ms_const_name(sc) {
+            Some(n) => !self.ms_allowed_classes().contains(&n),
+            None => true,
+        }
+    }
+
+    /// `class_new_block`'s node-pattern verdict for the CALL a block is
+    /// attached to — `(any_block (send (const {nil? cbase} :Class) :new
+    /// $_) ...)`: `Some(b)` when `call` is `Class.new(x)`/`::Class.new(x)`
+    /// with EXACTLY one argument `x` (the pattern's `$_` capture requires
+    /// arity 1 — zero args, as in a bare `Class.new do...end`, never
+    /// matches), `b` being whether `x` is disallowed; `None` otherwise
+    /// (a non-`Class` receiver, safe-navigation, or the wrong arg count).
+    pub(crate) fn ms_class_new_pending(&self, call: &ruby_prism::CallNode) -> Option<bool> {
+        if call.name().as_slice() != b"new" || call.is_safe_navigation() {
+            return None;
+        }
+        let recv = call.receiver()?;
+        if const_name_root(&recv).as_deref() != Some("Class") {
+            return None;
+        }
+        let args = call.arguments()?;
+        let arg_list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        let [arg] = arg_list.as_slice() else { return None };
+        Some(match ms_const_name(arg) {
+            Some(n) => !self.ms_allowed_classes().contains(&n),
+            None => true,
+        })
+    }
+
+    /// `STATELESS_CLASSES + cop_config.fetch('AllowedParentClasses', [])` —
+    /// `AllowedParentClasses` has no schema entry (array-valued defaults
+    /// are omitted by the schema generator), so its upstream default
+    /// (`[]`) is hardcoded here as the `None` fallback.
+    fn ms_allowed_classes(&self) -> Vec<String> {
+        let mut allowed = vec!["BasicObject".to_string(), "Object".to_string()];
+        if let Some(v) = self.cfg.get("Lint/MissingSuper", "AllowedParentClasses") {
+            allowed.extend(crate::config::parse_allowed_list(v));
+        }
+        allowed
+    }
+}
+
+/// `CALLBACKS = (CLASS_LIFECYCLE_CALLBACKS + METHOD_LIFECYCLE_CALLBACKS)` —
+/// deliberately excludes `method_missing`/`respond_to_missing?` (see the doc
+/// comment on `check_missing_super`).
+const MS_CALLBACKS: &[&[u8]] = &[
+    b"inherited",
+    b"method_added",
+    b"method_removed",
+    b"method_undefined",
+    b"singleton_method_added",
+    b"singleton_method_removed",
+    b"singleton_method_undefined",
+];
+
+/// rubocop-ast's `Node#const_name`: the full dotted name of a constant
+/// expression (`ConstantReadNode`/`ConstantPathNode`), with a leading `::`
+/// (cbase) anchor stripped — `None` for anything else, exactly like
+/// upstream (`return unless const_type? || casgn_type?`).
+fn ms_const_name(node: &ruby_prism::Node) -> Option<String> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some(String::from_utf8_lossy(c.name().as_slice()).into_owned());
+    }
+    if let Some(p) = node.as_constant_path_node() {
+        let name = String::from_utf8_lossy(p.name()?.as_slice()).into_owned();
+        return match p.parent() {
+            None => Some(name),
+            Some(parent) => Some(format!("{}::{name}", ms_const_name(&parent)?)),
+        };
+    }
+    None
+}
+
+/// `contains_super?`: `node.each_descendant(:super, :zsuper).any?` — a
+/// plain, unbounded descendant walk.
+fn ms_contains_super(node: &ruby_prism::Node) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_super_node(&mut self, _node: &ruby_prism::SuperNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_forwarding_super_node(&mut self, _node: &ruby_prism::ForwardingSuperNode<'pr>) {
+            self.found = true;
+        }
+    }
+    let mut f = Finder { found: false };
+    use ruby_prism::Visit;
+    f.visit(node);
+    f.found
+}
+

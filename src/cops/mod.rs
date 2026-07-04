@@ -242,6 +242,7 @@ const IMPLEMENTED: &[&str] = &[
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
+    "Lint/MissingSuper",
 ];
 
 impl Engine {
@@ -998,6 +999,36 @@ pub(crate) struct Cops<'a> {
     // StatementsNode in `check_predicate_prefix_sig_scan` before its
     // children are visited.
     pub(crate) pp_sig_ok: HashSet<usize>,
+    // Lint/MissingSuper: depth of enclosing `class`/`module`/`class << self`
+    // ancestors — upstream's `node.each_ancestor(:class, :sclass,
+    // :module).first` for `callback_method_def?` only needs to know ONE
+    // exists (whichever it is), so a plain counter suffices.
+    pub(crate) ms_scope_depth: usize,
+    // Lint/MissingSuper: one entry per REAL `class` node ancestor (not
+    // `module`/`sclass` — those don't push here, so a nested one is
+    // transparently skipped, matching `each_ancestor(:class).first`):
+    // whether that class's own superclass is "stateful" (present and not
+    // `Object`/`BasicObject`/`AllowedParentClasses`). Consulted only when
+    // `ms_block_stack` is empty (a block ancestor always takes priority —
+    // see `ms_block_stack`'s doc).
+    pub(crate) ms_class_stack: Vec<bool>,
+    // Lint/MissingSuper: one entry per `any_block` ancestor (an ordinary
+    // `do...end`/`{}` `BlockNode`, OR a stabby-lambda `LambdaNode` — both
+    // translate to rubocop's `:block` type, so both count) — upstream's
+    // `node.each_ancestor(:any_block).first` takes priority over any
+    // `class` ancestor whenever one exists at all, however far out. `None`
+    // = this nearest block isn't a `Class.new(x)`-with-exactly-one-arg
+    // shape (`class_new_block`); `Some(b)` = it is, and `b` says whether
+    // `x` is "stateful" (not an allowed class name).
+    pub(crate) ms_block_stack: Vec<Option<bool>>,
+    // Lint/MissingSuper: the `Some`/`None` `visit_block_node` should push
+    // onto `ms_block_stack` for the block about to be visited — set by
+    // `visit_call_node` right before its `self.visit(&b)` call (mirrors the
+    // established `nle_pending` idiom) and consumed (`.take()`) at the top
+    // of `visit_block_node`. Never sees a stabby lambda (those aren't
+    // reached through a call's `.block()`), which always pushes `None`
+    // directly instead.
+    pub(crate) ms_pending_block: Option<bool>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1993,6 +2024,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.check_keyword_parameters_order_block(&p);
         }
         self.rs_block_stack.push((is_plain, no_delims));
+        // Lint/MissingSuper: consume the `Class.new(x)`-shape verdict
+        // `visit_call_node` set right before descending into us — see the
+        // `ms_pending_block` field doc.
+        self.ms_block_stack.push(self.ms_pending_block.take());
         // Lint/NonLocalExitFromIterator: consume the pending call-context
         // `visit_call_node` set right before descending into us (`None`
         // when we weren't reached that way, e.g. a `super`/`zsuper` block —
@@ -2054,6 +2089,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.rs_scope_stack.pop();
         self.rs_block_stack.pop();
         self.nle_stack.pop();
+        self.ms_block_stack.pop();
         if is_ctor_block {
             self.el_am_scope.pop();
         }
@@ -2343,10 +2379,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Style/Attr: check if this class has a custom `attr` method
         let has_custom_attr = Self::has_custom_attr_method_in_body(&node.body());
         self.style_attr_custom_method_stack.push(has_custom_attr);
+        // Lint/MissingSuper: this REAL `class` node's own "stateful parent"
+        // verdict — see the `ms_class_stack` field doc.
+        self.ms_class_stack.push(self.ms_has_stateful_parent(node.superclass().as_ref()));
+        self.ms_scope_depth += 1;
         // Default walk — covers the superclass expression too, not just the body.
         self.class_module_depth += 1;
         ruby_prism::visit_class_node(self, node);
         self.class_module_depth -= 1;
+        self.ms_scope_depth -= 1;
+        self.ms_class_stack.pop();
         self.style_attr_custom_method_stack.pop();
         self.el_am_scope.pop();
         self.respond_to_missing_stack.pop();
@@ -2376,7 +2418,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let has_custom_attr = Self::has_custom_attr_method_in_body(&node.body());
         self.style_attr_custom_method_stack.push(has_custom_attr);
         self.class_module_depth += 1;
+        self.ms_scope_depth += 1;
         ruby_prism::visit_module_node(self, node);
+        self.ms_scope_depth -= 1;
         self.class_module_depth -= 1;
         self.style_attr_custom_method_stack.pop();
         self.el_am_scope.pop();
@@ -2434,6 +2478,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_keyword_parameters_order_def(node);
         self.check_non_nil_check_def(node);
         self.check_parameter_alignment(node);
+        self.check_missing_super(node);
         // Default walk (receiver, params, body) one def level deeper — matches
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
         // parameter default values, which a body-only walk silently skipped.
@@ -2506,7 +2551,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // RuboCop's Prism translator rewrites `LambdaNode` into the same
         // "block whose send is `lambda`" shape it uses for `lambda do...end`).
         self.nle_stack.push(NleFrame::Lambda);
+        // Lint/MissingSuper: a stabby lambda is an `any_block` ancestor too
+        // (same rewrite noted above) but is never `Class.new(x)`-shaped.
+        self.ms_block_stack.push(None);
         ruby_prism::visit_lambda_node(self, node);
+        self.ms_block_stack.pop();
         self.nle_stack.pop();
         self.usage_block_depth -= 1;
     }
@@ -2574,6 +2623,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.visit(&node.expression());
         // `class << self` is a scoping context — nested defs inside are allowed.
         self.scoping_depth += 1;
+        // Lint/MissingSuper: `sclass` counts as a `class`/`sclass`/`module`
+        // ancestor for `callback_method_def?`'s existence check.
+        self.ms_scope_depth += 1;
         self.el_am_scope.push(true);
         self.respond_to_missing_stack.push(Self::scan_respond_to_missing(&node.body()));
         if let Some(b) = node.body() {
@@ -2581,6 +2633,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.respond_to_missing_stack.pop();
         self.el_am_scope.pop();
+        self.ms_scope_depth -= 1;
         self.scoping_depth -= 1;
     }
     fn visit_alias_method_node(&mut self, node: &ruby_prism::AliasMethodNode<'pr>) {
@@ -2944,6 +2997,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                     matches!(node.name().as_slice(), b"define_method" | b"define_singleton_method")
                         && node.arguments().is_some_and(|a| a.arguments().iter().count() == 1);
                 self.nle_pending = Some((is_lambda_call, node.receiver().is_some(), is_define_method));
+                // Lint/MissingSuper: this block's `class_new_block` verdict —
+                // see the `ms_pending_block` field doc.
+                self.ms_pending_block = self.ms_class_new_pending(node);
             }
             // Consumed by the `visit_block_node` call this triggers below
             // (`&:sym` block-pass args aren't block nodes, so this is false
@@ -3141,6 +3197,10 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         il_no_offense: HashSet::new(),
         rrs_modifier_end: None,
         pp_sig_ok: HashSet::new(),
+        ms_scope_depth: 0,
+        ms_class_stack: Vec::new(),
+        ms_block_stack: Vec::new(),
+        ms_pending_block: None,
     };
 
     let t = tick(&T_PREP, t);

@@ -256,6 +256,7 @@ COPS = {
   'Style/RedundantAssignment'        => 'style/redundant_assignment',
   'Bundler/OrderedGems'              => 'bundler/ordered_gems',
   'Layout/SpaceBeforeBlockBraces'    => 'layout/space_before_block_braces',
+  'Lint/MissingSuper'                => 'lint/missing_super',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
