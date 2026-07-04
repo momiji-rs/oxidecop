@@ -14370,3 +14370,551 @@ impl<'pr> ruby_prism::Visit<'pr> for UbaCollector {
         self.declare_here(node.name().as_slice(), loc.start_offset(), loc.start_offset(), loc.end_offset(), UbaKind::ShadowArg);
     }
 }
+
+
+// ---------------------------------------------------------------------
+// Lint/UnusedMethodArgument
+//
+// Upstream layers `Lint::UnusedArgument` (shared with `UnusedBlockArgument`)
+// on top of `VariableForce`'s generic `after_leaving_scope`/`Variable#
+// referenced?` machinery, then narrows to `variable.method_argument?` (a
+// parameter declared directly in a `def`/`defs`'s own parameter list) and
+// adds its own `ignored_method?`/`block_argument_with_yield?`/message-
+// building logic on top.
+//
+// Like `Lint/ShadowedArgument`'s `SaCollector` (see its doc comment above),
+// we hand-roll a narrow scope/reference walk instead of a full
+// `VariableForce` port, leaning on the same fact: prism's `depth` field on
+// every local-variable read/write already encodes exactly the scope-
+// resolution rule `VariableTable#find_variable` re-derives upstream. But
+// this cop needs dramatically LESS bookkeeping than `ShadowedArgument`:
+//
+// `Variable#referenced?` is simply `!@references.empty?` — `reference!`
+// unconditionally appends to `@references` before doing any of its
+// branch/assignment bookkeeping (that bookkeeping only feeds OTHER
+// consumers, like `Assignment#used?` for `UselessAssignment`). So for THIS
+// cop, "was the argument ever referenced" reduces to "does prism ever
+// resolve a local-variable READ (or an implicit zero-arity-`super`/bare-
+// `binding` reference) back to this parameter's own declaration frame" —
+// no ordering, branch, or reassignment-tracking logic needed at all. In
+// particular a masgn's LHS targets (`a, b = b, a`) are pure writes (no
+// `reference!` call upstream either), so leaving `LocalVariableTargetNode`
+// unhandled (falls through to the `Visit` trait's no-op default — it has no
+// child nodes of its own) already gives the right answer: `a, b = b, a`
+// references both `a` and `b` (read on the RHS, evaluated before the
+// targets are written), while `a, b = b, 42` references only `b`.
+//
+// Only method-argument declarations (`UmaCollector` only ever calls
+// `declare` while `frames.last().kind == Def`) are ever tracked; a block's
+// own parameters are silently ignored (not even declared), matching
+// `method_argument?`'s `scope.node.any_def_type?` gate — a block frame's
+// `names` map simply stays empty, so a `depth`-resolved read that lands on
+// it is a harmless no-op (correctly NOT counting as a reference to an
+// outer, same-named method argument, since prism's depth already reflects
+// real Ruby shadowing rules).
+impl<'a> Cops<'a> {
+    /// `after_leaving_scope` + `UnusedMethodArgument#check_argument`/
+    /// `#message`/`#ignored_method?`/`#block_argument_with_yield?`, run once
+    /// (from `visit_program_node` in mod.rs) over the whole file.
+    pub(crate) fn check_unused_method_argument(&mut self, node: &ruby_prism::ProgramNode) {
+        const COP: &str = "Lint/UnusedMethodArgument";
+        if !self.on(COP) {
+            return;
+        }
+        let allow_unused_kw = self.cfg.get(COP, "AllowUnusedKeywordArguments") == Some("true");
+        let ignore_empty = self.cfg.get(COP, "IgnoreEmptyMethods") != Some("false");
+        let ignore_not_impl = self.cfg.get(COP, "IgnoreNotImplementedMethods") != Some("false");
+        // `NotImplementedExceptions` is an Array default, absent from the
+        // generated SCHEMA (see the dept-file convention noted in the brief)
+        // — hardcode rubocop's default.yml value (`['NotImplementedError']`)
+        // as the fallback when unset.
+        let allowed_exceptions: Vec<Vec<u8>> = match self.cfg.get(COP, "NotImplementedExceptions") {
+            Some(raw) => {
+                let list = crate::config::parse_allowed_list(raw);
+                if list.is_empty() { vec![b"NotImplementedError".to_vec()] } else { list.into_iter().map(String::into_bytes).collect() }
+            }
+            None => vec![b"NotImplementedError".to_vec()],
+        };
+
+        let mut c = UmaCollector {
+            frames: vec![UmaFrame { kind: UmaKind::Other, names: HashMap::new() }],
+            vars: Vec::new(),
+            results: Vec::new(),
+            allowed_exceptions,
+        };
+        use ruby_prism::Visit;
+        c.visit(&node.as_node());
+
+        struct Pending {
+            start: usize,
+            msg: String,
+            fix: Option<(usize, usize, Vec<u8>)>,
+        }
+        let mut pending: Vec<Pending> = Vec::new();
+
+        for result in &c.results {
+            // `ignored_method?`: an empty body or a lone `raise <allowed>`/
+            // `fail` body suppresses EVERY argument of this method, not just
+            // the currently-checked one.
+            let ignored = (ignore_empty && result.empty_body) || (ignore_not_impl && result.not_implemented);
+            if ignored {
+                continue;
+            }
+            // `message`'s `all_arguments.none?(&:referenced?)` — computed
+            // once per method, over ALL its declared parameters (including
+            // `_`-prefixed/keyword/etc ones), not just the offending one.
+            let any_referenced = result.param_idxs.iter().any(|&i| c.vars[i].referenced);
+            for &i in &result.param_idxs {
+                let p = &c.vars[i];
+                // `should_be_unused?`
+                if p.name.starts_with(b"_") {
+                    continue;
+                }
+                // `referenced?`
+                if p.referenced {
+                    continue;
+                }
+                let is_kw = matches!(p.kind, UmaParamKind::Kwarg | UmaParamKind::Kwoptarg);
+                // `keyword_argument? && cop_config['AllowUnusedKeywordArguments']`
+                if is_kw && allow_unused_kw {
+                    continue;
+                }
+                // `block_argument_with_yield?`
+                if matches!(p.kind, UmaParamKind::Blockarg) && result.has_yield {
+                    continue;
+                }
+
+                let mut msg = format!("Unused method argument - `{}`.", String::from_utf8_lossy(&p.name));
+                if !is_kw {
+                    msg.push_str(&format!(
+                        " If it's necessary, use `_` or `_{}` as an argument name to indicate that it won't be used. If it's unnecessary, remove it.",
+                        String::from_utf8_lossy(&p.name)
+                    ));
+                }
+                if !any_referenced {
+                    msg.push_str(&format!(
+                        " You can also write as `{}(*)` if you want the method to accept any arguments but don't care about them.",
+                        String::from_utf8_lossy(&result.scope_name)
+                    ));
+                }
+
+                // `UnusedArgCorrector.correct`: kwarg/kwoptarg never
+                // correct; a block-pass param is removed entirely (with its
+                // surrounding space + comma); everything else gets a `_`
+                // prefix inserted onto its bare name.
+                let fix = match p.kind {
+                    UmaParamKind::Kwarg | UmaParamKind::Kwoptarg => None,
+                    UmaParamKind::Blockarg => {
+                        let (rs, re) = uma_blockarg_removal_range(self.src, p.node_start, p.node_end);
+                        Some((rs, re, Vec::new()))
+                    }
+                    _ => {
+                        let mut repl = Vec::with_capacity(p.name.len() + 1);
+                        repl.push(b'_');
+                        repl.extend_from_slice(&p.name);
+                        Some((p.name_start, p.name_end, repl))
+                    }
+                };
+                pending.push(Pending { start: p.name_start, msg, fix });
+            }
+        }
+        pending.sort_by_key(|p| p.start);
+        for p in pending {
+            let correctable = p.fix.is_some();
+            self.push(p.start, COP, correctable, p.msg);
+            if let Some(f) = p.fix {
+                self.fixes.push(f);
+            }
+        }
+    }
+}
+
+/// `RangeHelp#range_with_surrounding_space(node.source_range, side: :left)`
+/// (spaces/tabs, then newlines) followed by `range_with_surrounding_comma
+/// (range, :left)` (a run of commas) — `UnusedArgCorrector.
+/// correct_for_blockarg_type`'s removal range for an unused `&block` param,
+/// e.g. turning `foo, bar, &block` into `foo, bar`.
+fn uma_blockarg_removal_range(src: &[u8], node_start: usize, node_end: usize) -> (usize, usize) {
+    let mut start = node_start;
+    while start > 0 && matches!(src[start - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    while start > 0 && src[start - 1] == b'\n' {
+        start -= 1;
+    }
+    while start > 0 && src[start - 1] == b',' {
+        start -= 1;
+    }
+    (start, node_end)
+}
+
+/// `Node#const_name` (rubocop-ast): the fully-qualified name of a `const`
+/// node, dropping a leading top-level `::` qualifier (`cbase`) — e.g.
+/// `::Foo` and `Foo` both yield `"Foo"`; `::Lib::Error` and `Lib::Error`
+/// both yield `"Lib::Error"`. Returns `None` for any non-const node
+/// (`allowed_exception_class?`'s `return false unless node.const_type?`).
+fn uma_const_full_name(node: &ruby_prism::Node) -> Option<Vec<u8>> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some(c.name().as_slice().to_vec());
+    }
+    if let Some(p) = node.as_constant_path_node() {
+        let short = p.name()?.as_slice().to_vec();
+        return match p.parent() {
+            None => Some(short),
+            Some(parent) => {
+                let mut full = uma_const_full_name(&parent)?;
+                full.extend_from_slice(b"::");
+                full.extend_from_slice(&short);
+                Some(full)
+            }
+        };
+    }
+    None
+}
+
+/// `not_implemented?` def_node_matcher: `{(send nil? :raise
+/// #allowed_exception_class? ...) (send nil? :fail ...)}`, applied to a
+/// method's body. Prism always wraps a `def`'s body in a `StatementsNode`
+/// (even a single statement — unlike whitequark, which leaves a lone
+/// statement unwrapped), so the whitequark pattern's "body IS directly this
+/// one send node" becomes "body has EXACTLY one statement, and it's this
+/// send node".
+fn uma_not_implemented(body: &ruby_prism::Node, allowed: &[Vec<u8>]) -> bool {
+    let Some(stmts) = body.as_statements_node() else { return false };
+    let items: Vec<_> = stmts.body().iter().collect();
+    let [only] = items.as_slice() else { return false };
+    let Some(call) = only.as_call_node() else { return false };
+    if call.receiver().is_some() {
+        return false;
+    }
+    match call.name().as_slice() {
+        b"fail" => true,
+        b"raise" => {
+            let Some(args) = call.arguments() else { return false };
+            let Some(first) = args.arguments().iter().next() else { return false };
+            uma_const_full_name(&first).is_some_and(|full| allowed.iter().any(|a| a.as_slice() == full.as_slice()))
+        }
+        _ => false,
+    }
+}
+
+/// `block_argument_with_yield?`'s `method_body.yield_type? ||
+/// method_body.each_descendant(:yield).any?` — both disjuncts collapse into
+/// one search here: prism's `StatementsNode` wrapper means a lone `yield`
+/// statement is a DESCENDANT of `body` (never `body` itself), so a single
+/// scope-oblivious search (matching upstream's `each_descendant`, which
+/// also doesn't stop at nested def/block boundaries) covers both.
+fn uma_contains_yield(node: &ruby_prism::Node) -> bool {
+    struct Search {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Search {
+        fn visit_yield_node(&mut self, _node: &ruby_prism::YieldNode<'pr>) {
+            self.found = true;
+        }
+    }
+    let mut s = Search { found: false };
+    use ruby_prism::Visit;
+    s.visit(node);
+    s.found
+}
+
+/// One method (`def`/`defs`) parameter kind — mirrors the
+/// `ARGUMENT_DECLARATION_TYPES` subset that can ever appear in a `def`'s own
+/// parameter list (`shadowarg` is block-local-only, never a method param).
+#[derive(Clone, Copy, PartialEq)]
+enum UmaParamKind {
+    Required,
+    Optional,
+    Rest,
+    Kwarg,
+    Kwoptarg,
+    Kwrest,
+    Blockarg,
+}
+
+/// One tracked method-parameter declaration. `name_start`/`name_end` is the
+/// bare identifier's own span (`declaration_node.loc.name` — the offense
+/// anchor, and the `_`-prefix insertion point for every non-block-arg,
+/// non-keyword kind). `node_start`/`node_end` is the FULL parameter span
+/// (including a leading `&`) — only actually used by `Blockarg`'s removal
+/// range; identical to the name span for every other kind.
+struct UmaParam {
+    name: Vec<u8>,
+    kind: UmaParamKind,
+    name_start: usize,
+    name_end: usize,
+    node_start: usize,
+    node_end: usize,
+    referenced: bool,
+}
+
+/// One finished `def`/`defs` scope: its own declared parameters (by index
+/// into the collector's flat `vars`), enough about its body to replicate
+/// `ignored_method?`/`block_argument_with_yield?`, and its bare method name
+/// (`Scope#name` — `variable.scope.name`, used in the "write as `foo(*)`"
+/// message suffix).
+struct UmaDefResult {
+    param_idxs: Vec<usize>,
+    empty_body: bool,
+    not_implemented: bool,
+    has_yield: bool,
+    scope_name: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum UmaKind {
+    /// A `def`/`defs` scope — the only kind that ever declares a trackable
+    /// (`method_argument?`) parameter.
+    Def,
+    /// A `block`/`lambda` scope — "soft": zero-arity `super` and bare
+    /// `binding` both walk straight through it to reach an enclosing scope.
+    /// Its own parameters are never declared here at all (this cop doesn't
+    /// care about block-argument usage), so a depth-resolved read landing
+    /// on one is always a harmless no-op.
+    Block,
+    /// `class`/`module`/`sclass`, or the file's top level: a hard scope
+    /// boundary that owns no trackable parameters, but still needs its own
+    /// frame so nested defs/blocks compute the right depth-relative index,
+    /// and still stops an outward `super`/`binding` walk once reached.
+    Other,
+}
+
+struct UmaFrame {
+    kind: UmaKind,
+    /// Declared parameter name -> index into the collector's flat `vars`.
+    /// Only ever populated for a `Def`-kind frame.
+    names: HashMap<Vec<u8>, usize>,
+}
+
+/// The scope-tracking visitor described in the module comment above
+/// `check_unused_method_argument`.
+struct UmaCollector {
+    frames: Vec<UmaFrame>,
+    vars: Vec<UmaParam>,
+    results: Vec<UmaDefResult>,
+    allowed_exceptions: Vec<Vec<u8>>,
+}
+
+impl UmaCollector {
+    fn in_def(&self) -> bool {
+        self.frames.last().is_some_and(|f| f.kind == UmaKind::Def)
+    }
+
+    fn declare(&mut self, name: &[u8], kind: UmaParamKind, name_start: usize, name_end: usize, node_start: usize, node_end: usize) {
+        let frame = self.frames.last_mut().unwrap();
+        if frame.names.contains_key(name) {
+            return;
+        }
+        let idx = self.vars.len();
+        self.vars.push(UmaParam { name: name.to_vec(), kind, name_start, name_end, node_start, node_end, referenced: false });
+        frame.names.insert(name.to_vec(), idx);
+    }
+
+    fn resolve(&self, name: &[u8], depth: u32) -> Option<usize> {
+        let top = self.frames.len().checked_sub(1)?;
+        let f = top.checked_sub(depth as usize)?;
+        self.frames[f].names.get(name).copied()
+    }
+
+    fn reference(&mut self, name: &[u8], depth: u32) {
+        if let Some(idx) = self.resolve(name, depth) {
+            self.vars[idx].referenced = true;
+        }
+    }
+
+    fn enter_frame(&mut self, kind: UmaKind) {
+        self.frames.push(UmaFrame { kind, names: HashMap::new() });
+    }
+    fn exit_frame(&mut self) -> UmaFrame {
+        self.frames.pop().unwrap()
+    }
+
+    /// Zero-arity `super` (`process_zero_arity_super`): walks from the
+    /// CURRENT scope outward, referencing the nearest `Def` frame's own
+    /// params and STOPPING there; a `Block` frame contributes nothing but
+    /// doesn't stop the walk; any other (hard, non-`Def`) frame stops the
+    /// walk without marking anything.
+    fn mark_zsuper(&mut self) {
+        for i in (0..self.frames.len()).rev() {
+            match self.frames[i].kind {
+                UmaKind::Def => {
+                    let idxs: Vec<usize> = self.frames[i].names.values().copied().collect();
+                    for idx in idxs {
+                        self.vars[idx].referenced = true;
+                    }
+                    break;
+                }
+                UmaKind::Block => continue,
+                UmaKind::Other => break,
+            }
+        }
+    }
+
+    /// Bare `binding` call (`VariableTable#accessible_variables`): marks the
+    /// current scope's own vars, and keeps walking (and marking) outward
+    /// through `Block` frames, stopping right after including the first
+    /// non-`Block` frame.
+    fn mark_binding(&mut self) {
+        let mut i = self.frames.len();
+        while i > 0 {
+            i -= 1;
+            let is_block = self.frames[i].kind == UmaKind::Block;
+            let idxs: Vec<usize> = self.frames[i].names.values().copied().collect();
+            for idx in idxs {
+                self.vars[idx].referenced = true;
+            }
+            if !is_block {
+                break;
+            }
+        }
+    }
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for UmaCollector {
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        if let Some(recv) = node.receiver() {
+            self.visit(&recv);
+        }
+        self.enter_frame(UmaKind::Def);
+        if let Some(params) = node.parameters() {
+            self.visit_parameters_node(&params);
+        }
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        let frame = self.exit_frame();
+        if !frame.names.is_empty() {
+            let body = node.body();
+            let empty_body = body.is_none();
+            let not_implemented = body.as_ref().is_some_and(|b| uma_not_implemented(b, &self.allowed_exceptions));
+            let has_yield = body.as_ref().is_some_and(uma_contains_yield);
+            self.results.push(UmaDefResult {
+                param_idxs: frame.names.into_values().collect(),
+                empty_body,
+                not_implemented,
+                has_yield,
+                scope_name: node.name().as_slice().to_vec(),
+            });
+        }
+    }
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        self.visit(&node.constant_path());
+        if let Some(sup) = node.superclass() {
+            self.visit(&sup);
+        }
+        self.enter_frame(UmaKind::Other);
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.exit_frame();
+    }
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        self.visit(&node.constant_path());
+        self.enter_frame(UmaKind::Other);
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.exit_frame();
+    }
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        self.visit(&node.expression());
+        self.enter_frame(UmaKind::Other);
+        if let Some(body) = node.body() {
+            self.visit(&body);
+        }
+        self.exit_frame();
+    }
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        self.enter_frame(UmaKind::Block);
+        ruby_prism::visit_block_node(self, node);
+        self.exit_frame();
+    }
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.enter_frame(UmaKind::Block);
+        ruby_prism::visit_lambda_node(self, node);
+        self.exit_frame();
+    }
+    fn visit_required_parameter_node(&mut self, node: &ruby_prism::RequiredParameterNode<'pr>) {
+        if self.in_def() {
+            let l = node.location();
+            self.declare(node.name().as_slice(), UmaParamKind::Required, l.start_offset(), l.end_offset(), l.start_offset(), l.end_offset());
+        }
+    }
+    fn visit_optional_parameter_node(&mut self, node: &ruby_prism::OptionalParameterNode<'pr>) {
+        if self.in_def() {
+            let nl = node.name_loc();
+            self.declare(node.name().as_slice(), UmaParamKind::Optional, nl.start_offset(), nl.end_offset(), nl.start_offset(), nl.end_offset());
+        }
+        self.visit(&node.value());
+    }
+    fn visit_rest_parameter_node(&mut self, node: &ruby_prism::RestParameterNode<'pr>) {
+        if self.in_def() {
+            if let (Some(name), Some(nl)) = (node.name(), node.name_loc()) {
+                self.declare(name.as_slice(), UmaParamKind::Rest, nl.start_offset(), nl.end_offset(), nl.start_offset(), nl.end_offset());
+            }
+        }
+    }
+    fn visit_required_keyword_parameter_node(&mut self, node: &ruby_prism::RequiredKeywordParameterNode<'pr>) {
+        if self.in_def() {
+            let nl = node.name_loc();
+            self.declare(node.name().as_slice(), UmaParamKind::Kwarg, nl.start_offset(), nl.end_offset(), nl.start_offset(), nl.end_offset());
+        }
+    }
+    fn visit_optional_keyword_parameter_node(&mut self, node: &ruby_prism::OptionalKeywordParameterNode<'pr>) {
+        if self.in_def() {
+            let nl = node.name_loc();
+            self.declare(node.name().as_slice(), UmaParamKind::Kwoptarg, nl.start_offset(), nl.end_offset(), nl.start_offset(), nl.end_offset());
+        }
+        self.visit(&node.value());
+    }
+    fn visit_keyword_rest_parameter_node(&mut self, node: &ruby_prism::KeywordRestParameterNode<'pr>) {
+        if self.in_def() {
+            if let (Some(name), Some(nl)) = (node.name(), node.name_loc()) {
+                self.declare(name.as_slice(), UmaParamKind::Kwrest, nl.start_offset(), nl.end_offset(), nl.start_offset(), nl.end_offset());
+            }
+        }
+    }
+    fn visit_block_parameter_node(&mut self, node: &ruby_prism::BlockParameterNode<'pr>) {
+        if self.in_def() {
+            if let (Some(name), Some(nl)) = (node.name(), node.name_loc()) {
+                let full = node.location();
+                self.declare(name.as_slice(), UmaParamKind::Blockarg, nl.start_offset(), nl.end_offset(), full.start_offset(), full.end_offset());
+            }
+        }
+    }
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.reference(node.name().as_slice(), node.depth());
+    }
+    // `+=`/`||=`/`&&=`-shaped writes implicitly read the OLD value first
+    // (`process_variable_operator_assignment`'s `reference_variable` call
+    // before processing the RHS) — a plain `=` write (`LocalVariableWriteNode`,
+    // left to the default traversal) never does.
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        self.reference(node.name().as_slice(), node.depth());
+        self.visit(&node.value());
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        self.reference(node.name().as_slice(), node.depth());
+        self.visit(&node.value());
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        self.reference(node.name().as_slice(), node.depth());
+        self.visit(&node.value());
+    }
+    fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+        self.mark_zsuper();
+        if let Some(block) = node.block() {
+            self.visit_block_node(&block);
+        }
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if node.name().as_slice() == b"binding" {
+            let empty_args = node.arguments().map(|a| a.arguments().iter().next().is_none()).unwrap_or(true);
+            if empty_args {
+                self.mark_binding();
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+}

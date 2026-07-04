@@ -330,6 +330,7 @@ COPS = {
   'Lint/Void'                        => 'lint/void',
   'Style/HashSyntax'                 => 'style/hash_syntax',
   'Lint/UnusedBlockArgument'         => 'lint/unused_block_argument',
+  'Lint/UnusedMethodArgument'        => 'lint/unused_method_argument',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
