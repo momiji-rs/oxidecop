@@ -276,6 +276,7 @@ COPS = {
   'Style/MethodCallWithoutArgsParentheses' => 'style/method_call_without_args_parentheses',
   'Style/Alias'                      => 'style/alias',
   'Style/RaiseArgs'                  => 'style/raise_args',
+  'Style/MethodDefParentheses'       => 'style/method_def_parentheses',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

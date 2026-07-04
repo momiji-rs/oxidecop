@@ -308,7 +308,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
     "Style/ExplicitBlockArgument",
     "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
-    "Style/MethodCallWithoutArgsParentheses", "Style/Alias", "Style/RaiseArgs",
+    "Style/MethodCallWithoutArgsParentheses", "Style/Alias", "Style/RaiseArgs", "Style/MethodDefParentheses",
 ];
 
 impl Engine {
@@ -2925,6 +2925,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_parameter_alignment(node);
         self.check_first_parameter_indentation(node);
         self.check_missing_super(node);
+        self.check_method_def_parentheses(node);
         // Default walk (receiver, params, body) one def level deeper — matches
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
         // parameter default values, which a body-only walk silently skipped.

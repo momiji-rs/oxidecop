@@ -17199,3 +17199,131 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((l.start_offset(), l.end_offset(), replacement));
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/MethodDefParentheses — port of `on_def`/`alias on_defs`. Both
+    /// instance methods (`DefNode` with `receiver.is_none()`) and
+    /// class/singleton methods share the exact same prism `DefNode`, so one
+    /// hook (called from `visit_def_node`) covers both `on_def`/`on_defs`.
+    ///
+    /// rubocop's whitequark `node.arguments` is the `:args` AST node itself
+    /// (not the flat array of individual params): its `source_range`
+    /// includes the surrounding parens when they exist (even for an empty
+    /// `()`), or spans just the bare param list when there are no parens,
+    /// or is absent when there are neither params nor parens. `md_args_range`
+    /// below reconstructs that same span from prism's `lparen_loc`/
+    /// `rparen_loc`/`parameters()` so offense anchors and the `multiline?`
+    /// check (used by `require_no_parentheses_except_multiline`) land on the
+    /// same bytes rubocop would report.
+    ///
+    /// `forced_parentheses?` (endless defs, or a `*`/`**`/`...`/anonymous
+    /// `&` argument — ported in `md_forced_parentheses` below) takes
+    /// priority over the configured style in either direction: it never
+    /// registers an offense, it just short-circuits (`correct_style_detected`
+    /// upstream, a style-tracking no-op we don't need to model).
+    pub(crate) fn check_method_def_parentheses(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/MethodDefParentheses";
+        if !self.on(COP) {
+            return;
+        }
+
+        let has_params = node.parameters().is_some();
+        let has_parens = node.lparen_loc().is_some();
+
+        // Mirrors whitequark's `args.source_range`: parens-inclusive when
+        // present (even for an empty `()`), else the bare param span, else
+        // absent (no params, no parens — never dereferenced below since
+        // that case never reaches `missing_parentheses`/`unwanted_parentheses`).
+        let args_range: Option<(usize, usize)> = if has_parens {
+            let lp = node.lparen_loc().unwrap();
+            let rp = node.rparen_loc().unwrap();
+            Some((lp.start_offset(), rp.end_offset()))
+        } else if let Some(params) = node.parameters() {
+            let l = params.location();
+            Some((l.start_offset(), l.end_offset()))
+        } else {
+            None
+        };
+
+        let multiline = args_range.is_some_and(|(s, e)| {
+            self.idx.loc(s).0 != self.idx.loc(e.saturating_sub(1)).0
+        });
+
+        let style = self.cfg.enforced_style(COP);
+        let require_parens_style =
+            style == "require_parentheses" || (style == "require_no_parentheses_except_multiline" && multiline);
+
+        if require_parens_style {
+            // `arguments_without_parentheses?`: has params, but not written
+            // with parens.
+            if has_params && !has_parens {
+                let (s, e) = args_range.unwrap();
+                self.push(s, COP, true, "Use def with parentheses when there are parameters.");
+
+                // `add_parentheses`: replace the run of spaces/tabs (then
+                // any further newlines) immediately preceding the args with
+                // `(`, and insert `)` right after the args end — verbatim
+                // port of `range_with_surrounding_space(side: :left)` +
+                // `corrector.replace(leading_space, '(')` /
+                // `corrector.insert_after(arguments_range, ')')`.
+                let mut ws_start = s;
+                while ws_start > 0 && matches!(self.src.get(ws_start - 1), Some(b' ') | Some(b'\t')) {
+                    ws_start -= 1;
+                }
+                while ws_start > 0 && self.src.get(ws_start - 1) == Some(&b'\n') {
+                    ws_start -= 1;
+                }
+                self.fixes.push((ws_start, s, b"(".to_vec()));
+                self.fixes.push((e, e, b")".to_vec()));
+            }
+            // else: already parenthesized (or no params at all) — matches
+            // the configured style, `correct_style_detected` is a no-op.
+            return;
+        }
+
+        if md_forced_parentheses(node) {
+            // Regardless of style, these argument shapes require parens (or
+            // rubocop simply never contests either presence/absence) — a
+            // style-tracking no-op upstream, no offense either way.
+            return;
+        }
+
+        if has_parens {
+            // `unwanted_parentheses`: anchor + fix on the whole `(...)` span.
+            let (s, _e) = args_range.unwrap();
+            self.push(s, COP, true, "Use def without parentheses.");
+
+            let lp = node.lparen_loc().unwrap();
+            let rp = node.rparen_loc().unwrap();
+            self.fixes.push((lp.start_offset(), lp.end_offset(), b" ".to_vec()));
+            self.fixes.push((rp.start_offset(), rp.end_offset(), Vec::new()));
+        }
+    }
+}
+
+/// `forced_parentheses?`: endless methods, or any of a `*`/`**` rest
+/// argument (named or anonymous — prism gives both the same
+/// `RestParameterNode`/`KeywordRestParameterNode` type regardless of name),
+/// a bare `...` (prism parses it into the `keyword_rest` slot as a
+/// `ForwardingParameterNode`, so `keyword_rest().is_some()` alone already
+/// covers both `**`/`**name` and `...`), or an anonymous `&` block-forward
+/// (named `&block` does NOT force parens — only `name.is_none()` does).
+fn md_forced_parentheses(node: &ruby_prism::DefNode) -> bool {
+    if node.equal_loc().is_some() {
+        return true;
+    }
+    let Some(params) = node.parameters() else { return false };
+    if params.rest().is_some() {
+        return true;
+    }
+    if params.keyword_rest().is_some() {
+        return true;
+    }
+    if let Some(block) = params.block() {
+        if block.name().is_none() {
+            return true;
+        }
+    }
+    false
+}
