@@ -1334,3 +1334,185 @@ pub(crate) fn correct_rescue_refs(
     use ruby_prism::Visit;
     v.visit(node);
 }
+
+
+// ---------------------------------------------------------------------
+// Naming/PredicatePrefix
+// ---------------------------------------------------------------------
+// `NamePrefix`/`ForbiddenPrefixes`/`MethodDefinitionMacros` are all ARRAY
+// defaults (config/default.yml), so — like
+// `DEFAULT_METHOD_PARAMETER_ALLOWED_NAMES` above — they don't live in the
+// generated flat `SCHEMA` table and are hardcoded here as the `cfg.get`
+// None-fallback.
+const PP_DEFAULT_NAME_PREFIXES: &[&str] = &["is_", "has_", "have_", "does_"];
+const PP_DEFAULT_FORBIDDEN_PREFIXES: &[&str] = &["is_", "has_", "have_", "does_"];
+const PP_DEFAULT_METHOD_DEFINITION_MACROS: &[&str] = &["define_method", "define_singleton_method"];
+
+fn pp_prefix_list(cfg: &crate::config::Config, cop: &str, key: &str, default: &[&str]) -> Vec<String> {
+    match cfg.get(cop, key) {
+        Some(v) => crate::config::parse_allowed_list(v),
+        None => default.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// rubocop's private `allowed_method_name?`'s cheap first check: does `name`
+/// actually start with `prefix` followed by a non-digit? (A quick byte
+/// check to avoid allocating a Regexp, per the original comment.)
+fn pp_quick_prefix_match(name: &str, prefix: &str) -> bool {
+    name.len() > prefix.len()
+        && name.as_bytes()[..prefix.len()] == *prefix.as_bytes()
+        && !name.as_bytes()[prefix.len()].is_ascii_digit()
+}
+
+/// rubocop's private `expected_name`: strip `prefix` (only when it is ALSO
+/// listed in `ForbiddenPrefixes`) and ensure a trailing `?`.
+fn pp_expected_name(name: &str, prefix: &str, forbidden: &[String]) -> String {
+    let mut new_name = if forbidden.iter().any(|p| p == prefix) {
+        // Safe: `pp_quick_prefix_match` already confirmed `name`'s first
+        // `prefix.len()` BYTES equal `prefix` exactly, and `prefix` (being a
+        // valid `&str`) ends on a char boundary — so does `name` at the same
+        // byte offset.
+        name[prefix.len()..].to_string()
+    } else {
+        name.to_string()
+    };
+    if !name.ends_with('?') {
+        new_name.push('?');
+    }
+    new_name
+}
+
+/// Naming/PredicatePrefix (`UseSorbetSigs`) — does `node` (a raw prism node,
+/// as it sits in an enclosing StatementsNode's body list) look like
+/// `sig { ...returns(TYPE) }` / `sig do ... end`? Mirrors rubocop's
+/// `sorbet_return_type` node-pattern `(block (send nil? :sig) args (send _
+/// :returns $_type))` — written against whitequark's `(block (send ...)
+/// ...)` wrapper, whereas prism represents "a call with a block" the other
+/// way around: a `CallNode` with a `block` field. Returns TYPE's exact
+/// source text.
+fn pp_sig_return_type_src<'x>(node: &ruby_prism::Node, src: &'x [u8]) -> Option<&'x [u8]> {
+    let call = node.as_call_node()?;
+    if call.receiver().is_some() || call.arguments().is_some() || call.name().as_slice() != b"sig" {
+        return None;
+    }
+    let block = call.block()?;
+    let block = block.as_block_node()?;
+    let stmts = block.body()?;
+    let stmts = stmts.as_statements_node()?;
+    let body = stmts.body();
+    if body.len() != 1 {
+        return None;
+    }
+    let inner = body.first()?;
+    let inner = inner.as_call_node()?;
+    if inner.name().as_slice() != b"returns" {
+        return None;
+    }
+    let args = inner.arguments()?;
+    let arglist = args.arguments();
+    if arglist.len() != 1 {
+        return None;
+    }
+    let t = arglist.first()?;
+    let l = t.location();
+    Some(&src[l.start_offset()..l.end_offset()])
+}
+
+impl<'a> Cops<'a> {
+    /// Naming/PredicatePrefix's private `allowed_method_name?` — true means
+    /// NO offense for this (name, prefix) pair (the prefix check itself,
+    /// the "already correct" check, trailing `=` setters, and
+    /// `AllowedMethods`).
+    fn pp_allowed_method_name(&self, cop: &str, name: &str, prefix: &str, forbidden: &[String]) -> bool {
+        if !pp_quick_prefix_match(name, prefix) {
+            return true;
+        }
+        if pp_expected_name(name, prefix, forbidden) == name {
+            return true;
+        }
+        if name.ends_with('=') {
+            return true;
+        }
+        self.allowed(cop, name.as_bytes())
+    }
+
+    /// Naming/PredicatePrefix (`UseSorbetSigs` support): scan a
+    /// StatementsNode's direct children for a `sig { returns(T::Boolean) }`
+    /// (or `sig do...end`) immediately preceding a `def`/`defs` — rubocop's
+    /// `node.left_sibling` walks the AST PARENT's children array, which
+    /// (whenever that parent is itself a StatementsNode-shaped body: class/
+    /// module/program/sclass/method/block) is exactly "the previous element
+    /// of this same statements list". Precomputed here, before any child is
+    /// visited, and consulted later by `check_predicate_prefix_def`.
+    pub(crate) fn check_predicate_prefix_sig_scan(&mut self, node: &ruby_prism::StatementsNode) {
+        const COP: &str = "Naming/PredicatePrefix";
+        if !self.on(COP) || self.cfg.get(COP, "UseSorbetSigs") != Some("true") {
+            return;
+        }
+        let children: Vec<ruby_prism::Node> = node.body().iter().collect();
+        for w in children.windows(2) {
+            let Some(def) = w[1].as_def_node() else { continue };
+            if pp_sig_return_type_src(&w[0], self.src) == Some(b"T::Boolean") {
+                self.pp_sig_ok.insert(def.location().start_offset());
+            }
+        }
+    }
+
+    /// Naming/PredicatePrefix on a `def`/`defs` — prism unifies both into a
+    /// single `DefNode` (an optional `receiver()`), so rubocop's `alias
+    /// on_defs on_def` needs no special casing here.
+    pub(crate) fn check_predicate_prefix_def(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Naming/PredicatePrefix";
+        if !self.on(COP) {
+            return;
+        }
+        let name_prefixes = pp_prefix_list(self.cfg, COP, "NamePrefix", PP_DEFAULT_NAME_PREFIXES);
+        let forbidden_prefixes = pp_prefix_list(self.cfg, COP, "ForbiddenPrefixes", PP_DEFAULT_FORBIDDEN_PREFIXES);
+        let use_sorbet_sigs = self.cfg.get(COP, "UseSorbetSigs") == Some("true");
+        let method_name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+        let sig_ok = self.pp_sig_ok.contains(&node.location().start_offset());
+        let anchor = node.name_loc().start_offset();
+        for prefix in &name_prefixes {
+            if self.pp_allowed_method_name(COP, &method_name, prefix, &forbidden_prefixes) {
+                continue;
+            }
+            if use_sorbet_sigs && !sig_ok {
+                continue;
+            }
+            let new_name = pp_expected_name(&method_name, prefix, &forbidden_prefixes);
+            self.push(anchor, COP, false, format!("Rename `{method_name}` to `{new_name}`."));
+        }
+    }
+
+    /// Naming/PredicatePrefix on `define_method(:is_foo) { ... }` / any
+    /// configured `MethodDefinitionMacros` — rubocop's `dynamic_method_define`
+    /// node-pattern `(send nil? #method_definition_macro? (sym $_) ...)`:
+    /// a bare call (no receiver) to one of the configured macros, whose
+    /// FIRST argument is a plain symbol literal (not a string, not an
+    /// interpolated `:"..."`).
+    pub(crate) fn check_predicate_prefix_dynamic(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Naming/PredicatePrefix";
+        if !self.on(COP) || node.receiver().is_some() {
+            return;
+        }
+        let macros = pp_prefix_list(self.cfg, COP, "MethodDefinitionMacros", PP_DEFAULT_METHOD_DEFINITION_MACROS);
+        if !macros.iter().any(|m| m.as_bytes() == node.name().as_slice()) {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let Some(first) = args.arguments().first() else { return };
+        let Some(sym) = first.as_symbol_node() else { return };
+        let Some(vloc) = sym.value_loc() else { return };
+        let method_name = String::from_utf8_lossy(&self.src[vloc.start_offset()..vloc.end_offset()]).into_owned();
+        let name_prefixes = pp_prefix_list(self.cfg, COP, "NamePrefix", PP_DEFAULT_NAME_PREFIXES);
+        let forbidden_prefixes = pp_prefix_list(self.cfg, COP, "ForbiddenPrefixes", PP_DEFAULT_FORBIDDEN_PREFIXES);
+        let anchor = first.location().start_offset();
+        for prefix in &name_prefixes {
+            if self.pp_allowed_method_name(COP, &method_name, prefix, &forbidden_prefixes) {
+                continue;
+            }
+            let new_name = pp_expected_name(&method_name, prefix, &forbidden_prefixes);
+            self.push(anchor, COP, false, format!("Rename `{method_name}` to `{new_name}`."));
+        }
+    }
+}

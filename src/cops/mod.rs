@@ -237,6 +237,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
+    "Naming/PredicatePrefix",
 ];
 
 impl Engine {
@@ -969,6 +970,14 @@ pub(crate) struct Cops<'a> {
     // (taken) the moment that exact call node is visited, whichever call it
     // turns out to be, so it never leaks to an unrelated node.
     pub(crate) rrs_modifier_end: Option<(usize, usize)>,
+    // Naming/PredicatePrefix (UseSorbetSigs config only): start offsets of
+    // `def`/`defs` nodes immediately preceded, in their enclosing
+    // StatementsNode's body list, by a `sig { returns(T::Boolean) }` (or
+    // `sig do...end`) call — rubocop's `node.left_sibling`-based
+    // `sorbet_sig?(node, return_type: 'T::Boolean')`. Precomputed per
+    // StatementsNode in `check_predicate_prefix_sig_scan` before its
+    // children are visited.
+    pub(crate) pp_sig_ok: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1906,6 +1915,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_lines_around_access_modifier(node);
         self.check_unreachable_code(node);
         self.check_empty_line_between_defs(node);
+        self.check_predicate_prefix_sig_scan(node);
         self.stmts_stack.push(node.location().start_offset());
         if self.on("Naming/RescuedExceptionsVariableName") {
             // Hand-rolled (rather than the plain default-visitor call) so
@@ -2378,6 +2388,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.check_trailing_body_on_method_definition(node);
         }
         self.check_method_name_def(node);
+        self.check_predicate_prefix_def(node);
         self.check_binary_operator_parameter(node);
         self.check_nested_method_definition(node);
         self.check_redundant_return(node);
@@ -2606,6 +2617,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.check_method_name_macros(node);
+        self.check_predicate_prefix_dynamic(node);
         self.check_colon_method_call(node);
         self.check_deprecated_class_methods(node);
         self.check_marshal_load(node);
@@ -3086,6 +3098,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         renv_just_closed_kwbegin_renames: Vec::new(),
         il_no_offense: HashSet::new(),
         rrs_modifier_end: None,
+        pp_sig_ok: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);

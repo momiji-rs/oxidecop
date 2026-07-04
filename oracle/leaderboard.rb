@@ -243,6 +243,7 @@ COPS = {
   'Lint/SendWithMixinArgument'       => 'lint/send_with_mixin_argument',
   'Style/HashAsLastArrayItem'        => 'style/hash_as_last_array_item',
   'Lint/ParenthesesAsGroupedExpression' => 'lint/parentheses_as_grouped_expression',
+  'Naming/PredicatePrefix'           => 'naming/predicate_prefix',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
