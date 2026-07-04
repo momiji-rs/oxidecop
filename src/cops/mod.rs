@@ -310,6 +310,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
     "Style/MethodCallWithoutArgsParentheses", "Style/Alias", "Style/RaiseArgs", "Style/MethodDefParentheses",
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
+    "Layout/ArrayAlignment",
 ];
 
 impl Engine {
@@ -1238,6 +1239,30 @@ pub(crate) struct Cops<'a> {
     // (mirroring `sak_end_seen` above) is equivalent to upstream's
     // full-range identity check.
     pub(crate) snc_offended: HashSet<usize>,
+    // Layout/ArrayAlignment: start offsets of bracketless `ArrayNode`s that
+    // are the `value` of a `MultiWriteNode` — rubocop's `node.parent&
+    // .masgn_type?` early return in `on_array` (a mass-assignment's bare
+    // RHS list, e.g. `a, b =\n  1, 2`, is never itself alignment-checked).
+    // Populated by `visit_multi_write_node` before descending.
+    pub(crate) aa_masgn_rhs: HashSet<usize>,
+    // Layout/ArrayAlignment: start offset of a bracketless `ArrayNode` that
+    // is the `value` of an ordinary (non-masgn) assignment -> that write
+    // node's own start offset, standing in for rubocop's `node.parent.loc
+    // .line` (`target_method_lineno`'s non-`bracketed?` branch, needed only
+    // under `EnforcedStyle: with_fixed_indentation`). Populated by the
+    // `assignment_write!`/`assignment_operator_write!` macros before
+    // descending into the value.
+    pub(crate) aa_unbracketed_rhs_parent: HashMap<usize, usize>,
+    // Layout/ArrayAlignment: byte ranges of every offense node registered so
+    // far THIS RUN, in traversal order — rubocop's cop-instance-wide
+    // `@current_offenses` (populated by `Base#add_offense` across the whole
+    // file, not just the current array's own siblings), consulted by
+    // `Alignment#check_alignment`'s overlap guard: a nested array's own
+    // bad-alignment node that falls entirely inside an already-registered
+    // (enclosing) offense is still reported, but its correction is skipped
+    // (`register_offense(expr, nil)` -> `AlignmentCorrector.correct` no-ops
+    // on a nil node) so the two rewrites don't collide in one pass.
+    pub(crate) aa_registered_ranges: Vec<(usize, usize)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1443,6 +1468,7 @@ macro_rules! assignment_write {
     ($self:expr, $node:expr) => {{
         let lhs_start = $node.name_loc().start_offset();
         let op_end = $node.operator_loc().end_offset();
+        $self.aa_note_unbracketed_rhs(lhs_start, &$node.value());
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
     }};
 }
@@ -1450,6 +1476,7 @@ macro_rules! assignment_operator_write {
     ($self:expr, $node:expr) => {{
         let lhs_start = $node.name_loc().start_offset();
         let op_end = $node.binary_operator_loc().end_offset();
+        $self.aa_note_unbracketed_rhs(lhs_start, &$node.value());
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
     }};
 }
@@ -2033,6 +2060,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
         let lhs_start = node.location().start_offset();
         let op_end = node.operator_loc().end_offset();
+        // Layout/ArrayAlignment's `node.parent&.masgn_type?` guard — the
+        // bare comma-list value of a mass assignment is never itself
+        // alignment-checked (prism represents it as a bracketless
+        // `ArrayNode`, same shape as a single-target `a = 1, 2`, whose
+        // exclusion is keyed on parentage alone).
+        if node.value().as_array_node().is_some() {
+            self.aa_masgn_rhs.insert(node.value().location().start_offset());
+        }
         self.assignment_indentation_hook(lhs_start, op_end, node.value());
         self.check_self_assignment_masgn(node);
         self.check_trailing_underscore_variable(node);
@@ -2741,6 +2776,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.isc_array_child.insert(e.location().start_offset());
             }
         }
+        self.check_array_alignment(node);
         ruby_prism::visit_array_node(self, node);
         self.ll_exit_collection();
     }
@@ -3794,6 +3830,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         eba_def_fixed: HashSet::new(),
         rescue_mod_parens: HashMap::new(),
         snc_offended: HashSet::new(),
+        aa_masgn_rhs: HashSet::new(),
+        aa_unbracketed_rhs_parent: HashMap::new(),
+        aa_registered_ranges: Vec::new(),
     };
 
     let t = tick(&T_PREP, t);

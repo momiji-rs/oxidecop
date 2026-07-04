@@ -6349,3 +6349,213 @@ impl<'a> super::Cops<'a> {
 fn is_elaa_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C | 0x0B)
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/ArrayAlignment — checks that the elements of a multi-line
+    /// array literal are aligned: to the first element's own column
+    /// (`EnforcedStyle: with_first_element`, the default), or to the
+    /// enclosing line's own indentation plus one configured indentation
+    /// step (`with_fixed_indentation`). Ports rubocop's `ArrayAlignment`
+    /// cop + the shared `Alignment` mixin's `check_alignment`/
+    /// `each_bad_alignment`/`register_offense`, and the `AlignmentCorrector`
+    /// autocorrector — see `check_parameter_alignment` above for the same
+    /// mixin ported for `Layout/ParameterAlignment`. This port additionally
+    /// needs two things that cop never exercises: (a) `Alignment#check_
+    /// alignment`'s overlap guard (`@current_offenses`), needed because an
+    /// array literal can nest inside another array literal, each getting
+    /// its own `on_array` investigation; and (b) `AlignmentCorrector`'s
+    /// heredoc taboo-range guard, needed because an array ELEMENT (e.g. a
+    /// hash literal) can itself contain a heredoc whose body must not be
+    /// re-indented as a side effect of shifting the element's own lines.
+    ///
+    /// `on_array` bails out when there are fewer than 2 elements
+    /// (`node.children.size < 2`) or when the array IS the bare RHS value
+    /// of a mass assignment (`node.parent&.masgn_type?` — prism represents
+    /// `a, b = 1, 2`'s RHS as an opening-less `ArrayNode`; membership is
+    /// tracked via `aa_masgn_rhs`, populated by `visit_multi_write_node`
+    /// before it descends into the value).
+    ///
+    /// `each_bad_alignment`'s core loop: walking the elements in order,
+    /// only one that (a) starts a NEW source line relative to the previous
+    /// element's line, and (b) is the first non-whitespace token on that
+    /// line (`begins_its_line?`) is a candidate; its bad-alignment
+    /// `column_delta` is `base - display_column(element)` (the Unicode
+    /// East-Asian-Width-aware column). A zero delta is fine; otherwise
+    /// it's an offense anchored at the element's own start.
+    pub(crate) fn check_array_alignment(&mut self, node: &ruby_prism::ArrayNode) {
+        const COP: &str = "Layout/ArrayAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let items: Vec<ruby_prism::Node> = node.elements().iter().collect();
+        if items.len() < 2 {
+            return;
+        }
+        let node_start = node.location().start_offset();
+        if self.aa_masgn_rhs.contains(&node_start) {
+            return;
+        }
+        let fixed_indentation = self.cfg.enforced_style(COP) == "with_fixed_indentation";
+        let base = if fixed_indentation {
+            // `target_method_lineno`: `node.bracketed?` -> the array's own
+            // start line; else (a bare comma-list RHS of an ordinary,
+            // non-masgn assignment) the enclosing write node's own start
+            // line, via `aa_unbracketed_rhs_parent` (falls back to the
+            // array's own start when absent — unreached in practice, since
+            // a bracketless `ArrayNode` only ever occurs as some
+            // assignment's value, but kept total rather than panicking).
+            let lineno_offset = if node.opening_loc().is_some() {
+                node_start
+            } else {
+                self.aa_unbracketed_rhs_parent.get(&node_start).copied().unwrap_or(node_start)
+            };
+            let (line, _) = self.idx.loc(lineno_offset);
+            let line_start = self.idx.starts[line - 1];
+            let mut p = line_start;
+            while p < self.src.len() && self.src[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            let indentation_of_line = p - line_start;
+            indentation_of_line + self.aa_indentation_width(COP)
+        } else {
+            self.display_column(items[0].location().start_offset())
+        };
+
+        let mut prev_line: Option<usize> = None;
+        for item in &items {
+            let start = item.location().start_offset();
+            let (line, _) = self.idx.loc(start);
+            let starts_new_line = prev_line.map_or(true, |p| line > p);
+            if starts_new_line {
+                let line_start = self.idx.starts[line - 1];
+                let begins_its_line = self.src[line_start..start].iter().all(u8::is_ascii_whitespace);
+                if begins_its_line {
+                    let actual = self.display_column(start);
+                    if actual != base {
+                        let delta = base as isize - actual as isize;
+                        let end = item.location().end_offset();
+                        let msg = if fixed_indentation {
+                            "Use one level of indentation for elements following the first line of a multi-line array."
+                        } else {
+                            "Align the elements of an array literal if they span more than one line."
+                        };
+                        // `Alignment#check_alignment`'s overlap guard: an
+                        // offense node entirely within an already-registered
+                        // (necessarily enclosing) offense's range is still
+                        // reported, but its correction is dropped —
+                        // `register_offense(expr, nil)`, and `AlignmentCorrector
+                        // .correct` no-ops on a `nil` node.
+                        let within_prior =
+                            self.aa_registered_ranges.iter().any(|&(rs, re)| start >= rs && end <= re);
+                        self.push(start, COP, !within_prior, msg);
+                        if !within_prior {
+                            self.array_alignment_correct(start, end, delta);
+                        }
+                        self.aa_registered_ranges.push((start, end));
+                    }
+                }
+            }
+            prev_line = Some(line);
+        }
+    }
+
+    /// Populates `aa_unbracketed_rhs_parent` for `target_method_lineno`'s
+    /// non-`bracketed?` branch: when a plain (non-masgn) assignment's value
+    /// is a bracketless `ArrayNode` (`var = 1, 2` / `var =\n  1,\n  2`),
+    /// record that array's start offset -> this write node's own LHS start
+    /// offset, standing in for rubocop's `node.parent.loc.line` (a plain
+    /// write node's `loc.line` is the line its LHS name starts on).
+    pub(crate) fn aa_note_unbracketed_rhs(&mut self, lhs_start: usize, value: &ruby_prism::Node) {
+        if let Some(arr) = value.as_array_node() {
+            if arr.opening_loc().is_none() {
+                self.aa_unbracketed_rhs_parent.insert(arr.location().start_offset(), lhs_start);
+            }
+        }
+    }
+
+    /// `Alignment#configured_indentation_width`: the cop's own
+    /// `IndentationWidth` (no schema default — meaningful only when a user
+    /// sets it directly on this cop), else `Layout/IndentationWidth`'s
+    /// `Width` (schema default 2).
+    fn aa_indentation_width(&self, cop: &'static str) -> usize {
+        self.cfg
+            .get(cop, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+
+    /// `AlignmentCorrector.correct`, ported for the single misaligned array
+    /// element (upstream's `autocorrect(corrector, node)` always gets the
+    /// one bad element). Walks each physical line the element's own source
+    /// spans, starting at the element's OWN begin offset (not the physical
+    /// line's start) for line 1, then at each subsequent line's true
+    /// start: widening (`delta > 0`) inserts `delta` spaces immediately
+    /// before that position; narrowing removes `-delta` bytes, taken from
+    /// the run starting at that position if it's itself a space (an
+    /// interior line's own leading whitespace) or from just before it
+    /// otherwise (the gap between the previous token and the element's own
+    /// start, on line 1). Skips a would-be removal whose bytes aren't
+    /// purely spaces/tabs, matching upstream leaving such a case
+    /// uncorrected.
+    ///
+    /// Two upstream guards ported here that `parameter_alignment_correct`
+    /// never needs (no fixture parameter is multi-line or contains a
+    /// heredoc): `using_tabs?` (`Layout/IndentationStyle: EnforcedStyle:
+    /// tabs` disables `AlignmentCorrector` globally — the offense still
+    /// fires, only the fix is suppressed) and a heredoc taboo-range guard
+    /// (`inside_string_ranges`/`taboo_ranges`, restricted to the heredoc
+    /// case the fixture exercises: a hash-literal array element whose
+    /// value is a heredoc must have its OWN lines re-indented while the
+    /// heredoc's body content and its closing delimiter line stay
+    /// untouched — `self.heredoc_lines`' `(body_start_line, body_end_line,
+    /// ..)` entries, extended one line further to also cover the
+    /// terminator's own line). NOT ported: the non-heredoc "multi-line
+    /// quoted string interior" taboo case, and `block_comment_within?` (a
+    /// `=begin`/`=end` document comment inside the node disables the WHOLE
+    /// correction) — neither is exercised by the fixture.
+    fn array_alignment_correct(&mut self, start: usize, end: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            return;
+        }
+        let mut line_begin = start;
+        loop {
+            let (line_no, _) = self.idx.loc(line_begin);
+            let taboo = self.heredoc_lines.iter().any(|&(hs, he, _, _)| line_no >= hs && line_no <= he + 1);
+            if !taboo {
+                if delta > 0 {
+                    if self.src.get(line_begin) != Some(&b'\n') {
+                        self.fixes.push((line_begin, line_begin, vec![b' '; delta as usize]));
+                    }
+                } else {
+                    let n = (-delta) as usize;
+                    let starts_with_space = self.src.get(line_begin) == Some(&b' ');
+                    let (rs, re) = if starts_with_space {
+                        (line_begin, line_begin + n)
+                    } else {
+                        (line_begin.saturating_sub(n), line_begin)
+                    };
+                    if re <= self.src.len()
+                        && rs < re
+                        && self.src[rs..re].iter().all(|&b| b == b' ' || b == b'\t')
+                    {
+                        self.fixes.push((rs, re, Vec::new()));
+                    }
+                }
+            }
+            // Advance to the next physical line within [start, end), if any.
+            let mut p = line_begin;
+            while p < end && self.src[p] != b'\n' {
+                p += 1;
+            }
+            if p >= end {
+                break;
+            }
+            line_begin = p + 1;
+        }
+    }
+}

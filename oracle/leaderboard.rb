@@ -281,6 +281,7 @@ COPS = {
   'Style/HashTransformKeys'          => 'style/hash_transform_keys',
   'Style/SymbolArray'                => 'style/symbol_array',
   'Style/HashTransformValues'        => 'style/hash_transform_values',
+  'Layout/ArrayAlignment'            => 'layout/array_alignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
