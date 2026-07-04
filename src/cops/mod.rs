@@ -371,6 +371,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
+    "Style/RedundantCondition",
 ];
 
 impl Engine {
@@ -2306,6 +2307,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_assignment_in_condition(&node.predicate());
         self.check_negated_if(node);
         self.check_redundant_conditional(node);
+        self.check_redundant_condition(node);
         self.check_duplicate_elsif_condition(node);
         self.check_empty_conditional_body(node);
         self.check_comparable_clamp_if(node);
@@ -2405,6 +2407,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_assignment_in_condition(&node.predicate());
         self.check_parens_around_condition("unless", false, &node.predicate());
         self.check_redundant_conditional_unless(node);
+        self.check_redundant_condition_unless(node);
         self.check_safe_navigation_with_empty(&node.predicate());
         self.check_negated_unless(node);
         self.check_unless_else(node);

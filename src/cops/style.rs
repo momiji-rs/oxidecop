@@ -29374,3 +29374,695 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// Style/RedundantCondition — `if b; b; else; c; end` -> `b || c`,
+// `a.nil? ? true : a` -> `a.nil? || a`, `if do_something; do_something; end`
+// -> `do_something`, and the `unless` mirror image.
+//
+// Ported (as literally as the prism/whitequark AST divide allows) from
+// rubocop's `RedundantCondition#on_if` + its dozen private helpers. Two
+// upstream quirks matter a lot here:
+//
+// 1. whitequark's parser PHYSICALLY SWAPS an `unless` node's raw children
+//    (`*node` gives `[cond, textual-else, textual-then]` for `unless`, vs
+//    `[cond, textual-then, textual-else]` for `if`), while the `if_branch`/
+//    `else_branch` ACCESSOR methods undo that swap (`node_parts`), so they
+//    always mean "textual then"/"textual else" regardless of keyword.
+//    Verified live via `RuboCop::AST::ProcessedSource` — see branch notes.
+//    Upstream's private helpers inconsistently mix `*node` (raw, keyword-
+//    dependent) and `.if_branch`/`.else_branch` (accessor, keyword-agnostic)
+//    destructuring; this port names the raw pair `c1`/`c2` (`c1` = textual
+//    then for `if`, textual else for `unless`; `c2` is the other one) and
+//    the accessor pair `acc_if`/`acc_else` (always textual then/else) to
+//    keep the two straight, matching each upstream method's own choice.
+// 2. `if_branch_is_true_type_and_else_is_not?` is gated to `node.ternary? ||
+//    node.if?` — it NEVER fires for `unless`, so the "true branch" family of
+//    examples in the fixture only exercises `if`/ternary.
+//
+// `node.parent&.send_type?` (whether the whole construct sits as a receiver
+// or bare-operator argument of an enclosing call, e.g. `ary << if foo ... `)
+// has no cheap equivalent without parent pointers, so `rc_is_call_operand`
+// does a fresh, on-demand `ruby_prism::parse` + scan — rare (only run once
+// an offense is confirmed and non-ternary/non-redundant), acceptable cost.
+impl<'a> super::Cops<'a> {
+    /// Entry for `if`/ternary — both share prism's `IfNode` shape.
+    pub(crate) fn check_redundant_condition(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Style/RedundantCondition";
+        if !self.on(COP) {
+            return;
+        }
+        let is_ternary = node.if_keyword_loc().is_none();
+        if !is_ternary {
+            // `node.modifier_form?`: postfix `if`/`unless`, no `end`.
+            if node.end_keyword_loc().is_none() {
+                return;
+            }
+            // `!node.elsif?` (inside `offense?`): this node itself is an
+            // `elsif` branch — never a primary offense site.
+            if node.if_keyword_loc().is_some_and(|k| k.as_slice() == b"elsif") {
+                return;
+            }
+            // `node.elsif_conditional?`: this node's OWN subsequent branch
+            // is itself an `elsif` — skip the whole chain's head too.
+            if node
+                .subsequent()
+                .and_then(|s| s.as_if_node())
+                .is_some_and(|inner| inner.if_keyword_loc().is_some_and(|k| k.as_slice() == b"elsif"))
+            {
+                return;
+            }
+        }
+        let l = node.location();
+        let else_node = node.subsequent().and_then(|s| s.as_else_node());
+        let (question_start, colon_end) = if is_ternary {
+            (
+                node.then_keyword_loc().map(|q| q.start_offset()),
+                else_node.as_ref().map(|e| e.else_keyword_loc().end_offset()),
+            )
+        } else {
+            (None, None)
+        };
+        self.rc_run(
+            l.start_offset(),
+            l.end_offset(),
+            node.predicate(),
+            false,
+            is_ternary,
+            node.statements(),
+            else_node,
+            question_start,
+            colon_end,
+        );
+    }
+
+    /// Entry for `unless` — prism's dedicated `UnlessNode`.
+    pub(crate) fn check_redundant_condition_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Style/RedundantCondition";
+        if !self.on(COP) {
+            return;
+        }
+        if node.end_keyword_loc().is_none() {
+            return; // modifier form
+        }
+        let l = node.location();
+        self.rc_run(
+            l.start_offset(),
+            l.end_offset(),
+            node.predicate(),
+            true,
+            false,
+            node.statements(),
+            node.else_clause(),
+            None,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rc_run<'pr>(
+        &mut self,
+        whole_start: usize,
+        whole_end: usize,
+        condition: ruby_prism::Node<'pr>,
+        is_unless: bool,
+        is_ternary: bool,
+        then_stmts: Option<ruby_prism::StatementsNode<'pr>>,
+        else_node: Option<ruby_prism::ElseNode<'pr>>,
+        question_start: Option<usize>,
+        colon_end: Option<usize>,
+    ) {
+        const COP: &str = "Style/RedundantCondition";
+
+        let then_body: Vec<ruby_prism::Node<'pr>> =
+            then_stmts.as_ref().map(|s| s.body().iter().collect()).unwrap_or_default();
+        let then_single = if then_body.len() == 1 { then_body.into_iter().next() } else { None };
+
+        let else_stmts = else_node.as_ref().and_then(|e| e.statements());
+        let else_body: Vec<ruby_prism::Node<'pr>> =
+            else_stmts.as_ref().map(|s| s.body().iter().collect()).unwrap_or_default();
+        let else_exists = !else_body.is_empty();
+        let else_single = if else_body.len() == 1 { else_body.into_iter().next() } else { None };
+        // `else_branch.single_line?` for a >1-statement (implicit `begin`)
+        // else branch — only reachable when `else_exists` and NOT `else_single`.
+        let else_multi_single_line = if else_exists && else_single.is_none() {
+            else_stmts.as_ref().is_some_and(|s| {
+                let loc = s.location();
+                self.idx.loc(loc.start_offset()).0 == self.idx.loc(loc.end_offset().saturating_sub(1)).0
+            })
+        } else {
+            false
+        };
+
+        let allowed = |name: &[u8]| self.allowed(COP, name);
+        let Some((anchor, message, fixes)) = rc_evaluate(
+            self.src,
+            &allowed,
+            &condition,
+            is_unless,
+            is_ternary,
+            then_single.as_ref(),
+            else_single.as_ref(),
+            else_exists,
+            else_multi_single_line,
+            whole_start,
+            whole_end,
+            question_start,
+            colon_end,
+        ) else {
+            return;
+        };
+
+        self.push(anchor, COP, true, message);
+        // `autocorrect`'s `return if node.each_descendant.any? { |d|
+        // contains_comments?(d) }` — approximated as "any comment
+        // physically inside the whole construct's byte range" (sufficient
+        // for every comment-guard example in the fixture, all of which
+        // place the comment strictly between the node's own start/end).
+        if !rc_has_comment(self.comments, whole_start, whole_end) {
+            for f in fixes {
+                self.fixes.push(f);
+            }
+        }
+    }
+}
+
+fn rc_has_comment(comments: &[(usize, usize, usize)], start: usize, end: usize) -> bool {
+    comments.iter().any(|&(_, cs, _)| cs >= start && cs < end)
+}
+
+fn rc_src<'x>(src: &'x [u8], n: &ruby_prism::Node) -> &'x [u8] {
+    let l = n.location();
+    &src[l.start_offset()..l.end_offset()]
+}
+
+fn rc_parenthesized_call(call: &ruby_prism::CallNode) -> bool {
+    call.opening_loc().is_some_and(|o| o.as_slice() == b"(")
+}
+
+fn rc_use_if_branch(n: Option<&ruby_prism::Node>) -> bool {
+    n.is_some_and(|x| x.as_if_node().is_some())
+}
+
+fn rc_use_hash_key_assignment(n: Option<&ruby_prism::Node>) -> bool {
+    n.and_then(|x| x.as_call_node()).is_some_and(|c| c.name().as_slice() == b"[]=")
+}
+
+/// `asgn_type?` (`lvasgn`/`ivasgn`/`cvasgn`/`gvasgn`/`casgn`) paired with the
+/// assigned value (`.expression`), for the four write-node shapes plus plain
+/// constant assignment.
+fn rc_asgn_name_value<'pr>(node: &ruby_prism::Node<'pr>) -> Option<(&'pr [u8], ruby_prism::Node<'pr>)> {
+    if let Some(n) = node.as_local_variable_write_node() {
+        return Some((n.name().as_slice(), n.value()));
+    }
+    if let Some(n) = node.as_instance_variable_write_node() {
+        return Some((n.name().as_slice(), n.value()));
+    }
+    if let Some(n) = node.as_class_variable_write_node() {
+        return Some((n.name().as_slice(), n.value()));
+    }
+    if let Some(n) = node.as_global_variable_write_node() {
+        return Some((n.name().as_slice(), n.value()));
+    }
+    if let Some(n) = node.as_constant_write_node() {
+        return Some((n.name().as_slice(), n.value()));
+    }
+    None
+}
+
+/// `ARGUMENT_WITH_OPERATOR_TYPES` (`splat`/`block_pass`/`forwarded_restarg`/
+/// `forwarded_kwrestarg`/`forwarded_args`) — prism collapses the "anonymous"
+/// forwarding forms (`*`, `**`, `&`, all with no inner expression) into the
+/// same node kinds as their named counterparts, so no separate case is
+/// needed for those.
+fn rc_argument_with_operator(arg: &ruby_prism::Node) -> bool {
+    if arg.as_splat_node().is_some() {
+        return true;
+    }
+    if arg.as_forwarding_arguments_node().is_some() {
+        return true;
+    }
+    if arg.as_block_argument_node().is_some() {
+        return true;
+    }
+    if let Some(hash) = arg.as_keyword_hash_node() {
+        if let Some(first) = hash.elements().iter().next() {
+            return first.as_assoc_splat_node().is_some();
+        }
+    }
+    false
+}
+
+fn rc_single_argument_method(n: &ruby_prism::Node) -> bool {
+    let Some(call) = n.as_call_node() else { return false };
+    if call.name().as_slice() == b"[]" {
+        return false;
+    }
+    let Some(args) = call.arguments() else { return false };
+    let items: Vec<_> = args.arguments().iter().collect();
+    if items.len() != 1 {
+        return false;
+    }
+    !rc_argument_with_operator(&items[0])
+}
+
+fn rc_same_method(src: &[u8], a: &ruby_prism::Node, b: &ruby_prism::Node) -> bool {
+    let (Some(ca), Some(cb)) = (a.as_call_node(), b.as_call_node()) else { return false };
+    if ca.name().as_slice() != cb.name().as_slice() {
+        return false;
+    }
+    match (ca.receiver(), cb.receiver()) {
+        (None, None) => true,
+        (Some(ra), Some(rb)) => rc_src(src, &ra) == rc_src(src, &rb),
+        _ => false,
+    }
+}
+
+/// `branches_have_method?`: uses the ACCESSOR pair (always textual
+/// then/else), keyword-agnostic.
+fn rc_branches_have_method(
+    src: &[u8],
+    acc_if: Option<&ruby_prism::Node>,
+    acc_else: Option<&ruby_prism::Node>,
+) -> bool {
+    let (Some(a), Some(b)) = (acc_if, acc_else) else { return false };
+    rc_single_argument_method(a) && rc_single_argument_method(b) && rc_same_method(src, a, b)
+}
+
+/// `branches_have_assignment?`: uses the RAW `c1`/`c2` pair.
+fn rc_branches_have_assignment(c1: Option<&ruby_prism::Node>, c2: Option<&ruby_prism::Node>) -> bool {
+    let (Some(a), Some(b)) = (c1, c2) else { return false };
+    match (rc_asgn_name_value(a), rc_asgn_name_value(b)) {
+        (Some((n1, _)), Some((n2, _))) => n1 == n2,
+        _ => false,
+    }
+}
+
+fn rc_is_arithmetic(n: &ruby_prism::Node) -> bool {
+    n.as_call_node().is_some_and(|c| matches!(c.name().as_slice(), b"+" | b"-" | b"*" | b"/" | b"%" | b"**"))
+}
+
+/// `require_parentheses?`: `(basic_conditional? && modifier_form?) ||
+/// range_type? || rescue_type? || semantic_operator?` — `basic_conditional?`
+/// is `if`/`while`/`until` in whitequark, which ALSO covers `unless` (same
+/// `:if` node type there); prism gives `unless` its own type, so it's
+/// checked here too.
+fn rc_require_parentheses(n: &ruby_prism::Node) -> bool {
+    if let Some(i) = n.as_if_node() {
+        if i.if_keyword_loc().is_some() && i.end_keyword_loc().is_none() {
+            return true;
+        }
+    }
+    if let Some(u) = n.as_unless_node() {
+        if u.end_keyword_loc().is_none() {
+            return true;
+        }
+    }
+    if let Some(w) = n.as_while_node() {
+        if w.closing_loc().is_none() {
+            return true;
+        }
+    }
+    if let Some(u) = n.as_until_node() {
+        if u.closing_loc().is_none() {
+            return true;
+        }
+    }
+    if n.as_range_node().is_some() {
+        return true;
+    }
+    if n.as_rescue_modifier_node().is_some() {
+        return true;
+    }
+    if let Some(a) = n.as_and_node() {
+        if a.operator_loc().as_slice() == b"and" {
+            return true;
+        }
+    }
+    if let Some(o) = n.as_or_node() {
+        if o.operator_loc().as_slice() == b"or" {
+            return true;
+        }
+    }
+    false
+}
+
+/// `require_braces?`: `hash_type? && !braces?` — prism's `KeywordHashNode`
+/// (an implicit, brace-less hash argument) IS exactly that condition;
+/// explicit `{ ... }` hashes are `HashNode` instead.
+fn rc_require_braces(n: &ruby_prism::Node) -> bool {
+    n.as_keyword_hash_node().is_some()
+}
+
+/// `without_argument_parentheses_method?`.
+fn rc_without_argument_parens_method<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::CallNode<'pr>> {
+    let call = n.as_call_node()?;
+    let has_args = call.arguments().is_some_and(|a| a.arguments().iter().next().is_some());
+    if !has_args {
+        return None;
+    }
+    if rc_parenthesized_call(&call) {
+        return None;
+    }
+    let name = call.name().as_slice();
+    if is_operator_method_name(name) {
+        return None;
+    }
+    if ta_assignment_method(name) {
+        return None;
+    }
+    Some(call)
+}
+
+/// `wrap_arguments_with_parens`: `"#{start..selector_end}(#{first_arg_start..
+/// node_end})"` — turns `foo? arg` / `obj&.foo? arg` into `foo?(arg)` /
+/// `obj&.foo?(arg)`.
+fn rc_wrap_arguments_with_parens(src: &[u8], call: &ruby_prism::CallNode) -> Vec<u8> {
+    let cond_start = call.location().start_offset();
+    let sel_end = call.message_loc().map(|m| m.end_offset()).unwrap_or(cond_start);
+    let first_arg_start = call
+        .arguments()
+        .and_then(|a| a.arguments().iter().next())
+        .map(|a| a.location().start_offset())
+        .unwrap_or(sel_end);
+    let cond_end = call.location().end_offset();
+    let mut out = src[cond_start..sel_end].to_vec();
+    out.push(b'(');
+    out.extend_from_slice(&src[first_arg_start..cond_end]);
+    out.push(b')');
+    out
+}
+
+/// `if_source(if_branch, arithmetic_operation)`.
+fn rc_if_source(src: &[u8], if_branch: &ruby_prism::Node, condition: &ruby_prism::Node, bhm: bool, arithmetic: bool) -> Vec<u8> {
+    if bhm {
+        if let Some(call) = if_branch.as_call_node() {
+            if rc_parenthesized_call(&call) {
+                let s = rc_src(src, if_branch);
+                return s[..s.len().saturating_sub(1)].to_vec();
+            }
+        }
+    }
+    if arithmetic {
+        if let Some(call) = if_branch.as_call_node() {
+            let recv = call.receiver().map(|r| rc_src(src, &r).to_vec()).unwrap_or_default();
+            let method = call.name().as_slice();
+            let arg_src = call
+                .arguments()
+                .and_then(|a| a.arguments().iter().next())
+                .map(|a| rc_src(src, &a).to_vec())
+                .unwrap_or_default();
+            let mut out = recv;
+            out.push(b' ');
+            out.extend_from_slice(method);
+            out.push(b' ');
+            out.push(b'(');
+            out.extend_from_slice(&arg_src);
+            return out;
+        }
+    }
+    if if_branch.as_true_node().is_some() {
+        if let Some(call) = condition.as_call_node() {
+            let args_empty = call.arguments().is_none();
+            let parenthesized = rc_parenthesized_call(&call);
+            if args_empty || parenthesized {
+                return rc_src(src, condition).to_vec();
+            }
+            return rc_wrap_arguments_with_parens(src, &call);
+        }
+        return rc_src(src, condition).to_vec();
+    }
+    rc_src(src, if_branch).to_vec()
+}
+
+fn rc_join_sources(parts: &[Vec<u8>], sep: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(sep);
+        }
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+fn rc_else_source_if_has_method(src: &[u8], else_branch: &ruby_prism::Node) -> Vec<u8> {
+    let Some(call) = else_branch.as_call_node() else { return rc_src(src, else_branch).to_vec() };
+    let Some(first) = call.arguments().and_then(|a| a.arguments().iter().next()) else {
+        return rc_src(src, else_branch).to_vec();
+    };
+    if rc_require_parentheses(&first) {
+        let mut out = b"(".to_vec();
+        out.extend_from_slice(rc_src(src, &first));
+        out.push(b')');
+        return out;
+    }
+    if rc_require_braces(&first) {
+        let mut out = b"{ ".to_vec();
+        out.extend_from_slice(rc_src(src, &first));
+        out.extend_from_slice(b" }");
+        return out;
+    }
+    rc_src(src, &first).to_vec()
+}
+
+fn rc_else_source_if_has_assignment(src: &[u8], else_branch: &ruby_prism::Node) -> Vec<u8> {
+    let Some((_, value)) = rc_asgn_name_value(else_branch) else {
+        return rc_src(src, else_branch).to_vec();
+    };
+    if rc_require_parentheses(&value) {
+        let mut out = b"(".to_vec();
+        out.extend_from_slice(rc_src(src, &value));
+        out.push(b')');
+        return out;
+    }
+    if rc_require_braces(&value) {
+        let mut out = b"{ ".to_vec();
+        out.extend_from_slice(rc_src(src, &value));
+        out.extend_from_slice(b" }");
+        return out;
+    }
+    rc_src(src, &value).to_vec()
+}
+
+/// `else_source(else_branch, arithmetic_operation)`.
+fn rc_else_source(src: &[u8], else_branch: &ruby_prism::Node, bhm: bool, arithmetic: bool, has_assignment: bool) -> Vec<u8> {
+    if arithmetic {
+        if let Some(call) = else_branch.as_call_node() {
+            if let Some(first) = call.arguments().and_then(|a| a.arguments().iter().next()) {
+                let mut out = rc_src(src, &first).to_vec();
+                out.push(b')');
+                return out;
+            }
+        }
+    }
+    if bhm {
+        return rc_else_source_if_has_method(src, else_branch);
+    }
+    if rc_require_parentheses(else_branch) {
+        let mut out = b"(".to_vec();
+        out.extend_from_slice(rc_src(src, else_branch));
+        out.push(b')');
+        return out;
+    }
+    if let Some(call) = rc_without_argument_parens_method(else_branch) {
+        let mut out = call.name().as_slice().to_vec();
+        out.push(b'(');
+        let parts: Vec<Vec<u8>> = call
+            .arguments()
+            .map(|a| a.arguments().iter().map(|x| rc_src(src, &x).to_vec()).collect())
+            .unwrap_or_default();
+        out.extend_from_slice(&rc_join_sources(&parts, b", "));
+        out.push(b')');
+        return out;
+    }
+    if has_assignment {
+        return rc_else_source_if_has_assignment(src, else_branch);
+    }
+    rc_src(src, else_branch).to_vec()
+}
+
+/// `make_ternary_form(node)`, given the already-resolved RAW `c1`/`c2` pair.
+#[allow(clippy::too_many_arguments)]
+fn rc_make_ternary_form(
+    src: &[u8],
+    condition: &ruby_prism::Node,
+    c1: &ruby_prism::Node,
+    c2: &ruby_prism::Node,
+    bhm: bool,
+    has_assignment: bool,
+    parent_is_send: bool,
+) -> Vec<u8> {
+    let arithmetic = rc_is_arithmetic(c1);
+    let if_src = rc_if_source(src, c1, condition, bhm, arithmetic);
+    let else_src = rc_else_source(src, c2, bhm, arithmetic, has_assignment);
+    let mut form = if_src;
+    form.extend_from_slice(b" || ");
+    form.extend_from_slice(&else_src);
+    if bhm {
+        if let Some(call) = c1.as_call_node() {
+            if rc_parenthesized_call(&call) {
+                form.push(b')');
+            }
+        }
+    }
+    if parent_is_send {
+        let mut wrapped = b"(".to_vec();
+        wrapped.extend_from_slice(&form);
+        wrapped.push(b')');
+        return wrapped;
+    }
+    form
+}
+
+/// `node.parent&.send_type?` — no parent pointers in prism, so this does a
+/// fresh, throwaway parse of the whole file and checks whether any
+/// (non-safe-navigation) call's receiver or one of its arguments has EXACTLY
+/// the given byte range. Only invoked once an offense is confirmed and only
+/// on the `make_ternary_form` path, so the extra parse is rare.
+fn rc_is_call_operand(src: &[u8], start: usize, end: usize) -> bool {
+    struct Finder {
+        start: usize,
+        end: usize,
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if self.found {
+                return;
+            }
+            if !node.is_safe_navigation() {
+                let hit = |l: ruby_prism::Location| l.start_offset() == self.start && l.end_offset() == self.end;
+                if node.receiver().is_some_and(|r| hit(r.location())) {
+                    self.found = true;
+                }
+                if let Some(args) = node.arguments() {
+                    if args.arguments().iter().any(|a| hit(a.location())) {
+                        self.found = true;
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let result = ruby_prism::parse(src);
+    let mut f = Finder { start, end, found: false };
+    use ruby_prism::Visit;
+    f.visit(&result.node());
+    f.found
+}
+
+/// `offense?` + `message` + `range_of_offense` + `autocorrect`, fused: given
+/// everything already extracted from the AST, decide whether to offend at
+/// all and, if so, the anchor offset, the message, and the concrete
+/// `(start, end, replacement)` fixes (the caller separately suppresses the
+/// fixes — never the offense itself — when a comment sits inside the node).
+#[allow(clippy::too_many_arguments)]
+fn rc_evaluate<'pr>(
+    src: &[u8],
+    allowed: &dyn Fn(&[u8]) -> bool,
+    condition: &ruby_prism::Node<'pr>,
+    is_unless: bool,
+    is_ternary: bool,
+    then_single: Option<&ruby_prism::Node<'pr>>,
+    else_single: Option<&ruby_prism::Node<'pr>>,
+    else_exists: bool,
+    else_multi_single_line: bool,
+    whole_start: usize,
+    whole_end: usize,
+    question_start: Option<usize>,
+    colon_end: Option<usize>,
+) -> Option<(usize, &'static str, Vec<(usize, usize, Vec<u8>)>)> {
+    // C1/C2: RAW positional pair — physically swapped for `unless` (see the
+    // block doc comment above `impl<'a> super::Cops<'a>` for this cop).
+    let c1 = if is_unless { else_single } else { then_single };
+    let c2 = if is_unless { then_single } else { else_single };
+    // Accessor pair: always textual then/else, regardless of keyword.
+    let acc_if = then_single;
+    let acc_else = else_single;
+
+    // `use_if_branch?(else_branch) || use_hash_key_assignment?(else_branch)`
+    // — `else_branch` here is `c2` (offense?'s own raw destructure).
+    if rc_use_if_branch(c2) || rc_use_hash_key_assignment(c2) {
+        return None;
+    }
+
+    // `synonymous_condition_and_branch?(node)`.
+    let synonymous = {
+        // 1. `condition == if_branch` (c1).
+        let check1 = c1.is_some_and(|b| rc_src(src, condition) == rc_src(src, b));
+        // 2. `if_branch_is_true_type_and_else_is_not?` — `if`/ternary only.
+        let check2 = !is_unless
+            && condition.as_call_node().is_some_and(|call| {
+                let name = call.name().as_slice();
+                name.ends_with(b"?")
+                    && !allowed(name)
+                    && acc_if.is_some_and(|n| n.as_true_node().is_some())
+                    && acc_else.is_some()
+                    && acc_else.is_some_and(|n| n.as_true_node().is_none())
+            });
+        // 3. `branches_have_assignment?(node) && condition == if_branch.expression`.
+        let check3 = match (c1.and_then(|n| rc_asgn_name_value(n)), c2.and_then(|n| rc_asgn_name_value(n))) {
+            (Some((n1, v1)), Some((n2, _))) => n1 == n2 && rc_src(src, condition) == rc_src(src, &v1),
+            _ => false,
+        };
+        // 4. `branches_have_method?(node) && condition == if_branch.first_argument
+        //    && !use_hash_key_access?(if_branch)`.
+        let check4 = rc_branches_have_method(src, acc_if, acc_else)
+            && c1.and_then(|n| n.as_call_node()).is_some_and(|call| {
+                call.name().as_slice() != b"[]"
+                    && call
+                        .arguments()
+                        .and_then(|a| a.arguments().iter().next())
+                        .is_some_and(|first| rc_src(src, condition) == rc_src(src, &first))
+            });
+        check1 || check2 || check3 || check4
+    };
+    if !synonymous {
+        return None;
+    }
+
+    let else_qualifies = is_ternary || !else_exists || else_single.is_some() || else_multi_single_line;
+    if !else_qualifies {
+        return None;
+    }
+
+    let redundant = !else_exists; // modifier form already excluded upstream
+    let message: &'static str =
+        if redundant { "This condition is not needed." } else { "Use double pipes `||` instead." };
+
+    let bhm = rc_branches_have_method(src, acc_if, acc_else);
+
+    // `range_of_offense`.
+    let (anchor, offense_range) = if !is_ternary || bhm {
+        (whole_start, (whole_start, whole_end))
+    } else {
+        let q = question_start.unwrap_or(whole_start);
+        let c = colon_end.unwrap_or(whole_end);
+        (q, (q, c))
+    };
+
+    let mut fixes: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    if is_ternary && !bhm {
+        // `correct_ternary`.
+        fixes.push((offense_range.0, offense_range.1, b"||".to_vec()));
+        if let Some(else_n) = acc_else {
+            if else_n.as_range_node().is_some() {
+                let l = else_n.location();
+                fixes.push((l.start_offset(), l.start_offset(), b"(".to_vec()));
+                fixes.push((l.end_offset(), l.end_offset(), b")".to_vec()));
+            }
+        }
+    } else if redundant {
+        let Some(ab) = acc_if else { return None };
+        fixes.push((whole_start, whole_end, rc_src(src, ab).to_vec()));
+    } else {
+        let (Some(a), Some(b)) = (c1, c2) else { return None };
+        let has_assignment = rc_branches_have_assignment(c1, c2);
+        let parent_is_send = rc_is_call_operand(src, whole_start, whole_end);
+        let corrected = rc_make_ternary_form(src, condition, a, b, bhm, has_assignment, parent_is_send);
+        fixes.push((whole_start, whole_end, corrected));
+    }
+
+    Some((anchor, message, fixes))
+}
