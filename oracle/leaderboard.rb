@@ -325,6 +325,7 @@ COPS = {
   'Naming/FileName'                  => 'naming/file_name',
   'Style/Lambda'                     => 'style/lambda',
   'Style/GuardClause'                => 'style/guard_clause',
+  'Lint/LiteralAsCondition'          => 'lint/literal_as_condition',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

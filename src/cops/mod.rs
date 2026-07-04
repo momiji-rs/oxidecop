@@ -370,7 +370,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
-    "Style/Lambda", "Style/GuardClause",
+    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition",
 ];
 
 impl Engine {
@@ -1578,6 +1578,19 @@ pub(crate) struct Cops<'a> {
     // `or` of a chain (`node == root_of_or_node(node)`), i.e. one whose own
     // (start, end) is NOT in this set.
     pub(crate) mc_nested_or: HashSet<(usize, usize)>,
+    // Lint/LiteralAsCondition: `IgnoredNode#ignore_node`/`part_of_ignored_node?`
+    // for `correct_if_node`'s corrector block — (start, "whitequark-accurate"
+    // end) byte ranges of every `if`/`elsif`/ternary node whose autocorrect
+    // has already been applied THIS FILE, in traversal (i.e. outer-before-
+    // inner) order. Before applying a further `if`-chain correction, the
+    // candidate node's own (start, end) is checked against every range here;
+    // if it falls inside one, only the offense (never the fix) is recorded —
+    // mirrors upstream skipping autocorrection for a nested elsif/ternary
+    // whose enclosing if/elsif was already rewritten (rewriting both would
+    // double-edit overlapping text). See `lac_elsif_content_end`'s doc for
+    // why a nested `elsif` node's own end here is NOT its raw prism
+    // `location().end_offset()`.
+    pub(crate) lac_ignored: Vec<(usize, usize)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2212,6 +2225,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_identical_conditional_branches_if(node);
         self.check_sole_nested_conditional(&node.as_node());
         self.check_guard_clause_if(node);
+        self.check_literal_as_condition_if(node);
         if let Some(kw) = node.if_keyword_loc() {
             if matches!(kw.as_slice(), b"if" | b"elsif") {
                 let kw_text = if kw.as_slice() == b"elsif" { "elsif" } else { "if" };
@@ -2296,6 +2310,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_or_assignment_unless(node);
         self.check_sole_nested_conditional(&node.as_node());
         self.check_guard_clause_unless(node);
+        self.check_literal_as_condition_unless(node);
         self.check_multiline_if_then(
             node.then_keyword_loc(),
             node.end_keyword_loc(),
@@ -2656,6 +2671,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_hash_like_case(node);
         self.check_empty_case_condition(node);
         self.check_identical_conditional_branches_case(node);
+        self.check_literal_as_condition_case(node);
         {
             let kw = node.case_keyword_loc();
             self.sak_check(kw.start_offset(), kw.end_offset(), b"case");
@@ -2673,6 +2689,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
         self.check_case_match_indentation(node);
         self.check_identical_conditional_branches_case_match(node);
+        self.check_literal_as_condition_case_match(node);
         {
             let kw = node.case_keyword_loc();
             self.sak_check(kw.start_offset(), kw.end_offset(), b"case");
@@ -3123,6 +3140,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_next_while(node);
         self.check_loop_while(node);
         self.check_unreachable_loop_while(node);
+        if node.is_begin_modifier() {
+            self.check_literal_as_condition_while_post(node);
+        } else {
+            self.check_literal_as_condition_while(node);
+        }
         self.check_infinite_loop(
             style::il_truthy_literal(&node.predicate()),
             node.location(),
@@ -3193,6 +3215,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_next_until(node);
         self.check_loop_until(node);
         self.check_unreachable_loop_until(node);
+        if node.is_begin_modifier() {
+            self.check_literal_as_condition_until_post(node);
+        } else {
+            self.check_literal_as_condition_until(node);
+        }
         self.check_infinite_loop(
             style::il_falsey_literal(&node.predicate()),
             node.location(),
@@ -3938,6 +3965,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
         self.check_and_or_and(node);
         self.check_and_with_identical_operands(node);
+        self.check_literal_as_condition_and(node);
         self.check_safe_navigation_consistency(node.left(), node.right(), true);
         let op = node.operator_loc();
         self.redundant_sort_logical_left.insert(node.left().location().start_offset(), (op.start_offset(), op.end_offset()));
@@ -3965,6 +3993,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
         self.check_and_or_or(node);
         self.check_or_with_identical_operands(node);
+        self.check_literal_as_condition_or(node);
         self.check_safe_navigation_consistency(node.left(), node.right(), false);
         let op = node.operator_loc();
         self.redundant_sort_logical_left.insert(node.left().location().start_offset(), (op.start_offset(), op.end_offset()));
@@ -4061,6 +4090,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.check_double_negation(node);
         self.check_signal_exception_send(node);
+        self.check_literal_as_condition_send(node);
         // Lint/UselessMethodDefinition: register def-arguments of generic
         // macro calls (anything but a receiver-less access modifier).
         if let Some(args) = node.arguments() {
@@ -4733,6 +4763,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         dn_pending_define_method: None,
         nx_reindented: HashMap::new(),
         mc_nested_or: HashSet::new(),
+        lac_ignored: Vec::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),

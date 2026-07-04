@@ -12066,3 +12066,627 @@ pub(crate) enum SnavParent<'a> {
     /// `require_parentheses?` disjunct.
     ComparisonCallArg,
 }
+
+
+// =====================================================================
+// Lint/LiteralAsCondition
+//
+// Ported from rubocop's `Lint::LiteralAsCondition` (`include RangeHelp`,
+// `extend AutoCorrector`). Flags a literal used as (or as an and/or operand
+// feeding) the condition of `if`/`unless`/`while`/`until`/ternary/`case`/
+// `case-in`, plus a literal that's the operand of a `!`/`not`.
+//
+// whitequark folds `unless` into the very same `:if` node type (condition/
+// true-branch/false-branch just swapped — see `IfNode#node_parts` in
+// rubocop-ast), so upstream's single `on_if` handles real `if`, `unless`,
+// AND ternaries all at once. Prism gives `unless` its own `UnlessNode`, so
+// this port splits that one upstream method into
+// `check_literal_as_condition_if` (real `if`/elsif/ternary — all the same
+// prism `IfNode`) and `check_literal_as_condition_unless`.
+//
+// Two prism-vs-whitequark traps drive most of the complexity below:
+//
+// 1. `node.source` for a nested `elsif`'s own `IfNode`: whitequark's
+//    `SourceMap` for an elsif clause spans from the `elsif` keyword through
+//    the END OF ITS OWN CONTENT (the deepest branch in its chain), NEVER
+//    reaching the shared closing `end` keyword — that `end` belongs only to
+//    the outermost `if`. Prism's `IfNode#location`, in contrast, gives EVERY
+//    level of the chain (including every nested elsif) the SAME range,
+//    reaching all the way to that shared `end`. Verified live against both
+//    `Prism.parse` and `RuboCop::ProcessedSource`. `lac_elsif_content_end`
+//    computes the whitequark-accurate stopping point; `lac_if_wq_range`
+//    applies it only to a genuine elsif level (`if_keyword_loc` reading
+//    `elsif`), leaving the outermost `if`/ternary/modifier-`if`'s own
+//    `location().end_offset()` (already correct) alone.
+// 2. `IgnoredNode#part_of_ignored_node?` compares byte ranges computed with
+//    trap #1 already applied — an offense on a nested elsif/ternary whose
+//    enclosing `if` was already rewritten this pass is reported but never
+//    autocorrected (avoids emitting two overlapping edits). Modeled here by
+//    `Cops::lac_ignored`, a running list of (start, end) ranges already
+//    corrected this file, checked/extended by both
+//    `lac_correct_if_node`/`lac_correct_unless_node`.
+//
+// `on_while`/`on_until` vs. `on_while_post`/`on_until_post`: whitequark gives
+// the post-condition `begin...end while/until cond` loop shape its own
+// `:while_post`/`:until_post` node type (still built into the same
+// `RuboCop::AST::WhileNode`/`UntilNode` class — see rubocop-ast's
+// `builder.rb`); prism folds it into the ordinary `WhileNode`/`UntilNode`
+// with `is_begin_modifier?` true. `lac_loop_regular`/`lac_loop_post` take a
+// `guard_kw` (`"true"`/`"false"`) plus `is_while` so one pair of functions
+// serves both `while` and `until`.
+impl<'a> super::Cops<'a> {
+    /// `on_send`'s `RESTRICT_ON_SEND = [:!]` + `negation_method?` guard,
+    /// then `check_for_literal`: unlike `handle_node` (below), the operand
+    /// checked HERE gets no `parent.and_type?` suppression — that guard only
+    /// matters for literals found via the `check_node`/`handle_node`
+    /// recursion this falls into when the operand isn't itself a literal.
+    pub(crate) fn check_literal_as_condition_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        if !self.on(COP) {
+            return;
+        }
+        if node.name().as_slice() != b"!" {
+            return;
+        }
+        let Some(cond) = node.receiver() else { return };
+        if lac_literal(&cond) {
+            self.push(cond.location().start_offset(), COP, false, lac_msg(self.node_src(&cond)));
+        } else {
+            lac_check_node(self, &cond);
+        }
+    }
+
+    /// `on_and`: `node.lhs.truthy_literal?` — the WHOLE `and` node is
+    /// replaced with the right-hand side's source, unless that rhs is a bare
+    /// `return`/`break`/`next` (would-be void-value syntax error once it's
+    /// promoted to the leftmost expression).
+    pub(crate) fn check_literal_as_condition_and(&mut self, node: &ruby_prism::AndNode) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        if !self.on(COP) {
+            return;
+        }
+        let lhs = node.left();
+        if !style::il_truthy_literal(&lhs) {
+            return;
+        }
+        let rhs = node.right();
+        let correctable = !lac_is_return_break_next(&rhs);
+        self.push(lhs.location().start_offset(), COP, correctable, lac_msg(self.node_src(&lhs)));
+        if correctable {
+            let repl = self.node_src(&rhs).to_vec();
+            let l = node.location();
+            self.fixes.push((l.start_offset(), l.end_offset(), repl));
+        }
+    }
+
+    /// `on_or`: `node.lhs.falsey_literal?`, otherwise the mirror of
+    /// `check_literal_as_condition_and`.
+    pub(crate) fn check_literal_as_condition_or(&mut self, node: &ruby_prism::OrNode) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        if !self.on(COP) {
+            return;
+        }
+        let lhs = node.left();
+        if !style::il_falsey_literal(&lhs) {
+            return;
+        }
+        let rhs = node.right();
+        let correctable = !lac_is_return_break_next(&rhs);
+        self.push(lhs.location().start_offset(), COP, correctable, lac_msg(self.node_src(&lhs)));
+        if correctable {
+            let repl = self.node_src(&rhs).to_vec();
+            let l = node.location();
+            self.fixes.push((l.start_offset(), l.end_offset(), repl));
+        }
+    }
+
+    /// Shared body for `on_while`/`on_until` (the ordinary, non-post-loop
+    /// shape — block form `while cond ... end` AND bare modifier form `body
+    /// while cond`, both whitequark's plain `:while`/`:until`). `guard_kw` is
+    /// the literal text that short-circuits entirely (`"true"` for while,
+    /// `"false"` for until: the canonical "intentional infinite loop"
+    /// idiom); `is_while` selects which literal set is the "self" (replace
+    /// the condition with `guard_kw`) vs. "opposite" (drop the whole loop —
+    /// it would never run even once) case.
+    fn lac_loop_regular(&mut self, cond: &ruby_prism::Node, node_loc: ruby_prism::Location, guard_kw: &'static [u8], is_while: bool) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        if !self.on(COP) {
+            return;
+        }
+        if self.node_src(cond) == guard_kw {
+            return;
+        }
+        let (is_self, is_opposite) = if is_while {
+            (style::il_truthy_literal(cond), style::il_falsey_literal(cond))
+        } else {
+            (style::il_falsey_literal(cond), style::il_truthy_literal(cond))
+        };
+        if is_self {
+            self.push(cond.location().start_offset(), COP, true, lac_msg(self.node_src(cond)));
+            self.fixes.push((cond.location().start_offset(), cond.location().end_offset(), guard_kw.to_vec()));
+        } else if is_opposite {
+            self.push(cond.location().start_offset(), COP, true, lac_msg(self.node_src(cond)));
+            self.fixes.push((node_loc.start_offset(), node_loc.end_offset(), Vec::new()));
+        }
+    }
+
+    pub(crate) fn check_literal_as_condition_while(&mut self, node: &ruby_prism::WhileNode) {
+        self.lac_loop_regular(&node.predicate(), node.location(), b"true", true);
+    }
+
+    pub(crate) fn check_literal_as_condition_until(&mut self, node: &ruby_prism::UntilNode) {
+        self.lac_loop_regular(&node.predicate(), node.location(), b"false", false);
+    }
+
+    /// Shared body for `on_while_post`/`on_until_post` (the `begin ... end
+    /// while/until cond` post-condition loop; prism: ordinary `WhileNode`/
+    /// `UntilNode` with `is_begin_modifier() == true`). The "self" case does
+    /// a raw FIRST-OCCURRENCE substring replace of the condition's own
+    /// source text with `guard_kw` across the whole node's source (mirrors
+    /// upstream's `node.source.sub(node.condition.source, 'true')` literally
+    /// — a real quirk: it's textual, not AST-aware). The "opposite" case
+    /// replaces the whole node with its `begin` body's statements, each
+    /// re-emitted verbatim and joined with a bare `"\n"` (upstream
+    /// `node.body.child_nodes.map(&:source).join("\n")` — original
+    /// indentation between statements is NOT preserved).
+    fn lac_loop_post(
+        &mut self,
+        cond: &ruby_prism::Node,
+        statements: Option<ruby_prism::StatementsNode>,
+        node_loc: ruby_prism::Location,
+        guard_kw: &'static [u8],
+        is_while: bool,
+    ) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        if !self.on(COP) {
+            return;
+        }
+        if self.node_src(cond) == guard_kw {
+            return;
+        }
+        let (is_self, is_opposite) = if is_while {
+            (style::il_truthy_literal(cond), style::il_falsey_literal(cond))
+        } else {
+            (style::il_falsey_literal(cond), style::il_truthy_literal(cond))
+        };
+        if is_self {
+            self.push(cond.location().start_offset(), COP, true, lac_msg(self.node_src(cond)));
+            let whole = self.src[node_loc.start_offset()..node_loc.end_offset()].to_vec();
+            let cond_src = self.node_src(cond).to_vec();
+            let replacement = lac_sub_first(&whole, &cond_src, guard_kw);
+            self.fixes.push((node_loc.start_offset(), node_loc.end_offset(), replacement));
+        } else if is_opposite {
+            self.push(cond.location().start_offset(), COP, true, lac_msg(self.node_src(cond)));
+            let begin_node = statements.and_then(|s| s.body().iter().find_map(|n| n.as_begin_node()));
+            let replacement = begin_node
+                .and_then(|b| b.statements())
+                .map(|s| {
+                    s.body().iter().map(|n| self.node_src(&n).to_vec()).collect::<Vec<_>>().join(&b"\n"[..])
+                })
+                .unwrap_or_default();
+            self.fixes.push((node_loc.start_offset(), node_loc.end_offset(), replacement));
+        }
+    }
+
+    pub(crate) fn check_literal_as_condition_while_post(&mut self, node: &ruby_prism::WhileNode) {
+        self.lac_loop_post(&node.predicate(), node.statements(), node.location(), b"true", true);
+    }
+
+    pub(crate) fn check_literal_as_condition_until_post(&mut self, node: &ruby_prism::UntilNode) {
+        self.lac_loop_post(&node.predicate(), node.statements(), node.location(), b"false", false);
+    }
+
+    /// `on_case`: a subject present (`case cond ... end`) delegates to
+    /// `lac_check_case_common`; a subject-LESS `case` (`case\nwhen a then
+    /// ...\nend`) instead flags any `when` clause every one of whose
+    /// (possibly multiple, comma-separated) conditions is itself a literal —
+    /// the offense spans the first condition's start through the last's end.
+    pub(crate) fn check_literal_as_condition_case(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        if !self.on(COP) {
+            return;
+        }
+        if let Some(cond) = node.predicate() {
+            if !style::il_falsey_literal(&cond) && !style::il_truthy_literal(&cond) {
+                return;
+            }
+            self.lac_check_case_common(&cond, &node.as_node());
+        } else {
+            for branch in node.conditions().iter() {
+                let Some(when_node) = branch.as_when_node() else { continue };
+                let conds: Vec<ruby_prism::Node> = when_node.conditions().iter().collect();
+                if conds.is_empty() || !conds.iter().all(lac_literal) {
+                    continue;
+                }
+                let start = conds.first().unwrap().location().start_offset();
+                let end = conds.last().unwrap().location().end_offset();
+                self.push(start, COP, false, lac_msg(&self.src[start..end]));
+            }
+        }
+    }
+
+    /// `on_case_match`: a `case-in` ALWAYS has a subject (prism's
+    /// `CaseMatchNode#predicate` is never absent — the subject-less branch
+    /// upstream guards for is unreachable pattern-matching syntax and is not
+    /// ported). `descendants.any?(&:match_var_type?)` (any pattern anywhere
+    /// in the `in` branches binds a NEW local — `in x`, `in [*rest]`, `in a:
+    /// Integer => m`, ...) is scoped to just the `in` PATTERNS themselves
+    /// (`lac_has_match_var`), not their guard/body statements: whitequark's
+    /// `:match_var` node type is exclusive to pattern captures, but prism
+    /// represents both a pattern capture AND an ordinary multiple-assignment
+    /// target (`a, b = 1, 2`) with the SAME `LocalVariableTargetNode` — a
+    /// body statement doing the latter must not be mistaken for the former.
+    pub(crate) fn check_literal_as_condition_case_match(&mut self, node: &ruby_prism::CaseMatchNode) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(cond) = node.predicate() else { return };
+        if lac_has_match_var(node) {
+            return;
+        }
+        if !style::il_falsey_literal(&cond) && !style::il_truthy_literal(&cond) {
+            return;
+        }
+        self.lac_check_case_common(&cond, &node.as_node());
+    }
+
+    /// `check_case`: an array subject is only followed through when every
+    /// element is (recursively) a `basic_literal?` (`primitive_array?`); a
+    /// `dstr` (interpolated string) subject is never followed at all. Falls
+    /// into the same `check_node`/`handle_node` recursion `on_send` uses,
+    /// with `parent` = the `case`/`case-in` node itself (never `and_type?`,
+    /// so the `handle_node` suppression there never fires from this path).
+    fn lac_check_case_common(&mut self, cond: &ruby_prism::Node, parent: &ruby_prism::Node) {
+        if let Some(arr) = cond.as_array_node() {
+            if !lac_primitive_array(&arr) {
+                return;
+            }
+        }
+        if cond.as_interpolated_string_node().is_some() {
+            return;
+        }
+        lac_handle_node(self, cond, parent);
+    }
+
+    /// `on_if`: real `if`/`elsif` (prism `IfNode` with an `if_keyword_loc`)
+    /// AND ternaries (no keyword at all) share this one upstream method —
+    /// see the module doc for why `unless` needs its own,
+    /// `check_literal_as_condition_unless`.
+    pub(crate) fn check_literal_as_condition_if(&mut self, node: &ruby_prism::IfNode) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        if !self.on(COP) {
+            return;
+        }
+        let cond = node.predicate();
+        if !style::il_falsey_literal(&cond) && !style::il_truthy_literal(&cond) {
+            return;
+        }
+        self.lac_correct_if_node(node, &cond);
+    }
+
+    pub(crate) fn check_literal_as_condition_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        if !self.on(COP) {
+            return;
+        }
+        let cond = node.predicate();
+        if !style::il_falsey_literal(&cond) && !style::il_truthy_literal(&cond) {
+            return;
+        }
+        self.lac_correct_unless_node(node, &cond);
+    }
+
+    /// `correct_if_node`, specialized to a real `if`/elsif/ternary
+    /// (`condition_evaluation?` always takes the non-`unless?` branch:
+    /// `cond.truthy_literal?`). See the module doc for the two
+    /// prism-vs-whitequark traps this leans on.
+    fn lac_correct_if_node(&mut self, node: &ruby_prism::IfNode, cond: &ruby_prism::Node) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        let result = style::il_truthy_literal(cond);
+        let (start, end) = lac_if_wq_range(node);
+        let ignored = self.lac_ignored.iter().any(|&(is, ie)| is <= start && ie >= end);
+        self.push(cond.location().start_offset(), COP, !ignored, lac_msg(self.node_src(cond)));
+        if ignored {
+            return;
+        }
+
+        let is_elsif = node.if_keyword_loc().is_some_and(|k| k.as_slice() == b"elsif");
+        let is_ternary = node.if_keyword_loc().is_none();
+        let elsif_conditional = node.subsequent().is_some_and(|s| s.as_if_node().is_some());
+        let has_else = node.subsequent().is_some_and(|s| s.as_else_node().is_some());
+
+        let new_node: Vec<u8> = if is_elsif && result {
+            // "else\n  #{range_with_comments(node.if_branch).source}"
+            let mut out = b"else\n  ".to_vec();
+            if let Some(stmts) = node.statements() {
+                let lower = node.predicate().location().end_offset();
+                let (s, e) = lac_range_with_comments(self, stmts.location().start_offset(), stmts.location().end_offset(), lower);
+                out.extend_from_slice(&self.src[s..e]);
+            }
+            out
+        } else if is_elsif && !result {
+            // "else\n  #{node.else_branch.source}"
+            let mut out = b"else\n  ".to_vec();
+            match node.subsequent() {
+                Some(sub) => {
+                    if let Some(else_node) = sub.as_else_node() {
+                        if let Some(stmts) = else_node.statements() {
+                            out.extend_from_slice(self.node_src(&stmts.as_node()));
+                        }
+                    } else if let Some(nested) = sub.as_if_node() {
+                        let ns = nested.location().start_offset();
+                        let ne = lac_elsif_content_end(&nested);
+                        out.extend_from_slice(&self.src[ns..ne]);
+                    }
+                }
+                None => {}
+            }
+            out
+        } else if node.statements().is_some() && result {
+            // node.if_branch.source
+            self.node_src(&node.statements().unwrap().as_node()).to_vec()
+        } else if elsif_conditional {
+            // "#{node.else_branch.source.sub('elsif', 'if')}\nend"
+            let nested = node.subsequent().unwrap().as_if_node().unwrap();
+            let ns = nested.location().start_offset();
+            let ne = lac_elsif_content_end(&nested);
+            let nested_src = self.src[ns..ne].to_vec();
+            let mut out = lac_sub_first(&nested_src, b"elsif", b"if");
+            out.extend_from_slice(b"\nend");
+            out
+        } else if has_else || is_ternary {
+            // node.else_branch.source
+            node.subsequent()
+                .and_then(|s| s.as_else_node())
+                .and_then(|e| e.statements())
+                .map(|s| self.node_src(&s.as_node()).to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        self.fixes.push((start, end, new_node));
+        self.lac_ignored.push((start, end));
+    }
+
+    /// `correct_if_node` for `unless` (`condition_evaluation?`'s `unless?`
+    /// branch: `cond.falsey_literal?`). `unless` never chains an elsif and
+    /// is never a ternary, so only 2 of the upstream `new_node` cases are
+    /// reachable: the (normalized) if-branch when `result`, else the
+    /// `else`-clause body (or `''` with neither).
+    fn lac_correct_unless_node(&mut self, node: &ruby_prism::UnlessNode, cond: &ruby_prism::Node) {
+        const COP: &str = "Lint/LiteralAsCondition";
+        let result = style::il_falsey_literal(cond);
+        let start = node.location().start_offset();
+        let end = node.location().end_offset();
+        let ignored = self.lac_ignored.iter().any(|&(is, ie)| is <= start && ie >= end);
+        self.push(cond.location().start_offset(), COP, !ignored, lac_msg(self.node_src(cond)));
+        if ignored {
+            return;
+        }
+
+        let new_node: Vec<u8> = if node.statements().is_some() && result {
+            self.node_src(&node.statements().unwrap().as_node()).to_vec()
+        } else if let Some(else_clause) = node.else_clause() {
+            else_clause.statements().map(|s| self.node_src(&s.as_node()).to_vec()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        self.fixes.push((start, end, new_node));
+        self.lac_ignored.push((start, end));
+    }
+}
+
+use super::style;
+
+/// `Node::LITERALS` (`TRUTHY_LITERALS ∪ FALSEY_LITERALS`) — rubocop-ast's
+/// generic `literal?`.
+fn lac_literal(n: &ruby_prism::Node) -> bool {
+    style::il_truthy_literal(n) || style::il_falsey_literal(n)
+}
+
+/// `Node::BASIC_LITERALS` (`LITERALS` minus the composite/interpolated
+/// types: `dstr`, `xstr`, `dsym`, `array`, `hash`, `irange`, `erange`,
+/// `regexp`) — rubocop-ast's generic `basic_literal?`, called
+/// `lac_basic_literal` below once arrays get their `primitive_array?`
+/// override layered on top.
+fn lac_ast_basic_literal(n: &ruby_prism::Node) -> bool {
+    n.as_string_node().is_some()
+        || n.as_integer_node().is_some()
+        || n.as_float_node().is_some()
+        || n.as_symbol_node().is_some()
+        || n.as_true_node().is_some()
+        || n.as_false_node().is_some()
+        || n.as_nil_node().is_some()
+        || n.as_imaginary_node().is_some()
+        || n.as_rational_node().is_some()
+}
+
+/// `LiteralAsCondition#basic_literal?`: same as the AST's own
+/// `basic_literal?`, except an array recurses into `primitive_array?`
+/// instead of being blanket-composite (`false`).
+fn lac_basic_literal(n: &ruby_prism::Node) -> bool {
+    if let Some(arr) = n.as_array_node() { lac_primitive_array(&arr) } else { lac_ast_basic_literal(n) }
+}
+
+/// `primitive_array?`: every element is (recursively) `basic_literal?`.
+fn lac_primitive_array(arr: &ruby_prism::ArrayNode) -> bool {
+    arr.elements().iter().all(|el| lac_basic_literal(&el))
+}
+
+/// `return`/`break`/`next` — `rhs.type?(:return, :break, :next)`, guarding
+/// `on_and`/`on_or`'s autocorrect (promoting one of these to the leftmost
+/// expression of the resulting `&&`/`||`-free code would be a void-value
+/// syntax error).
+fn lac_is_return_break_next(n: &ruby_prism::Node) -> bool {
+    n.as_return_node().is_some() || n.as_break_node().is_some() || n.as_next_node().is_some()
+}
+
+/// `descendants.any?(&:match_var_type?)`, scoped to every `in` branch's own
+/// PATTERN (never its guard or body) — see
+/// `check_literal_as_condition_case_match`'s doc for why the scoping
+/// matters. `LocalVariableTargetNode` is prism's stand-in for whitequark's
+/// `:match_var` here (a bare `in x`, an array/find pattern's splat capture,
+/// a hash pattern's shorthand/`=>` capture, ...).
+fn lac_has_match_var(node: &ruby_prism::CaseMatchNode) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_local_variable_target_node(&mut self, _node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.found = true;
+        }
+    }
+    use ruby_prism::Visit;
+    let mut f = Finder { found: false };
+    for cond in node.conditions().iter() {
+        if let Some(in_node) = cond.as_in_node() {
+            f.visit(&in_node.pattern());
+        }
+    }
+    f.found
+}
+
+/// `check_node`/`handle_node`'s mutual recursion. `parent` is `node`'s
+/// immediate AST parent (prism gives no parent pointers, so every recursive
+/// call threads it through explicitly instead of upstream's `node.parent`).
+/// A literal found here is suppressed when its immediate parent is an `and`
+/// node — already independently flagged (on its OWN lhs) by
+/// `check_literal_as_condition_and`, so this avoids a double report for
+/// exactly that shape.
+fn lac_handle_node(cops: &mut Cops, node: &ruby_prism::Node, parent: &ruby_prism::Node) {
+    if lac_literal(node) {
+        if parent.as_and_node().is_some() {
+            return;
+        }
+        cops.push(node.location().start_offset(), "Lint/LiteralAsCondition", false, lac_msg(cops.node_src(node)));
+    } else if node.as_call_node().is_some() || node.as_and_node().is_some() || node.as_or_node().is_some() || node.as_parentheses_node().is_some() {
+        lac_check_node(cops, node);
+    }
+}
+
+/// `check_node`: unwraps a `!`/`not` call (bang-spelled ONLY —
+/// `prefix_bang?` requires the literal `!` selector, so a nested `not` is a
+/// dead end here, matching upstream), an `and`/`or` node's own two operands,
+/// or a single-statement parenthesized group (prism `ParenthesesNode`,
+/// whitequark's `:begin` — `kwbegin`/`begin...end` is a DIFFERENT node type
+/// in both and is never unwrapped here), each further into `handle_node`.
+fn lac_check_node(cops: &mut Cops, node: &ruby_prism::Node) {
+    if let Some(call) = node.as_call_node() {
+        if call.receiver().is_some()
+            && call.name().as_slice() == b"!"
+            && call.message_loc().is_some_and(|m| m.as_slice() == b"!")
+        {
+            let recv = call.receiver().unwrap();
+            lac_handle_node(cops, &recv, node);
+        }
+    } else if let Some(and) = node.as_and_node() {
+        let l = and.left();
+        let r = and.right();
+        lac_handle_node(cops, &l, node);
+        lac_handle_node(cops, &r, node);
+    } else if let Some(or) = node.as_or_node() {
+        let l = or.left();
+        let r = or.right();
+        lac_handle_node(cops, &l, node);
+        lac_handle_node(cops, &r, node);
+    } else if let Some(paren) = node.as_parentheses_node() {
+        if let Some(body) = paren.body() {
+            if let Some(stmts) = body.as_statements_node() {
+                let items: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+                if items.len() == 1 {
+                    lac_handle_node(cops, &items[0], node);
+                }
+            }
+        }
+    }
+}
+
+/// `range_with_comments(if_branch)`: extend `[start, end)` to also cover a
+/// same-last-line trailing ("decorating") comment and a directly-preceding
+/// comment run down to `lower_bound` (the elsif/if's own condition end) —
+/// see `lac_correct_if_node`'s `is_elsif && result` branch, the one case
+/// where a comment attached to the content being spliced INTO `new_node`
+/// would otherwise be silently dropped (every other branch's comments
+/// survive for free as untouched bytes outside the replaced range).
+fn lac_range_with_comments(cops: &Cops, start: usize, end: usize, lower_bound: usize) -> (usize, usize) {
+    let mut lo = start;
+    let mut hi = end;
+    let last_line = cops.idx.loc(end.saturating_sub(1)).0;
+    for &(line, s, e) in cops.comments {
+        if s > lower_bound && e <= start {
+            lo = lo.min(s);
+        }
+        if s >= end && line == last_line {
+            hi = hi.max(e);
+        }
+    }
+    (lo, hi)
+}
+
+/// The whitequark-accurate stopping point for an elsif-chain `IfNode`'s own
+/// content: recurses through `subsequent` (another elsif, or a terminal
+/// `else`) to the deepest branch's last statement — see the module doc's
+/// trap #1. Invariant under WHICH level of the chain it's called from: every
+/// non-outermost node's own whitequark range stops at this exact same
+/// offset, since none of them (unlike the outermost) reach the shared
+/// closing `end`.
+fn lac_elsif_content_end(node: &ruby_prism::IfNode) -> usize {
+    match node.subsequent() {
+        Some(sub) => {
+            if let Some(else_node) = sub.as_else_node() {
+                else_node
+                    .statements()
+                    .map(|s| s.location().end_offset())
+                    .unwrap_or_else(|| else_node.else_keyword_loc().end_offset())
+            } else if let Some(elsif) = sub.as_if_node() {
+                lac_elsif_content_end(&elsif)
+            } else {
+                node.location().end_offset()
+            }
+        }
+        None => node
+            .statements()
+            .map(|s| s.location().end_offset())
+            .unwrap_or_else(|| node.predicate().location().end_offset()),
+    }
+}
+
+/// The whitequark-accurate `(start, end)` byte range of ANY level of an
+/// `if`/elsif/ternary chain: the outermost `if`/ternary/modifier-`if`'s own
+/// `location().end_offset()` is already correct (it owns whatever `end`
+/// keyword — or lack thereof — the construct has); only a genuine nested
+/// `elsif` needs `lac_elsif_content_end`'s adjustment.
+fn lac_if_wq_range(node: &ruby_prism::IfNode) -> (usize, usize) {
+    let start = node.location().start_offset();
+    let is_elsif = node.if_keyword_loc().is_some_and(|k| k.as_slice() == b"elsif");
+    let end = if is_elsif { lac_elsif_content_end(node) } else { node.location().end_offset() };
+    (start, end)
+}
+
+/// `String#sub(needle, repl)` semantics: replace the FIRST byte-occurrence
+/// of `needle`, or return `haystack` unchanged if it doesn't occur.
+fn lac_sub_first(haystack: &[u8], needle: &[u8], repl: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        let mut out = repl.to_vec();
+        out.extend_from_slice(haystack);
+        return out;
+    }
+    match haystack.windows(needle.len()).position(|w| w == needle) {
+        Some(pos) => {
+            let mut out = Vec::with_capacity(haystack.len() - needle.len() + repl.len());
+            out.extend_from_slice(&haystack[..pos]);
+            out.extend_from_slice(repl);
+            out.extend_from_slice(&haystack[pos + needle.len()..]);
+            out
+        }
+        None => haystack.to_vec(),
+    }
+}
+
+/// `format(MSG, literal: node.source)`.
+fn lac_msg(src: &[u8]) -> String {
+    format!("Literal `{}` appeared as a condition.", String::from_utf8_lossy(src))
+}
