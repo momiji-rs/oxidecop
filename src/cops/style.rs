@@ -23317,3 +23317,372 @@ fn yc_recursive_literal(n: &ruby_prism::Node) -> bool {
     }
     false
 }
+
+
+// ---------------------------------------------------------------------------
+// Style/TernaryParentheses
+// ---------------------------------------------------------------------------
+
+impl<'a> Cops<'a> {
+    /// `on_if`, gated to ternaries only (`node.ternary?`: a `?:` never carries
+    /// an `if`/`elsif`/`unless` keyword — only modifier/statement `if` does,
+    /// so `if_keyword_loc().is_some()` rules those out up front; upstream
+    /// technically runs its first two early-return checks before that gate,
+    /// but they're inert no-ops for a non-ternary since the gate gets there
+    /// regardless).
+    ///
+    /// `only_closing_parenthesis_is_last_line?` / the one-line-pattern-match
+    /// carve-out both look at the RAW condition source before any parens
+    /// classification, so they run first, mirroring upstream's order.
+    pub(crate) fn check_ternary_parentheses(&mut self, node: &ruby_prism::IfNode<'_>) {
+        const COP: &str = "Style/TernaryParentheses";
+        if !self.on(COP) {
+            return;
+        }
+        if node.if_keyword_loc().is_some() {
+            return;
+        }
+        let condition = node.predicate();
+
+        if tp_only_closing_paren_last_line(self.node_src(&condition)) {
+            return;
+        }
+        if tp_condition_is_paren_pattern_match(&condition) {
+            return;
+        }
+
+        let style = self.cfg.enforced_style(COP);
+        // `SafeAssignment#safe_assignment_allowed?`: `cop_config['AllowSafeAssignment']`,
+        // schema default `true`.
+        let allow_safe_assignment = self.cfg.get(COP, "AllowSafeAssignment") != Some("false");
+
+        if !tp_offense(&condition, style, allow_safe_assignment) {
+            return;
+        }
+
+        let message = tp_message(&condition, style);
+        // Anchor: the WHOLE ternary node (condition through the `:`-branch),
+        // never just the condition — confirmed against the fixture, whose
+        // carets always run from the condition's own start through the very
+        // end of the ternary.
+        self.push(node.location().start_offset(), COP, true, message);
+
+        // `autocorrect`: a corrector block is ALWAYS passed to `add_offense`
+        // above (hence `correctable: true` unconditionally), but this body
+        // can still decide to make no edits at all (safe-assignment /
+        // below-ternary-precedence cases) — `expect_no_corrections` in the
+        // fixture, not `expect_offense` without a block.
+        let is_paren = condition.as_parentheses_node().is_some();
+        if is_paren && (tp_is_safe_assignment(&condition) || tp_unsafe_autocorrect(&condition)) {
+            return;
+        }
+        if let Some(paren) = condition.as_parentheses_node() {
+            self.tp_correct_parenthesized(&paren);
+        } else {
+            tp_correct_unparenthesized(self, &condition);
+        }
+    }
+
+    /// `correct_parenthesized`: strip the outer `(`/`)`, re-inserting a
+    /// single space after the removed `)` only if none already followed it
+    /// (otherwise `(bar?)? a : b`-style inputs would merge into `bar?? a`).
+    /// Then, if the sole wrapped expression is itself a parenthesization
+    /// candidate (a receiverless/dot command call or bare `defined?` with
+    /// its OWN args not yet wrapped in `()`), add those parens too — losing
+    /// the outer group must not let the call's arguments swallow the `?`.
+    fn tp_correct_parenthesized(&mut self, paren: &ruby_prism::ParenthesesNode<'_>) {
+        let open = paren.opening_loc();
+        let close = paren.closing_loc();
+        self.fixes.push((open.start_offset(), open.end_offset(), Vec::new()));
+        self.fixes.push((close.start_offset(), close.end_offset(), Vec::new()));
+
+        // `whitespace_after?`: is the byte right after the (about to be
+        // removed) closing paren already whitespace?
+        let has_space_after =
+            self.src.get(close.end_offset()).is_some_and(|b| b.is_ascii_whitespace());
+        if !has_space_after {
+            self.fixes.push((close.end_offset(), close.end_offset(), b" ".to_vec()));
+        }
+
+        if let Some(send_node) = tp_last_body_child(paren) {
+            if tp_node_args_need_parens(&send_node) {
+                self.tp_parenthesize_condition_arguments(&send_node);
+            }
+        }
+    }
+
+    /// `parenthesize_condition_arguments`: replace the gap between the
+    /// selector (`defined?`'s own keyword text, or a call's method-name
+    /// token) and the first argument with `(`, then insert `)` right after
+    /// the last argument — turning `defined? bar` into `defined?(bar)` /
+    /// `baz? bar` into `baz?(bar)`.
+    fn tp_parenthesize_condition_arguments(&mut self, send_node: &ruby_prism::Node<'_>) {
+        let (selector_end, first_start, last_end) = if let Some(call) = send_node.as_call_node() {
+            let Some(sel) = call.message_loc() else { return };
+            let args: Vec<ruby_prism::Node> =
+                call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            let (Some(first), Some(last)) = (args.first(), args.last()) else { return };
+            (sel.end_offset(), first.location().start_offset(), last.location().end_offset())
+        } else if let Some(defined) = send_node.as_defined_node() {
+            // "defined?" is always exactly 8 bytes — the node's own start.
+            let kw_end = defined.location().start_offset() + 8;
+            let value = defined.value();
+            (kw_end, value.location().start_offset(), value.location().end_offset())
+        } else {
+            return;
+        };
+        self.fixes.push((selector_end, first_start, b"(".to_vec()));
+        self.fixes.push((last_end, last_end, b")".to_vec()));
+    }
+}
+
+/// `only_closing_parenthesis_is_last_line?`: the condition's OWN last
+/// physical source line is exactly `)` — e.g.
+/// ```ruby
+/// (foo ||
+///   bar) ? a : b
+/// ```
+/// does NOT qualify (last line is `  bar)`), but
+/// ```ruby
+/// (
+///   foo || bar
+/// ) ? a : b
+/// ```
+/// does (last line is bare `)`).
+fn tp_only_closing_paren_last_line(src: &[u8]) -> bool {
+    let last = src.rsplit(|&b| b == b'\n').next().unwrap_or(src);
+    last == b")"
+}
+
+/// `condition_as_parenthesized_one_line_pattern_matching?` (Ruby >= 3.0
+/// branch only — the Ruby 2.7 whitequark-only AST shape this also guards
+/// against is `unsupported_on: :prism` in the fixture, hence unreachable
+/// here): a parenthesized one-line `expr in pattern` (prism's
+/// `MatchPredicateNode`) is inert, never an offense — `expr => pattern`
+/// (`MatchRequiredNode`) is NOT exempted, matching upstream's `match_pattern_p_type?`
+/// check (as opposed to the required/non-predicate `match_pattern_type?`).
+fn tp_condition_is_paren_pattern_match(condition: &ruby_prism::Node<'_>) -> bool {
+    let Some(paren) = condition.as_parentheses_node() else { return false };
+    let Some(body) = paren.body() else { return false };
+    let first = if let Some(stmts) = body.as_statements_node() {
+        stmts.body().iter().next()
+    } else {
+        Some(body)
+    };
+    first.is_some_and(|n| n.as_match_predicate_node().is_some())
+}
+
+/// A parenthesized condition's own body, flattened to its statement list —
+/// `ParenthesesNode#body` is `None` for a bare `()`, else either a single
+/// non-`StatementsNode` expression or (the common case) a `StatementsNode`
+/// wrapping one-or-more `;`-separated statements.
+fn tp_paren_children<'pr>(paren: &ruby_prism::ParenthesesNode<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    paren
+        .body()
+        .map(|b| {
+            if let Some(s) = b.as_statements_node() {
+                s.body().iter().collect()
+            } else {
+                vec![b]
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn tp_last_body_child<'pr>(paren: &ruby_prism::ParenthesesNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    tp_paren_children(paren).into_iter().last()
+}
+
+/// `SafeAssignment#safe_assignment?`: `(begin {equals_asgn? #setter_method?})`
+/// — the condition must ITSELF be a literal `(...)` group with EXACTLY one
+/// statement inside, and that statement a plain `=` write or a setter call
+/// (reuses `pac_is_safe_assignment`, which implements the identical
+/// `Style/ParenthesesAroundCondition` inner test).
+fn tp_is_safe_assignment(condition: &ruby_prism::Node<'_>) -> bool {
+    let Some(paren) = condition.as_parentheses_node() else { return false };
+    let children = tp_paren_children(&paren);
+    children.len() == 1 && pac_is_safe_assignment(&children[0])
+}
+
+/// `offense?`: safe-assignment conditions are governed solely by
+/// `AllowSafeAssignment` (regardless of `EnforcedStyle`); otherwise it's
+/// styled — `require_parentheses_when_complex` flips on `complex_condition?`
+/// rather than a fixed "always require"/"always omit".
+fn tp_offense(condition: &ruby_prism::Node<'_>, style: &str, allow_safe_assignment: bool) -> bool {
+    if tp_is_safe_assignment(condition) {
+        return !allow_safe_assignment;
+    }
+    let parens = condition.as_parentheses_node().is_some();
+    if style == "require_parentheses_when_complex" {
+        if tp_complex_condition(condition) {
+            !parens
+        } else {
+            parens
+        }
+    } else {
+        let require = style == "require_parentheses";
+        if require {
+            !parens
+        } else {
+            parens
+        }
+    }
+}
+
+/// `message`: `require_parentheses_when_complex` phrases its command as
+/// "Only use"/"Use" (keyed off whether parens are ALREADY present, since
+/// either direction of correction is possible under this style); the other
+/// two styles are unconditionally "Use"/"Omit", one fixed direction each.
+fn tp_message(condition: &ruby_prism::Node<'_>, style: &str) -> String {
+    let parens = condition.as_parentheses_node().is_some();
+    if style == "require_parentheses_when_complex" {
+        let command = if parens { "Only use" } else { "Use" };
+        format!("{command} parentheses for ternary expressions with complex conditions.")
+    } else {
+        let command = if style == "require_parentheses" { "Use" } else { "Omit" };
+        format!("{command} parentheses for ternary conditions.")
+    }
+}
+
+/// `complex_condition?`: recurses through NESTED literal parens only (a
+/// non-`begin`/non-parenthesized node is a recursion LEAF, classified
+/// directly by `non_complex_expression?` — its own children are never
+/// visited, so `bar && (baz || bar)` is complex because `&&`'s `and_type?`
+/// itself isn't in `NON_COMPLEX_TYPES`, not because `baz || bar` is complex).
+fn tp_complex_condition(condition: &ruby_prism::Node<'_>) -> bool {
+    if let Some(paren) = condition.as_parentheses_node() {
+        tp_paren_children(&paren).iter().any(tp_complex_condition)
+    } else {
+        !tp_non_complex_expression(condition)
+    }
+}
+
+/// `non_complex_expression?`: `NON_COMPLEX_TYPES` (variable reads, `const`
+/// reads — bare or scoped, `defined?`, `yield`) or a non-complex send.
+fn tp_non_complex_expression(node: &ruby_prism::Node<'_>) -> bool {
+    node.as_instance_variable_read_node().is_some()
+        || node.as_global_variable_read_node().is_some()
+        || node.as_class_variable_read_node().is_some()
+        || node.as_local_variable_read_node().is_some()
+        || node.as_constant_read_node().is_some()
+        || node.as_constant_path_node().is_some()
+        || node.as_defined_node().is_some()
+        || node.as_yield_node().is_some()
+        || tp_non_complex_send(node)
+}
+
+/// `non_complex_send?`: any call whose method name ISN'T a symbolic operator
+/// counts as simple (`bar.baz?`, `bar[:baz]` via the explicit `[]`
+/// carve-out); actual operator calls (`1 + 1`, `foo == bar`, ...) are
+/// complex.
+fn tp_non_complex_send(node: &ruby_prism::Node<'_>) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    let name = call.name().as_slice();
+    !tp_is_operator_method(name) || name == b"[]"
+}
+
+/// `OPERATOR_METHODS` (`MethodIdentifierPredicates`), verbatim.
+fn tp_is_operator_method(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"|" | b"^"
+            | b"&"
+            | b"<=>"
+            | b"=="
+            | b"==="
+            | b"=~"
+            | b">"
+            | b">="
+            | b"<"
+            | b"<="
+            | b"<<"
+            | b">>"
+            | b"+"
+            | b"-"
+            | b"*"
+            | b"/"
+            | b"%"
+            | b"**"
+            | b"~"
+            | b"+@"
+            | b"-@"
+            | b"!@"
+            | b"~@"
+            | b"[]"
+            | b"[]="
+            | b"!"
+            | b"!="
+            | b"!~"
+            | b"`"
+    )
+}
+
+/// `unsafe_autocorrect?`: the parenthesized condition's sole statement is a
+/// semantic `or`/`and` (`foo or bar`, not `foo || bar`) or a prefix `not` —
+/// removing the parens would silently change what the `?:` binds to.
+fn tp_unsafe_autocorrect(condition: &ruby_prism::Node<'_>) -> bool {
+    let Some(paren) = condition.as_parentheses_node() else { return false };
+    tp_paren_children(&paren).iter().any(tp_below_ternary_precedence)
+}
+
+/// `below_ternary_precedence?`, verbatim (see `Style/ParenthesesAroundCondition`'s
+/// `pac_is_modifier_op` for the same `prefix_not?` idiom used elsewhere in
+/// this file).
+fn tp_below_ternary_precedence(node: &ruby_prism::Node<'_>) -> bool {
+    if let Some(or) = node.as_or_node() {
+        if or.operator_loc().as_slice() == b"or" {
+            return true;
+        }
+    }
+    if let Some(and) = node.as_and_node() {
+        if and.operator_loc().as_slice() == b"and" {
+            return true;
+        }
+    }
+    if let Some(call) = node.as_call_node() {
+        if call.receiver().is_some()
+            && call.name().as_slice() == b"!"
+            && call.message_loc().is_some_and(|m| m.as_slice() == b"not")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `correct_unparenthesized`: `corrector.wrap(condition, '(', ')')`.
+fn tp_correct_unparenthesized(cops: &mut Cops<'_>, condition: &ruby_prism::Node<'_>) {
+    let loc = condition.location();
+    cops.fixes.push((loc.start_offset(), loc.start_offset(), b"(".to_vec()));
+    cops.fixes.push((loc.end_offset(), loc.end_offset(), b")".to_vec()));
+}
+
+/// `node_args_need_parens?`: does `send_node`'s OWN argument list need to
+/// gain explicit `()` once the condition's outer parens are stripped? Only
+/// when it (a) actually has arguments, (b) isn't ALREADY parenthesized, and
+/// (c) is either a dot/safe-nav call (`bar.foo? 10`) or a receiverless
+/// command call whose name reads as a plain (lowercase-starting) identifier
+/// (`baz? bar`, `defined? bar`) — the `unparenthesized_method_call?` regex
+/// check, collapsed to "starts with an ASCII letter" since every call/
+/// `defined?` node reaching this point already has a real method-name-shaped
+/// selector (no bare operator call ever lacks a receiver AND takes args this
+/// way).
+fn tp_node_args_need_parens(node: &ruby_prism::Node<'_>) -> bool {
+    if let Some(call) = node.as_call_node() {
+        let Some(args) = call.arguments() else { return false };
+        if args.arguments().iter().next().is_none() {
+            return false;
+        }
+        if call.opening_loc().is_some() {
+            return false;
+        }
+        if call.call_operator_loc().is_some() {
+            return true;
+        }
+        call.name().as_slice().first().is_some_and(|b| b.is_ascii_alphabetic())
+    } else if let Some(defined) = node.as_defined_node() {
+        defined.lparen_loc().is_none()
+    } else {
+        false
+    }
+}

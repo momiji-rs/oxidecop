@@ -312,6 +312,7 @@ COPS = {
   'Style/AndOr'                      => 'style/and_or',
   'Style/IdenticalConditionalBranches' => 'style/identical_conditional_branches',
   'Style/YodaCondition'              => 'style/yoda_condition',
+  'Style/TernaryParentheses'         => 'style/ternary_parentheses',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
