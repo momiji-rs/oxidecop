@@ -18345,3 +18345,497 @@ fn sa_build_bracketed_array(
     out.push(b']');
     out
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/HashTransformValues (mixin `HashTransformMethod`, shared with
+    /// `Style/HashTransformKeys`) — `each_with_object({})`, `map{}.to_h`,
+    /// `Hash[map{}]`, and `to_h{}` shapes that only rewrite the VALUE half of
+    /// a key/value pair (the key passes through untouched as a bare lvar
+    /// read) collapse to `transform_values { |v| ... }`.
+    ///
+    /// rubocop drives all four shapes off two AST-node kinds:
+    /// `on_block`/`on_numblock`(N/A here — numblock never matches, see
+    /// below)/`on_send`/`on_csend`. Prism folds a call's own trailing block
+    /// into the SAME `CallNode` (no separate wrapping node the way
+    /// whitequark's `:block` type wraps a `:send`), so every one of the four
+    /// shapes is reachable from a single `visit_call_node` hook by switching
+    /// on `node.name()` — no `visit_block_node` hook needed.
+    ///
+    /// `minimum_target_ruby_version 2.4` gates the whole cop;
+    /// `target_ruby_version < 2.6` additionally guards ONLY the bare
+    /// `_.to_h { |k, v| ... }` shape (`to_h` didn't accept a block before
+    /// 2.6) — `map{}.to_h` and `Hash[map{}]` have no such gate, matching
+    /// `HashTransformMethod#on_block`'s early return applying only to its
+    /// `on_bad_to_h` call.
+    pub(crate) fn check_hash_transform_values<'pr>(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        const COP: &str = "Style/HashTransformValues";
+        if !self.on(COP) || self.cfg.target_ruby() < 2.4 {
+            return;
+        }
+        match node.name().as_slice() {
+            b"each_with_object" => self.htv_try_each_with_object(node),
+            b"to_h" => {
+                self.htv_try_map_to_h(node);
+                if self.cfg.target_ruby() >= 2.6 {
+                    self.htv_try_to_h_block(node);
+                }
+            }
+            b"[]" => self.htv_try_hash_brackets_map(node),
+            _ => {}
+        }
+    }
+
+    /// `on_bad_each_with_object` — `hash_receiver.each_with_object(HASH) {
+    /// |(key, val), memo| memo[key] = EXPR }`. Offense anchor and full strip
+    /// range are the SAME call: prism's `CallNode::location` already spans
+    /// from the receiver chain through the block's own closing delimiter
+    /// (verified against live `Prism.parse` — unlike the raw nested
+    /// `BlockNode`, whose own `location` starts at `{`/`do`, NOT the
+    /// receiver chain — hence hooking this from the CALL, never the block).
+    fn htv_try_each_with_object<'pr>(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        let Some(receiver) = node.receiver() else { return };
+        if !htv_hash_receiver(&receiver) {
+            return;
+        }
+        // `(hash)` — exactly one argument, itself a literal hash (any
+        // number of pairs, even zero — `each_with_object({})` is typical
+        // but the pattern doesn't require emptiness).
+        let Some(args) = node.arguments() else { return };
+        let arg_list: Vec<_> = args.arguments().iter().collect();
+        if arg_list.len() != 1 || arg_list[0].as_hash_node().is_none() {
+            return;
+        }
+        let Some(block) = node.block().and_then(|b| b.as_block_node()) else { return };
+        let Some(params_node) = block.parameters() else { return };
+        let Some(bp) = params_node.as_block_parameters_node() else { return };
+        let Some(params) = bp.parameters() else { return };
+        if !htv_only_requireds(&params, 2) {
+            return;
+        }
+        let requireds: Vec<_> = params.requireds().iter().collect();
+        // `(mlhs (arg _key) (arg $_))` — the first param must be a
+        // destructured `(k, v)` pair, exactly two plain names, no
+        // splat/rest.
+        let Some(mtn) = requireds[0].as_multi_target_node() else { return };
+        if mtn.rest().is_some() || mtn.rights().iter().count() != 0 {
+            return;
+        }
+        let lefts: Vec<_> = mtn.lefts().iter().collect();
+        if lefts.len() != 2 {
+            return;
+        }
+        let Some(key_param) = lefts[0].as_required_parameter_node() else { return };
+        let Some(val_param) = lefts[1].as_required_parameter_node() else { return };
+        let Some(memo_param) = requireds[1].as_required_parameter_node() else { return };
+        let key_name = key_param.name().as_slice().to_vec();
+        let val_name = val_param.name().as_slice().to_vec();
+        let memo_name = memo_param.name().as_slice().to_vec();
+
+        // `(call (lvar _memo) :[]= $(lvar _key) $!\`_memo)` — the block's
+        // sole statement must be exactly `memo[key] = EXPR`.
+        let Some(body) = block.body() else { return };
+        let Some(stmt) = htv_single_stmt(body) else { return };
+        let Some(asgn) = stmt.as_call_node() else { return };
+        if asgn.name().as_slice() != b"[]=" {
+            return;
+        }
+        let Some(asgn_recv) = asgn.receiver() else { return };
+        let Some(recv_lvar) = asgn_recv.as_local_variable_read_node() else { return };
+        if recv_lvar.name().as_slice() != memo_name.as_slice() {
+            return;
+        }
+        let Some(asgn_args) = asgn.arguments() else { return };
+        let mut asgn_arg_iter = asgn_args.arguments().iter();
+        let Some(key_arg) = asgn_arg_iter.next() else { return };
+        let Some(val_body) = asgn_arg_iter.next() else { return };
+        if asgn_arg_iter.next().is_some() {
+            return;
+        }
+        let Some(key_body) = key_arg.as_local_variable_read_node() else { return };
+        if key_body.name().as_slice() != key_name.as_slice() {
+            return;
+        }
+
+        if !htv_passes_guards(&val_body, &key_name, &val_name) {
+            return;
+        }
+        // The node-pattern's `$!\`_memo` unification: reject if EXPR itself
+        // (or anything nested in it) still reads the accumulator hash —
+        // verified live against RuboCop::NodePattern (`h[k] = h` and
+        // `h[k] = h.count` both fail to match upstream's raw matcher).
+        if htv_refs_lvar(&val_body, &memo_name) {
+            return;
+        }
+
+        let call_loc = node.location();
+        self.htv_fire(
+            call_loc.start_offset(),
+            call_loc.start_offset(),
+            call_loc.end_offset(),
+            0,
+            0,
+            node,
+            &val_name,
+            &val_body,
+            "each_with_object",
+        );
+    }
+
+    /// `on_bad_to_h` — `hash_receiver.to_h { |key, val| [key, EXPR] }`.
+    /// Same call-is-the-whole-node shape as each_with_object (no
+    /// leading/trailing stripping), gated by `target_ruby_version >= 2.6` by
+    /// the caller.
+    fn htv_try_to_h_block<'pr>(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        let Some(receiver) = node.receiver() else { return };
+        if !htv_hash_receiver(&receiver) {
+            return;
+        }
+        if node.arguments().is_some() {
+            return;
+        }
+        let Some((val_name, val_body)) = htv_match_pair_block(node) else { return };
+        let call_loc = node.location();
+        self.htv_fire(
+            call_loc.start_offset(),
+            call_loc.start_offset(),
+            call_loc.end_offset(),
+            0,
+            0,
+            node,
+            &val_name,
+            &val_body,
+            "to_h {...}",
+        );
+    }
+
+    /// `on_bad_map_to_h` — `hash_receiver.map { |key, val| [key, EXPR] }.to_h`
+    /// (`collect` accepted too). `node` here is the OUTER `.to_h` call;
+    /// `map_call` (its receiver) is the call whose selector/args/params/body
+    /// actually get rewritten into `transform_values`.
+    fn htv_try_map_to_h<'pr>(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if node.arguments().is_some() {
+            return;
+        }
+        let Some(receiver) = node.receiver() else { return };
+        let Some(map_call) = receiver.as_call_node() else { return };
+        if !matches!(map_call.name().as_slice(), b"map" | b"collect") {
+            return;
+        }
+        let Some(map_receiver) = map_call.receiver() else { return };
+        if !htv_hash_receiver(&map_receiver) {
+            return;
+        }
+        let Some((val_name, val_body)) = htv_match_pair_block(&map_call) else { return };
+
+        // Autocorrection.from_map_to_h: leading is always 0; trailing is 0
+        // when `.to_h` carries its OWN trailing block (that block is
+        // unrelated to this match and must survive untouched, e.g.
+        // `map{}.to_h { |k, v| [v, k] } `), else it's whatever sits between
+        // the map block's own end and this call's end (a bare `.to_h`,
+        // possibly with a line break before it).
+        let (node_start, node_end) = htv_call_extent_excl_block(node);
+        let map_end = map_call.location().end_offset();
+        let trailing = if node.block().is_some() { 0 } else { node_end - map_end };
+
+        self.htv_fire(
+            node_start,
+            node_start,
+            node_end,
+            0,
+            trailing,
+            &map_call,
+            &val_name,
+            &val_body,
+            "map {...}.to_h",
+        );
+    }
+
+    /// `on_bad_hash_brackets_map` — `Hash[hash_receiver.map { |key, val|
+    /// [key, EXPR] }]` (`collect` accepted too). Upstream's outer pattern is
+    /// explicitly `send`-typed (never `csend`), so a hypothetical
+    /// `Hash&.[](...)` is excluded.
+    fn htv_try_hash_brackets_map<'pr>(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if node.is_safe_navigation() {
+            return;
+        }
+        let Some(receiver) = node.receiver() else { return };
+        let Some(cr) = receiver.as_constant_read_node() else { return };
+        if cr.name().as_slice() != b"Hash" {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let arg_list: Vec<_> = args.arguments().iter().collect();
+        if arg_list.len() != 1 {
+            return;
+        }
+        let Some(map_call) = arg_list[0].as_call_node() else { return };
+        if !matches!(map_call.name().as_slice(), b"map" | b"collect") {
+            return;
+        }
+        let Some(map_receiver) = map_call.receiver() else { return };
+        if !htv_hash_receiver(&map_receiver) {
+            return;
+        }
+        let Some((val_name, val_body)) = htv_match_pair_block(&map_call) else { return };
+
+        let (node_start, node_end) = htv_call_extent_excl_block(node);
+        self.htv_fire(
+            node_start,
+            node_start,
+            node_end,
+            "Hash[".len(),
+            "]".len(),
+            &map_call,
+            &val_name,
+            &val_body,
+            "Hash[_.map {...}]",
+        );
+    }
+
+    /// Shared correction: strip `leading`/`trailing` bytes off
+    /// `[strip_start, strip_end)`, rename `target_call`'s selector (plus its
+    /// own parenthesized args, if any — only `each_with_object({})` has
+    /// those) to `transform_values`, replace its block's `|k, v|` params
+    /// with `|val_name|`, and replace its block's body with `val_body`'s
+    /// source (wrapped in `{ }` when `val_body` is itself a brace-less
+    /// keyword-hash, mirroring `hash_type? && !braces?`).
+    fn htv_fire<'pr>(
+        &mut self,
+        anchor: usize,
+        strip_start: usize,
+        strip_end: usize,
+        leading: usize,
+        trailing: usize,
+        target_call: &ruby_prism::CallNode<'pr>,
+        val_name: &[u8],
+        val_body: &ruby_prism::Node<'pr>,
+        match_desc: &str,
+    ) {
+        const COP: &str = "Style/HashTransformValues";
+        self.push(anchor, COP, true, format!("Prefer `transform_values` over `{match_desc}`."));
+
+        if leading > 0 {
+            self.fixes.push((strip_start, strip_start + leading, Vec::new()));
+        }
+        if trailing > 0 {
+            self.fixes.push((strip_end - trailing, strip_end, Vec::new()));
+        }
+
+        let msg_loc = target_call.message_loc().expect("call always has a message");
+        let name_end =
+            target_call.closing_loc().map(|c| c.end_offset()).unwrap_or_else(|| msg_loc.end_offset());
+        self.fixes.push((msg_loc.start_offset(), name_end, b"transform_values".to_vec()));
+
+        let block = target_call.block().and_then(|b| b.as_block_node()).expect("matched a block shape");
+        let params = block.parameters().expect("matched exactly two params");
+        let p_loc = params.location();
+        let mut new_params = Vec::with_capacity(val_name.len() + 2);
+        new_params.push(b'|');
+        new_params.extend_from_slice(val_name);
+        new_params.push(b'|');
+        self.fixes.push((p_loc.start_offset(), p_loc.end_offset(), new_params));
+
+        let body = block.body().expect("matched a single-statement body");
+        let body_loc = body.location();
+        let mut body_src = self.node_src(val_body).to_vec();
+        if val_body.as_keyword_hash_node().is_some() {
+            let mut wrapped = b"{ ".to_vec();
+            wrapped.extend_from_slice(&body_src);
+            wrapped.extend_from_slice(b" }");
+            body_src = wrapped;
+        }
+        self.fixes.push((body_loc.start_offset(), body_loc.end_offset(), body_src));
+    }
+}
+
+/// `HashTransformMethod#hash_receiver?` — does `node` look like it produces
+/// a Hash? A literal hash; a blockless call to one of a fixed whitelist
+/// (`to_h`, `to_hash`, `merge`, `merge!`, `update`, `invert`, `except`,
+/// `tally`); a call-with-block to a different whitelist (`group_by`, `to_h`,
+/// `tally`, `transform_keys[!]`, `transform_values[!]`); or
+/// `each_with_object` with a block AND a literal-hash sole argument.
+fn htv_hash_receiver(node: &ruby_prism::Node) -> bool {
+    if node.as_hash_node().is_some() {
+        return true;
+    }
+    let Some(call) = node.as_call_node() else { return false };
+    let name = call.name().as_slice();
+    match call.block().and_then(|b| b.as_block_node()) {
+        None => matches!(
+            name,
+            b"to_h" | b"to_hash" | b"merge" | b"merge!" | b"update" | b"invert" | b"except" | b"tally"
+        ),
+        Some(_) => {
+            matches!(
+                name,
+                b"group_by"
+                    | b"to_h"
+                    | b"tally"
+                    | b"transform_keys"
+                    | b"transform_keys!"
+                    | b"transform_values"
+                    | b"transform_values!"
+            ) || (name == b"each_with_object" && htv_ewo_hash_arg(&call))
+        }
+    }
+}
+
+/// `(block (send _ :each_with_object (hash)) ...)` — the nested
+/// `each_with_object`'s own sole argument must be a literal hash.
+fn htv_ewo_hash_arg(call: &ruby_prism::CallNode) -> bool {
+    let Some(args) = call.arguments() else { return false };
+    let list: Vec<_> = args.arguments().iter().collect();
+    list.len() == 1 && list[0].as_hash_node().is_some()
+}
+
+/// A `ParametersNode` has EXACTLY `n` required positional params and
+/// nothing else (no optionals/rest/post/keywords/kwrest/block) — mirrors
+/// upstream's `(args (arg _)(arg _))`-style patterns, which demand an exact
+/// child count of a specific shape.
+fn htv_only_requireds(params: &ruby_prism::ParametersNode, n: usize) -> bool {
+    params.requireds().iter().count() == n
+        && params.optionals().iter().count() == 0
+        && params.rest().is_none()
+        && params.posts().iter().count() == 0
+        && params.keywords().iter().count() == 0
+        && params.keyword_rest().is_none()
+        && params.block().is_none()
+}
+
+/// Shared shape check for the three "`{ |key, val| [key, EXPR] }`" matchers
+/// (`on_bad_to_h`, and the map/collect block inside `on_bad_map_to_h` /
+/// `on_bad_hash_brackets_map`): exactly two plain (non-destructured) block
+/// params, a single-statement body that's a 2-element array literal whose
+/// first element is a bare read of the key param, and the trailing guards
+/// (`noop_transformation?` / `transformation_uses_both_args?` /
+/// `use_transformed_argname?`). Returns `(val_argname, val_body)` on match.
+fn htv_match_pair_block<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+) -> Option<(Vec<u8>, ruby_prism::Node<'pr>)> {
+    let block = call.block().and_then(|b| b.as_block_node())?;
+    let params_node = block.parameters()?;
+    let bp = params_node.as_block_parameters_node()?;
+    let params = bp.parameters()?;
+    if !htv_only_requireds(&params, 2) {
+        return None;
+    }
+    let requireds: Vec<_> = params.requireds().iter().collect();
+    let key_param = requireds[0].as_required_parameter_node()?;
+    let val_param = requireds[1].as_required_parameter_node()?;
+    let key_name = key_param.name().as_slice().to_vec();
+    let val_name = val_param.name().as_slice().to_vec();
+
+    let body = block.body()?;
+    let stmt = htv_single_stmt(body)?;
+    let arr = stmt.as_array_node()?;
+    let mut elem_iter = arr.elements().iter();
+    let key_elem = elem_iter.next()?;
+    let val_body = elem_iter.next()?;
+    if elem_iter.next().is_some() {
+        return None;
+    }
+    let key_body = key_elem.as_local_variable_read_node()?;
+    if key_body.name().as_slice() != key_name.as_slice() {
+        return None;
+    }
+
+    if !htv_passes_guards(&val_body, &key_name, &val_name) {
+        return None;
+    }
+    Some((val_name, val_body))
+}
+
+/// `handle_possible_offense`'s three shared guards, in upstream's order:
+/// `noop_transformation?` (the value expression IS just the value param,
+/// unchanged — nothing to transform, almost certainly a false-positive
+/// receiver), `transformation_uses_both_args?` (the value expression also
+/// reads the key param — can't be a values-only transform), and
+/// `use_transformed_argname?` (the value expression must read the value
+/// param SOMEWHERE, or there's nothing to preserve by keeping a block at
+/// all).
+fn htv_passes_guards(val_body: &ruby_prism::Node, key_name: &[u8], val_name: &[u8]) -> bool {
+    if htv_is_bare_lvar(val_body, val_name) {
+        return false;
+    }
+    if htv_refs_lvar(val_body, key_name) {
+        return false;
+    }
+    htv_refs_lvar(val_body, val_name)
+}
+
+/// `node.lvar_type? && node.children == [name]` — a bare local-variable
+/// read of exactly `name`, no wrapping expression at all.
+fn htv_is_bare_lvar(node: &ruby_prism::Node, name: &[u8]) -> bool {
+    node.as_local_variable_read_node().is_some_and(|l| l.name().as_slice() == name)
+}
+
+/// Does `node` (itself, or anywhere in its subtree) read a local variable
+/// named `name`? Upstream's `descendants`/`each_descendant` checks exclude
+/// the node itself, but the one case that distinction matters for (the
+/// value expression being NOTHING but a bare read of `name`) is already
+/// excluded by `htv_is_bare_lvar`/`noop_transformation?` before this ever
+/// runs, so a self-inclusive search is behaviorally equivalent here.
+fn htv_refs_lvar(node: &ruby_prism::Node, name: &[u8]) -> bool {
+    let mut finder = HtvLvarFinder { name, found: false };
+    finder.visit(node);
+    finder.found
+}
+
+struct HtvLvarFinder<'n> {
+    name: &'n [u8],
+    found: bool,
+}
+
+impl<'pr, 'n> ruby_prism::Visit<'pr> for HtvLvarFinder<'n> {
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        if node.name().as_slice() == self.name {
+            self.found = true;
+        }
+        ruby_prism::visit_local_variable_read_node(self, node);
+    }
+}
+
+/// A block body's single statement, or `None` for an empty body or one
+/// with more than one statement — mirrors whitequark's convention (a
+/// single-statement body is that statement directly, never wrapped) that
+/// upstream's node patterns rely on implicitly by matching the body's shape
+/// exactly; prism instead always wraps in a `StatementsNode`, so unwrap
+/// that (rejecting anything but exactly one child).
+fn htv_single_stmt(node: ruby_prism::Node) -> Option<ruby_prism::Node> {
+    if let Some(stmts) = node.as_statements_node() {
+        let mut it = stmts.body().iter();
+        let first = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        Some(first)
+    } else {
+        Some(node)
+    }
+}
+
+/// The rubocop-equivalent "send node" extent of a prism `CallNode`: the
+/// start is always the receiver-chain start (prism never lets a trailing
+/// block push this back), but the end must EXCLUDE a trailing block if one
+/// is attached — prism's own `CallNode::location` folds an attached block
+/// into the call's range (verified live: a bare `foo.each_with_object({})
+/// { ... }` CallNode's `location` spans through the block's closing `}`),
+/// whereas whitequark's (and thus rubocop's) plain `send` node never
+/// includes a block it's wrapped by. Needed only for the two SEND-based
+/// matchers (`map{}.to_h`, `Hash[map{}]`), where rubocop's `node` is
+/// deliberately block-exclusive even when the call happens to carry one
+/// (e.g. `map{}.to_h { |k, v| [v, k] }`).
+fn htv_call_extent_excl_block(call: &ruby_prism::CallNode) -> (usize, usize) {
+    let loc = call.location();
+    let start = loc.start_offset();
+    if call.block().is_none() {
+        return (start, loc.end_offset());
+    }
+    let end = call
+        .closing_loc()
+        .map(|c| c.end_offset())
+        .or_else(|| call.message_loc().map(|m| m.end_offset()))
+        .unwrap_or_else(|| loc.end_offset());
+    (start, end)
+}
