@@ -7073,6 +7073,11 @@ impl<'a> super::Cops<'a> {
         if body_start >= body_end {
             return; // `body.strip.empty?`
         }
+        // upstream's `heredoc_body` always starts at COLUMN 0 of the line
+        // after the opener; an interpolated heredoc's first part is the
+        // `#{...}` itself, whose start offset would drop the line's leading
+        // whitespace and fake a zero min-indent (rails plugin_helpers.rb).
+        let body_start = self.idx.starts[self.idx.loc(body_start).0 - 1];
         let Ok(body) = std::str::from_utf8(&self.src[body_start..body_end]) else { return };
         if body.trim().is_empty() {
             return; // `body.strip.empty?`

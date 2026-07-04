@@ -1632,7 +1632,7 @@ impl<'a> Cops<'a> {
         let Some(block) = ml_module_new_block(&node.value()) else { return };
         let (max, count_comments, foldable) = self.ml_config(COP);
         let mut length = match block.body() {
-            Some(b) => self.ml_node_own_length(&b, count_comments),
+            Some(b) => self.ml_method_body_length(&b, count_comments),
             None => 0,
         };
         if foldable.any() {
@@ -1763,7 +1763,7 @@ impl<'a> Cops<'a> {
         }
         let (max, count_comments, foldable) = self.ml_config(COP);
         let mut length = match block.body() {
-            Some(b) => self.ml_node_own_length(&b, count_comments),
+            Some(b) => self.ml_method_body_length(&b, count_comments),
             None => 0,
         };
         if foldable.any() {
@@ -1895,7 +1895,7 @@ impl<'a> Cops<'a> {
         }
         let (max, count_comments, foldable) = self.ml_config(COP);
         let mut length = match node.body() {
-            Some(b) => self.ml_node_own_length(&b, count_comments),
+            Some(b) => self.ml_method_body_length(&b, count_comments),
             None => 0,
         };
         if foldable.any() {
@@ -1925,7 +1925,7 @@ impl<'a> Cops<'a> {
         let Some((call, block)) = cl_class_new_block(value) else { return };
         let (max, count_comments, foldable) = self.ml_config(COP);
         let mut length = match block.body() {
-            Some(b) => self.ml_node_own_length(&b, count_comments),
+            Some(b) => self.ml_method_body_length(&b, count_comments),
             None => 0,
         };
         if foldable.any() {
@@ -2269,6 +2269,15 @@ impl<'i> MlHeredocEndScanner<'i> {
         if std::mem::replace(&mut self.is_root, false) {
             return;
         }
+        // A prism BlockNode spans through its `end`, but its whitequark
+        // counterparts (the block's args + body, visited as children) stop
+        // earlier — the enclosing CallNode already carries the full span
+        // when the block-call is itself a descendant, so recording the
+        // BlockNode would leak the `end` line when the block-call is the
+        // (excluded) root.
+        if node.as_block_node().is_some() {
+            return;
+        }
         let line = if super::breakable::is_heredoc_node(node) {
             let closing = if let Some(n) = node.as_string_node() {
                 n.closing_loc()
@@ -2402,7 +2411,24 @@ impl<'a> Cops<'a> {
         if gate.found {
             let first_line = self.idx.loc(start).0;
             let mut scanner = MlHeredocEndScanner { idx: self.idx, is_root: true, max_line: first_line };
-            scanner.visit(body);
+            // `source_from_node_with_heredoc` takes the max over DESCENDANTS
+            // only — the body node itself never contributes its own last
+            // line. Whitequark's unwrapped single-statement body (a do-block
+            // spanning the whole def) is therefore excluded, so a prism
+            // StatementsNode with ONE child must scan from that child as the
+            // root, or the block's own `end` line leaks into the count
+            // (rails releaser_test.rb: 20 vs upstream's 19).
+            let sole = body
+                .as_statements_node()
+                .and_then(|st| {
+                    let mut it = st.body().iter();
+                    let first = it.next();
+                    if it.next().is_none() { first } else { None }
+                });
+            match sole {
+                Some(child) => scanner.visit(&child),
+                None => scanner.visit(body),
+            }
             let mut length = 0i64;
             for line in first_line..=scanner.max_line {
                 if !self.ml_irrelevant_file_line(line, count_comments) {
