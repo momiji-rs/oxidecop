@@ -35925,7 +35925,18 @@ fn rp_descend_unary<'a>(node: &ruby_prism::Node<'a>, src: &[u8]) -> ruby_prism::
         return c.as_node();
     }
     match c.receiver() {
-        Some(recv) => rp_descend_unary(&recv, src),
+        // a NON-call receiver (`!"str"`, `-[1, 2].sum` — rails corpus
+        // panic) ends upstream's `while suspect_unary?(node)` loop right
+        // there: `suspect_unary?` is false for any non-send node, so the
+        // receiver becomes the descend result (and `method_call_with_
+        // redundant_parentheses?` then rejects it).
+        Some(recv) => {
+            if recv.as_call_node().is_some() {
+                rp_descend_unary(&recv, src)
+            } else {
+                recv
+            }
+        }
         None => c.as_node(),
     }
 }
