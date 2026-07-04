@@ -8904,3 +8904,138 @@ fn ul_conditional_continue_keyword(node: &ruby_prism::Node) -> bool {
     f.last_matches.unwrap_or(false)
 }
 
+
+impl<'a> super::Cops<'a> {
+    /// Lint/RedundantRequireStatement — `require` of a feature already
+    /// loaded by the target Ruby version. Mirrors upstream's
+    /// `redundant_require_statement?` node matcher: `(send nil? :require
+    /// (str #redundant_feature?))` — a bare, receiver-less `require` call
+    /// with exactly one plain (non-interpolated) string literal argument
+    /// naming a feature `rrs_redundant_feature` recognizes for the active
+    /// `target_ruby_version`.
+    ///
+    /// Offense anchor: the `require` call node's own start offset
+    /// (rubocop's `add_offense(node)` default location is the whole send
+    /// node's source range).
+    ///
+    /// Autocorrect has two shapes, both ported from the single
+    /// `corrector` block in the Ruby source:
+    ///   - Ordinary statement (the overwhelming common case): remove the
+    ///     WHOLE line(s) the call's own source range spans, final newline
+    ///     included (`range_by_whole_lines(node.source_range,
+    ///     include_final_newline: true)`).
+    ///   - The call is the SOLE statement of a modifier-form `if`/`unless`/
+    ///     `while`/`until` (`node.parent.modifier_form?`, flagged ahead of
+    ///     time by `rrs_note_modifier_body` since prism gives no parent
+    ///     pointers — see that field's doc on `rrs_modifier_end` in
+    ///     `mod.rs`): remove the call plus any immediately adjacent
+    ///     trailing horizontal whitespace then newlines
+    ///     (`range_with_surrounding_space(node.source_range, side:
+    ///     :right)`), and separately insert `"\nend"` right after the
+    ///     conditional's own end (a modifier form has no `end` keyword, so
+    ///     its own source range already ends at the predicate) — turning
+    ///     `require 'x' if cond` into `if cond\nend`.
+    pub(crate) fn check_redundant_require_statement(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/RedundantRequireStatement";
+        if !self.on(COP) {
+            return;
+        }
+        let call_start = node.location().start_offset();
+        // Consume the modifier-body note if it belongs to exactly this call
+        // node. It was set unconditionally for any bare-call modifier body
+        // (see `rrs_note_modifier_body`), so it must be cleared here even
+        // when this call turns out not to be a qualifying `require` — it
+        // can never be relevant to any OTHER node either way.
+        let modifier_end = match self.rrs_modifier_end.take() {
+            Some((s, e)) if s == call_start => Some(e),
+            other => {
+                self.rrs_modifier_end = other;
+                None
+            }
+        };
+        if node.name().as_slice() != b"require" || node.receiver().is_some() {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let items: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        if items.len() != 1 {
+            return;
+        }
+        let Some(str_node) = items[0].as_string_node() else { return };
+        if !rrs_redundant_feature(str_node.content_loc().as_slice(), self.cfg.target_ruby()) {
+            return;
+        }
+        self.push(call_start, COP, true, "Remove unnecessary `require` statement.");
+        if let Some(parent_end) = modifier_end {
+            let right_end = rrs_space_right(self.src, node.location().end_offset());
+            self.fixes.push((call_start, right_end, Vec::new()));
+            self.fixes.push((parent_end, parent_end, b"\nend".to_vec()));
+        } else {
+            let (line_s, _) = self.idx.loc(call_start);
+            let (line_e, _) = self.idx.loc(node.location().end_offset().saturating_sub(1));
+            let start = self.idx.starts[line_s - 1];
+            let end = self.idx.starts.get(line_e).copied().unwrap_or(self.src.len());
+            self.fixes.push((start, end, Vec::new()));
+        }
+    }
+
+    /// Called pre-recursion by `visit_if_node`/`visit_unless_node`/
+    /// `visit_while_node`/`visit_until_node` (see each call site) once
+    /// they've established the node is a genuine modifier-form conditional
+    /// (has a keyword, has no `end` keyword; `while`/`until` additionally
+    /// require the body to precede the keyword, ruling out the
+    /// `begin...end while` post-condition-loop shape). If the sole body
+    /// statement is a bare call node, record it — matching value — so
+    /// `check_redundant_require_statement` can recognize its parent as
+    /// modifier-form once traversal reaches that exact call.
+    pub(crate) fn rrs_note_modifier_body(
+        &mut self,
+        stmts: Option<ruby_prism::StatementsNode>,
+        parent_end: usize,
+    ) {
+        if !self.on("Lint/RedundantRequireStatement") {
+            return;
+        }
+        let Some(stmts) = stmts else { return };
+        let items: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        if items.len() != 1 {
+            return;
+        }
+        if let Some(call) = items[0].as_call_node() {
+            self.rrs_modifier_end = Some((call.location().start_offset(), parent_end));
+        }
+    }
+}
+
+/// Upstream's `RUBY_22_LOADED_FEATURES` plus every other version-gated
+/// feature named in `redundant_feature?`'s doc comment: `enumerator`
+/// unconditionally; `thread` at 2.1+; `rational`/`complex` at 2.2+;
+/// `ruby2_keywords` at 2.7+; `fiber` at 3.1+; `set` at 3.2+; `pathname` at
+/// 4.0+.
+fn rrs_redundant_feature(feature: &[u8], target_ruby: f64) -> bool {
+    match feature {
+        b"enumerator" => true,
+        b"thread" => target_ruby >= 2.1,
+        b"rational" | b"complex" => target_ruby >= 2.2,
+        b"ruby2_keywords" => target_ruby >= 2.7,
+        b"fiber" => target_ruby >= 3.1,
+        b"set" => target_ruby >= 3.2,
+        b"pathname" => target_ruby >= 4.0,
+        _ => false,
+    }
+}
+
+/// The END position only of `RangeHelp#range_with_surrounding_space(range,
+/// side: :right)` (the start is left untouched by callers) — extend
+/// rightward over immediately adjacent horizontal whitespace, then over
+/// newlines.
+fn rrs_space_right(src: &[u8], mut end: usize) -> usize {
+    while end < src.len() && matches!(src[end], b' ' | b'\t') {
+        end += 1;
+    }
+    while end < src.len() && src[end] == b'\n' {
+        end += 1;
+    }
+    end
+}
+

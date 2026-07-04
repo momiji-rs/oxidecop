@@ -239,6 +239,7 @@ COPS = {
   'Style/InfiniteLoop'               => 'style/infinite_loop',
   'Style/OrAssignment'               => 'style/or_assignment',
   'Style/EmptyMethod'                => 'style/empty_method',
+  'Lint/RedundantRequireStatement'   => 'lint/redundant_require_statement',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -233,6 +233,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
+    "Lint/RedundantRequireStatement",
 ];
 
 impl Engine {
@@ -944,6 +945,15 @@ pub(crate) struct Cops<'a> {
     // main visitor runs, since the check needs assignments/references that
     // occur textually AFTER the loop too — see `infinite_loop_skips`.
     pub(crate) il_no_offense: HashSet<usize>,
+    // Lint/RedundantRequireStatement: (call's own start offset, enclosing
+    // modifier-form conditional's own end offset) set right before recursing
+    // into a modifier `if`/`unless`/`while`/`until` node's SOLE statement
+    // when that statement is itself a bare call (any call — validity as a
+    // redundant `require` is checked later) — rubocop's `node.parent&.
+    // modifier_form?`, since prism gives no parent pointers. Consumed
+    // (taken) the moment that exact call node is visited, whichever call it
+    // turns out to be, so it never leaks to an unrelated node.
+    pub(crate) rrs_modifier_end: Option<(usize, usize)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1429,6 +1439,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if node.end_keyword_loc().is_none() && node.if_keyword_loc().is_some() {
             self.check_multiline_if_modifier("if", node.location(), node.predicate(), node.statements());
             self.check_nested_modifier("if", node.predicate(), node.statements(), true);
+            self.rrs_note_modifier_body(node.statements(), node.location().end_offset());
         }
         self.cond_depth += 1;
         ruby_prism::visit_if_node(self, node);
@@ -1474,6 +1485,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if node.end_keyword_loc().is_none() {
             self.check_multiline_if_modifier("unless", node.location(), node.predicate(), node.statements());
             self.check_nested_modifier("unless", node.predicate(), node.statements(), true);
+            self.rrs_note_modifier_body(node.statements(), node.location().end_offset());
         }
         self.cond_depth += 1;
         ruby_prism::visit_unless_node(self, node);
@@ -2026,6 +2038,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             && node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset())
         {
             self.check_nested_modifier("while", node.predicate(), node.statements(), false);
+            self.rrs_note_modifier_body(node.statements(), node.location().end_offset());
         }
         self.check_while_until_modifier(
             &node.as_node(),
@@ -2065,6 +2078,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             && node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset())
         {
             self.check_nested_modifier("until", node.predicate(), node.statements(), false);
+            self.rrs_note_modifier_body(node.statements(), node.location().end_offset());
         }
         self.check_while_until_modifier(
             &node.as_node(),
@@ -2672,6 +2686,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_stderr_puts(node);
         self.check_not(node);
         self.check_duplicate_require(node);
+        self.check_redundant_require_statement(node);
         // Style/RedundantReturn also fires for method-defining blocks
         // (rubocop's RESTRICT_ON_SEND: define_method & friends, lambda).
         if self.hot.redundant_return
@@ -3052,6 +3067,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         renv_pending_kwbegin_stack: Vec::new(),
         renv_just_closed_kwbegin_renames: Vec::new(),
         il_no_offense: HashSet::new(),
+        rrs_modifier_end: None,
     };
 
     let t = tick(&T_PREP, t);
