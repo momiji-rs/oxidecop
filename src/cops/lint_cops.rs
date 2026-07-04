@@ -9375,3 +9375,288 @@ fn ms_contains_super(node: &ruby_prism::Node) -> bool {
     f.found
 }
 
+
+// ---- Lint/SafeNavigationConsistency ----
+//
+// Upstream (`lib/rubocop/cop/lint/safe_navigation_consistency.rb`): inside an
+// `&&`/`||` condition, every method call on the SAME receiver must use safe
+// navigation (`&.`) consistently. `on_and`/`on_or` (aliased) fire for EVERY
+// `and`/`or` node in the file, not just the topmost of a chain — nested
+// `and`/`or` nodes get their own independent pass. Each pass:
+//   1. walks its own `left`/`right` (recursing through nested `and`/`or`,
+//      dropping anything else — in particular a parenthesized group, which
+//      is neither `call_type?` nor `operator_keyword?` — see
+//      `operand_nodes`) collecting every call-type "operand" reached, tagged
+//      with which side (`&&` vs `||`) of whichever `and`/`or` node it came
+//      from directly (never through a dropped parenthesized wrapper — see
+//      the module doc below for why that case never arises here);
+//   2. groups those operands by receiver source text (`""` for a bare,
+//      receiver-less call — upstream's `receiver_name_as_key`, whose
+//      `method.parent.call_type?` branch is dead code for operands reached
+//      this way: an operand's immediate parent is always the `and`/`or`
+//      node it was `left`/`right` of, never another call);
+//   3. per group, `find_consistent_parts` picks a target navigation style
+//      (`.` or `&.`) and a start index into the group from the leftmost
+//      safe/unsafe calls found — see `snc_find_consistent_parts` for the
+//      literal port of its branching;
+//   4. every operand from that index onward that doesn't already match the
+//      target style gets flagged (and, unless it's an operator-method call
+//      like `foo + 1` with no dot to rewrite, corrected).
+//
+// Upstream's `Base#add_offense` silently drops a second offense registered
+// at a RANGE already claimed earlier in the SAME file (`current_offense_
+// locations.add?`) — since the commissioner dispatches pre-order (outer
+// `and`/`or` before the nested ones inside it), an outer pass can already
+// claim a range that an inner pass's own independent pass would also want to
+// flag; only the first (outer) registration counts. `Cops::snc_offended`
+// (keyed by the offense's own start offset — no two distinct candidate
+// offenses for this cop ever share a start offset) reproduces that.
+impl<'a> Cops<'a> {
+    pub(crate) fn check_safe_navigation_consistency(
+        &mut self,
+        left: ruby_prism::Node,
+        right: ruby_prism::Node,
+        is_and: bool,
+    ) {
+        const COP: &str = "Lint/SafeNavigationConsistency";
+        if !self.on(COP) {
+            return;
+        }
+
+        let mut operands: Vec<SncOperand<'a>> = Vec::new();
+        self.snc_collect(&left, is_and, &mut operands);
+        self.snc_collect(&right, is_and, &mut operands);
+
+        // `group_by` — preserve first-seen key order, and within each group
+        // the operands' original (left-to-right, depth-first) order.
+        let mut groups: Vec<(&'a [u8], Vec<usize>)> = Vec::new();
+        for (i, op) in operands.iter().enumerate() {
+            if let Some(g) = groups.iter_mut().find(|(k, _)| *k == op.receiver_key) {
+                g.1.push(i);
+            } else {
+                groups.push((op.receiver_key, vec![i]));
+            }
+        }
+
+        for (_, idxs) in &groups {
+            let Some((dot_is_period, begin)) = snc_find_consistent_parts(&operands, idxs) else {
+                continue;
+            };
+            for &i in &idxs[begin..] {
+                let op = &operands[i];
+                if snc_already_appropriate(op, dot_is_period) {
+                    continue;
+                }
+                self.snc_register_offense(op, dot_is_period);
+            }
+        }
+    }
+
+    /// `collect_operands`/`operand_nodes`: walk `node` (one side of an
+    /// `and`/`or` node), recursing through nested `and`/`or` nodes (their own
+    /// `left`/`right`, re-tagged with THEIR OWN kind — `parent_is_and` is
+    /// only consulted at the leaf) and collecting every call-type leaf
+    /// reached. Anything else (in particular a parenthesized group, which
+    /// upstream's whitequark `begin_type?`/prism `ParenthesesNode` is
+    /// neither `operator_keyword?` nor `call_type?`) is dropped — the whole
+    /// subtree underneath it, even if it's itself an `and`/`or` chain, is
+    /// invisible to THIS pass (it gets its own independent pass when the
+    /// visitor reaches that nested `and`/`or` node directly).
+    fn snc_collect(&self, node: &ruby_prism::Node, parent_is_and: bool, out: &mut Vec<SncOperand<'a>>) {
+        if let Some(and) = node.as_and_node() {
+            self.snc_collect(&and.left(), true, out);
+            self.snc_collect(&and.right(), true, out);
+        } else if let Some(or) = node.as_or_node() {
+            self.snc_collect(&or.left(), false, out);
+            self.snc_collect(&or.right(), false, out);
+        } else if let Some(call) = node.as_call_node() {
+            out.push(self.snc_make_operand(&call, parent_is_and));
+        }
+    }
+
+    fn snc_make_operand(&self, call: &ruby_prism::CallNode, in_and: bool) -> SncOperand<'a> {
+        const COP: &str = "Lint/SafeNavigationConsistency";
+        let name_bytes = call.name().as_slice();
+        let is_csend = call.is_safe_navigation();
+        let dot_range = call.call_operator_loc().map(|l| (l.start_offset(), l.end_offset()));
+        let is_dot = call.call_operator_loc().is_some_and(|l| l.as_slice() == b".");
+        let is_operator_method = snc_is_operator_method(name_bytes);
+        // `nilable?`: a safe-navigated call always is; otherwise a method
+        // nil itself responds to (upstream's `NilMethods` mixin — nil's own
+        // instance methods, plus `to_d`, plus the cop's configured
+        // `AllowedMethods`, default `present?`/`blank?`/`presence`/`try`/
+        // `try!` per the schema).
+        let is_nilable = is_csend || snc_is_builtin_nil_method(name_bytes) || self.allowed(COP, name_bytes);
+        let receiver_key: &'a [u8] = call.receiver().map(|r| self.node_src(&r)).unwrap_or(b"");
+        SncOperand {
+            node_start: call.location().start_offset(),
+            dot_range,
+            is_csend,
+            is_dot,
+            is_operator_method,
+            is_nilable,
+            receiver_key,
+            in_and,
+        }
+    }
+
+    /// `register_offense`: `offense_range` is the whole call for an
+    /// operator-method operand (no dot to anchor on, e.g. `foo + 1`),
+    /// otherwise the call-operator (`.`/`&.`) token. The corrector only
+    /// fires (and only then is the offense actually `[Correctable]`, per
+    /// upstream) for the latter case.
+    fn snc_register_offense(&mut self, op: &SncOperand, dot_is_period: bool) {
+        const COP: &str = "Lint/SafeNavigationConsistency";
+        let offense_start = if op.is_operator_method {
+            op.node_start
+        } else {
+            let Some((s, _)) = op.dot_range else { return };
+            s
+        };
+        // Upstream's range-identity offense dedup (see module doc above).
+        if !self.snc_offended.insert(offense_start) {
+            return;
+        }
+        let message = if dot_is_period {
+            "Use `.` instead of unnecessary `&.`."
+        } else {
+            "Use `&.` for consistency with safe navigation."
+        };
+        self.push(offense_start, COP, !op.is_operator_method, message);
+        if !op.is_operator_method {
+            if let Some((s, e)) = op.dot_range {
+                let replacement: &[u8] = if dot_is_period { b"." } else { b"&." };
+                self.fixes.push((s, e, replacement.to_vec()));
+            }
+        }
+    }
+}
+
+/// One call-type operand collected from an `&&`/`||` chain, tagged with
+/// which side (`in_and` = `&&`, else `||`) of its immediate `and`/`or`
+/// parent it came from — upstream's `operand_in_and?`/`operand_in_or?`,
+/// specialized: an operand's immediate parent, reached the way `snc_collect`
+/// reaches it, is ALWAYS the `and`/`or` node it was `left`/`right` of
+/// (never a parenthesized wrapper — see `snc_collect`'s doc), so upstream's
+/// defensive walk up through `begin_type?` ancestors never actually fires,
+/// and `operand_in_and?`/`operand_in_or?` collapse to this one bool.
+struct SncOperand<'a> {
+    /// The call's own start offset — the offense anchor for an
+    /// operator-method operand (`register_offense`'s `operand` branch).
+    node_start: usize,
+    /// The call-operator (`.`/`&.`) token's (start, end), if any.
+    dot_range: Option<(usize, usize)>,
+    is_csend: bool,
+    /// `dot?` — the call-operator token is exactly `.` (as opposed to
+    /// `&.`, `::`, or absent for a receiver-less call).
+    is_dot: bool,
+    is_operator_method: bool,
+    is_nilable: bool,
+    /// Receiver's own source text (`""` for a receiver-less call) — the
+    /// `group_by` key.
+    receiver_key: &'a [u8],
+    in_and: bool,
+}
+
+/// `most_left_indices`, inlined into `find_consistent_parts`: the leftmost
+/// index (within `idxs`, i.e. within ONE receiver-group) of, respectively, a
+/// safe-navigated (`csend`) operand on the `&&` side / the `||` side, and a
+/// non-nilable (`send`) operand on the `&&` side / the `||` side.
+fn snc_most_left_indices(
+    operands: &[SncOperand],
+    idxs: &[usize],
+) -> (Option<usize>, Option<usize>, Option<usize>, Option<usize>) {
+    let mut csend_in_and = None;
+    let mut csend_in_or = None;
+    let mut send_in_and = None;
+    let mut send_in_or = None;
+    for (idx, &oi) in idxs.iter().enumerate() {
+        let op = &operands[oi];
+        if op.in_and {
+            if op.is_csend && csend_in_and.is_none() {
+                csend_in_and = Some(idx);
+            }
+            if !op.is_nilable && send_in_and.is_none() {
+                send_in_and = Some(idx);
+            }
+        } else {
+            if op.is_csend && csend_in_or.is_none() {
+                csend_in_or = Some(idx);
+            }
+            if !op.is_nilable && send_in_or.is_none() {
+                send_in_or = Some(idx);
+            }
+        }
+    }
+    (csend_in_and, csend_in_or, send_in_and, send_in_or)
+}
+
+/// `find_consistent_parts`, ported literally (branch order matters — these
+/// are `elsif`s, not independent conditions): returns the target navigation
+/// style (`true` = `.`, `false` = `&.`) and the index INTO `idxs` (a single
+/// receiver-group) where flagging starts, or `None` if this group has
+/// nothing to reconcile (or is unreconcilable — a safe-navigated `&&` operand
+/// to the left of a safe-navigated `||` operand can never be made
+/// consistent by adding/removing navigation on the operands after it).
+fn snc_find_consistent_parts(operands: &[SncOperand], idxs: &[usize]) -> Option<(bool, usize)> {
+    let (csend_in_and, csend_in_or, send_in_and, send_in_or) = snc_most_left_indices(operands, idxs);
+
+    if let (Some(ca), Some(co)) = (csend_in_and, csend_in_or) {
+        if ca < co {
+            return None;
+        }
+    }
+
+    if let Some(ca) = csend_in_and {
+        let begin = match send_in_and {
+            Some(sa) => sa.min(ca),
+            None => ca,
+        };
+        return Some((true, begin + 1));
+    }
+    if let (Some(so), Some(co)) = (send_in_or, csend_in_or) {
+        return if so < co { Some((true, so + 1)) } else { Some((false, co + 1)) };
+    }
+    if let (Some(sa), Some(co)) = (send_in_and, csend_in_or) {
+        if sa < co {
+            return Some((true, co));
+        }
+    }
+    None
+}
+
+/// `already_appropriate_call?`.
+fn snc_already_appropriate(op: &SncOperand, dot_is_period: bool) -> bool {
+    if op.is_csend && !dot_is_period {
+        return true;
+    }
+    (op.is_dot || op.is_operator_method) && dot_is_period
+}
+
+/// `RuboCop::AST::Node::OPERATOR_METHODS`.
+fn snc_is_operator_method(name: &[u8]) -> bool {
+    const OPS: &[&[u8]] = &[
+        b"|", b"^", b"&", b"<=>", b"==", b"===", b"=~", b">", b">=", b"<", b"<=", b"<<", b">>", b"+", b"-", b"*",
+        b"/", b"%", b"**", b"~", b"+@", b"-@", b"!@", b"~@", b"[]", b"[]=", b"!", b"!=", b"!~", b"`",
+    ];
+    OPS.iter().any(|&op| op == name)
+}
+
+/// `NilMethods#nil_methods`, minus the cop-config `AllowedMethods` part
+/// (checked separately via `self.allowed`, so config overrides — like the
+/// fixture's own — apply): `nil.methods` (Ruby 3.4) plus `to_d`.
+fn snc_is_builtin_nil_method(name: &[u8]) -> bool {
+    const METHODS: &[&[u8]] = &[
+        b"!", b"!=", b"!~", b"&", b"<=>", b"==", b"===", b"=~", b"^", b"__id__", b"__send__", b"class", b"clone",
+        b"define_singleton_method", b"display", b"dup", b"enum_for", b"eql?", b"equal?", b"extend", b"freeze",
+        b"frozen?", b"hash", b"inspect", b"instance_eval", b"instance_exec", b"instance_of?",
+        b"instance_variable_defined?", b"instance_variable_get", b"instance_variable_set", b"instance_variables",
+        b"is_a?", b"itself", b"kind_of?", b"method", b"methods", b"nil?", b"object_id", b"private_methods",
+        b"protected_methods", b"public_method", b"public_methods", b"public_send", b"rationalize",
+        b"remove_instance_variable", b"respond_to?", b"send", b"singleton_class", b"singleton_method",
+        b"singleton_methods", b"tap", b"then", b"to_a", b"to_c", b"to_d", b"to_enum", b"to_f", b"to_h", b"to_i",
+        b"to_r", b"to_s", b"yield_self", b"|",
+    ];
+    METHODS.iter().any(|&m| m == name)
+}
+

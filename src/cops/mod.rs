@@ -309,6 +309,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/ExplicitBlockArgument",
     "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
     "Style/MethodCallWithoutArgsParentheses", "Style/Alias", "Style/RaiseArgs", "Style/MethodDefParentheses",
+    "Lint/SafeNavigationConsistency",
 ];
 
 impl Engine {
@@ -1225,6 +1226,18 @@ pub(crate) struct Cops<'a> {
     // not one nested deeper inside). Value: (open_start, open_end,
     // close_start, close_end) of the parens' own `(`/`)` delimiters.
     pub(crate) rescue_mod_parens: HashMap<usize, (usize, usize, usize, usize)>,
+    // Lint/SafeNavigationConsistency: start offsets of offense ranges
+    // already registered by an OUTER `and`/`or` node's pass over this same
+    // chain — since `on_and`/`on_or` fires for EVERY `and`/`or` node in the
+    // file (not just the topmost of a chain), a nested node's own pass can
+    // recompute the very same candidate offense. Upstream's
+    // `Base#add_offense` silently drops any later call whose range was
+    // already claimed (`current_offense_locations.add?`); this reproduces
+    // that dedup explicitly. Two distinct candidate ranges for this cop
+    // never share a start offset, so keying on the start offset alone
+    // (mirroring `sak_end_seen` above) is equivalent to upstream's
+    // full-range identity check.
+    pub(crate) snc_offended: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -3129,6 +3142,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
         self.check_and_with_identical_operands(node);
+        self.check_safe_navigation_consistency(node.left(), node.right(), true);
         let op = node.operator_loc();
         self.redundant_sort_logical_left.insert(node.left().location().start_offset(), (op.start_offset(), op.end_offset()));
         self.ra_needs_parens.insert(node.left().location().start_offset());
@@ -3140,6 +3154,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
         self.check_or_with_identical_operands(node);
+        self.check_safe_navigation_consistency(node.left(), node.right(), false);
         let op = node.operator_loc();
         self.redundant_sort_logical_left.insert(node.left().location().start_offset(), (op.start_offset(), op.end_offset()));
         self.ra_needs_parens.insert(node.left().location().start_offset());
@@ -3775,6 +3790,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         eba_def_stack: Vec::new(),
         eba_def_fixed: HashSet::new(),
         rescue_mod_parens: HashMap::new(),
+        snc_offended: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);
