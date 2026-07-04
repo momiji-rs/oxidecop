@@ -313,7 +313,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation",
+    "Layout/HeredocIndentation", "Style/RescueStandardError",
 ];
 
 impl Engine {
@@ -2415,6 +2415,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_rescue_exception(node);
         self.check_rescue_type(node);
         self.check_suppressed_exception(node);
+        self.check_rescue_standard_error(node);
         {
             let kw = node.keyword_loc();
             self.sak_check(kw.start_offset(), kw.end_offset(), b"rescue");

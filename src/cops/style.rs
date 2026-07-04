@@ -20529,3 +20529,87 @@ fn tcia_last_item_precedes_newline(src: &[u8], node: &ruby_prism::CallNode, item
     }
     i < text.len() && text[i] == b'\n'
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/RescueStandardError — per `EnforcedStyle` (`explicit`, the
+    /// default: `rescue` -> `rescue StandardError`; `implicit`: `rescue
+    /// StandardError` -> `rescue`). Ported from rubocop's
+    /// `RescueStandardError` (`include RescueNode, ConfigurableEnforcedStyle,
+    /// RangeHelp`, `extend AutoCorrector`).
+    ///
+    /// upstream's `on_resbody` fires on EVERY `resbody`/`RescueNode` clause
+    /// (each link of a multi-`rescue` chain gets its own call — traversal
+    /// already visits every `.subsequent()` node, see `mod.rs`'s
+    /// `visit_rescue_node`), guarded by `return if rescue_modifier?(node)`.
+    /// Prism gives the modifier form (`expr rescue expr2`) a wholly separate
+    /// node type (`RescueModifierNode`), so it never reaches this function —
+    /// that guard is satisfied for free by dispatch.
+    ///
+    /// - "bare" (`rescue_without_error_class?`, `(resbody nil? _ _)`) means
+    ///   `node.exceptions()` is empty — true for both plain `rescue` AND
+    ///   `rescue => e` (a var binding alone adds no exception class).
+    /// - "standard error" (`rescue_standard_error?`,
+    ///   `$(array (const {nil? cbase} :StandardError))`) means exactly ONE
+    ///   exception that is a ROOT `StandardError` const — plain or
+    ///   `::`-qualified, but NOT namespaced (`Foo::StandardError` doesn't
+    ///   match, mirroring `{nil? cbase}` rejecting a non-nil/non-cbase
+    ///   parent). Whether a var binding is present doesn't matter (the
+    ///   pattern's `_ _` wildcards the reference/body children).
+    ///
+    /// Offense anchors both styles on `node.loc.keyword` (`rescue`'s start
+    /// offset) — `push` only needs a start offset, matching every other
+    /// ported cop's anchor convention.
+    ///
+    /// Autocorrect:
+    /// - implicit: remove from the keyword's end through the exception
+    ///   node's end (upstream's `range_between(keyword.end_pos,
+    ///   error.source_range.end_pos)`) — deletes exactly " StandardError",
+    ///   leaving a trailing " => e" (if any) untouched.
+    /// - explicit: insert " StandardError" right after the keyword
+    ///   (upstream's `insert_after(node.loc.keyword, ' StandardError')`) —
+    ///   lands before a trailing " => e" (if any).
+    pub(crate) fn check_rescue_standard_error(&mut self, node: &ruby_prism::RescueNode) {
+        const COP: &str = "Style/RescueStandardError";
+        if !self.on(COP) {
+            return;
+        }
+        let implicit = self.cfg.get(COP, "EnforcedStyle").is_some_and(|v| v == "implicit");
+        let exceptions: Vec<ruby_prism::Node> = node.exceptions().iter().collect();
+        let kw = node.keyword_loc();
+
+        if implicit {
+            if exceptions.len() != 1 {
+                return;
+            }
+            if rse_const_name_root(&exceptions[0]).as_deref() != Some("StandardError") {
+                return;
+            }
+            let err_end = exceptions[0].location().end_offset();
+            self.push(kw.start_offset(), COP, true,
+                "Omit the error class when rescuing `StandardError` by itself.");
+            self.fixes.push((kw.end_offset(), err_end, Vec::new()));
+        } else {
+            if !exceptions.is_empty() {
+                return;
+            }
+            self.push(kw.start_offset(), COP, true, "Avoid rescuing without specifying an error class.");
+            self.fixes.push((kw.end_offset(), kw.end_offset(), b" StandardError".to_vec()));
+        }
+    }
+}
+
+/// The exception node as a root constant name: `Foo` or `::Foo` (never
+/// something deeper like `Bar::Foo`) — mirrors `{nil? cbase}` in upstream's
+/// node pattern.
+fn rse_const_name_root(node: &ruby_prism::Node) -> Option<String> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some(String::from_utf8_lossy(c.name().as_slice()).into_owned());
+    }
+    if let Some(p) = node.as_constant_path_node() {
+        if p.parent().is_none() {
+            return Some(String::from_utf8_lossy(p.name()?.as_slice()).into_owned());
+        }
+    }
+    None
+}
