@@ -232,7 +232,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
-    "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment",
+    "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
 ];
 
 impl Engine {
@@ -2337,6 +2337,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_useless_method_definition(node);
         self.check_to_json(node);
         self.check_single_line_methods(node);
+        self.check_empty_method(node);
         self.check_accessor_method_name(node);
         self.check_metrics_complexity_def(node);
         self.check_metrics_parameter_lists(node);

@@ -13913,3 +13913,164 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((full.start_offset(), full.end_offset(), replacement));
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/EmptyMethod — port of rubocop's `EmptyMethod#on_def` (upstream
+    /// aliases `on_defs` to the same handler; prism already unifies both
+    /// into one `DefNode` with an optional `receiver`, so a single hook
+    /// here covers both `def foo` and `def self.foo`). EnforcedStyle
+    /// `compact` (default) wants an empty method collapsed onto one line;
+    /// `expanded` wants the `end` pushed onto its own line. A def whose
+    /// range covers a comment on any line is never "empty", even with an
+    /// otherwise-nil body.
+    pub(crate) fn check_empty_method(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/EmptyMethod";
+        if !self.on(COP) {
+            return;
+        }
+        if node.body().is_some() {
+            return;
+        }
+        let loc = node.location();
+        let start = loc.start_offset();
+        let end = loc.end_offset();
+        let (start_line, _) = self.idx.loc(start);
+        let (end_line, _) = self.idx.loc(end.saturating_sub(1));
+        // `processed_source.contains_comment?(node.source_range)`: any
+        // comment on ANY line the node's range spans (not offset-precise —
+        // a whole-line check), e.g. a blank-bodied def with `# baz` inside.
+        if self.comments.iter().any(|&(l, _, _)| l >= start_line && l <= end_line) {
+            return;
+        }
+        let compact_style = self.cfg.enforced_style(COP) != "expanded";
+        let single_line = start_line == end_line;
+        // `correct_style?`: `(compact? && single_line?) || (expanded? && multiline?)`
+        // — already in the right shape, nothing to flag.
+        if compact_style == single_line {
+            return;
+        }
+        let message = if compact_style {
+            "Put empty method definitions on a single line."
+        } else {
+            "Put the `end` of empty method definitions on the next line."
+        };
+        self.push(start, COP, true, message);
+
+        let correction = em_corrected(self, node, compact_style, start);
+        // `next if compact_style? && max_line_length && correction.size > max_line_length`
+        // — offense still registered above, but the fix is withheld.
+        if compact_style {
+            if let Some(max) = self.em_max_line_length() {
+                if correction.len() > max {
+                    return;
+                }
+            }
+        }
+        self.fixes.push((start, end, correction));
+    }
+
+    /// `AutocorrectLogic#max_line_length`: `Layout/LineLength`'s raw
+    /// config-file enablement (NOT this run's `--only`/`--except`-filtered
+    /// `self.on`) gates whether a `Max` applies at all; when it does, an
+    /// absent `Max` still defaults to 120. Same semantics as this file's
+    /// `wum_max_line_length` (Style/WhileUntilModifier) — duplicated here
+    /// since upstream's version lives on a cop-independent mixin, not
+    /// something `EmptyMethod` itself owns.
+    fn em_max_line_length(&self) -> Option<usize> {
+        if !self.cfg.cop_config_enabled("Layout/LineLength") {
+            return None;
+        }
+        Some(
+            self.cfg
+                .get("Layout/LineLength", "Max")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(120),
+        )
+    }
+}
+
+/// `corrected(node)` — `def #{scope}#{name}#{arguments}` then `joint(node)`
+/// then `end`. `arguments` is rebuilt from each individual parameter node's
+/// OWN source text joined with `, ` (rubocop's
+/// `node.arguments.map(&:source).join(', ')`) — this deliberately does NOT
+/// preserve the original parameter list's own line breaks/spacing even when
+/// it spanned multiple physical lines; a live `rubocop -a` probe of
+/// `def foo(abc: '10000',\n        def: '20000', ghi: '30000')\nend`
+/// confirms the correction renormalizes to
+/// `def foo(abc: '10000', def: '20000', ghi: '30000'); end`. Parameter
+/// order follows Ruby's fixed grammar order (required, optional, rest,
+/// post, keyword, keyword-rest, block), which is also prism's field layout
+/// on `ParametersNode`, so walking the fields in that order reconstructs
+/// the original written order. A totally empty parameter list — `def
+/// foo()` — has NO `ParametersNode` at all in prism (unlike whitequark's
+/// empty-but-present `args` node), so it naturally takes the "no
+/// arguments" branch and its parens are dropped entirely, matching a live
+/// probe of `def foo()\nend` -> `def foo; end`.
+fn em_corrected(
+    cops: &super::Cops,
+    node: &ruby_prism::DefNode,
+    compact_style: bool,
+    def_start: usize,
+) -> Vec<u8> {
+    let mut out: Vec<u8> = b"def ".to_vec();
+    if let Some(recv) = node.receiver() {
+        out.extend_from_slice(cops.node_src(&recv));
+        out.push(b'.');
+    }
+    out.extend_from_slice(node.name().as_slice());
+    if let Some(params) = node.parameters() {
+        let parts = em_ordered_params(&params);
+        if !parts.is_empty() {
+            let mut args: Vec<u8> = Vec::new();
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    args.extend_from_slice(b", ");
+                }
+                args.extend_from_slice(cops.node_src(p));
+            }
+            if node.lparen_loc().is_some() {
+                out.push(b'(');
+                out.extend_from_slice(&args);
+                out.push(b')');
+            } else {
+                out.push(b' ');
+                out.extend_from_slice(&args);
+            }
+        }
+    }
+    if compact_style {
+        out.extend_from_slice(b"; end");
+    } else {
+        // `joint`: `"\n#{' ' * node.loc.column}"` — indent matches the
+        // `def` keyword's own (0-based) column.
+        out.push(b'\n');
+        let col = cops.idx.loc(def_start).1 - 1;
+        out.extend(std::iter::repeat(b' ').take(col));
+        out.extend_from_slice(b"end");
+    }
+    out
+}
+
+/// Parameters in the order they were originally written. Ruby's grammar
+/// fixes this order (required, optional, rest, post, keyword,
+/// keyword-rest, block) — no other arrangement parses — and it's also the
+/// field layout prism exposes on `ParametersNode`, so visiting the fields
+/// in this order reproduces source order exactly.
+fn em_ordered_params<'pr>(params: &ruby_prism::ParametersNode<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    let mut out = Vec::new();
+    out.extend(params.requireds().iter());
+    out.extend(params.optionals().iter());
+    if let Some(r) = params.rest() {
+        out.push(r);
+    }
+    out.extend(params.posts().iter());
+    out.extend(params.keywords().iter());
+    if let Some(kr) = params.keyword_rest() {
+        out.push(kr);
+    }
+    if let Some(b) = params.block() {
+        out.push(b.as_node());
+    }
+    out
+}
