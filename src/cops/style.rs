@@ -14590,6 +14590,16 @@ fn lec_trailing_plain_string(node: &ruby_prism::Node) -> bool {
         return false;
     }
     if let Some(args) = call.arguments() {
+        // upstream is TOKEN-based: the token before the `+` must be a string
+        // terminator. A parenthesized call (`x.join("\n") +`) textually ends
+        // in `)`, so only a paren-less call whose last argument's bytes reach
+        // the call's own end can qualify.
+        if call
+            .closing_loc()
+            .is_some_and(|c| c.end_offset() == call.location().end_offset())
+        {
+            return false;
+        }
         let list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
         return list.last().is_some_and(lec_trailing_plain_string);
     }
