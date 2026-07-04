@@ -312,7 +312,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
-    "Style/StringConcatenation",
+    "Style/StringConcatenation", "Metrics/BlockLength",
 ];
 
 impl Engine {
@@ -3645,6 +3645,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_empty_lines_around_block_body(&bn);
                 self.check_metrics_complexity_define_method(node, &bn);
                 self.check_empty_lines_around_exception_handling_keywords_block(node, &bn);
+                self.check_block_length(node, &bn);
             }
             // Lint/NonLocalExitFromIterator: stash this call's shape
             // (`send_node.method?(:lambda)`, `define_method?`,

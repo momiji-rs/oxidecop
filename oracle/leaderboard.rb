@@ -287,6 +287,7 @@ COPS = {
   'Metrics/ModuleLength'             => 'metrics/module_length',
   'Style/SpecialGlobalVars'          => 'style/special_global_vars',
   'Style/StringConcatenation'        => 'style/string_concatenation',
+  'Metrics/BlockLength'              => 'metrics/block_length',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

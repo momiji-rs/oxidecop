@@ -1646,3 +1646,144 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Metrics/BlockLength — reuses the same `CodeLength`-mixin machinery as
+// Metrics/ModuleLength above (`ml_config`/`ml_node_own_length`/
+// `ml_apply_folding`/`MlFoldWalker`), applied to `on_block` (aliased
+// `on_numblock`/`on_itblock` upstream — prism collapses all three shapes,
+// `do...end`, `{}`, numbered-param `_1`, and `it`-param, into ONE
+// `ruby_prism::BlockNode`, so a single hook covers every alias). Adds:
+//  - `AllowedMethods`/`AllowedPatterns` (+ the deprecated `IgnoredMethods`/
+//    `ExcludedMethods` aliases the `AllowedMethods` mixin still honors).
+//  - `method_receiver_excluded?`: a `Receiver.method`-shaped config entry
+//    requires an exact (whitespace-stripped) receiver-source match; a bare
+//    entry matches the method name against ANY receiver.
+//  - `class_constructor?`: `Class.new`/`Module.new`/`Struct.new`/
+//    `Data.define` (any args, `::`-qualified or not) are exempt — the first
+//    two are scored by Metrics/ClassLength/ModuleLength instead, and
+//    Struct/Data blocks are never scored by any Metrics length cop (the
+//    cop's own "NOTE: does not apply for Struct definitions").
+//
+// Known gaps (none exercised by the spec fixture):
+//  - `source_from_node_with_heredoc` (see the ModuleLength note above) isn't
+//    replicated for a block body containing a heredoc.
+//  - The deprecated `IgnoredMethods`/`ExcludedMethods` aliases are folded
+//    into the very same plain-string list `AllowedMethods` uses, rather than
+//    rubocop's real type-sniffing (an array holding a `Regexp` moves the
+//    WHOLE deprecated array into `AllowedPattern`'s regex matching instead of
+//    `AllowedMethods`'s exact-name matching). This is indistinguishable from
+//    upstream's actual behavior for the fixture: the oracle's static spec
+//    parser flattens a Ruby `/regex/` literal to its bare source text before
+//    it ever reaches our config file, and a bare (dot-less) list entry
+//    already matches a method name against ANY receiver under
+//    `method_receiver_excluded?` — the exact same effect `AllowedPattern`'s
+//    regex matching has on a plain (non-metacharacter) pattern.
+// ---------------------------------------------------------------------------
+
+impl<'a> Cops<'a> {
+    /// `AllowedMethods` (config override, else schema default `['refine']`,
+    /// via `self.eng.allowed_methods` — `self.cfg.get` can't see this default
+    /// since it's an ARRAY, absent from the scalar `SCHEMA.params` table)
+    /// plus the deprecated `IgnoredMethods`/`ExcludedMethods` aliases
+    /// (default `[]` each, read straight off `self.cfg` since neither has a
+    /// schema default to miss) — see the module doc above for why these
+    /// don't need real regex-vs-string type sniffing here.
+    fn bl_allowed_methods(&self, cop: &'static str) -> Vec<String> {
+        let mut list = self.eng.allowed_methods.get(cop).cloned().unwrap_or_default();
+        for key in ["IgnoredMethods", "ExcludedMethods"] {
+            if let Some(v) = self.cfg.get(cop, key) {
+                list.extend(crate::config::parse_allowed_list(v));
+            }
+        }
+        list
+    }
+
+    /// `matches_allowed_pattern?(node.method_name)` — the real `AllowedPatterns`
+    /// key only (default `[]`).
+    fn bl_matches_pattern(&self, cop: &'static str, method: &[u8]) -> bool {
+        self.eng.allowed_patterns.get(cop).is_some_and(|pats| {
+            let s = String::from_utf8_lossy(method);
+            pats.iter().any(|re| re.is_match(&s))
+        })
+    }
+
+    /// `allowed_method?(node.method_name) || method_receiver_excluded?(node)`
+    /// collapsed into one pass over the combined list: a bare (dot-less)
+    /// entry behaves exactly like `allowed_method?` (matches the method name
+    /// against ANY receiver, including none — `method_receiver_excluded?`'s
+    /// own fallback assignment, `method = receiver; receiver =
+    /// node_receiver`, makes the two upstream checks literally the same code
+    /// path once an entry has no dot), while a `Receiver.method` entry
+    /// requires an exact (whitespace-stripped) receiver-source match. Only
+    /// the FIRST two dot-split segments matter, matching Ruby's `receiver,
+    /// method = config.split('.')` parallel assignment (extra segments, if
+    /// any, are silently dropped upstream too).
+    fn bl_method_or_receiver_excluded(&self, call: &ruby_prism::CallNode, combined: &[String]) -> bool {
+        let node_method = call.name().as_slice();
+        let node_receiver: Option<Vec<u8>> = call.receiver().map(|r| {
+            let l = r.location();
+            self.src[l.start_offset()..l.end_offset()].iter().copied().filter(|b| !b.is_ascii_whitespace()).collect()
+        });
+        combined.iter().any(|config| {
+            let parts: Vec<&str> = config.split('.').collect();
+            if parts.len() >= 2 {
+                node_method == parts[1].as_bytes() && node_receiver.as_deref() == Some(parts[0].as_bytes())
+            } else {
+                node_method == config.as_bytes()
+            }
+        })
+    }
+
+    /// `Metrics/BlockLength#on_block` (aliased `on_numblock`/`on_itblock`).
+    /// `call` is the `CallNode` this block is attached to — never reached for
+    /// a `&:sym` block-PASS argument, which prism never turns into a
+    /// `BlockNode` at all (so no `check_block_length` call site ever sees
+    /// one; nothing to guard against here).
+    pub(crate) fn check_block_length(&mut self, call: &ruby_prism::CallNode, block: &ruby_prism::BlockNode) {
+        const COP: &str = "Metrics/BlockLength";
+        if !self.on(COP) {
+            return;
+        }
+        if self.bl_matches_pattern(COP, call.name().as_slice()) {
+            return;
+        }
+        let combined = self.bl_allowed_methods(COP);
+        if self.bl_method_or_receiver_excluded(call, &combined) {
+            return;
+        }
+        // `node.class_constructor?`: checking the underlying `send` shape
+        // (receiver + method name, any args) is equivalent to checking it on
+        // the wrapping `any_block` node upstream — the block-node alternative
+        // of that node-pattern is satisfied by exactly the same send shape,
+        // regardless of the block's own contents.
+        if super::lint_cops::is_class_constructor(call, self.src) {
+            return;
+        }
+        let (max, count_comments, foldable) = self.ml_config(COP);
+        let mut length = match block.body() {
+            Some(b) => self.ml_node_own_length(&b, count_comments),
+            None => 0,
+        };
+        if foldable.any() {
+            let mut walker = MlFoldWalker { foldable, matches: Vec::new() };
+            ruby_prism::visit_block_node(&mut walker, block);
+            length = self.ml_apply_folding(length, walker.matches, count_comments);
+        }
+        if length > max {
+            let msg = format!("Block has too many lines. [{length}/{max}]");
+            // `CodeLength#location`'s non-LSP branch is the node's full
+            // `source_range` — for a block, that starts at the RECEIVER
+            // (verified live against rubocop: `Foo::Bar.bar do ... end`
+            // anchors at column 1, the `F` of `Foo`, not the `bar` selector),
+            // falling back to the selector itself when there's no receiver.
+            let anchor = call
+                .receiver()
+                .map(|r| r.location().start_offset())
+                .or_else(|| call.message_loc().map(|m| m.start_offset()))
+                .unwrap_or_else(|| call.location().start_offset());
+            self.push(anchor, COP, false, msg);
+        }
+    }
+}
