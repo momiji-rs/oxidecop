@@ -28520,7 +28520,12 @@ impl<'a> super::Cops<'a> {
                 return;
             }
             if let Some(inner) = node.receiver().and_then(|r| r.as_call_node()) {
+                // `(call _ :keys)` — the node pattern is EXACT arity: a
+                // `keys(...)`/`values(...)` call WITH arguments (or a block)
+                // is not Hash#keys/#values (rails: redis.keys("delayed:*")).
                 if matches!(inner.name().as_slice(), b"keys" | b"values")
+                    && inner.arguments().is_none()
+                    && inner.block().is_none()
                     && self.hem_register_kv_offense(node, &inner)
                 {
                     return;
@@ -28538,7 +28543,10 @@ impl<'a> super::Cops<'a> {
                 return;
             }
             let Some(inner) = node.receiver().and_then(|r| r.as_call_node()) else { return };
-            if matches!(inner.name().as_slice(), b"keys" | b"values") {
+            if matches!(inner.name().as_slice(), b"keys" | b"values")
+                && inner.arguments().is_none()
+                && inner.block().is_none()
+            {
                 self.hem_register_kv_block_pass_offense(node, &inner);
             }
         }
