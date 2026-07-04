@@ -241,6 +241,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
+    "Layout/IndentationStyle",
 ];
 
 impl Engine {
@@ -3157,6 +3158,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
     cops.check_trailing_empty_lines();
     cops.check_initial_indentation(first_code_off);
     cops.check_leading_empty_lines(first_code_off);
+    cops.check_indentation_style();
     let t = tick(&T_TEXT, t);
 
     // ---- AST-based cops ----

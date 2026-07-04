@@ -5362,3 +5362,106 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/IndentationStyle — flags the first "wrong" whitespace run in a
+    /// line's leading indentation: under `EnforcedStyle: spaces` (default) a
+    /// tab anywhere in the leading run is wrong; under `tabs` a literal
+    /// space is. Mirrors rubocop's `find_offense`/`autocorrect_lambda_for_*`
+    /// verbatim, including the regex's backtracking behavior (see
+    /// `find_offense_match` below) and its floor-division tab/space
+    /// conversion.
+    ///
+    /// Heredoc body lines and (non-single-line) quoted `str`/`dstr` literal
+    /// lines are exempt (`in_string_literal?`) — mirrored with the engine's
+    /// existing `heredoc_lines`/`multiline_str_lines` line tables rather
+    /// than a bespoke AST walk. Nothing at or after `__END__` is lintable
+    /// text.
+    pub(crate) fn check_indentation_style(&mut self) {
+        const COP: &str = "Layout/IndentationStyle";
+        if !self.on(COP) {
+            return;
+        }
+        let tabs_style = self.cfg.enforced_style(COP) == "tabs";
+        // `configured_indentation_width`: own cop's `IndentationWidth` (no
+        // schema default — absent unless user-set) else
+        // `Layout/IndentationWidth`'s `Width` (schema default "2").
+        let width: usize = self
+            .cfg
+            .get(COP, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+            .max(1);
+        // `message`: `type: style == :spaces ? 'Tab' : 'Space'` — driven by
+        // the CONFIGURED style, not by what the matched run actually
+        // contains.
+        let msg = if tabs_style { "Space detected in indentation." } else { "Tab detected in indentation." };
+        let nlines = self.idx.starts.len();
+        for line_no in 1..=nlines {
+            // nothing at or after `__END__` is program text
+            if self.data_line.is_some_and(|d| line_no >= d) {
+                break;
+            }
+            let s = self.idx.starts[line_no - 1];
+            let e = self.line_end(line_no);
+            let line = &self.src[s..e];
+            let Some(match_len) = find_offense_match(line, tabs_style) else { continue };
+            // `in_string_literal?`: the whole matched run must fall inside a
+            // heredoc body or a multi-line quoted string's expression range.
+            // Since the match always starts at column 0, this reduces to
+            // "is the line itself one of those tracked body/string lines".
+            if self.heredoc_lines.iter().any(|(hs, he, _, _)| line_no >= *hs && line_no <= *he)
+                || self.multiline_str_lines.iter().any(|(hs, he)| line_no >= *hs && line_no <= *he)
+            {
+                continue;
+            }
+            let match_end = s + match_len;
+            self.push(s, COP, true, msg);
+            let matched = &self.src[s..match_end];
+            let replacement = if matched.contains(&b'\t') {
+                // autocorrect_lambda_for_tabs: every tab -> `width` spaces;
+                // any other byte (a plain space) passes through unchanged.
+                let mut out = Vec::with_capacity(matched.len() * width);
+                for &b in matched {
+                    if b == b'\t' {
+                        out.extend(std::iter::repeat_n(b' ', width));
+                    } else {
+                        out.push(b);
+                    }
+                }
+                out
+            } else {
+                // autocorrect_lambda_for_spaces: the whole match (guaranteed
+                // to be pure `\s`, no tabs) collapses to `len / width` tabs
+                // — floor division, per rubocop's own rounding-down test.
+                vec![b'\t'; matched.len() / width]
+            };
+            self.fixes.push((s, match_end, replacement));
+        }
+    }
+}
+
+/// Ruby's `\s`: space, tab, CR, LF, form feed, vertical tab. `\n` can't
+/// occur within a single line's slice, but the others can (`\r` on CRLF
+/// sources, rare `\f`/`\v`).
+fn is_ruby_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | 0x0C | 0x0B)
+}
+
+/// The closed form of `/\A\s*\t+/` (style spaces) / `/\A\s* +/` (style
+/// tabs)'s backtracking: `\s*` greedily eats the whole leading-whitespace
+/// run, then the engine backs it off one character at a time until the
+/// trailing quantifier (one-or-more of the target byte) can match — which
+/// happens at the LAST occurrence of the target byte in the run (nothing to
+/// its right can be a further occurrence, by definition of "last"). So the
+/// match is always `[0, last_target_index]` inclusive — never extending
+/// past the target into trailing whitespace of a different kind. Returns
+/// the match's byte length, or `None` when the leading run has no such
+/// byte at all (rubocop's `match` returning nil).
+fn find_offense_match(line: &[u8], tabs_style: bool) -> Option<usize> {
+    let ws_end = line.iter().position(|&b| !is_ruby_ws(b)).unwrap_or(line.len());
+    let target = if tabs_style { b' ' } else { b'\t' };
+    line[..ws_end].iter().rposition(|&b| b == target).map(|p| p + 1)
+}
