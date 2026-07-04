@@ -26227,3 +26227,256 @@ fn mc_node_src<'s>(n: &ruby_prism::Node, src: &'s [u8]) -> &'s [u8] {
     let l = n.location();
     &src[l.start_offset()..l.end_offset()]
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/TrivialAccessors — flags a `def`/`def self.` whose entire body
+    /// is exactly `@ivar` (a trivial reader) or exactly `@ivar = <plain
+    /// param>` (a trivial writer with a single required positional
+    /// parameter), and offers `attr_reader`/`attr_writer` as the fix.
+    ///
+    /// Ports rubocop's `on_def`/`alias on_defs`. Both instance and singleton
+    /// defs collapse into prism's one `DefNode` (a `receiver` distinguishes
+    /// `defs`), so a single hook covers both, exactly like upstream's alias.
+    pub(crate) fn check_trivial_accessors(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/TrivialAccessors";
+        if !self.on(COP) {
+            return;
+        }
+        // `top_level_node?`: `node.parent.nil?` — true only when this def is
+        // the SOLE top-level statement in the whole file (see
+        // `top_level_sole_stmt`'s doc); a def alongside ANY sibling (even
+        // just other top-level statements, not inside any class/module) is
+        // NOT top-level in this sense and gets evaluated normally.
+        if self.top_level_sole_stmt == Some(node.location().start_offset()) {
+            return;
+        }
+        // `in_module_or_instance_eval?` — see `ta_barrier`'s doc.
+        if matches!(self.ta_barrier.last(), Some(1) | Some(2)) {
+            return;
+        }
+        // `ignore_class_methods? && node.defs_type?` — ANY singleton def
+        // (`def self.foo`, `def obj.foo`), not just a `self` receiver.
+        if node.receiver().is_some() && self.cfg.get(COP, "IgnoreClassMethods") == Some("true") {
+            return;
+        }
+        let kind = if self.ta_trivial_reader(node) {
+            "reader"
+        } else if self.ta_trivial_writer(node) {
+            "writer"
+        } else {
+            return;
+        };
+        let kw = node.def_keyword_loc();
+        self.push(
+            kw.start_offset(),
+            COP,
+            true,
+            format!("Use `attr_{kind}` to define trivial {kind} methods."),
+        );
+        self.ta_autocorrect(node);
+    }
+
+    /// `autocorrect`: `return if parent&.send_type?` (a def passed as a call
+    /// argument — `private def foo; end`, `define_method def foo; end`, …
+    /// see `ta_call_arg_defs`'s doc) then dispatches on `def_type?`/
+    /// `defs_type? && receiver.self_type?`; a `defs` with a non-`self`
+    /// receiver (`def obj.foo`) matches neither branch and is left alone.
+    fn ta_autocorrect(&mut self, node: &ruby_prism::DefNode) {
+        if self.ta_call_arg_defs.contains(&node.location().start_offset()) {
+            return;
+        }
+        match node.receiver() {
+            None => self.ta_autocorrect_instance(node),
+            Some(r) if r.as_self_node().is_some() => self.ta_autocorrect_class(node),
+            Some(_) => {}
+        }
+    }
+
+    /// `autocorrect_instance`: `return unless names_match?(node) &&
+    /// !node.predicate_method? && kind` — note `kind` here is
+    /// `trivial_accessor_kind`, NOT the (possibly different) kind used for
+    /// the offense message; see that method's doc for why they can diverge.
+    fn ta_autocorrect_instance(&mut self, node: &ruby_prism::DefNode) {
+        let Some(kind) = self.ta_trivial_accessor_kind(node) else { return };
+        let name = node.name().as_slice();
+        if !self.ta_names_match(node) || name.ends_with(b"?") {
+            return;
+        }
+        let loc = node.location();
+        self.fixes.push((loc.start_offset(), loc.end_offset(), ta_accessor(kind, name)));
+    }
+
+    /// `autocorrect_class`: wraps the accessor in `class << self ... end`,
+    /// re-indented from `node.loc.column` (the `def`'s own 0-based column —
+    /// no predicate exclusion here, unlike the instance case above).
+    fn ta_autocorrect_class(&mut self, node: &ruby_prism::DefNode) {
+        let Some(kind) = self.ta_trivial_accessor_kind(node) else { return };
+        if !self.ta_names_match(node) {
+            return;
+        }
+        let loc = node.location();
+        let (_, col) = self.idx.loc(loc.start_offset());
+        let indent = " ".repeat(col - 1);
+        let accessor_src = ta_accessor(kind, node.name().as_slice());
+        let mut replacement = Vec::with_capacity(accessor_src.len() + indent.len() * 2 + 24);
+        replacement.extend_from_slice(b"class << self\n");
+        replacement.extend_from_slice(indent.as_bytes());
+        replacement.extend_from_slice(b"  ");
+        replacement.extend_from_slice(&accessor_src);
+        replacement.push(b'\n');
+        replacement.extend_from_slice(indent.as_bytes());
+        replacement.extend_from_slice(b"end");
+        self.fixes.push((loc.start_offset(), loc.end_offset(), replacement));
+    }
+
+    fn ta_trivial_reader(&self, node: &ruby_prism::DefNode) -> bool {
+        ta_looks_like_trivial_reader(node)
+            && !self.ta_allowed_method_name(node)
+            && !self.ta_allowed_reader(node)
+    }
+
+    fn ta_trivial_writer(&self, node: &ruby_prism::DefNode) -> bool {
+        ta_looks_like_trivial_writer(node)
+            && !self.ta_allowed_method_name(node)
+            && !self.ta_allowed_writer(node)
+    }
+
+    /// `trivial_accessor_kind`: writer takes priority here (unlike the
+    /// message-selection order in `check_trivial_accessors`, reader-first) —
+    /// harmless in practice since a node's body shape can never satisfy both
+    /// `trivial_reader?`/`trivial_writer?` at once, EXCEPT this extra
+    /// `!dsl_writer?` condition (`node.assignment_method?`): when
+    /// `AllowDSLWriters` is disabled, `trivial_writer?` can be true for a
+    /// DSL-style writer (name doesn't end in `=`) that was already reported
+    /// with kind "writer" — but `trivial_accessor_kind` then yields `None`,
+    /// silently suppressing the autocorrect (`expect_no_corrections` in the
+    /// "with DSL denied" fixture context).
+    fn ta_trivial_accessor_kind(&self, node: &ruby_prism::DefNode) -> Option<&'static str> {
+        if self.ta_trivial_writer(node) && ta_assignment_method(node.name().as_slice()) {
+            Some("writer")
+        } else if self.ta_trivial_reader(node) {
+            Some("reader")
+        } else {
+            None
+        }
+    }
+
+    fn ta_allowed_method_name(&self, node: &ruby_prism::DefNode) -> bool {
+        const COP: &str = "Style/TrivialAccessors";
+        let name = node.name().as_slice();
+        if self.allowed(COP, name) || name == b"initialize" {
+            return true;
+        }
+        self.cfg.get(COP, "ExactNameMatch") == Some("true") && !self.ta_names_match(node)
+    }
+
+    fn ta_allowed_reader(&self, node: &ruby_prism::DefNode) -> bool {
+        self.cfg.get("Style/TrivialAccessors", "AllowPredicates") == Some("true")
+            && node.name().as_slice().ends_with(b"?")
+    }
+
+    fn ta_allowed_writer(&self, node: &ruby_prism::DefNode) -> bool {
+        self.cfg.get("Style/TrivialAccessors", "AllowDSLWriters") == Some("true")
+            && !ta_assignment_method(node.name().as_slice())
+    }
+
+    /// `names_match?`: `node.method_name.to_s.sub(/[=?]$/, '') ==
+    /// ivar_name[1..]` — strips at most ONE trailing `=`/`?` off the method
+    /// name and compares to the ivar name minus its leading `@`.
+    fn ta_names_match(&self, node: &ruby_prism::DefNode) -> bool {
+        let Some(ivar_name) = ta_body_ivar_name(node) else { return false };
+        let method_name = node.name().as_slice();
+        let trimmed = method_name
+            .strip_suffix(b"=")
+            .or_else(|| method_name.strip_suffix(b"?"))
+            .unwrap_or(method_name);
+        trimmed == &ivar_name[1..]
+    }
+}
+
+/// `looks_like_trivial_reader?`: `!node.arguments? && node.body&.ivar_type?`
+/// — prism's `def foo; end`/`def foo(); end` both give `parameters() ==
+/// None` (matching `arguments?` being false for either), and a method body
+/// is always wrapped in a `StatementsNode` (even a single statement), so
+/// "body is exactly one bare ivar read" is `body.len() == 1` +
+/// `InstanceVariableReadNode`.
+fn ta_looks_like_trivial_reader(node: &ruby_prism::DefNode) -> bool {
+    if node.parameters().is_some() {
+        return false;
+    }
+    let Some(body) = node.body() else { return false };
+    let Some(stmts) = body.as_statements_node() else { return false };
+    if stmts.body().len() != 1 {
+        return false;
+    }
+    stmts.body().first().is_some_and(|s| s.as_instance_variable_read_node().is_some())
+}
+
+/// `looks_like_trivial_writer?`'s node pattern: `{(def _ (args (arg ...))
+/// (ivasgn _ (lvar _))) (defs _ _ (args (arg ...)) (ivasgn _ (lvar _)))}` —
+/// EXACTLY one required positional parameter (no optionals/rest/post/
+/// keywords/keyword-rest/block, and not a destructured `(a, b)` param), body
+/// is exactly one ivar-write whose value is a bare local-variable read.
+fn ta_looks_like_trivial_writer(node: &ruby_prism::DefNode) -> bool {
+    let Some(params) = node.parameters() else { return false };
+    if params.requireds().len() != 1
+        || !params.optionals().is_empty()
+        || params.rest().is_some()
+        || !params.posts().is_empty()
+        || !params.keywords().is_empty()
+        || params.keyword_rest().is_some()
+        || params.block().is_some()
+    {
+        return false;
+    }
+    if params.requireds().first().is_some_and(|p| p.as_required_parameter_node().is_none()) {
+        return false;
+    }
+    let Some(body) = node.body() else { return false };
+    let Some(stmts) = body.as_statements_node() else { return false };
+    if stmts.body().len() != 1 {
+        return false;
+    }
+    let Some(w) = stmts.body().first().and_then(|s| s.as_instance_variable_write_node()) else {
+        return false;
+    };
+    w.value().as_local_variable_read_node().is_some()
+}
+
+/// The ivar name (INCLUDING its leading `@`) written or read by a
+/// reader/writer body already known to be a single ivar-read/ivar-write
+/// statement (`names_match?`'s `ivar_name, = *node.body`).
+fn ta_body_ivar_name<'pr>(node: &ruby_prism::DefNode<'pr>) -> Option<&'pr [u8]> {
+    let stmt = node.body()?.as_statements_node()?.body().first()?;
+    if let Some(r) = stmt.as_instance_variable_read_node() {
+        return Some(r.name().as_slice());
+    }
+    if let Some(w) = stmt.as_instance_variable_write_node() {
+        return Some(w.name().as_slice());
+    }
+    None
+}
+
+/// `assignment_method?`: `!comparison_method? && method_name.to_s.
+/// end_with?('=')` — excludes the handful of `==`-family comparison
+/// operators from counting as "assignment-shaped" despite ending in `=`.
+fn ta_assignment_method(name: &[u8]) -> bool {
+    const COMPARISON: &[&[u8]] = &[b"==", b"===", b"!=", b"<=", b">=", b">", b"<"];
+    !COMPARISON.contains(&name) && name.ends_with(b"=")
+}
+
+/// `accessor(kind, method_name)`: `"attr_#{kind} :#{method_name.to_s.
+/// chomp('=')}"` — strips at most one trailing `=` (a predicate's trailing
+/// `?` is left as-is, so a class-level predicate reader — never excluded in
+/// `autocorrect_class`, unlike the instance case — can legally produce
+/// `attr_reader :foo?`).
+fn ta_accessor(kind: &'static str, method_name: &[u8]) -> Vec<u8> {
+    let trimmed = method_name.strip_suffix(b"=").unwrap_or(method_name);
+    let mut out = Vec::with_capacity(trimmed.len() + kind.len() + 7);
+    out.extend_from_slice(b"attr_");
+    out.extend_from_slice(kind.as_bytes());
+    out.extend_from_slice(b" :");
+    out.extend_from_slice(trimmed);
+    out
+}

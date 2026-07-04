@@ -369,7 +369,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
-    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison",
+    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors",
 ];
 
 impl Engine {
@@ -1153,6 +1153,22 @@ pub(crate) struct Cops<'a> {
     // actual `class`/`module`). `true` = class, `false` = module; empty ==
     // top level. Pushed only by `visit_class_node`/`visit_module_node`.
     pub(crate) alias_cm_stack: Vec<bool>,
+    // Style/TrivialAccessors: nearest-enclosing "barrier" ancestor for
+    // `in_module_or_instance_eval?` (rubocop's `node.each_ancestor(:any_block,
+    // :class, :sclass, :module)` walk, stopping at the FIRST ancestor of one
+    // of those types: `class`/`sclass` -> not exempt (0), `module` -> exempt
+    // (1), a block whose owning call is `instance_eval` -> exempt (2)). A
+    // non-instance_eval block/lambda is transparent — mirrors upstream's
+    // `else` branch falling through to the NEXT ancestor without returning —
+    // so it pushes nothing; `last()` is always the nearest real barrier, if
+    // any (empty stack == top level == not exempt, same as `class`/`sclass`).
+    pub(crate) ta_barrier: Vec<u8>,
+    // Style/TrivialAccessors: start offsets of DefNodes that are a direct
+    // argument of ANY call (`private def foo; end`, …) — rubocop's
+    // `autocorrect` guard `node.parent&.send_type?`, which (unlike
+    // `def_macro_args` below) does NOT exempt access modifiers: the offense
+    // still fires, only the correction is suppressed.
+    pub(crate) ta_call_arg_defs: HashSet<usize>,
     // Style/Alias: count of enclosing PLAIN `def` nodes (receiver-less —
     // whitequark's `:def`, NOT `:defs`) — rubocop's `each_ancestor(:def)`
     // guard in `alias_method_possible?`. Only a regular instance-method body
@@ -3025,6 +3041,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // block. `None` (unreached via that path) defaults to `:dynamic`.
         let alias_instance_eval = self.alias_pending_instance_eval.take().unwrap_or(false);
         self.alias_scope_stack.push(if alias_instance_eval { 2 } else { 1 });
+        // Style/TrivialAccessors: an `instance_eval` block is a barrier (see
+        // `ta_barrier`'s doc); any other block/lambda is transparent, so
+        // nothing is pushed and the ancestor walk passes straight through.
+        if alias_instance_eval {
+            self.ta_barrier.push(2);
+        }
         // Style/DoubleNegation: consume the `define_method`/
         // `define_singleton_method` verdict `visit_call_node` set right
         // before descending into us — see the `dn_pending_define_method`
@@ -3046,6 +3068,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         if dn_define_method.is_some() {
             self.dn_ancestors.pop();
+        }
+        if alias_instance_eval {
+            self.ta_barrier.pop();
         }
         self.alias_scope_stack.pop();
         self.se_ancestor_end_lines.pop();
@@ -3545,7 +3570,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cl_class_depth += 1;
         self.alias_scope_stack.push(0);
         self.alias_cm_stack.push(true);
+        self.ta_barrier.push(0);
         ruby_prism::visit_class_node(self, node);
+        self.ta_barrier.pop();
         self.alias_cm_stack.pop();
         self.alias_scope_stack.pop();
         self.cl_class_depth -= 1;
@@ -3588,7 +3615,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ms_scope_depth += 1;
         self.alias_scope_stack.push(0);
         self.alias_cm_stack.push(false);
+        self.ta_barrier.push(1);
         ruby_prism::visit_module_node(self, node);
+        self.ta_barrier.pop();
         self.alias_cm_stack.pop();
         self.alias_scope_stack.pop();
         self.ms_scope_depth -= 1;
@@ -3614,6 +3643,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        self.check_trivial_accessors(node);
         self.check_ascii_def(node);
         self.check_multiline_method_definition_brace_layout(node);
         self.check_def_end_alignment(node);
@@ -3851,9 +3881,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ms_scope_depth += 1;
         self.el_am_scope.push(true);
         self.respond_to_missing_stack.push(Self::scan_respond_to_missing(&node.body()));
+        // Style/TrivialAccessors: `sclass` is a `class`/`sclass` barrier too
+        // (see `ta_barrier`'s doc) — a nested def's ancestor walk stops here,
+        // returning "not exempt", even under an outer `instance_eval`.
+        self.ta_barrier.push(0);
         if let Some(b) = node.body() {
             self.visit(&b);
         }
+        self.ta_barrier.pop();
         self.respond_to_missing_stack.pop();
         self.el_am_scope.pop();
         self.ms_scope_depth -= 1;
@@ -3980,6 +4015,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                     if a.as_def_node().is_some() {
                         self.def_macro_args.insert(a.location().start_offset());
                     }
+                }
+            }
+            // Style/TrivialAccessors: unlike the set above, this one is NOT
+            // exempted for access modifiers — see `ta_call_arg_defs`'s doc.
+            for a in args.arguments().iter() {
+                if a.as_def_node().is_some() {
+                    self.ta_call_arg_defs.insert(a.location().start_offset());
                 }
             }
         }
@@ -4665,6 +4707,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         isc_send_child: HashSet::new(),
         alias_scope_stack: Vec::new(),
         alias_cm_stack: Vec::new(),
+        ta_barrier: Vec::new(),
+        ta_call_arg_defs: HashSet::new(),
         alias_def_depth: 0,
         alias_pending_instance_eval: None,
         alias_arg_offsets: HashSet::new(),

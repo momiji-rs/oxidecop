@@ -321,6 +321,7 @@ COPS = {
   'Lint/ShadowedException'           => 'lint/shadowed_exception',
   'Lint/SafeNavigationChain'         => 'lint/safe_navigation_chain',
   'Style/MultipleComparison'         => 'style/style_multiple_comparison',
+  'Style/TrivialAccessors'           => 'style/trivial_accessors',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
