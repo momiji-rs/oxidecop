@@ -242,7 +242,7 @@ const IMPLEMENTED: &[&str] = &[
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
-    "Lint/MissingSuper", "Style/LineEndConcatenation",
+    "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops",
 ];
 
 impl Engine {
@@ -1973,6 +1973,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_unreachable_code(node);
         self.check_empty_line_between_defs(node);
         self.check_predicate_prefix_sig_scan(node);
+        self.check_combinable_loops(node);
         self.stmts_stack.push(node.location().start_offset());
         if self.on("Naming/RescuedExceptionsVariableName") {
             // Hand-rolled (rather than the plain default-visitor call) so

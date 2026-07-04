@@ -14600,3 +14600,196 @@ fn lec_trailing_plain_string(node: &ruby_prism::Node) -> bool {
     }
     false
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/CombinableLoops — ports rubocop's `on_block`/`on_numblock`/
+    /// `on_itblock` (aliased to one method upstream since whitequark's AST
+    /// gives them a common `left_sibling`/`any_block_type?` interface) plus
+    /// `on_for`.
+    ///
+    /// Upstream reaches `node.left_sibling` only after confirming
+    /// `node.parent&.begin_type?` — whitequark's AST wraps any
+    /// MULTI-statement sequence in a synthetic `begin` node (a lone
+    /// statement has no such wrapper, hence no siblings to combine with).
+    /// Prism's `StatementsNode` wraps EVERY body regardless of length, so
+    /// that whole "is this a `begin`-wrapped statement with a predecessor"
+    /// question collapses to "is there a previous element in this
+    /// `StatementsNode`'s own body list" — decided here by a single
+    /// adjacent-pair scan per `StatementsNode`, mirroring
+    /// `check_predicate_prefix_sig_scan`'s windowed-scan idiom (hooked
+    /// alongside it in `visit_statements_node`) rather than needing any
+    /// parent-tracking state.
+    pub(crate) fn check_combinable_loops(&mut self, node: &ruby_prism::StatementsNode) {
+        const COP: &str = "Style/CombinableLoops";
+        if !self.on(COP) {
+            return;
+        }
+        let children: Vec<ruby_prism::Node> = node.body().iter().collect();
+        for i in 1..children.len() {
+            let left = &children[i - 1];
+            let right = &children[i];
+            if let (Some(lc), Some(rc)) = (left.as_call_node(), right.as_call_node()) {
+                // `node.right_sibling&.any_block_type?` — consulted only by
+                // `correct_end_of_block` below, purely structural (it
+                // doesn't matter whether that next statement itself
+                // combines with anything).
+                let right_sibling_is_block = children.get(i + 1).is_some_and(|n| {
+                    n.as_call_node().is_some_and(|c| c.block().and_then(|b| b.as_block_node()).is_some())
+                });
+                self.cl_check_block_pair(&lc, &rc, right_sibling_is_block);
+                continue;
+            }
+            if let (Some(lf), Some(rf)) = (left.as_for_node(), right.as_for_node()) {
+                self.cl_check_for_pair(&lf, &rf);
+            }
+        }
+    }
+
+    /// `on_block`/`on_numblock`/`on_itblock` body — `left`/`right` are the
+    /// OUTER `CallNode`s (prism keeps a call's block on the `CallNode`
+    /// itself via `.block()`, unlike whitequark's separate `block` AST
+    /// type), so `right.location()` already spans the full
+    /// `receiver.method { ... }` expression, matching upstream's
+    /// `add_offense(node)` anchor (confirmed against `Style/For`'s
+    /// `check_for_each`, which anchors the same way).
+    fn cl_check_block_pair(&mut self, left: &ruby_prism::CallNode, right: &ruby_prism::CallNode, right_sibling_is_block: bool) {
+        const COP: &str = "Style/CombinableLoops";
+        // `!sibling.any_block_type?` guard, from both ends: `&:sym`
+        // block-pass args produce a `BlockArgumentNode` from `.block()`,
+        // not a `BlockNode` — `as_block_node()` filters those out.
+        let Some(rb) = right.block().and_then(|b| b.as_block_node()) else { return };
+        let Some(lb) = left.block().and_then(|b| b.as_block_node()) else { return };
+
+        // `collection_looping_method?(node)` — only the CANDIDATE offense
+        // (the right-hand node) needs this; `same_collection_looping_block?`
+        // below requires the sibling's method NAME to match it anyway.
+        let rname = right.name();
+        let rname = rname.as_slice();
+        if !(rname.starts_with(b"each") || rname.ends_with(b"_each")) {
+            return;
+        }
+        // `same_collection_looping_block?`: same method, same receiver
+        // (bare/implicit-self calls compare equal to each other), same
+        // CALL arguments (`each_slice(2)` vs `each_slice(3)` differ).
+        if left.name().as_slice() != rname {
+            return;
+        }
+        if !cl_opt_node_eq(left.receiver(), right.receiver(), self.src) {
+            return;
+        }
+        if !cl_opt_args_eq(left.arguments(), right.arguments(), self.src) {
+            return;
+        }
+        // `node.body && node.left_sibling.body` — an empty `{}`/`do end`
+        // block has no `StatementsNode` at all.
+        let Some(rbody) = rb.body() else { return };
+        let Some(lbody) = lb.body() else { return };
+
+        self.push(right.location().start_offset(), COP, true, "Combine this loop with the previous loop.");
+
+        // `next unless node.arguments == node.left_sibling.arguments` — the
+        // BLOCK's own declared parameter list (`|item|` / numbered `_1.._9`
+        // / `it`), NOT the call arguments already compared above.
+        if cl_block_param_key(&lb, self.src) != cl_block_param_key(&rb, self.src) {
+            return;
+        }
+
+        // Step 1 (`combine_with_left_sibling`): drop the left loop's own
+        // trailing delimiter — from the end of its body through its own
+        // closing token (` }` / ` end`).
+        self.fixes.push((lbody.location().end_offset(), lb.closing_loc().end_offset(), Vec::new()));
+        // Step 2: drop the right loop's leading `receiver.method { |args| `
+        // (or `do |args|`) prefix, up to the start of its own body.
+        self.fixes.push((right.location().start_offset(), rbody.location().start_offset(), Vec::new()));
+
+        // `correct_end_of_block`: only fires when the left sibling is
+        // itself a block (always true here) and the node AFTER `right`
+        // isn't also block-shaped (otherwise that later combination step
+        // owns the final closing delimiter).
+        if right_sibling_is_block {
+            return;
+        }
+        let braces = lb.opening_loc().as_slice().first() == Some(&b'{');
+        let end_of_block: &[u8] = if braces { b"}" } else { b" end" };
+        let rclose = rb.closing_loc();
+        self.fixes.push((rclose.start_offset(), rclose.end_offset(), end_of_block.to_vec()));
+    }
+
+    /// `on_for` body.
+    fn cl_check_for_pair(&mut self, left: &ruby_prism::ForNode, right: &ruby_prism::ForNode) {
+        const COP: &str = "Style/CombinableLoops";
+        // `same_collection_looping_for?`: `sibling.for_type? && node.collection == sibling.collection`
+        // (the `for_type?` half is implied by both nodes already being `ForNode`s here).
+        if !cli_node_eq(&left.collection(), &right.collection(), self.src) {
+            return;
+        }
+        // `node.body && node.left_sibling.body`
+        let Some(rbody) = right.statements() else { return };
+        let Some(lbody) = left.statements() else { return };
+
+        self.push(right.location().start_offset(), COP, true, "Combine this loop with the previous loop.");
+
+        // `next unless node.variable == node.left_sibling.variable`
+        if !cli_node_eq(&left.index(), &right.index(), self.src) {
+            return;
+        }
+
+        self.fixes.push((lbody.location().end_offset(), left.end_keyword_loc().end_offset(), Vec::new()));
+        self.fixes.push((right.location().start_offset(), rbody.location().start_offset(), Vec::new()));
+        // `correct_end_of_block`: `ForNode` never `respond_to?(:braces?)`,
+        // so upstream always bails before touching the closing keyword —
+        // nothing else to emit here.
+    }
+}
+
+/// `sibling.receiver == node.receiver` — `None` (implicit self) compares
+/// equal to `None`; otherwise falls back to `cli_node_eq`'s source-text
+/// structural-equality approximation.
+fn cl_opt_node_eq(a: Option<ruby_prism::Node>, b: Option<ruby_prism::Node>, src: &[u8]) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => cli_node_eq(&a, &b, src),
+        _ => false,
+    }
+}
+
+/// `sibling.send_node.arguments == node.send_node.arguments` — the CALL's
+/// own argument list (e.g. `each_slice(2)` vs `each_slice(3)`), compared the
+/// same source-text-approximation way.
+fn cl_opt_args_eq(a: Option<ruby_prism::ArgumentsNode>, b: Option<ruby_prism::ArgumentsNode>, src: &[u8]) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            let (al, bl) = (a.location(), b.location());
+            src[al.start_offset()..al.end_offset()] == src[bl.start_offset()..bl.end_offset()]
+        }
+        _ => false,
+    }
+}
+
+/// A block's own declared-parameter "signature" for the autocorrect-only
+/// `node.arguments == node.left_sibling.arguments` check (`BlockNode`'s
+/// `#arguments`, i.e. the `|item|` param list — not the call's arguments,
+/// already handled by `cl_opt_args_eq`). Explicit `BlockParametersNode`s
+/// compare by their own source text (pipes included, so `|item|` != `|x|`);
+/// numbered (`_1`) and `it` params have no source text of their own, so they
+/// get synthetic `\0`-prefixed keys (`\0` can't appear in real source, so
+/// these never collide with an explicit list's text) — numbered blocks
+/// additionally key on arity (`_1` vs `_1, _2`), matching upstream's
+/// `Array#==` over their positional pseudo-arguments.
+fn cl_block_param_key(block: &ruby_prism::BlockNode, src: &[u8]) -> Vec<u8> {
+    match block.parameters() {
+        None => Vec::new(),
+        Some(n) => {
+            if let Some(np) = n.as_numbered_parameters_node() {
+                return format!("\0numbered:{}", np.maximum()).into_bytes();
+            }
+            if n.as_it_parameters_node().is_some() {
+                return b"\0it".to_vec();
+            }
+            let l = n.location();
+            src[l.start_offset()..l.end_offset()].to_vec()
+        }
+    }
+}
