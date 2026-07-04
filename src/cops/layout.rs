@@ -13343,3 +13343,673 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// ============================================================================
+// Layout/EndAlignment
+//
+// Ported from rubocop's `EndAlignment` cop plus the mixins it includes:
+// `CheckAssignment` (the `on_lvasgn`-family + `on_send` dispatch — ANY
+// assignment-shaped write node, or ANY call whose LAST positional argument
+// is, after unwinding a trailing `.method` receiver-chain and any
+// `begin`(parens)/`or`/`and` wrapper, a non-ternary `if`/`unless`/`while`/
+// `until`/`case`/`case_match` — routes to `check_asgn_alignment` instead of
+// the plain `check_other_alignment` every such node's own visitor otherwise
+// uses) and `EndKeywordAlignment` (`check_end_kw_alignment`'s "does `end`
+// share a line, or a column, with the configured style's align target?"
+// core, plus `AlignmentCorrector.align_end`'s autocorrect). `RangeHelp` is
+// only used here for `start_line_range`'s line-trim math.
+//
+// Three `EnforcedStyleAlignWith` styles: `keyword` (default — align with the
+// node's own keyword), `start_of_line` (align with the first non-blank
+// column of the keyword's own physical line), `variable` (in assignment/
+// operator-call/argument position, align with that OUTER context instead —
+// see `enda_variable_align_to`'s doc for the full ancestor-search it mirrors).
+//
+// `class`/`module` NEVER get outer-context treatment (`on_class`/`on_module`
+// always call `check_other_alignment` unconditionally). `class << self`
+// (`sclass`) gets a narrow special case: ONLY when it is the LITERAL direct
+// value of a plain assignment-type write node (no chain/wrapper unwinding at
+// all) does it get `check_asgn_alignment`; see `check_end_alignment_write`.
+// `case`/`case_match` uniquely ALSO get outer-context treatment merely for
+// being a (not-necessarily-last) positional ARGUMENT of any call, even
+// outside any assignment — `enda_case_arg`, populated eagerly in
+// `visit_call_node`, mirrors upstream's `on_case`'s own `node.argument?`
+// branch (`if`/`while`/`until` never get this — only `CheckAssignment`'s
+// own last-argument route can give them outer context).
+//
+// Prism gives `unless` its own `UnlessNode` (whitequark folds it into the
+// same `:if` type `on_if` already handles), so it needs its own hook here —
+// same trap already documented for `Layout/IndentationWidth` et al.
+// elsewhere in this file. Prism also gives a nested `elsif` link its OWN
+// `IfNode` reporting the SAME (outer) `end_keyword_loc` (whitequark's nested
+// elsif node has `loc.end == nil`, so upstream's `on_if` naturally no-ops
+// there via `check_end_kw_alignment`'s `return unless (end_loc = node.loc.
+// end)`) — `check_end_alignment_if` reproduces that by checking the keyword
+// TEXT is literally `if`, not `elsif`.
+// ============================================================================
+
+/// A single link in the "outer_node ... conditional" chain `CheckAssignment#
+/// check_assignment` walks through en route to the actual `if`/`case`/etc:
+/// either a peeled `.method` receiver-chain call (tagged with whether its
+/// OWN name is an operator method, per rubocop-ast's `OPERATOR_METHODS`,
+/// relevant to `assignment_or_operator_method`'s ancestor search), or an
+/// unwrapped `begin`(parens)/`or`/`and` wrapper (never itself a match, and
+/// never `send_type?`, so it always blocks the plain outward "climb" the
+/// moment it's encountered — see `enda_climb`). Ordered INNER-to-OUTER
+/// (nearest the conditional first), mirroring `Node#ancestors`.
+enum EndaLink {
+    Call { start: usize, is_op: bool },
+    Wrapper,
+}
+
+/// `MethodIdentifierPredicates::OPERATOR_METHODS` (rubocop-ast) — the exact
+/// method-name set `#operator_method?` recognizes.
+fn enda_is_operator_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"|" | b"^"
+            | b"&"
+            | b"<=>"
+            | b"=="
+            | b"==="
+            | b"=~"
+            | b">"
+            | b">="
+            | b"<"
+            | b"<="
+            | b"<<"
+            | b">>"
+            | b"+"
+            | b"-"
+            | b"*"
+            | b"/"
+            | b"%"
+            | b"**"
+            | b"~"
+            | b"+@"
+            | b"-@"
+            | b"!@"
+            | b"~@"
+            | b"[]"
+            | b"[]="
+            | b"!"
+            | b"!="
+            | b"!~"
+            | b"`"
+    )
+}
+
+/// `Util#first_part_of_call_chain` + `CheckAssignment#check_assignment`'s
+/// `rhs.child_nodes.first while rhs.type?(:begin, :or, :and)`: peel a
+/// trailing `.method` receiver-chain (recording each peeled call, and
+/// whether its own name is an operator method), then peel any
+/// `begin`(parenthesized-expression)/`or`/`and` wrapper (recording a
+/// `Wrapper` link for each), landing on the value to actually inspect.
+/// Returns `None` exactly where upstream aborts `check_assignment` entirely:
+/// the receiver-chain bottoms into a receiverless call, or a wrapper unwraps
+/// into nothing (`()`, or a multi-statement `begin` whose first statement
+/// position is otherwise empty). The returned chain is INNER-to-OUTER
+/// (nearest the conditional first) — the reverse of peel order.
+fn enda_peel(rhs: ruby_prism::Node) -> Option<(ruby_prism::Node, Vec<EndaLink>)> {
+    let mut chain = Vec::new();
+    let mut cur = rhs;
+    let landed = loop {
+        if let Some(call) = cur.as_call_node() {
+            let is_op = enda_is_operator_name(call.name().as_slice());
+            chain.push(EndaLink::Call { start: cur.location().start_offset(), is_op });
+            cur = call.receiver()?;
+        } else {
+            break cur;
+        }
+    };
+    cur = landed;
+    let inner = loop {
+        if let Some(o) = cur.as_or_node() {
+            chain.push(EndaLink::Wrapper);
+            cur = o.left();
+        } else if let Some(a) = cur.as_and_node() {
+            chain.push(EndaLink::Wrapper);
+            cur = a.left();
+        } else if let Some(p) = cur.as_parentheses_node() {
+            chain.push(EndaLink::Wrapper);
+            let body = p.body()?;
+            cur = match body.as_statements_node() {
+                Some(s) => s.body().iter().next()?,
+                None => body,
+            };
+        } else {
+            break cur;
+        }
+    };
+    chain.reverse();
+    Some((inner, chain))
+}
+
+impl<'a> super::Cops<'a> {
+    const EA_COP: &'static str = "Layout/EndAlignment";
+
+    fn enda_style(&self) -> &str {
+        match self.cfg.get(Self::EA_COP, "EnforcedStyleAlignWith") {
+            Some("variable") => "variable",
+            Some("start_of_line") => "start_of_line",
+            _ => "keyword",
+        }
+    }
+
+    fn enda_same_line(&self, a: usize, b: usize) -> bool {
+        self.idx.loc(a).0 == self.idx.loc(b).0
+    }
+
+    /// `EndKeywordAlignment#start_line_range`: the checked node's own
+    /// physical line, trimmed of leading/trailing whitespace — its START is
+    /// the align target's column, its full span is the message's
+    /// backtick-quoted source text.
+    fn enda_start_line_range(&self, node_start: usize) -> (usize, usize) {
+        let (line, _) = self.idx.loc(node_start);
+        let line_start = self.idx.starts[line - 1];
+        let line_end = self.line_end(line);
+        let line_src = &self.src[line_start..line_end];
+        let first_nonws = line_src.iter().position(|&b| !b.is_ascii_whitespace()).unwrap_or(0);
+        let last_nonws =
+            line_src.iter().rposition(|&b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(line_src.len());
+        (line_start + first_nonws, line_start + last_nonws.max(first_nonws))
+    }
+
+    /// `AlignmentCorrector.align_end`: replace the `end` line's leading
+    /// whitespace with `col0` indentation characters when nothing but
+    /// whitespace precedes `end` on its own line; otherwise (some other
+    /// statement shares the line via `;`, e.g. `bar end`) leave that prefix
+    /// untouched and insert a newline + fresh indentation right before `end`
+    /// instead.
+    fn enda_autocorrect(&mut self, end_pos: usize, end_line: usize, col0: usize) {
+        let line_start = self.idx.starts[end_line - 1];
+        let prefix = &self.src[line_start..end_pos];
+        let use_tabs = self.cfg.enforced_style("Layout/IndentationStyle") == "tabs";
+        let indentation = vec![if use_tabs { b'\t' } else { b' ' }; col0];
+        if prefix.iter().all(|&b| b == b' ' || b == b'\t') {
+            self.fixes.push((line_start, end_pos, indentation));
+        } else {
+            let mut repl = Vec::with_capacity(1 + indentation.len());
+            repl.push(b'\n');
+            repl.extend(indentation);
+            self.fixes.push((end_pos, end_pos, repl));
+        }
+    }
+
+    /// `check_end_kw_alignment` + `add_offense_for_misalignment` +
+    /// `matching_ranges`/`same_line?`/`column_offset_between`: no offense
+    /// when `end` shares a line, or a column, with `target`; otherwise
+    /// reports upstream's byte-for-byte message and autocorrects to `col0`.
+    fn enda_finish(&mut self, end_start: usize, target: (usize, usize), col0: usize) {
+        let (end_line, end_col) = self.idx.loc(end_start);
+        let (t_line, t_col) = self.idx.loc(target.0);
+        if t_line == end_line || t_col == end_col {
+            return;
+        }
+        let source = String::from_utf8_lossy(&self.src[target.0..target.1]).into_owned();
+        let msg = format!(
+            "`end` at {}, {} is not aligned with `{}` at {}, {}.",
+            end_line,
+            end_col - 1,
+            source,
+            t_line,
+            t_col - 1
+        );
+        self.push(end_start, Self::EA_COP, true, &msg);
+        self.enda_autocorrect(end_start, end_line, col0);
+    }
+
+    /// `check_other_alignment`: no assignment/call-argument context at all —
+    /// `variable` collapses to `keyword` (both = the node's own keyword).
+    fn enda_report_other(&mut self, inner_start: usize, kw: (usize, usize), end_start: usize) {
+        let style = self.enda_style();
+        let target = if style == "start_of_line" { self.enda_start_line_range(inner_start) } else { kw };
+        let col0 = if style == "start_of_line" {
+            self.idx.loc(target.0).1 - 1
+        } else {
+            self.idx.loc(inner_start).1 - 1
+        };
+        self.enda_finish(end_start, target, col0);
+    }
+
+    /// `check_asgn_alignment` + `asgn_variable_align_with` +
+    /// `line_break_before_keyword?`. `outer_start` is the assignment/call
+    /// node's own start; `outer_is_call`/`outer_is_match`/`chain`/
+    /// `is_case_like` feed `enda_variable_align_to`'s autocorrect-only search
+    /// (detection only ever needs `outer_start` itself).
+    #[allow(clippy::too_many_arguments)]
+    fn enda_report_asgn(
+        &mut self,
+        inner_start: usize,
+        kw: (usize, usize),
+        end_start: usize,
+        outer_start: usize,
+        outer_is_call: bool,
+        outer_is_match: bool,
+        chain: &[EndaLink],
+        is_case_like: bool,
+    ) {
+        let style = self.enda_style();
+        let target = match style {
+            "start_of_line" => self.enda_start_line_range(inner_start),
+            "variable" => {
+                if self.idx.loc(inner_start).0 > self.idx.loc(outer_start).0 {
+                    kw
+                } else {
+                    (outer_start, kw.1)
+                }
+            }
+            _ => kw,
+        };
+        let col0 = match style {
+            "start_of_line" => self.idx.loc(target.0).1 - 1,
+            "keyword" => self.idx.loc(inner_start).1 - 1,
+            _ => {
+                let align_to =
+                    self.enda_variable_align_to(inner_start, is_case_like, outer_start, outer_is_call, outer_is_match, chain);
+                self.idx.loc(align_to).1 - 1
+            }
+        };
+        self.enda_finish(end_start, target, col0);
+    }
+
+    /// `alignment_node` (`variable` branch) + `alignment_node_for_variable_
+    /// style` + `assignment_or_operator_method`: the AUTOCORRECT target
+    /// column under `variable` style, independent of (and sometimes
+    /// different from) the detection target `enda_report_asgn` computed.
+    ///
+    /// 1. Special case (`case`/`case_match` DIRECTLY an argument of
+    ///    `outer_start`, same line, no unwinding at all — `chain.is_empty()`
+    ///    is exactly that condition, since a peeled chain link would make
+    ///    the inner node a call's RECEIVER, never its argument): align to
+    ///    `outer_start` unconditionally.
+    /// 2. Otherwise search the known chain (inner-to-outer) then
+    ///    `outer_start` itself for the first node that is either an
+    ///    assignment-type write (`outer_is_match` when `outer_start` is
+    ///    reached — chain links are never assignment-type) or an
+    ///    operator-method-named call. If found AND the conditional's own
+    ///    line doesn't come after it, align there.
+    /// 3. Otherwise align to the inner conditional itself, then climb
+    ///    outward through consecutive same-line `send`-type links (a
+    ///    `Wrapper` link, or a line change, stops the climb immediately) —
+    ///    capped at `outer_start` (we have no visibility past it).
+    fn enda_variable_align_to(
+        &self,
+        inner_start: usize,
+        is_case_like: bool,
+        outer_start: usize,
+        outer_is_call: bool,
+        outer_is_match: bool,
+        chain: &[EndaLink],
+    ) -> usize {
+        if is_case_like && chain.is_empty() && self.enda_same_line(inner_start, outer_start) {
+            return outer_start;
+        }
+        let found = chain
+            .iter()
+            .find_map(|l| match l {
+                EndaLink::Call { start, is_op } if *is_op => Some(*start),
+                _ => None,
+            })
+            .or(if outer_is_match { Some(outer_start) } else { None });
+        if let Some(f) = found {
+            if self.idx.loc(inner_start).0 <= self.idx.loc(f).0 {
+                return f;
+            }
+        }
+        self.enda_climb(inner_start, chain, outer_start, outer_is_call)
+    }
+
+    fn enda_climb(&self, inner_start: usize, chain: &[EndaLink], outer_start: usize, outer_is_call: bool) -> usize {
+        let mut cur = inner_start;
+        let mut cur_line = self.idx.loc(cur).0;
+        for link in chain {
+            match link {
+                EndaLink::Wrapper => return cur,
+                EndaLink::Call { start, .. } => {
+                    let line = self.idx.loc(*start).0;
+                    if line != cur_line {
+                        return cur;
+                    }
+                    cur = *start;
+                    cur_line = line;
+                }
+            }
+        }
+        if outer_is_call && self.idx.loc(outer_start).0 == cur_line {
+            cur = outer_start;
+        }
+        cur
+    }
+
+    /// `check_assignment`'s tail: given the landed (non-call, non-wrapper)
+    /// node and its inner-to-outer chain, dispatch on its concrete type —
+    /// `return unless rhs&.conditional?` + (for `if` only) `return if rhs.
+    /// if_type? && rhs.ternary?`. `ignore_node` always fires once a
+    /// conditional type matches, even when it turns out to have no `end` at
+    /// all (a modifier-form `if`/`while`/`until` reached via an EXPLICIT
+    /// wrapper, e.g. `x = (y if cond)`) — harmless, since that node's own
+    /// plain visit would find no `end` either way.
+    fn enda_dispatch_conditional(
+        &mut self,
+        inner: &ruby_prism::Node,
+        outer_start: usize,
+        outer_is_call: bool,
+        outer_is_match: bool,
+        chain: &[EndaLink],
+    ) {
+        let inner_start = inner.location().start_offset();
+        if let Some(n) = inner.as_if_node() {
+            let Some(kw) = n.if_keyword_loc() else { return }; // ternary
+            self.enda_ignored.insert(inner_start);
+            if let Some(end_loc) = n.end_keyword_loc() {
+                self.enda_report_asgn(
+                    inner_start,
+                    (kw.start_offset(), kw.end_offset()),
+                    end_loc.start_offset(),
+                    outer_start,
+                    outer_is_call,
+                    outer_is_match,
+                    chain,
+                    false,
+                );
+            }
+        } else if let Some(n) = inner.as_unless_node() {
+            self.enda_ignored.insert(inner_start);
+            let kw = n.keyword_loc();
+            if let Some(end_loc) = n.end_keyword_loc() {
+                self.enda_report_asgn(
+                    inner_start,
+                    (kw.start_offset(), kw.end_offset()),
+                    end_loc.start_offset(),
+                    outer_start,
+                    outer_is_call,
+                    outer_is_match,
+                    chain,
+                    false,
+                );
+            }
+        } else if let Some(n) = inner.as_while_node() {
+            self.enda_ignored.insert(inner_start);
+            let kw = n.keyword_loc();
+            if let Some(end_loc) = n.closing_loc() {
+                self.enda_report_asgn(
+                    inner_start,
+                    (kw.start_offset(), kw.end_offset()),
+                    end_loc.start_offset(),
+                    outer_start,
+                    outer_is_call,
+                    outer_is_match,
+                    chain,
+                    false,
+                );
+            }
+        } else if let Some(n) = inner.as_until_node() {
+            self.enda_ignored.insert(inner_start);
+            let kw = n.keyword_loc();
+            if let Some(end_loc) = n.closing_loc() {
+                self.enda_report_asgn(
+                    inner_start,
+                    (kw.start_offset(), kw.end_offset()),
+                    end_loc.start_offset(),
+                    outer_start,
+                    outer_is_call,
+                    outer_is_match,
+                    chain,
+                    false,
+                );
+            }
+        } else if let Some(n) = inner.as_case_node() {
+            self.enda_ignored.insert(inner_start);
+            let kw = n.case_keyword_loc();
+            self.enda_report_asgn(
+                inner_start,
+                (kw.start_offset(), kw.end_offset()),
+                n.end_keyword_loc().start_offset(),
+                outer_start,
+                outer_is_call,
+                outer_is_match,
+                chain,
+                true,
+            );
+        } else if let Some(n) = inner.as_case_match_node() {
+            self.enda_ignored.insert(inner_start);
+            let kw = n.case_keyword_loc();
+            self.enda_report_asgn(
+                inner_start,
+                (kw.start_offset(), kw.end_offset()),
+                n.end_keyword_loc().start_offset(),
+                outer_start,
+                outer_is_call,
+                outer_is_match,
+                chain,
+                true,
+            );
+        }
+        // else: not a conditional type at all — `return unless rhs&.
+        // conditional?` — no-op.
+    }
+
+    /// `CheckAssignment#check_assignment`'s peel-then-dispatch, shared by
+    /// every assignment-write hook and (for calls) `check_end_alignment_call`.
+    fn check_end_alignment_assignment_like(
+        &mut self,
+        outer_start: usize,
+        outer_is_call: bool,
+        outer_is_match: bool,
+        rhs: ruby_prism::Node,
+    ) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        let Some((inner, chain)) = enda_peel(rhs) else { return };
+        self.enda_dispatch_conditional(&inner, outer_start, outer_is_call, outer_is_match, &chain);
+    }
+
+    /// `CheckAssignment#on_lvasgn` (+ every aliased write-node shape) —
+    /// called from the `assignment_write!`-family macros, `visit_multi_
+    /// write_node`, and the six call-/index-write visitors (`foo.bar += x`,
+    /// `h[k] ||= x`, ...) — every shape `Node#assignment?` recognizes.
+    pub(crate) fn check_end_alignment_write(&mut self, outer_start: usize, value: ruby_prism::Node) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        if let Some(sc) = value.as_singleton_class_node() {
+            // `on_sclass`'s `node.parent&.assignment?` branch: the LITERAL
+            // direct value only — upstream never unwinds a call-chain or
+            // `begin`/`or`/`and` wrapper to reach an `sclass` this way.
+            let start = sc.location().start_offset();
+            self.enda_ignored.insert(start);
+            let kw = sc.class_keyword_loc();
+            self.enda_report_asgn(
+                start,
+                (kw.start_offset(), kw.end_offset()),
+                sc.end_keyword_loc().start_offset(),
+                outer_start,
+                false,
+                true,
+                &[],
+                false,
+            );
+            return;
+        }
+        self.check_end_alignment_assignment_like(outer_start, false, true, value);
+    }
+
+    /// `CheckAssignment#on_send` (any call whose LAST argument, after
+    /// unwinding, is a non-ternary conditional) + eager population of
+    /// `enda_case_arg` for `on_case`'s own `node.argument?` branch (ANY
+    /// positional argument, not just the last).
+    pub(crate) fn check_end_alignment_call(&mut self, node: &ruby_prism::CallNode) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        let outer_start = node.location().start_offset();
+        let is_op = enda_is_operator_name(node.name().as_slice());
+        let Some(args) = node.arguments() else { return };
+        let items: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        for a in &items {
+            if a.as_case_node().is_some() || a.as_case_match_node().is_some() {
+                self.enda_case_arg.insert(a.location().start_offset(), (outer_start, is_op));
+            }
+        }
+        if let Some(last) = items.into_iter().last() {
+            self.check_end_alignment_assignment_like(outer_start, true, is_op, last);
+        }
+    }
+
+    /// `on_class`: always `check_other_alignment` — `class` never gets
+    /// outer-context (assignment/argument) treatment upstream.
+    pub(crate) fn check_end_alignment_class(&mut self, node: &ruby_prism::ClassNode) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.enda_ignored.contains(&start) {
+            return;
+        }
+        let kw = node.class_keyword_loc();
+        self.enda_report_other(start, (kw.start_offset(), kw.end_offset()), node.end_keyword_loc().start_offset());
+    }
+
+    /// `on_module`: always `check_other_alignment`.
+    pub(crate) fn check_end_alignment_module(&mut self, node: &ruby_prism::ModuleNode) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.enda_ignored.contains(&start) {
+            return;
+        }
+        let kw = node.module_keyword_loc();
+        self.enda_report_other(start, (kw.start_offset(), kw.end_offset()), node.end_keyword_loc().start_offset());
+    }
+
+    /// `on_sclass`'s `else` branch (`check_other_alignment`) — the
+    /// assignment-value special case is handled by `check_end_alignment_
+    /// write` instead, which marks `enda_ignored` first when it applies.
+    pub(crate) fn check_end_alignment_sclass(&mut self, node: &ruby_prism::SingletonClassNode) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.enda_ignored.contains(&start) {
+            return;
+        }
+        let kw = node.class_keyword_loc();
+        self.enda_report_other(start, (kw.start_offset(), kw.end_offset()), node.end_keyword_loc().start_offset());
+    }
+
+    /// `on_if(node): check_other_alignment(node) unless node.ternary?`. The
+    /// keyword-text check (`if`, never `elsif`) skips a nested elsif link —
+    /// see this section's header doc.
+    pub(crate) fn check_end_alignment_if(&mut self, node: &ruby_prism::IfNode) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        let Some(kw) = node.if_keyword_loc() else { return }; // ternary
+        if kw.as_slice() != b"if" {
+            return; // elsif link — reports the SAME `end` as the outer `if`
+        }
+        let start = node.location().start_offset();
+        if self.enda_ignored.contains(&start) {
+            return;
+        }
+        let Some(end_loc) = node.end_keyword_loc() else { return }; // modifier form
+        self.enda_report_other(start, (kw.start_offset(), kw.end_offset()), end_loc.start_offset());
+    }
+
+    /// `on_if`'s prism-side counterpart for `unless` (whitequark folds it
+    /// into `:if`; prism gives it its own `UnlessNode`).
+    pub(crate) fn check_end_alignment_unless(&mut self, node: &ruby_prism::UnlessNode) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.enda_ignored.contains(&start) {
+            return;
+        }
+        let Some(end_loc) = node.end_keyword_loc() else { return }; // modifier form
+        let kw = node.keyword_loc();
+        self.enda_report_other(start, (kw.start_offset(), kw.end_offset()), end_loc.start_offset());
+    }
+
+    /// `on_while`. Skips `is_begin_modifier()` (`begin...end while cond`) —
+    /// a distinct `:while_post` node type upstream, never dispatched to
+    /// `on_while` at all (this cop has no `on_while_post`/`alias`).
+    pub(crate) fn check_end_alignment_while(&mut self, node: &ruby_prism::WhileNode) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        if node.is_begin_modifier() {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.enda_ignored.contains(&start) {
+            return;
+        }
+        let Some(end_loc) = node.closing_loc() else { return }; // modifier form
+        let kw = node.keyword_loc();
+        self.enda_report_other(start, (kw.start_offset(), kw.end_offset()), end_loc.start_offset());
+    }
+
+    /// `on_until` (aliased to `on_while` upstream).
+    pub(crate) fn check_end_alignment_until(&mut self, node: &ruby_prism::UntilNode) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        if node.is_begin_modifier() {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.enda_ignored.contains(&start) {
+            return;
+        }
+        let Some(end_loc) = node.closing_loc() else { return }; // modifier form
+        let kw = node.keyword_loc();
+        self.enda_report_other(start, (kw.start_offset(), kw.end_offset()), end_loc.start_offset());
+    }
+
+    /// `on_case`: `node.argument?` (populated eagerly into `enda_case_arg` by
+    /// `check_end_alignment_call`) routes to `check_asgn_alignment`;
+    /// otherwise `check_other_alignment`.
+    pub(crate) fn check_end_alignment_case(&mut self, node: &ruby_prism::CaseNode) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.enda_ignored.contains(&start) {
+            return;
+        }
+        let kw = node.case_keyword_loc();
+        let kw_range = (kw.start_offset(), kw.end_offset());
+        let end_start = node.end_keyword_loc().start_offset();
+        match self.enda_case_arg.get(&start).copied() {
+            Some((outer_start, outer_is_op)) => {
+                self.enda_report_asgn(start, kw_range, end_start, outer_start, true, outer_is_op, &[], true)
+            }
+            None => self.enda_report_other(start, kw_range, end_start),
+        }
+    }
+
+    /// `on_case_match` (aliased to `on_case` upstream).
+    pub(crate) fn check_end_alignment_case_match(&mut self, node: &ruby_prism::CaseMatchNode) {
+        if !self.on(Self::EA_COP) {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.enda_ignored.contains(&start) {
+            return;
+        }
+        let kw = node.case_keyword_loc();
+        let kw_range = (kw.start_offset(), kw.end_offset());
+        let end_start = node.end_keyword_loc().start_offset();
+        match self.enda_case_arg.get(&start).copied() {
+            Some((outer_start, outer_is_op)) => {
+                self.enda_report_asgn(start, kw_range, end_start, outer_start, true, outer_is_op, &[], true)
+            }
+            None => self.enda_report_other(start, kw_range, end_start),
+        }
+    }
+}

@@ -389,7 +389,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
-    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation",
+    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment",
 ];
 
 impl Engine {
@@ -2056,6 +2056,25 @@ pub(crate) struct Cops<'a> {
     // `ba_ancestors` frame) is always chain-inclusive, so borrowing its
     // start here reproduces whitequark's `block_node.first_line` exactly.
     pub(crate) ba_pending_block_owner_start: Option<usize>,
+    // Layout/EndAlignment: `if`/`unless`/`while`/`until`/`case`/`case_match`/
+    // `class << self` node start offsets already handled via an assignment-
+    // or call-argument-driven `check_asgn_alignment` dispatch (the
+    // `CheckAssignment` mixin's own `on_lvasgn`-family/`on_send` hooks, or
+    // `on_sclass`/`on_case`'s own direct-parent checks) — rubocop's
+    // `ignore_node`/`ignored_node?`. Populated BEFORE the node's own plain
+    // `on_if`/`on_while`/.../`on_case` visit is reached (pre-order: the
+    // wrapping assignment/call is always visited first).
+    pub(crate) enda_ignored: HashSet<usize>,
+    // Layout/EndAlignment: a `case`/`case_match` node's start offset -> its
+    // enclosing call's own (start offset, is-an-operator-or-`<<`-method
+    // name) once that call is found to hold it as a (possibly non-last)
+    // positional argument — eagerly recorded in `visit_call_node` before
+    // descending into arguments (mirrors `chi_call_root`/`mlbl_call_child`'s
+    // populate-then-consume idiom, since prism gives no parent pointers).
+    // Drives the cop's own `on_case` `node.argument?` branch — the ONLY
+    // conditional type with this special call-argument-based alignment path
+    // (`if`/`while`/`until` never get it upstream either).
+    pub(crate) enda_case_arg: HashMap<usize, (usize, bool)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2282,6 +2301,7 @@ macro_rules! assignment_write {
         $self.aa_note_unbracketed_rhs(lhs_start, &$node.value());
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
         $self.check_indentation_width_assignment(lhs_start, $node.value());
+        $self.check_end_alignment_write(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
         $self.ea_note_block_assignment($node.location().start_offset(), $node.location().end_offset(), &$node.value());
@@ -2299,6 +2319,7 @@ macro_rules! assignment_operator_write {
         $self.aa_note_unbracketed_rhs(lhs_start, &$node.value());
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
         $self.check_indentation_width_assignment(lhs_start, $node.value());
+        $self.check_end_alignment_write(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
         $self.ea_note_block_assignment($node.location().start_offset(), $node.location().end_offset(), &$node.value());
@@ -2315,6 +2336,7 @@ macro_rules! assignment_path_write {
         let op_end = $node.operator_loc().end_offset();
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
         $self.check_indentation_width_assignment(lhs_start, $node.value());
+        $self.check_end_alignment_write(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
         $self.ea_note_block_assignment($node.location().start_offset(), $node.location().end_offset(), &$node.value());
@@ -2331,6 +2353,7 @@ macro_rules! assignment_path_operator_write {
         let op_end = $node.binary_operator_loc().end_offset();
         $self.assignment_indentation_hook(lhs_start, op_end, $node.value());
         $self.check_indentation_width_assignment(lhs_start, $node.value());
+        $self.check_end_alignment_write(lhs_start, $node.value());
         $self.icb_note_assignment_value(lhs_start, &$node.value());
         $self.gc_note_assignment_value(&$node.value());
         $self.ea_note_block_assignment($node.location().start_offset(), $node.location().end_offset(), &$node.value());
@@ -2784,6 +2807,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_else_alignment_if(node);
         self.check_assignment_in_condition(&node.predicate());
         self.check_indentation_width_if(node);
+        self.check_end_alignment_if(node);
         self.check_negated_if(node);
         self.check_redundant_conditional(node);
         self.check_redundant_condition(node);
@@ -2925,6 +2949,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // hook here to match.
         self.check_assignment_in_condition(&node.predicate());
         self.check_indentation_width_unless(node);
+        self.check_end_alignment_unless(node);
         self.check_parens_around_condition("unless", false, &node.predicate());
         self.check_redundant_conditional_unless(node);
         self.check_redundant_condition_unless(node);
@@ -3273,6 +3298,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_indentation_width_assignment(lhs_start, node.value());
         self.ea_note_block_assignment(node.location().start_offset(), node.location().end_offset(), &node.value());
         self.check_else_alignment_assignment(node.location().start_offset(), node.location().end_offset(), node.value());
+        self.check_end_alignment_write(lhs_start, node.value());
         self.check_self_assignment_masgn(node);
         self.check_trailing_underscore_variable(node);
         // Style/RedundantSelf: only plain local-var masgn targets carry a
@@ -3312,6 +3338,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // compound writes on index/attribute targets (rails:
         // `@responses[k] ||= if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
+        self.check_end_alignment_write(node.location().start_offset(), node.value());
         self.check_self_assignment_reader_write(
             node.location().start_offset(),
             node.receiver(),
@@ -3325,6 +3352,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Layout/IndentationWidth: CheckAssignment also fires for compound
         // writes on attribute-call targets (`foo.bar += if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
+        self.check_end_alignment_write(node.location().start_offset(), node.value());
         ruby_prism::visit_call_operator_write_node(self, node);
     }
     fn visit_call_or_write_node(&mut self, node: &ruby_prism::CallOrWriteNode<'pr>) {
@@ -3332,6 +3360,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // compound writes on index/attribute targets (rails:
         // `@responses[k] ||= if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
+        self.check_end_alignment_write(node.location().start_offset(), node.value());
         self.check_self_assignment_reader_write(
             node.location().start_offset(),
             node.receiver(),
@@ -3347,6 +3376,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // compound writes on index/attribute targets (rails:
         // `@responses[k] ||= if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
+        self.check_end_alignment_write(node.location().start_offset(), node.value());
         let key_args: Vec<ruby_prism::Node> =
             node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
         self.check_self_assignment_reader_write(
@@ -3369,6 +3399,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // compound writes on index/attribute targets (rails:
         // `@responses[k] ||= if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
+        self.check_end_alignment_write(node.location().start_offset(), node.value());
         let key_args: Vec<ruby_prism::Node> =
             node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
         self.check_self_assignment_reader_write(
@@ -3392,6 +3423,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // compound writes on index/attribute targets (rails:
         // `@responses[k] ||= if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
+        self.check_end_alignment_write(node.location().start_offset(), node.value());
         self.check_space_inside_reference_brackets_write(
             node.receiver(),
             node.opening_loc(),
@@ -3414,6 +3446,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_case_indentation(node);
         self.check_else_alignment_case(node);
         self.check_indentation_width_case(node);
+        self.check_end_alignment_case(node);
         self.check_empty_else_case(node);
         self.check_hash_like_case(node);
         self.check_empty_case_condition(node);
@@ -3441,6 +3474,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_case_match_indentation(node);
         self.check_else_alignment_case_match(node);
         self.check_indentation_width_case_match(node);
+        self.check_end_alignment_case_match(node);
         self.check_identical_conditional_branches_case_match(node);
         self.check_conditional_assignment_case_match(node);
         self.check_literal_as_condition_case_match(node);
@@ -4105,6 +4139,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.check_parens_around_condition("while", true, &node.predicate());
         }
         self.check_indentation_width_while(node);
+        self.check_end_alignment_while(node);
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
         if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
             self.check_condition_position(b"while", node.keyword_loc().start_offset(), &node.predicate());
@@ -4189,6 +4224,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.check_parens_around_condition("until", true, &node.predicate());
         }
         self.check_indentation_width_until(node);
+        self.check_end_alignment_until(node);
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
         if !node.statements().is_some_and(|st| st.location().start_offset() < node.keyword_loc().start_offset()) {
             self.check_condition_position(b"until", node.keyword_loc().start_offset(), &node.predicate());
@@ -4727,6 +4763,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_lines_around_class_body(node);
         self.check_access_modifier_indentation_class(node);
         self.check_indentation_width_class(node);
+        self.check_end_alignment_class(node);
         self.check_struct_inheritance(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.dm_enter_namespace(&node.constant_path());
@@ -4801,6 +4838,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_accessor_grouping(node.body());
         self.check_access_modifier_indentation_module(node);
         self.check_indentation_width_module(node);
+        self.check_end_alignment_module(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
         self.dm_enter_namespace(&node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
@@ -5128,6 +5166,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_lines_around_sclass_body(node);
         self.check_access_modifier_indentation_sclass(node);
         self.check_indentation_width_sclass(node);
+        self.check_end_alignment_sclass(node);
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(), node.body().is_some(), false, true);
         self.check_trailing_body_on_class(node.class_keyword_loc().start_offset(), l.end_offset(), node.body());
@@ -5276,6 +5315,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // foo; end`) — must run BEFORE `iw_chain_stack` gets this call's own
         // entry pushed below, so it only sees OUTER wrapping calls.
         self.check_indentation_width_send(node);
+        self.check_end_alignment_call(node);
         if let Some(args) = node.arguments() {
             self.ium_register_collection(&node.as_node(), args.arguments().iter().collect());
         }
@@ -6171,6 +6211,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         ba_ancestors: Vec::new(),
         ba_pending_transparent_stmts: false,
         ba_pending_block_owner_start: None,
+        enda_ignored: HashSet::new(),
+        enda_case_arg: HashMap::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),
