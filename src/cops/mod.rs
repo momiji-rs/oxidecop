@@ -3560,15 +3560,52 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let dm_ns_len_before = self.dm_ns_stack.len();
         self.dm_ns_stack.push(lint_cops::DmNsEntry { frame: dm_frame, simple_name: None });
         let dm_start = node.location().start_offset();
-        let dm_scope_id = self
-            .dm_named_recv
-            .get(&dm_start)
-            .cloned()
-            .map(|(r, m)| lint_cops::DmScopeId::Recv(r, m))
-            .unwrap_or(lint_cops::DmScopeId::Pos(dm_start));
+        // upstream `anon_block_scope_id`, keyed off the whitequark BLOCK
+        // node's parent (borrowing the always-maintained rp_ancestors
+        // stack; at this point the top Some frames are our own AnyBlock and
+        // the owning Call): a call parent with a named receiver -> that
+        // receiver.method text; a `begin` parent nested in a block -> the
+        // block's own location; a `begin` parent anywhere else (toplevel,
+        // def body) or an UNLISTED parent kind -> nil (keys collide);
+        // def/block/call/paren parents -> the block's own location.
+        // the whitequark block node is the prism call+block combo — its
+        // parent (for the lvasgn exemption AND the scope-id rules) is the
+        // OWNING CALL's parent, and lvasgn RHS bookkeeping keys off the
+        // call's start offset, not the block's.
+        let dm_owning_call_start = {
+            let mut it = self.rp_ancestors.iter().rev().filter_map(|k| k.as_ref());
+            let _own_block = it.next();
+            it.next().map(|c| c.start)
+        };
+        let dm_scope_id: Option<lint_cops::DmScopeId> =
+            if let Some((r, m)) = self.dm_named_recv.get(&dm_start).cloned() {
+                Some(lint_cops::DmScopeId::Recv(r, m))
+            } else {
+                let mut it = self.rp_ancestors.iter().rev().filter_map(|k| k.as_ref());
+                let _own_block = it.next();
+                let _owning_call = it.next();
+                match it.next() {
+                    Some(p) if p.tag == style::RpTag::Begin => match it.next() {
+                        Some(g) if g.tag == style::RpTag::AnyBlock => {
+                            Some(lint_cops::DmScopeId::Pos(dm_start))
+                        }
+                        _ => None,
+                    },
+                    Some(p)
+                        if matches!(
+                            p.tag,
+                            style::RpTag::AnyDef | style::RpTag::AnyBlock | style::RpTag::Call
+                        ) =>
+                    {
+                        Some(lint_cops::DmScopeId::Pos(dm_start))
+                    }
+                    _ => None,
+                }
+            };
         self.dm_anon_stack.push(lint_cops::DmAnonFrame {
             is_new_block: dm_is_new_block,
-            parent_lvasgn: self.dm_lvasgn_rhs.contains(&dm_start),
+            parent_lvasgn: self.dm_lvasgn_rhs.contains(&dm_start)
+                || dm_owning_call_start.is_some_and(|cs| self.dm_lvasgn_rhs.contains(&cs)),
             scope_id: dm_scope_id,
             ns_len_at_entry: dm_ns_len_before,
         });

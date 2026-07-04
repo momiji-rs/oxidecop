@@ -16116,7 +16116,12 @@ pub(crate) enum DmSclass {
 pub(crate) struct DmAnonFrame {
     pub(crate) is_new_block: bool,
     pub(crate) parent_lvasgn: bool,
-    pub(crate) scope_id: DmScopeId,
+    /// `None` = upstream's `anon_block_scope_id` returned nil (the block's
+    /// whitequark parent is a non-block-nested `begin`, or an unlisted node
+    /// kind) — such keys COLLIDE across every same-named definition in the
+    /// file (rails enum_test: `def self.name` in separate `Class.new do`
+    /// blocks inside different test methods all flag as `::Object.name`).
+    pub(crate) scope_id: Option<DmScopeId>,
     /// `Cops::dm_ns_stack`'s length just BEFORE this block's own frame was
     /// pushed — i.e. the ancestor chain for `anon_block.parent_module_name`
     /// itself (which does not include the block's own frame).
@@ -16556,7 +16561,7 @@ impl<'a> super::Cops<'a> {
             let base = dm_qualified_name(anon_pmn.as_deref(), "Object");
             let scope_txt = if self.dm_sclass_stack.is_empty() { base } else { format!("#<Class:{base}>") };
             let display = format!("{}{}", dm_humanize_scope(&scope_txt), name_str);
-            self.dm_found_method(anchor, display, Some(anon.scope_id.clone()));
+            self.dm_found_method(anchor, display, anon.scope_id.clone());
             return;
         }
         if let Some(DmSclass::SendKind(subj)) = self.dm_sclass_stack.last() {
@@ -16589,7 +16594,7 @@ impl<'a> super::Cops<'a> {
             let anon_pmn = self.dm_pmn(anon.ns_len_at_entry);
             let scope = dm_qualified_name(anon_pmn.as_deref(), "Object");
             let display = format!("{scope}.{name_str}");
-            self.dm_found_method(anchor, display, Some(anon.scope_id.clone()));
+            self.dm_found_method(anchor, display, anon.scope_id.clone());
         }
     }
 
