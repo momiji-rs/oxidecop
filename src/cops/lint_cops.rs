@@ -16022,3 +16022,738 @@ fn rsn_is_int_zero(node: &ruby_prism::Node) -> bool {
 fn rsn_is_float_zero(node: &ruby_prism::Node) -> bool {
     node.as_float_node().is_some_and(|n| n.value() == 0.0)
 }
+
+
+// ============================================================================
+// Lint/DuplicateMethods
+// ============================================================================
+//
+// Ported from `RuboCop::Cop::Lint::DuplicateMethods`. Tracks every method
+// definition (plain `def`, `def self.x`/`def CONST.x`, `alias`, `alias_method`,
+// `attr`/`attr_reader`/`attr_writer`/`attr_accessor`, `delegate` (only when
+// `AllCops: ActiveSupportExtensionsEnabled`), and `def_delegator(s)`/
+// `def_instance_delegator(s)`) under a QUALIFIED key (its enclosing class/
+// module/sclass/casgn/block "scope", à la rubocop-ast's `parent_module_name`,
+// plus the nearest enclosing `def`'s name for a nested definition) and flags
+// the SECOND (and later) definition under the same key, referencing the
+// file:line of the ORIGINAL. Definitions inside an `if`/`unless`/ternary are
+// ignored entirely (upstream: "a different definition is used depending on
+// platform, etc."), and a lone re-definition inside an `ensure`/`rescue`
+// clause is silently accepted ONCE per clause-kind (a common idiom: define,
+// then restore in `ensure`) — see `Cops::dm_found_method`'s doc.
+//
+// Prism has no parent pointers, so upstream's `node.parent_module_name`
+// (an ancestor walk over `:class`/`:module`/`:sclass`/`:casgn`/`:block`
+// nodes) is replicated as a STACK (`Cops::dm_ns_stack`) pushed/popped by the
+// relevant `visit_*` hooks in `mod.rs`, walked nearest-to-farthest by
+// `Cops::dm_pmn`. `anonymous_class_block` (the fallback for a `def`/alias/
+// attr sitting in an unassigned `Class.new`/`Module.new do...end` block) is
+// replicated the same way via `Cops::dm_anon_stack` + `Cops::dm_sclass_stack`.
+
+/// Nearest enclosing `rescue`/`ensure` "scope" — see `Cops::dm_rescue_scope`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DmScope {
+    Rescue,
+    Ensure,
+}
+
+/// A `Class.new`/`Module.new do...end` block's identity for
+/// `anon_block_scope_id` purposes — see `Cops::dm_anon_stack`'s doc. Unlike
+/// upstream's literal `"#{receiver.source}.#{method}"` / file:line text,
+/// only EQUALITY matters here (it's never rendered), so the block's own
+/// start offset stands in for upstream's `source_location(anon_block)`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) enum DmScopeId {
+    Pos(usize),
+    Recv(Vec<u8>, Vec<u8>),
+}
+
+/// A definition's dedup key: the fully-qualified display name (prefixed by
+/// the nearest enclosing `def`'s name for a nested definition — upstream's
+/// `method_key`), plus an optional `anon_block_scope_id` suffix.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DmKey {
+    base: String,
+    scope_id: Option<DmScopeId>,
+}
+
+/// One frame of `Cops::dm_ns_stack` — see `Cops::dm_pmn`'s doc.
+pub(crate) enum DmNsFrame {
+    /// Contributes this literal text segment to the joined scope name.
+    Frag(String),
+    /// This ancestor can't be resolved (upstream's `return nil` from deep
+    /// inside `parent_module_name`'s block) — the WHOLE walk fails (`None`),
+    /// matching Ruby's non-local return semantics.
+    Abort,
+    /// Transparent: contributes nothing, but doesn't fail the walk (a bare
+    /// `class_eval do...end` with an implicit receiver, or a `Class.new`/
+    /// `Module.new do...end` block directly assigned to a constant — the
+    /// casgn ancestor already contributes the name).
+    Skip,
+}
+
+pub(crate) struct DmNsEntry {
+    pub(crate) frame: DmNsFrame,
+    /// For a `class`/`module` frame only: its simple (last-segment)
+    /// declared name — backs `Cops::dm_lookup_constant`.
+    pub(crate) simple_name: Option<Vec<u8>>,
+}
+
+/// The subject shape of an enclosing `class << subject` — backs
+/// `Cops::dm_found_instance_method`'s `found_sclass_method` fallback and
+/// `anonymous_class_block`'s "any non-self sclass ancestor" exclusion.
+pub(crate) enum DmSclass {
+    SelfKind,
+    ConstKind,
+    /// A bare/method-call subject (`class << blah`) — holds its method name.
+    SendKind(Vec<u8>),
+    OtherKind,
+}
+
+/// One frame of `Cops::dm_anon_stack`, pushed for EVERY block (any kind) —
+/// mirrors `node.each_ancestor(:block).first` for `anonymous_class_block`.
+#[derive(Clone)]
+pub(crate) struct DmAnonFrame {
+    pub(crate) is_new_block: bool,
+    pub(crate) parent_lvasgn: bool,
+    pub(crate) scope_id: DmScopeId,
+    /// `Cops::dm_ns_stack`'s length just BEFORE this block's own frame was
+    /// pushed — i.e. the ancestor chain for `anon_block.parent_module_name`
+    /// itself (which does not include the block's own frame).
+    pub(crate) ns_len_at_entry: usize,
+}
+
+/// A bare (symbol or string) literal's content, or `None` for anything else
+/// — upstream's `sym_name`/`{sym str}` node-pattern fragments.
+fn dm_sym_or_str(n: &ruby_prism::Node) -> Option<Vec<u8>> {
+    if let Some(s) = n.as_symbol_node() {
+        return Some(s.unescaped().to_vec());
+    }
+    if let Some(s) = n.as_string_node() {
+        return Some(s.unescaped().to_vec());
+    }
+    None
+}
+
+/// `class_or_module_new_block?`'s call-shape half: `(send (const _ {:Class
+/// :Module}) :new ...)` — a plain (non-safe-nav) `new` call whose receiver's
+/// SOURCE TEXT is exactly `Class`/`::Class`/`Module`/`::Module`.
+pub(crate) fn dm_new_block_call(call: &ruby_prism::CallNode, src: &[u8]) -> bool {
+    if call.name().as_slice() != b"new" || call.is_safe_navigation() {
+        return false;
+    }
+    let Some(r) = call.receiver() else { return false };
+    let l = r.location();
+    matches!(&src[l.start_offset()..l.end_offset()], b"Class" | b"::Class" | b"Module" | b"::Module")
+}
+
+/// The simple (last-segment) name of a constant reference — `Foo` -> "Foo",
+/// `Foo::Bar` -> "Bar" (namespace ignored, matching upstream's `_, const_name
+/// = *node.receiver` destructure).
+fn dm_const_last_name(node: &ruby_prism::Node) -> Option<Vec<u8>> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some(c.name().as_slice().to_vec());
+    }
+    if let Some(p) = node.as_constant_path_node() {
+        return p.name().map(|n| n.as_slice().to_vec());
+    }
+    None
+}
+
+/// `smart_path`'s effective behavior for this port: the oracle always stages
+/// each example in its OWN fresh temp directory (never under this process's
+/// cwd), so upstream's "relative to project root, else absolute" reduces to
+/// "just the basename" for every representable example — matching the
+/// `rsplit('/')` idiom already used by `Naming/FileName`/`Bundler/GemFilename`.
+fn dm_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// `humanize_scope`: `scope.sub(/(?:(?<name>.*)::)#<Class:\k<name>>|
+/// #<Class:(?<name>.*)>(?:::)?/, '\k<name>.')`, then `#` appended unless it
+/// already ends in `.`. Hand-rolled (no backreference support in the `regex`
+/// crate) — safe for OUR OWN generated fragments, which only ever nest an
+/// `#<Class:...>` segment as the LAST (nearest) one.
+fn dm_humanize_scope(scope: &str) -> String {
+    let marker = "::#<Class:";
+    let mut replaced: Option<String> = None;
+    let mut search_from = 0;
+    while let Some(rel) = scope[search_from..].find(marker) {
+        let i = search_from + rel;
+        let name = &scope[..i];
+        let expect_suffix = format!("{marker}{name}>");
+        if scope[i..] == expect_suffix {
+            replaced = Some(format!("{name}."));
+            break;
+        }
+        search_from = i + 1;
+    }
+    if replaced.is_none() {
+        if let Some(idx) = scope.find("#<Class:") {
+            if let Some(close_rel) = scope[idx..].find('>') {
+                let close = idx + close_rel;
+                let name2 = &scope[idx + 8..close];
+                let mut after = close + 1;
+                if scope[after..].starts_with("::") {
+                    after += 2;
+                }
+                replaced = Some(format!("{}{}.{}", &scope[..idx], name2, &scope[after..]));
+            }
+        }
+    }
+    let out = replaced.unwrap_or_else(|| scope.to_string());
+    if out.ends_with('.') {
+        out
+    } else {
+        format!("{out}#")
+    }
+}
+
+/// `qualified_name(enclosing, namespace: nil, mod_name)`: the `namespace`
+/// argument is always `nil` at both of upstream's call sites this port
+/// exercises (the anon-block "Object" case, and `lookup_constant`'s simple
+/// single-segment class/module names).
+fn dm_qualified_name(enclosing: Option<&str>, mod_name: &str) -> String {
+    match enclosing {
+        Some("Object") => mod_name.to_string(),
+        Some(e) => format!("{e}::{mod_name}"),
+        None => format!("::{mod_name}"),
+    }
+}
+
+/// AssocNode elements of a `HashNode`/`KeywordHashNode` (an `AssocSplatNode`
+/// among them — `**opts` — simply isn't an `AssocNode` and is dropped, same
+/// as upstream's node-pattern only matching literal `pair`s).
+fn dm_hash_pairs<'pr>(node: &ruby_prism::Node<'pr>) -> Option<Vec<ruby_prism::AssocNode<'pr>>> {
+    let elements = if let Some(h) = node.as_hash_node() {
+        h.elements()
+    } else if let Some(h) = node.as_keyword_hash_node() {
+        h.elements()
+    } else {
+        return None;
+    };
+    Some(elements.iter().filter_map(|e| e.as_assoc_node()).collect())
+}
+
+fn dm_pair_value<'pr>(pairs: &[ruby_prism::AssocNode<'pr>], key: &[u8]) -> Option<ruby_prism::Node<'pr>> {
+    pairs
+        .iter()
+        .find(|p| p.key().as_symbol_node().is_some_and(|s| s.unescaped() == key))
+        .map(|p| p.value())
+}
+
+/// `alias_method?`: `(send nil? :alias_method (sym $_name) (sym $_original_name))`
+/// — BOTH arguments must be symbol literals (a string, or a dynamic
+/// expression, doesn't match at all).
+fn dm_match_alias_method(call: &ruby_prism::CallNode) -> Option<(Vec<u8>, Vec<u8>)> {
+    if call.receiver().is_some() || call.name().as_slice() != b"alias_method" {
+        return None;
+    }
+    let args = call.arguments()?;
+    let list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+    if list.len() != 2 {
+        return None;
+    }
+    let name = list[0].as_symbol_node()?.unescaped().to_vec();
+    let orig = list[1].as_symbol_node()?.unescaped().to_vec();
+    Some((name, orig))
+}
+
+/// `attribute_accessor?`: `(send nil? {:attr_reader :attr_writer
+/// :attr_accessor :attr} $...)` — captures EVERY remaining argument
+/// (any type; `sym_name` filters non-symbols out later).
+fn dm_match_attribute_accessor<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+) -> Option<(&'static str, Vec<ruby_prism::Node<'pr>>)> {
+    if call.receiver().is_some() {
+        return None;
+    }
+    let kind = match call.name().as_slice() {
+        b"attr_reader" => "attr_reader",
+        b"attr_writer" => "attr_writer",
+        b"attr_accessor" => "attr_accessor",
+        b"attr" => "attr",
+        _ => return None,
+    };
+    let args: Vec<ruby_prism::Node> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    Some((kind, args))
+}
+
+/// `delegate_method?`: `(send nil? :delegate ({sym str} $_)+ (hash <(pair
+/// (sym :to) {sym str}) ...>))` — one-or-more leading sym/str names, then
+/// EXACTLY a trailing hash argument that contains a `to:` pair with a
+/// sym/str value (any other keys, `**splat`, or a missing/dynamic `to:`,
+/// fail the whole match).
+fn dm_match_delegate(call: &ruby_prism::CallNode) -> Option<Vec<Vec<u8>>> {
+    if call.receiver().is_some() || call.name().as_slice() != b"delegate" {
+        return None;
+    }
+    let args = call.arguments()?;
+    let list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+    if list.len() < 2 {
+        return None;
+    }
+    let (last, rest) = list.split_last()?;
+    let pairs = dm_hash_pairs(last)?;
+    let has_to = pairs
+        .iter()
+        .any(|p| p.key().as_symbol_node().is_some_and(|s| s.unescaped() == b"to") && dm_sym_or_str(&p.value()).is_some());
+    if !has_to {
+        return None;
+    }
+    let mut names = Vec::with_capacity(rest.len());
+    for a in rest {
+        names.push(dm_sym_or_str(a)?);
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(names)
+}
+
+/// `delegate_prefix`: `nil` unless the trailing hash has a `prefix:` pair;
+/// `true` uses the `to:` value's text, a literal sym/str uses its own text,
+/// anything else (a dynamic expression, `false`, ...) means no prefix.
+fn dm_delegate_prefix(call: &ruby_prism::CallNode) -> Option<Vec<u8>> {
+    let args = call.arguments()?;
+    let list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+    let last = list.last()?;
+    let pairs = dm_hash_pairs(last)?;
+    let prefix_val = dm_pair_value(&pairs, b"prefix")?;
+    if prefix_val.as_true_node().is_some() {
+        let to_val = dm_pair_value(&pairs, b"to")?;
+        dm_sym_or_str(&to_val)
+    } else {
+        dm_sym_or_str(&prefix_val)
+    }
+}
+
+/// `delegator?`: `(send nil? {:def_delegator :def_instance_delegator}
+/// {{sym str} ({sym str} $_) | {sym str} {sym str} ({sym str} $_)})` —
+/// EXACTLY 2 or 3 positional sym/str args; captures the LAST one (the
+/// alias, when a 3rd argument is given).
+fn dm_match_delegator(call: &ruby_prism::CallNode) -> Option<Vec<u8>> {
+    if call.receiver().is_some() || !matches!(call.name().as_slice(), b"def_delegator" | b"def_instance_delegator") {
+        return None;
+    }
+    let args = call.arguments()?;
+    let list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+    if list.len() != 2 && list.len() != 3 {
+        return None;
+    }
+    let mut last = None;
+    for a in &list {
+        last = Some(dm_sym_or_str(a)?);
+    }
+    last
+}
+
+/// `delegators?`: `(send nil? {:def_delegators :def_instance_delegators}
+/// {sym str} ({sym str} $_)+)` — first arg (target, uncaptured) plus
+/// one-or-more captured names, all sym/str.
+fn dm_match_delegators(call: &ruby_prism::CallNode) -> Option<Vec<Vec<u8>>> {
+    if call.receiver().is_some() || !matches!(call.name().as_slice(), b"def_delegators" | b"def_instance_delegators") {
+        return None;
+    }
+    let args = call.arguments()?;
+    let list: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+    if list.len() < 2 {
+        return None;
+    }
+    dm_sym_or_str(&list[0])?;
+    let mut names = Vec::with_capacity(list.len() - 1);
+    for a in &list[1..] {
+        names.push(dm_sym_or_str(a)?);
+    }
+    Some(names)
+}
+
+impl<'a> super::Cops<'a> {
+    /// `on_def`/`on_defs` — prism unifies both into one `DefNode` (`defs` <=>
+    /// `receiver().is_some()`). A plain `def` always goes through
+    /// `found_instance_method`; `def self.x`/`def CONST.x` go through the
+    /// separate (simpler, no `found_sclass_method` fallback) `check_self_
+    /// receiver`/`check_const_receiver` paths; any OTHER receiver kind
+    /// (`def obj.x` for an arbitrary expression) is never checked at all,
+    /// matching upstream's `on_defs` having no `else` branch.
+    pub(crate) fn check_duplicate_methods_def(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Lint/DuplicateMethods";
+        if !self.on(COP) {
+            return;
+        }
+        if self.dm_if_depth > 0 {
+            return;
+        }
+        let anchor = node.def_keyword_loc().start_offset();
+        let name = node.name().as_slice().to_vec();
+        match node.receiver() {
+            None => self.dm_found_instance_method(anchor, &name),
+            Some(recv) => {
+                if let Some(const_name) = dm_const_last_name(&recv) {
+                    self.dm_check_const_receiver(anchor, &name, &const_name);
+                } else if recv.as_self_node().is_some() {
+                    self.dm_check_self_receiver(anchor, &name);
+                }
+            }
+        }
+    }
+
+    /// `on_alias`: `alias new old` — self-alias (`alias foo foo`) is always
+    /// allowed (suppresses Ruby's redefinition warning), and both sides
+    /// must be plain symbols (a `$gvar` alias uses different children and
+    /// never matches at all).
+    pub(crate) fn check_duplicate_methods_alias(&mut self, node: &ruby_prism::AliasMethodNode) {
+        const COP: &str = "Lint/DuplicateMethods";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(new_sym) = node.new_name().as_symbol_node() else { return };
+        let Some(old_sym) = node.old_name().as_symbol_node() else { return };
+        let name = new_sym.unescaped().to_vec();
+        let original = old_sym.unescaped().to_vec();
+        if name == original {
+            return;
+        }
+        if self.dm_if_depth > 0 {
+            return;
+        }
+        let anchor = node.location().start_offset();
+        self.dm_found_instance_method(anchor, &name);
+    }
+
+    /// `on_send` — `alias_method`/`attr*`/`delegate`/`def_delegator(s)`.
+    /// Restricted to those 9 method names (`RESTRICT_ON_SEND`), same as
+    /// upstream. NOTE: unlike the other four branches, `attr*` does NOT get
+    /// the `inside_condition?` exemption upstream — ported verbatim.
+    pub(crate) fn check_duplicate_methods_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/DuplicateMethods";
+        if !self.on(COP) {
+            return;
+        }
+        if !matches!(
+            node.name().as_slice(),
+            b"alias_method"
+                | b"attr_reader"
+                | b"attr_writer"
+                | b"attr_accessor"
+                | b"attr"
+                | b"delegate"
+                | b"def_delegator"
+                | b"def_instance_delegator"
+                | b"def_delegators"
+                | b"def_instance_delegators"
+        ) {
+            return;
+        }
+        let anchor = node.location().start_offset();
+        if let Some((name, original)) = dm_match_alias_method(node) {
+            if name == original || self.dm_if_depth > 0 {
+                return;
+            }
+            self.dm_found_instance_method(anchor, &name);
+            return;
+        }
+        if let Some((kind, args)) = dm_match_attribute_accessor(node) {
+            self.dm_on_attr(anchor, kind, &args);
+            return;
+        }
+        if self.hot.active_support {
+            if let Some(names) = dm_match_delegate(node) {
+                if self.dm_if_depth > 0 {
+                    return;
+                }
+                self.dm_on_delegate(anchor, node, &names);
+                return;
+            }
+        }
+        if let Some(name) = dm_match_delegator(node) {
+            if self.dm_if_depth > 0 {
+                return;
+            }
+            self.dm_found_instance_method(anchor, &name);
+            return;
+        }
+        if let Some(names) = dm_match_delegators(node) {
+            if self.dm_if_depth > 0 {
+                return;
+            }
+            for name in names {
+                self.dm_found_instance_method(anchor, &name);
+            }
+        }
+    }
+
+    fn dm_on_attr(&mut self, anchor: usize, kind: &str, args: &[ruby_prism::Node]) {
+        match kind {
+            "attr" => {
+                let writable = args.len() == 2 && args[1].as_true_node().is_some();
+                if let Some(first) = args.first() {
+                    self.dm_found_attr_arg(anchor, first, true, writable);
+                }
+            }
+            "attr_reader" => {
+                for a in args {
+                    self.dm_found_attr_arg(anchor, a, true, false);
+                }
+            }
+            "attr_writer" => {
+                for a in args {
+                    self.dm_found_attr_arg(anchor, a, false, true);
+                }
+            }
+            "attr_accessor" => {
+                for a in args {
+                    self.dm_found_attr_arg(anchor, a, true, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn dm_found_attr_arg(&mut self, anchor: usize, arg: &ruby_prism::Node, readable: bool, writable: bool) {
+        let Some(sym) = arg.as_symbol_node() else { return };
+        let name = sym.unescaped().to_vec();
+        if readable {
+            self.dm_found_instance_method(anchor, &name);
+        }
+        if writable {
+            let mut w = name;
+            w.push(b'=');
+            self.dm_found_instance_method(anchor, &w);
+        }
+    }
+
+    fn dm_on_delegate(&mut self, anchor: usize, node: &ruby_prism::CallNode, names: &[Vec<u8>]) {
+        let prefix = dm_delegate_prefix(node);
+        for name in names {
+            let full = if let Some(ref p) = prefix {
+                let mut v = p.clone();
+                v.push(b'_');
+                v.extend_from_slice(name);
+                v
+            } else {
+                name.clone()
+            };
+            self.dm_found_instance_method(anchor, &full);
+        }
+    }
+
+    /// `found_instance_method`: `parent_module_name` (a real enclosing class/
+    /// module/sclass/casgn/block chain) first; else `anonymous_class_block`
+    /// (an unassigned `Class.new`/`Module.new do...end` block); else
+    /// `found_sclass_method` (a `class << subject` whose subject is a bare
+    /// method call, e.g. `class << blah`).
+    fn dm_found_instance_method(&mut self, anchor: usize, name: &[u8]) {
+        let name_str = String::from_utf8_lossy(name).into_owned();
+        if let Some(scope) = self.dm_pmn(self.dm_ns_stack.len()) {
+            let display = format!("{}{}", dm_humanize_scope(&scope), name_str);
+            self.dm_found_method(anchor, display, None);
+            return;
+        }
+        if let Some(anon) = self.dm_anonymous_class_block() {
+            let anon_pmn = self.dm_pmn(anon.ns_len_at_entry);
+            let base = dm_qualified_name(anon_pmn.as_deref(), "Object");
+            let scope_txt = if self.dm_sclass_stack.is_empty() { base } else { format!("#<Class:{base}>") };
+            let display = format!("{}{}", dm_humanize_scope(&scope_txt), name_str);
+            self.dm_found_method(anchor, display, Some(anon.scope_id.clone()));
+            return;
+        }
+        if let Some(DmSclass::SendKind(subj)) = self.dm_sclass_stack.last() {
+            let display = format!("{}.{}", String::from_utf8_lossy(subj), name_str);
+            self.dm_found_method(anchor, display, None);
+        }
+    }
+
+    /// `check_const_receiver`: `def CONST.x` — resolve `CONST`'s simple name
+    /// against an enclosing `class`/`module` ancestor (compound casgn/
+    /// dotted-declaration matching isn't replicated — not exercised by the
+    /// fixture; see the final report).
+    fn dm_check_const_receiver(&mut self, anchor: usize, name: &[u8], const_name: &[u8]) {
+        let Some(qualified) = self.dm_lookup_constant(const_name) else { return };
+        let display = format!("{qualified}.{}", String::from_utf8_lossy(name));
+        self.dm_found_method(anchor, display, None);
+    }
+
+    /// `check_self_receiver`: `def self.x` — NOTE no `found_sclass_method`
+    /// fallback here (upstream has none either): if neither `parent_module_
+    /// name` nor `anonymous_class_block` resolves, nothing happens.
+    fn dm_check_self_receiver(&mut self, anchor: usize, name: &[u8]) {
+        let name_str = String::from_utf8_lossy(name).into_owned();
+        if let Some(enclosing) = self.dm_pmn(self.dm_ns_stack.len()) {
+            let display = format!("{enclosing}.{name_str}");
+            self.dm_found_method(anchor, display, None);
+            return;
+        }
+        if let Some(anon) = self.dm_anonymous_class_block() {
+            let anon_pmn = self.dm_pmn(anon.ns_len_at_entry);
+            let scope = dm_qualified_name(anon_pmn.as_deref(), "Object");
+            let display = format!("{scope}.{name_str}");
+            self.dm_found_method(anchor, display, Some(anon.scope_id.clone()));
+        }
+    }
+
+    /// `lookup_constant`: nearest-first walk over `dm_ns_stack`'s class/
+    /// module frames, matching by simple declared name.
+    fn dm_lookup_constant(&self, const_name: &[u8]) -> Option<String> {
+        for (idx, entry) in self.dm_ns_stack.iter().enumerate().rev() {
+            if entry.simple_name.as_deref() == Some(const_name) {
+                let enc = self.dm_pmn(idx);
+                return Some(dm_qualified_name(enc.as_deref(), &String::from_utf8_lossy(const_name)));
+            }
+        }
+        None
+    }
+
+    /// `parent_module_name`: walk `dm_ns_stack[..upto]` nearest-to-farthest,
+    /// collecting each frame's fragment (aborting the WHOLE walk — returns
+    /// `None` — the moment an `Abort` frame is hit, matching upstream's
+    /// non-local `return nil`), then reverse (farthest-to-nearest) and join
+    /// with `::`; an empty result is `"Object"` (upstream's fallback for "no
+    /// qualifying ancestors at all", DISTINCT from an abort).
+    fn dm_pmn(&self, upto: usize) -> Option<String> {
+        let mut parts = Vec::new();
+        for entry in self.dm_ns_stack[..upto].iter().rev() {
+            match &entry.frame {
+                DmNsFrame::Frag(s) => parts.push(s.clone()),
+                DmNsFrame::Abort => return None,
+                DmNsFrame::Skip => {}
+            }
+        }
+        parts.reverse();
+        Some(if parts.is_empty() { "Object".to_string() } else { parts.join("::") })
+    }
+
+    /// `anonymous_class_block`: the nearest enclosing block of ANY kind must
+    /// itself be a `Class.new`/`Module.new do...end` (`is_new_block`), not
+    /// assigned to a local variable (`parent_lvasgn`), and no enclosing
+    /// `sclass` may have a non-`self` subject.
+    fn dm_anonymous_class_block(&self) -> Option<DmAnonFrame> {
+        let top = self.dm_anon_stack.last()?;
+        if !top.is_new_block || top.parent_lvasgn {
+            return None;
+        }
+        if self.dm_sclass_stack.iter().any(|s| !matches!(s, DmSclass::SelfKind)) {
+            return None;
+        }
+        Some(top.clone())
+    }
+
+    /// Pushed/popped by `visit_class_node`/`visit_module_node` right after/
+    /// before `enter_namespace`/`leave_namespace` — see `dm_ns_stack`'s doc.
+    pub(crate) fn dm_enter_namespace(&mut self, constant_path: &ruby_prism::Node) {
+        let frag = String::from_utf8_lossy(self.node_src(constant_path)).into_owned();
+        let simple = dm_const_last_name(constant_path);
+        self.dm_ns_stack.push(DmNsEntry { frame: DmNsFrame::Frag(frag), simple_name: simple });
+    }
+    pub(crate) fn dm_leave_namespace(&mut self) {
+        self.dm_ns_stack.pop();
+    }
+
+    /// Pushed/popped by `visit_singleton_class_node` around its body —
+    /// `parent_module_name_for_sclass`: `class << self` recurses into the
+    /// ALREADY-established ancestor chain (computed BEFORE this frame is
+    /// pushed, matching upstream's `sclass_node.parent_module_name` never
+    /// including the sclass node itself); `class << CONST` wraps the
+    /// constant's own source text; anything else (a bare/method-call
+    /// subject, e.g. `class << blah`) aborts `parent_module_name` but is
+    /// still tracked (as a `SendKind`) for `found_sclass_method`.
+    pub(crate) fn dm_enter_sclass(&mut self, subject: &ruby_prism::Node) {
+        let (frame, kind) = if subject.as_self_node().is_some() {
+            let rec = self.dm_pmn(self.dm_ns_stack.len());
+            (DmNsFrame::Frag(format!("#<Class:{}>", rec.unwrap_or_default())), DmSclass::SelfKind)
+        } else if subject.as_constant_read_node().is_some() || subject.as_constant_path_node().is_some() {
+            let text = String::from_utf8_lossy(self.node_src(subject)).into_owned();
+            (DmNsFrame::Frag(format!("#<Class:{text}>")), DmSclass::ConstKind)
+        } else if let Some(call) = subject.as_call_node() {
+            (DmNsFrame::Abort, DmSclass::SendKind(call.name().as_slice().to_vec()))
+        } else {
+            (DmNsFrame::Abort, DmSclass::OtherKind)
+        };
+        self.dm_ns_stack.push(DmNsEntry { frame, simple_name: None });
+        self.dm_sclass_stack.push(kind);
+    }
+    pub(crate) fn dm_leave_sclass(&mut self) {
+        self.dm_ns_stack.pop();
+        self.dm_sclass_stack.pop();
+    }
+
+    /// `visit_call_node`'s `(is_new_block, ns_frame)` classification for a
+    /// block it's about to descend into — `parent_module_name_for_block`:
+    /// `class_eval` (implicit receiver contributes nothing; a const receiver
+    /// contributes its text; anything else aborts) takes priority; else a
+    /// `Class.new`/`Module.new` block DIRECTLY assigned to a constant
+    /// (`dm_pending_casgn_new_block`, set by `dm_check_casgn_value`)
+    /// contributes nothing (the casgn ancestor already does); any other
+    /// block aborts (`new_class_or_module_block?`'s catch-all `yield`).
+    pub(crate) fn dm_classify_block(&mut self, call: &ruby_prism::CallNode) -> (bool, DmNsFrame) {
+        let is_new = dm_new_block_call(call, self.src);
+        let is_casgn_assigned = std::mem::take(&mut self.dm_pending_casgn_new_block);
+        if call.name().as_slice() == b"class_eval" {
+            let frame = match call.receiver() {
+                None => DmNsFrame::Skip,
+                Some(recv) => {
+                    if recv.as_constant_read_node().is_some() || recv.as_constant_path_node().is_some() {
+                        DmNsFrame::Frag(String::from_utf8_lossy(self.node_src(&recv)).into_owned())
+                    } else {
+                        DmNsFrame::Abort
+                    }
+                }
+            };
+            (is_new, frame)
+        } else if is_new && is_casgn_assigned {
+            (is_new, DmNsFrame::Skip)
+        } else {
+            (is_new, DmNsFrame::Abort)
+        }
+    }
+
+    /// `visit_constant_write_node`/`visit_constant_path_write_node`: if
+    /// `value` is directly a `Class.new`/`Module.new do...end` call, push
+    /// this casgn's own `parent_module_name` fragment (`frag`) and arm
+    /// `dm_pending_casgn_new_block` so the upcoming block visit knows to
+    /// contribute nothing of its own — returns whether a frame was pushed
+    /// (the caller pops it back off after visiting the value).
+    pub(crate) fn dm_check_casgn_value(&mut self, value: &ruby_prism::Node, frag: String) -> bool {
+        let Some(c) = value.as_call_node() else { return false };
+        if !dm_new_block_call(&c, self.src) || c.block().is_none() {
+            return false;
+        }
+        self.dm_pending_casgn_new_block = true;
+        self.dm_ns_stack.push(DmNsEntry { frame: DmNsFrame::Frag(frag), simple_name: None });
+        true
+    }
+
+    /// `found_method`: the funnel every path above goes through. A
+    /// re-definition under an already-seen key is normally an offense,
+    /// EXCEPT the first time it happens while inside a `rescue`/`ensure`
+    /// clause of a given kind (`dm_scope_seen`) — a common idiom (define,
+    /// then restore in `ensure`) that upstream treats as re-baselining
+    /// rather than flagging; a SECOND redefinition within the SAME clause
+    /// kind (or one outside any rescue/ensure at all) still offends.
+    fn dm_found_method(&mut self, anchor: usize, display_name: String, scope_id: Option<DmScopeId>) {
+        const COP: &str = "Lint/DuplicateMethods";
+        let key_base = match self.def_name_stack.last() {
+            Some(encl) => format!("{}.{}", String::from_utf8_lossy(encl), display_name),
+            None => display_name.clone(),
+        };
+        let key = DmKey { base: key_base, scope_id };
+        let scope = self.dm_rescue_scope.last().copied();
+        if let Some(&prev_anchor) = self.dm_definitions.get(&key) {
+            if let Some(sc) = scope {
+                let seen = self.dm_scope_seen.entry(sc).or_default();
+                if !seen.contains(&key) {
+                    seen.insert(key.clone());
+                    self.dm_definitions.insert(key, anchor);
+                    return;
+                }
+            }
+            let prev_line = self.idx.loc(prev_anchor).0;
+            let cur_line = self.idx.loc(anchor).0;
+            let base = dm_basename(self.rel_path);
+            let msg = format!("Method `{display_name}` is defined at both {base}:{prev_line} and {base}:{cur_line}.");
+            self.push(anchor, COP, false, msg);
+        } else {
+            self.dm_definitions.insert(key, anchor);
+        }
+    }
+}

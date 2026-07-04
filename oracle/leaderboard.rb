@@ -338,6 +338,7 @@ COPS = {
   'Style/RedundantCondition'         => 'style/redundant_condition',
   'Lint/RedundantSafeNavigation'     => 'lint/redundant_safe_navigation',
   'Style/ClassAndModuleChildren'     => 'style/class_and_module_children',
+  'Lint/DuplicateMethods'            => 'lint/duplicate_methods',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
