@@ -369,7 +369,7 @@ while i < lines.length
   end
   # `before { cop_config['Key'] = value }` mutates ONE key of the shared
   # cop_config: splice the pair into the frame's cop_config hash text.
-  if l =~ /before\s*\{\s*cop_config\[(['"])([^'"]+)\1\]\s*=\s*([^\[\]{}]+?)\s*\}/ && cfg_stack.any?
+  if l =~ /before\s*\{\s*cop_config\[(['"])([^'"]+)\1\]\s*=\s*((?:\[[^\]]*\]|[^\[\]{}]+?))\s*\}/ && cfg_stack.any?
     key = Regexp.last_match(2)
     val = Regexp.last_match(3).strip
     base = cfg_stack.last[1]
