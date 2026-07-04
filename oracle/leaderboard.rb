@@ -273,6 +273,7 @@ COPS = {
   'Bundler/DuplicatedGroup'          => 'bundler/duplicated_group',
   'Layout/EmptyLinesAroundArguments' => 'layout/empty_lines_around_arguments',
   'Style/EvalWithLocation'           => 'style/eval_with_location',
+  'Style/MethodCallWithoutArgsParentheses' => 'style/method_call_without_args_parentheses',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

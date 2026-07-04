@@ -16647,3 +16647,157 @@ impl<'a> super::Cops<'a> {
         self.eval_wl_register(node, is_eval, method_name, Some(fix));
     }
 }
+
+
+// Style/MethodCallWithoutArgsParentheses
+//
+// Ported from rubocop's `on_send`/`on_csend` (aliased). The five upstream
+// exemptions map onto prism as follows:
+//   - `ineligible_node?` (camelCase / `.()`  / prefix `not`): plain field
+//     checks on the `CallNode` itself — no ancestor state needed.
+//   - `default_argument?` (`node.parent&.optarg_type?`): the DIRECT parent
+//     must be an optional-parameter default — recorded up front in
+//     `visit_optional_parameter_node` (`mcwap_optarg_default`, mod.rs) since
+//     prism has no parent pointers.
+//   - `allowed_method_name?`: `self.allowed`, generic AllowedMethods/
+//     AllowedPatterns plumbing shared by every cop with that mixin pair.
+//   - `same_name_assignment?`: `mcwap_assign_stack` (mod.rs) — one frame per
+//     enclosing local-variable write/masgn ancestor, pushed around that
+//     node's full subtree visit (exactly `each_ancestor`'s climb, since a
+//     stack-at-visit-time IS the ancestor chain). Only local-variable writes
+//     are tracked: ivar/cvar/gvar/casgn names carry a sigil or start
+//     uppercase and can never equal a bare method name, and a call-type lhs
+//     shorthand assign (`obj.method ||= x`) is a wholly different prism node
+//     kind (`CallOrWriteNode` &c.) that's simply never pushed — exactly
+//     upstream's `asgn_node.lhs.call_type?` exclusion, for free.
+//   - `parenthesized_it_method_in_block?`: mirrors Style/RedundantSelf's
+//     `it_method_in_block?` (see that cop's doc comment) via the same
+//     `rs_block_stack`, minus the `self` receiver.
+//
+// `node.arguments?` itself has a prism trap: whitequark's `send#arguments`
+// includes a trailing `&block` (block-pass) but NOT an attached `{ }`/
+// `do...end` literal block — prism splits `&block` into the separate `block`
+// field (as a `BlockArgumentNode`, distinct from a `BlockNode` literal), so
+// `node.arguments().is_some()` alone under-counts. `foo(&blk)` must NOT
+// offend; `foo() { }` MUST (verified against real rubocop's behavior).
+impl<'a> Cops<'a> {
+    pub(crate) fn check_method_call_without_args_parentheses(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/MethodCallWithoutArgsParentheses";
+        if !self.on(COP) {
+            return;
+        }
+        let has_args = node.arguments().is_some()
+            || node.block().is_some_and(|b| b.as_block_argument_node().is_some());
+        if has_args {
+            return;
+        }
+        // `parenthesized?`: `loc_is?(:end, ')')` — an index call's closing
+        // delimiter is `]`, never `)`, so this alone tells calls from
+        // indexing apart without any separate node-type check.
+        let Some(closing) = node.closing_loc() else { return };
+        if closing.as_slice() != b")" {
+            return;
+        }
+        let Some(opening) = node.opening_loc() else { return };
+
+        let name = node.name().as_slice();
+        // `ineligible_node?`: `camel_case_method?` (`Integer()`) / `implicit_call?`
+        // (`thing.()`, name `call` with no selector text) / `prefix_not?`
+        // (`not(x)` — a real `!x`, spelled `not`, that (unlike bare `!(x)`,
+        // whose parens belong to a separately-parsed wrapped receiver node,
+        // never this call's own `opening_loc`/`closing_loc`) keeps its own
+        // parens as this very call's delimiters).
+        if name.first().is_some_and(u8::is_ascii_uppercase) {
+            return;
+        }
+        if name == b"call" && node.message_loc().is_none() {
+            return;
+        }
+        if name == b"!" && node.receiver().is_some() && node.message_loc().is_some_and(|m| m.as_slice() == b"not") {
+            return;
+        }
+        // `default_argument?`.
+        if self.mcwap_optarg_default.contains(&node.location().start_offset()) {
+            return;
+        }
+        // `allowed_method_name?`.
+        if self.allowed(COP, name) {
+            return;
+        }
+        // `same_name_assignment?`: `return false if node.receiver` up front.
+        if node.receiver().is_none()
+            && self.mcwap_assign_stack.iter().any(|frame| frame.iter().any(|n| n.as_slice() == name))
+        {
+            return;
+        }
+        // `parenthesized_it_method_in_block?`.
+        if self.mcwap_it_method_in_block(node) {
+            return;
+        }
+
+        self.push(
+            opening.start_offset(),
+            COP,
+            true,
+            "Do not use parentheses for method calls with no arguments.",
+        );
+        // `corrector.remove(node.loc.begin)` + `corrector.remove(node.loc.end)`
+        // — TWO separate single-delimiter removals, not one merged range, so
+        // stray whitespace between the parens (`foo(   )`) survives untouched
+        // exactly like the real cop.
+        self.fixes.push((opening.start_offset(), opening.end_offset(), Vec::new()));
+        self.fixes.push((closing.start_offset(), closing.end_offset(), Vec::new()));
+    }
+
+    /// `parenthesized_it_method_in_block?`: bare `it()` (no receiver, no
+    /// block of its own) inside the nearest enclosing PLAIN block (skipping
+    /// `_1`/`it`-numbered ones, matching upstream's `each_ancestor(:block)`
+    /// type filter) that has no `|...|` delimiters at all — see
+    /// Style/RedundantSelf's near-identical `rs_it_method_in_block` (this
+    /// cop's variant additionally requires the ABSENCE of a receiver, and
+    /// upstream's `node.arguments.empty?` is already guaranteed true by the
+    /// caller's own `!node.arguments?` guard, so it's not re-checked here).
+    fn mcwap_it_method_in_block(&self, node: &ruby_prism::CallNode) -> bool {
+        if node.name().as_slice() != b"it" {
+            return false;
+        }
+        if node.receiver().is_some() {
+            return false;
+        }
+        let Some(&(_, no_delims)) = self.rs_block_stack.iter().rev().find(|(is_plain, _)| *is_plain) else {
+            return false;
+        };
+        if !no_delims {
+            return false;
+        }
+        node.block().is_none()
+    }
+
+    /// `MlhsNode#assignments`-equivalent, restricted to the only target kind
+    /// that can ever equal a bare method name: recurses through nested
+    /// destructuring (`MultiTargetNode`) and unwraps `*splat`, collecting
+    /// every `LocalVariableTargetNode`'s name. `IndexTargetNode`/
+    /// `CallTargetNode` (index/attribute writes) and the ivar/cvar/gvar/
+    /// const target kinds are silently skipped — exactly upstream's
+    /// `reject(&:send_type?)` for the former, and a name shape that can
+    /// never match a bare method name for the latter.
+    pub(crate) fn mcwap_collect_lvar_target_names(node: &ruby_prism::Node, out: &mut Vec<Vec<u8>>) {
+        if let Some(lv) = node.as_local_variable_target_node() {
+            out.push(lv.name().as_slice().to_vec());
+        } else if let Some(mt) = node.as_multi_target_node() {
+            for t in mt.lefts().iter() {
+                Self::mcwap_collect_lvar_target_names(&t, out);
+            }
+            if let Some(r) = mt.rest() {
+                Self::mcwap_collect_lvar_target_names(&r, out);
+            }
+            for t in mt.rights().iter() {
+                Self::mcwap_collect_lvar_target_names(&t, out);
+            }
+        } else if let Some(sp) = node.as_splat_node() {
+            if let Some(e) = sp.expression() {
+                Self::mcwap_collect_lvar_target_names(&e, out);
+            }
+        }
+    }
+}

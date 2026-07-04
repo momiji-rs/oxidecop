@@ -308,6 +308,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
     "Style/ExplicitBlockArgument",
     "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
+    "Style/MethodCallWithoutArgsParentheses",
 ];
 
 impl Engine {
@@ -817,6 +818,21 @@ pub(crate) struct Cops<'a> {
     // `each_ancestor(:block).first` (type-filtered!) +
     // `empty_and_without_delimiters?`.
     pub(crate) rs_block_stack: Vec<(bool, bool)>,
+    // Style/MethodCallWithoutArgsParentheses's `same_name_assignment?`: one
+    // frame per enclosing local-variable write/masgn ancestor, each holding
+    // the name(s) it assigns (a masgn frame can hold several). Only LOCAL
+    // variable writes are tracked — ivar/cvar/gvar/casgn writes carry sigils
+    // or start uppercase, so their name can never equal a bare method name
+    // (and camelCase methods are excluded earlier anyway), making them dead
+    // code here. `obj.method ||= x` / index writes are separate node kinds
+    // in prism (CallOrWriteNode &c.) that are simply never pushed here,
+    // which is exactly upstream's `asgn_node.lhs.call_type?` exclusion.
+    pub(crate) mcwap_assign_stack: Vec<Vec<Vec<u8>>>,
+    // Style/MethodCallWithoutArgsParentheses's `default_argument?`
+    // (`node.parent&.optarg_type?`): start offsets of call nodes that are the
+    // DIRECT `value` of a `def`/block optional parameter (`def foo(test =
+    // test())`) — set once, up front, in `visit_optional_parameter_node`.
+    pub(crate) mcwap_optarg_default: HashSet<usize>,
     // Lint/NonLocalExitFromIterator: one entry per active def/block/lambda
     // ancestor, innermost last — mirrors upstream's
     // `each_ancestor(:any_block, :any_def)` climb from a `return` node.
@@ -1503,6 +1519,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_space_around_equals_in_parameter_default(node);
         self.check_circular_argument_reference(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        // Style/MethodCallWithoutArgsParentheses's `default_argument?`:
+        // `node.parent&.optarg_type?` — only the DIRECT value counts, not any
+        // deeper descendant, so this is recorded here rather than via a stack.
+        if let Some(call) = node.value().as_call_node() {
+            self.mcwap_optarg_default.insert(call.location().start_offset());
+        }
         ruby_prism::visit_optional_parameter_node(self, node);
     }
     fn visit_required_parameter_node(&mut self, node: &ruby_prism::RequiredParameterNode<'pr>) {
@@ -1850,12 +1872,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        // Style/MethodCallWithoutArgsParentheses's `same_name_assignment?`:
+        // this name is a live "ancestor assignment" for the whole `value`
+        // subtree — see the `mcwap_assign_stack` field doc.
+        self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
         ruby_prism::visit_local_variable_write_node(self, node);
+        self.mcwap_assign_stack.pop();
     }
     fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
         assignment_operator_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
         ruby_prism::visit_local_variable_operator_write_node(self, node);
+        self.mcwap_assign_stack.pop();
     }
     fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
@@ -1863,14 +1892,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
         ruby_prism::visit_local_variable_or_write_node(self, node);
+        self.mcwap_assign_stack.pop();
     }
     fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+        self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
         ruby_prism::visit_local_variable_and_write_node(self, node);
+        self.mcwap_assign_stack.pop();
     }
     fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
         // masgn/rescue/for-loop targets are lvasgn in whitequark (checked);
@@ -1933,7 +1966,27 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.rs_lvar_write(&name, &node.value());
             }
         }
+        // Style/MethodCallWithoutArgsParentheses's `variable_in_mass_assignment?`
+        // (`node.assignments.reject(&:send_type?).any? { |n| n.name == ... }`):
+        // collect every plain local-variable target's name — `lefts`, an
+        // optional `*rest`, and `rights` — recursing through nested
+        // destructuring (`(a, *b), c = ...`) and unwrapping `*splat`.
+        // `IndexTargetNode`/`CallTargetNode` (index/attribute writes — the
+        // upstream `send_type?` rejects) are skipped for free by only
+        // matching `LocalVariableTargetNode`/`MultiTargetNode`/`SplatNode`.
+        let mut mcwap_names = Vec::new();
+        for t in node.lefts().iter() {
+            Self::mcwap_collect_lvar_target_names(&t, &mut mcwap_names);
+        }
+        if let Some(r) = node.rest() {
+            Self::mcwap_collect_lvar_target_names(&r, &mut mcwap_names);
+        }
+        for t in node.rights().iter() {
+            Self::mcwap_collect_lvar_target_names(&t, &mut mcwap_names);
+        }
+        self.mcwap_assign_stack.push(mcwap_names);
         ruby_prism::visit_multi_write_node(self, node);
+        self.mcwap_assign_stack.pop();
     }
     fn visit_call_and_write_node(&mut self, node: &ruby_prism::CallAndWriteNode<'pr>) {
         self.check_self_assignment_reader_write(
@@ -3127,6 +3180,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_useless_times(node);
         self.check_attr(node);
         self.check_lambda_call(node);
+        self.check_method_call_without_args_parentheses(node);
         self.check_unreachable_loop_call(node);
         self.check_insecure_protocol_source(node);
         self.check_required_ruby_version(node);
@@ -3553,6 +3607,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         rs_scope_stack: Vec::new(),
         rs_narrow: Vec::new(),
         rs_block_stack: Vec::new(),
+        mcwap_assign_stack: Vec::new(),
+        mcwap_optarg_default: HashSet::new(),
         nle_stack: Vec::new(),
         nle_pending: None,
         ut_call_child: HashSet::new(),
