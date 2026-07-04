@@ -8579,3 +8579,572 @@ fn elagc_heredoc_closing_loc<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_p
         None
     }
 }
+
+
+/// `PrecedingFollowingAlignment#aligned_with_equals_sign`'s three-way
+/// verdict: `None` — no relevant preceding assignment to compare against
+/// (first in its block, so nothing to flag); `Yes` — already aligned;
+/// `No` — misaligned (the only case `check_assignment` flags).
+enum EsAlignment {
+    None,
+    Yes,
+    No,
+}
+
+/// Layout/ExtraSpacing's single whole-file AST walk: collects (1) every
+/// multiline hash/keyword-hash pair's `key.end..value.begin` byte range —
+/// upstream's `ignored_ranges` (Layout/HashAlignment's territory, so a
+/// misaligned `=>`/`:` there is never "extra spacing") — and (2) every `=`
+/// position that LOOKS like a bare assignment but isn't one: an optarg
+/// default (`def foo(a = 1)`) or an endless method's own `=`
+/// (`remove_equals_in_def`), both excluded from assignment-operator
+/// detection.
+struct EsPairCollector {
+    ignored_ranges: Vec<(usize, usize)>,
+    excluded_eq: std::collections::HashSet<usize>,
+}
+impl EsPairCollector {
+    fn es_collect_pairs<'pr>(&mut self, hash_loc: ruby_prism::Location<'pr>, elements: ruby_prism::NodeList<'pr>) {
+        // `pair.parent.single_line?` — only a MULTILINE hash/kwargs exempts
+        // its pairs' key..value gap (that's Layout/HashAlignment's job).
+        if !hash_loc.as_slice().contains(&b'\n') {
+            return;
+        }
+        for el in elements.iter() {
+            if let Some(assoc) = el.as_assoc_node() {
+                let key_end = assoc.key().location().end_offset();
+                let value_start = assoc.value().location().start_offset();
+                if value_start > key_end {
+                    self.ignored_ranges.push((key_end, value_start));
+                }
+            }
+        }
+    }
+}
+impl<'pr> ruby_prism::Visit<'pr> for EsPairCollector {
+    fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
+        self.es_collect_pairs(node.location(), node.elements());
+        ruby_prism::visit_hash_node(self, node);
+    }
+    fn visit_keyword_hash_node(&mut self, node: &ruby_prism::KeywordHashNode<'pr>) {
+        self.es_collect_pairs(node.location(), node.elements());
+        ruby_prism::visit_keyword_hash_node(self, node);
+    }
+    fn visit_optional_parameter_node(&mut self, node: &ruby_prism::OptionalParameterNode<'pr>) {
+        self.excluded_eq.insert(node.operator_loc().start_offset());
+        ruby_prism::visit_optional_parameter_node(self, node);
+    }
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        if let Some(eq) = node.equal_loc() {
+            self.excluded_eq.insert(eq.start_offset());
+        }
+        ruby_prism::visit_def_node(self, node);
+    }
+}
+
+impl<'a> Cops<'a> {
+    /// Layout/ExtraSpacing — flags runs of 2+ horizontal-whitespace bytes
+    /// between two adjacent lexical tokens on the same line
+    /// (`MSG_UNNECESSARY`, `Unnecessary spacing detected.`), ported from
+    /// rubocop's `on_new_investigation` + `PrecedingFollowingAlignment`
+    /// mixin, with three independent escape hatches:
+    ///
+    ///   - `AllowForAlignment` (default true): the run is fine if the
+    ///     FOLLOWING token lines up with something on the nearest
+    ///     qualifying line above/below (identical text at that column, or —
+    ///     failing that — the nearest line at the SAME indentation as the
+    ///     token's own line). Reuses `Layout/SpaceBeforeFirstArg`'s already-
+    ///     ported `sbfa_*` helpers (same mixin, same algorithm) via
+    ///     `es_aligned_with_something` — just against an arbitrary byte
+    ///     range instead of a single AST node.
+    ///   - `AllowBeforeTrailingComments` (default false): a run right
+    ///     before a trailing `#` comment is fine regardless of alignment.
+    ///   - `ForceEqualSignAlignment` (default false): every line's first
+    ///     real assignment operator (`=` or a compound `OP_ASGN`, minus
+    ///     optarg defaults and endless-`def` equals signs) is instead
+    ///     checked against the nearest PRECEDING assignment at the same
+    ///     indentation (`MSG_UNALIGNED_ASGN`, `` `=` is not aligned with
+    ///     the preceding assignment.``) — replacing, not augmenting, the
+    ///     normal spacing check for that one token. Autocorrect re-aligns
+    ///     the WHOLE contiguous same-indentation block of assignments to
+    ///     the widest column, mirroring `align_equal_signs`.
+    ///
+    /// Real rubocop drives this off `processed_source.tokens` (parser-gem
+    /// tokens via whitequark); prism exposes no equivalent token stream. This
+    /// ports the algorithm onto the raw byte source instead: `self.lit_spans`
+    /// (every string/symbol/regexp/heredoc-body byte span, already tracked
+    /// for other text-based cops) and `self.comments` stand in for literal
+    /// and comment tokens, and everything else is scanned byte-by-byte, with
+    /// `es_token_len` approximating "how long is the lexical token starting
+    /// here" (identifier/keyword, number, or the longest matching operator/
+    /// punctuation lexeme) — enough to reproduce rubocop's column-based
+    /// alignment predicates without a real lexer. Known gap: `=begin`/`=end`
+    /// block comments aren't modeled as opaque past their first line (no
+    /// fixture example exercises one).
+    pub(crate) fn check_extra_spacing(&mut self, root: &ruby_prism::Node) {
+        const COP: &str = "Layout/ExtraSpacing";
+        if !self.on(COP) || self.src.is_empty() {
+            return;
+        }
+
+        use ruby_prism::Visit;
+        let mut collector = EsPairCollector { ignored_ranges: Vec::new(), excluded_eq: std::collections::HashSet::new() };
+        collector.visit(root);
+        let ignored_ranges = collector.ignored_ranges;
+        let excluded_eq = collector.excluded_eq;
+
+        let allow_for_alignment = self.cfg.get(COP, "AllowForAlignment") != Some("false");
+        let allow_before_comments = self.cfg.get(COP, "AllowBeforeTrailingComments") == Some("true");
+        let force_eq_align = self.cfg.get(COP, "ForceEqualSignAlignment") == Some("true");
+
+        let aligned_comment_lines = self.es_build_aligned_comments();
+        let comment_by_line: std::collections::HashMap<usize, (usize, usize)> =
+            self.comments.iter().map(|&(l, s, e)| (l, (s, e))).collect();
+        let nlines = self.idx.starts.len();
+
+        // Per-line first REAL assignment operator (after excluding optarg
+        // defaults / endless-method `=`) — only meaningful under
+        // ForceEqualSignAlignment, which routes MSG_UNNECESSARY away from it.
+        let mut assign_map: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+        if force_eq_align {
+            for line in 1..=nlines {
+                let ls = self.idx.starts[line - 1];
+                let code_end = comment_by_line.get(&line).map_or_else(|| self.line_end(line), |&(s, _)| s);
+                if let Some(tok) = self.es_find_assignment(ls, code_end, &excluded_eq) {
+                    assign_map.insert(line, tok);
+                }
+            }
+        }
+
+        for line in 1..=nlines {
+            let ls = self.idx.starts[line - 1];
+            let le = self.line_end(line);
+            let comment = comment_by_line.get(&line).copied();
+            let code_end = comment.map_or(le, |(s, _)| s);
+
+            let mut i = ls;
+            let mut prev_end: Option<usize> = None;
+            while i < code_end {
+                if let Some(e) = self.es_lit_containing_end(i) {
+                    if let Some(pe) = prev_end {
+                        self.es_check_other(
+                            COP,
+                            pe,
+                            i,
+                            e,
+                            false,
+                            allow_for_alignment,
+                            allow_before_comments,
+                            &ignored_ranges,
+                            &aligned_comment_lines,
+                        );
+                    }
+                    prev_end = Some(e);
+                    i = e;
+                    continue;
+                }
+                let b = self.src[i];
+                if b.is_ascii_whitespace() {
+                    i += 1;
+                    continue;
+                }
+                let tok_end = i + self.es_token_len(i).max(1);
+                if let Some(pe) = prev_end {
+                    let is_assign = force_eq_align && assign_map.get(&line) == Some(&(i, tok_end));
+                    if !is_assign {
+                        self.es_check_other(
+                            COP,
+                            pe,
+                            i,
+                            tok_end,
+                            false,
+                            allow_for_alignment,
+                            allow_before_comments,
+                            &ignored_ranges,
+                            &aligned_comment_lines,
+                        );
+                    }
+                }
+                prev_end = Some(tok_end);
+                i = tok_end;
+            }
+
+            // Trailing comment: only a real gap when there's non-blank code
+            // earlier on this SAME line — a standalone comment line has no
+            // same-line predecessor token (`token1.line != token2.line`
+            // upstream), so leading whitespace before it is never flagged.
+            if let (Some(pe), Some((cstart, cend))) = (prev_end, comment) {
+                self.es_check_other(
+                    COP,
+                    pe,
+                    cstart,
+                    cend,
+                    true,
+                    allow_for_alignment,
+                    allow_before_comments,
+                    &ignored_ranges,
+                    &aligned_comment_lines,
+                );
+            }
+        }
+
+        if force_eq_align {
+            self.es_check_assignments(COP, &assign_map);
+        }
+    }
+
+    /// `check_other`/`extra_space_range`: given the gap between `token1`'s
+    /// end (`token1_end`) and `token2`'s span (`token2_start..token2_end`)
+    /// on one physical line, flag+fix the "extra" whitespace (all but the
+    /// last one character of the gap) unless an escape hatch applies.
+    #[allow(clippy::too_many_arguments)]
+    fn es_check_other(
+        &mut self,
+        cop: &'static str,
+        token1_end: usize,
+        token2_start: usize,
+        token2_end: usize,
+        is_comment: bool,
+        allow_for_alignment: bool,
+        allow_before_comments: bool,
+        ignored_ranges: &[(usize, usize)],
+        aligned_comment_lines: &std::collections::HashSet<usize>,
+    ) {
+        if is_comment && allow_before_comments {
+            return;
+        }
+        let start_pos = token1_end;
+        let end_pos = token2_start.wrapping_sub(1);
+        if end_pos <= start_pos {
+            return;
+        }
+        if allow_for_alignment {
+            let aligned = if is_comment {
+                let line = self.idx.loc(token2_start).0;
+                aligned_comment_lines.contains(&line)
+            } else {
+                self.es_aligned_with_something(token2_start, token2_end)
+            };
+            if aligned {
+                return;
+            }
+        }
+        if ignored_ranges.iter().any(|&(s, e)| start_pos >= s && start_pos < e) {
+            return;
+        }
+        self.push(start_pos, cop, true, "Unnecessary spacing detected.");
+        self.fixes.push((start_pos, end_pos, Vec::new()));
+    }
+
+    /// `PrecedingFollowingAlignment#aligned_with_something?` generalized to
+    /// an arbitrary byte range instead of an AST node — same algorithm as
+    /// `sbfa_aligned_with_something` (reuses its `sbfa_first_candidate`
+    /// helper directly), duplicated here only because that one is typed to
+    /// take a `&ruby_prism::Node`.
+    fn es_aligned_with_something(&self, begin: usize, end: usize) -> bool {
+        let range_line = self.idx.loc(begin).0;
+        let range_col = begin - self.idx.starts[range_line - 1];
+        let range_src = &self.src[begin..end];
+        let total_lines = self.idx.starts.len();
+        let pre: Vec<usize> = if range_line >= 2 { (0..=range_line - 2).rev().collect() } else { Vec::new() };
+        let post: Vec<usize> = if range_line < total_lines { (range_line..total_lines).collect() } else { Vec::new() };
+        for lines in [&pre, &post] {
+            if self.sbfa_first_candidate(lines, range_col, range_src, None) == Some(true) {
+                return true;
+            }
+        }
+        let cur_line = self.sbfa_line_bytes(range_line);
+        let base_indent = Self::sbfa_first_nonspace(cur_line);
+        for lines in [&pre, &post] {
+            if self.sbfa_first_candidate(lines, range_col, range_src, base_indent) == Some(true) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `aligned_locations`: for each pair of TEXTUALLY CONSECUTIVE comments
+    /// (file order, not necessarily adjacent lines) whose start columns
+    /// match, both their lines are "aligned for comment purposes" — used
+    /// only when `token2` is itself a trailing comment.
+    fn es_build_aligned_comments(&self) -> std::collections::HashSet<usize> {
+        let mut set = std::collections::HashSet::new();
+        for w in self.comments.windows(2) {
+            let (l1, s1, _) = w[0];
+            let (l2, s2, _) = w[1];
+            let c1 = s1 - self.idx.starts[l1 - 1];
+            let c2 = s2 - self.idx.starts[l2 - 1];
+            if c1 == c2 {
+                set.insert(l1);
+                set.insert(l2);
+            }
+        }
+        set
+    }
+
+    /// The literal/heredoc-body span CONTAINING `pos` (start <= pos < end),
+    /// whether `pos` is its exact start or a continuation line of a
+    /// multiline literal — mirrors `in_lit_span`'s own lookup (same sorted
+    /// `self.lit_spans`), just returning the end offset to jump to instead
+    /// of a bool.
+    fn es_lit_containing_end(&self, pos: usize) -> Option<usize> {
+        let i = self.lit_spans.partition_point(|&(s, _)| s <= pos);
+        if i > 0 && pos < self.lit_spans[i - 1].1 {
+            Some(self.lit_spans[i - 1].1)
+        } else {
+            None
+        }
+    }
+
+    /// Length of the lexical token starting at `pos` (already known to be
+    /// real code — not whitespace, not inside a literal): an identifier/
+    /// keyword/ivar/gvar run, a number (with a `.digits` float tail), the
+    /// longest matching multi-char operator lexeme, or one byte of
+    /// punctuation. Approximates real tokenization closely enough for the
+    /// column-alignment predicates that consult a token's own text/length.
+    fn es_token_len(&self, pos: usize) -> usize {
+        let b = self.src[pos];
+        if b.is_ascii_alphabetic() || b == b'_' || b == b'@' || b == b'$' {
+            let mut i = pos;
+            if self.src[i] == b'@' {
+                i += 1;
+                if self.src.get(i) == Some(&b'@') {
+                    i += 1;
+                }
+            } else if self.src[i] == b'$' {
+                i += 1;
+            }
+            while i < self.src.len() && (self.src[i].is_ascii_alphanumeric() || self.src[i] == b'_') {
+                i += 1;
+            }
+            if i < self.src.len() && matches!(self.src[i], b'?' | b'!') {
+                i += 1;
+            }
+            return (i - pos).max(1);
+        }
+        if b.is_ascii_digit() {
+            let mut i = pos;
+            while i < self.src.len() && (self.src[i].is_ascii_digit() || self.src[i] == b'_') {
+                i += 1;
+            }
+            if i < self.src.len() && self.src[i] == b'.' && self.src.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+                while i < self.src.len() && (self.src[i].is_ascii_digit() || self.src[i] == b'_') {
+                    i += 1;
+                }
+            }
+            return i - pos;
+        }
+        const MULTI: &[&[u8]] = &[
+            b"**=", b"<<=", b">>=", b"&&=", b"||=", b"<=>", b"===", b"...", b"..", b"==", b"!=", b"<=", b">=", b"=~",
+            b"=>", b"->", b"::", b"&.", b"<<", b">>", b"**", b"+=", b"-=", b"*=", b"/=", b"%=", b"&=", b"|=", b"^=",
+        ];
+        for m in MULTI {
+            if self.src[pos..].starts_with(m) {
+                return m.len();
+            }
+        }
+        1
+    }
+
+    /// The first REAL assignment operator (`assignment_tokens`: `tEQL` or
+    /// `tOP_ASGN`, i.e. `=` or a compound `+=`/`-=`/.../`||=`) in
+    /// `src[ls..code_end]` — skipping literal spans, comparison/spaceship
+    /// operators (`==`, `===`, `!=`, `<=`, `>=`, `<=>`, never assignments),
+    /// `=>` (hash rocket) and `=~` (match), and any `=` in `excluded`
+    /// (optarg defaults, endless-`def`).
+    fn es_find_assignment(&self, ls: usize, code_end: usize, excluded: &std::collections::HashSet<usize>) -> Option<(usize, usize)> {
+        const ASSIGN_OPS: &[&[u8]] =
+            &[b"**=", b"<<=", b">>=", b"&&=", b"||=", b"+=", b"-=", b"*=", b"/=", b"%=", b"&=", b"|=", b"^="];
+        const CMP_SKIP: &[&[u8]] = &[b"<=>", b"===", b"==", b"!=", b"<=", b">="];
+        let mut i = ls;
+        while i < code_end {
+            if let Some(e) = self.es_lit_containing_end(i) {
+                i = e;
+                continue;
+            }
+            let rest = &self.src[i..code_end];
+            if let Some(op) = ASSIGN_OPS.iter().find(|op| rest.starts_with(**op)) {
+                if !excluded.contains(&i) {
+                    return Some((i, i + op.len()));
+                }
+                i += op.len();
+                continue;
+            }
+            if let Some(op) = CMP_SKIP.iter().find(|op| rest.starts_with(**op)) {
+                i += op.len();
+                continue;
+            }
+            if self.src[i] == b'=' {
+                let next = self.src.get(i + 1).copied();
+                if next == Some(b'>') || next == Some(b'~') {
+                    i += 2;
+                    continue;
+                }
+                if !excluded.contains(&i) {
+                    return Some((i, i + 1));
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// `processed_source.line_indentation`: the leading-whitespace run's
+    /// length — for a BLANK line (all whitespace or empty), that's the
+    /// line's own full length, not zero (matches `/^(\s*)/` on a blank
+    /// string matching the whole thing).
+    fn es_line_indentation(&self, line: usize) -> usize {
+        let bytes = self.sbfa_line_bytes(line);
+        bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len())
+    }
+
+    fn es_line_blank(&self, line: usize) -> bool {
+        self.sbfa_line_bytes(line).iter().all(u8::is_ascii_whitespace)
+    }
+
+    /// `PrecedingFollowingAlignment#relevant_assignment_lines`: walking
+    /// `line_range` (already-materialized, since it may run in either
+    /// direction), collect the assignment lines that stay at the SAME
+    /// indentation as `line_range`'s first line, stopping at a dedent (on a
+    /// non-blank line) or a blank line once we've left that indentation
+    /// level.
+    fn es_relevant_assignment_lines(
+        &self,
+        line_range: &[usize],
+        assign_map: &std::collections::HashMap<usize, (usize, usize)>,
+    ) -> Vec<usize> {
+        let mut result = Vec::new();
+        let Some(&first) = line_range.first() else { return result };
+        let original_line_indent = self.es_line_indentation(first);
+        let mut relevant_at_level = true;
+        for &line_number in line_range {
+            let current_indent = self.es_line_indentation(line_number);
+            let blank = self.es_line_blank(line_number);
+            if (current_indent < original_line_indent && !blank) || (relevant_at_level && blank) {
+                break;
+            }
+            if current_indent == original_line_indent && assign_map.contains_key(&line_number) {
+                result.push(line_number);
+            }
+            if !blank {
+                relevant_at_level = current_indent == original_line_indent;
+            }
+        }
+        result
+    }
+
+    /// `all_relevant_assignment_lines`: the union of the downward
+    /// (`line.downto(1)`) and upward (`line.upto(last)`) relevant-line
+    /// scans — the FULL same-indentation block of assignments `line`
+    /// belongs to, used by autocorrect to align every member at once.
+    fn es_all_relevant_assignment_lines(
+        &self,
+        line: usize,
+        assign_map: &std::collections::HashMap<usize, (usize, usize)>,
+    ) -> Vec<usize> {
+        let nlines = self.idx.starts.len();
+        let down: Vec<usize> = (1..=line).rev().collect();
+        let up: Vec<usize> = (line..=nlines).collect();
+        let mut res = self.es_relevant_assignment_lines(&down, assign_map);
+        res.extend(self.es_relevant_assignment_lines(&up, assign_map));
+        res.sort_unstable();
+        res.dedup();
+        res
+    }
+
+    /// `aligned_with_equals_sign(token, line_range)`: is `tok` (on
+    /// `token_line`) aligned with the SECOND entry of the relevant-
+    /// assignment-lines scan over `line_range` (the first entry is always
+    /// `tok`'s own line) — `None` when there's no such preceding assignment
+    /// to compare against, `Yes`/`No` otherwise (reusing
+    /// `sbfa_aligned_equals_operator`, the same end-column comparison
+    /// `PrecedingFollowingAlignment#aligned_equals_operator?` performs).
+    fn es_aligned_with_equals_sign(
+        &self,
+        token_line: usize,
+        tok_start: usize,
+        tok_end: usize,
+        line_range: &[usize],
+        assign_map: &std::collections::HashMap<usize, (usize, usize)>,
+    ) -> EsAlignment {
+        let token_line_indent = self.es_line_indentation(token_line);
+        let assignment_lines = self.es_relevant_assignment_lines(line_range, assign_map);
+        let Some(&relevant_line_number) = assignment_lines.get(1) else { return EsAlignment::None };
+        let relevant_indent = self.es_line_indentation(relevant_line_number);
+        if relevant_indent < token_line_indent {
+            return EsAlignment::None;
+        }
+        let token_col = tok_start - self.idx.starts[token_line - 1];
+        let ok =
+            Self::sbfa_aligned_equals_operator(token_col, &self.src[tok_start..tok_end], self.sbfa_line_bytes(relevant_line_number));
+        if ok {
+            EsAlignment::Yes
+        } else {
+            EsAlignment::No
+        }
+    }
+
+    /// `align_column`: the column this assignment operator's end would sit
+    /// at if the padding immediately before it were collapsed to nothing
+    /// (the `+ 1` reserves the single mandatory space).
+    fn es_align_column(&self, tok_start: usize, tok_end: usize) -> isize {
+        let line = self.idx.loc(tok_start).0;
+        let ls = self.idx.starts[line - 1];
+        let col0 = tok_start - ls;
+        let line_bytes = self.sbfa_line_bytes(line);
+        let leading = &line_bytes[..col0.min(line_bytes.len())];
+        let trailing_spaces = leading.iter().rev().take_while(|&&b| b == b' ').count();
+        let last_column = tok_end - ls;
+        last_column as isize - trailing_spaces as isize + 1
+    }
+
+    /// `check_assignment` + `align_equal_signs`: detect every misaligned
+    /// assignment line (`MSG_UNALIGNED_ASGN`), then — independent of WHICH
+    /// offending token triggers it, since `align_to` is the same either way
+    /// — realign every token in each offending block to the widest column,
+    /// deduplicated per token exactly like upstream's `@corrected` set (a
+    /// token already aligned by an earlier block-mate is left alone).
+    fn es_check_assignments(&mut self, cop: &'static str, assign_map: &std::collections::HashMap<usize, (usize, usize)>) {
+        let mut lines: Vec<usize> = assign_map.keys().copied().collect();
+        lines.sort_unstable();
+        // `@corrected`: a token already realigned by an earlier offense in
+        // the SAME block contributes no new edit to a later offense's own
+        // corrector call — such an offense is still reported (rubocop's
+        // `add_offense` always fires), but with no actual replacement it's
+        // NOT "correctable" in the CLI's `[Correctable]` sense (matches real
+        // rubocop: only the first offense touching a given block ends up
+        // marked correctable; its block-mates that were re-aligned as a
+        // side effect are reported but not individually correctable).
+        let mut corrected: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &line in &lines {
+            let &(s, e) = &assign_map[&line];
+            let down: Vec<usize> = (1..=line).rev().collect();
+            if !matches!(self.es_aligned_with_equals_sign(line, s, e, &down, assign_map), EsAlignment::No) {
+                continue;
+            }
+            let block = self.es_all_relevant_assignment_lines(line, assign_map);
+            let toks: Vec<(usize, usize)> = block.iter().filter_map(|l| assign_map.get(l).copied()).collect();
+            let align_to = toks.iter().map(|&(ts, te)| self.es_align_column(ts, te)).max();
+            let mut made_edit = false;
+            if let Some(align_to) = align_to {
+                for (ts, te) in toks {
+                    if !corrected.insert(ts) {
+                        continue;
+                    }
+                    let last_col = (te - self.idx.starts[self.idx.loc(ts).0 - 1]) as isize;
+                    let diff = align_to - last_col;
+                    if diff > 0 {
+                        self.fixes.push((ts, ts, vec![b' '; diff as usize]));
+                        made_edit = true;
+                    } else if diff < 0 {
+                        let n = (-diff) as usize;
+                        self.fixes.push((ts.saturating_sub(n), ts, Vec::new()));
+                        made_edit = true;
+                    }
+                }
+            }
+            self.push(s, cop, made_edit, "`=` is not aligned with the preceding assignment.");
+        }
+    }
+}

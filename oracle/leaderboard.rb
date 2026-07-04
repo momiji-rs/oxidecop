@@ -352,6 +352,7 @@ COPS = {
   'Layout/SpaceInsideBlockBraces'    => 'layout/space_inside_block_braces',
   'Layout/SpaceInsideArrayLiteralBrackets' => 'layout/space_inside_array_literal_brackets',
   'Layout/EmptyLineAfterGuardClause' => 'layout/empty_line_after_guard_clause',
+  'Layout/ExtraSpacing'              => 'layout/extra_spacing',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
