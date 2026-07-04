@@ -261,6 +261,9 @@ def parse_config_sections(joined)
       val = '{}'
     end
     # a bare identifier is a let reference — resolved per example, lazily
+    # a braceless implicit-hash merge arg (`cop_config.merge('K' => 4)`)
+    # has no {} for extract_hash to find — wrap it so the pairs survive.
+    val = "{ #{val} }" if val =~ /\A['"]?\w+['"]?\s*=>/
     sections[sec] = [val =~ /\A\w+\z/ ? val : extract_hash(val), merges_cop_config, defaults_based]
   end
   sections.empty? ? nil : sections

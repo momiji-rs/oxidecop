@@ -387,7 +387,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
-    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency",
+    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment",
 ];
 
 impl Engine {
@@ -1584,6 +1584,16 @@ pub(crate) struct Cops<'a> {
     // already handled by `on_kwbegin`. Populated in `visit_begin_node`
     // before the default traversal descends into it.
     pub(crate) ic_kwbegin_plain_body: HashSet<usize>,
+    // Layout/ArgumentAlignment: byte ranges of every offense node registered
+    // so far THIS RUN — this cop's own separate cop-instance-wide
+    // `@current_offenses` (a distinct instance from Layout/ArrayAlignment's,
+    // hence its own field), consulted by the same `Alignment#check_
+    // alignment` overlap guard: a nested call's own bad-alignment argument
+    // that falls entirely inside an already-registered (enclosing) offense
+    // — e.g. a `build(:x, :y => [...])` call whose bracketed value contains
+    // another misaligned `build(...)` call — is still reported, but its
+    // correction is skipped so the two rewrites don't collide in one pass.
+    pub(crate) argalign_registered_ranges: Vec<(usize, usize)>,
     // Style/SpecialGlobalVars: per-file `@required_english` flag — once a
     // `require 'English'` has been inserted (or was already present at the
     // relevant top-level position) for one offense, later offenses in the
@@ -5356,6 +5366,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.check_slicing_with_range(node);
         self.check_empty_lines_around_arguments(node);
+        self.check_argument_alignment(node);
         self.check_format_parameter_mismatch(node);
         // Lint/SafeNavigationChain: the main per-node check (see its doc
         // comment for why this must run BEFORE this call's own arguments are
@@ -5969,6 +5980,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         ic_parent_of_body: HashMap::new(),
         ic_registered_ranges: Vec::new(),
         ic_kwbegin_plain_body: HashSet::new(),
+        argalign_registered_ranges: Vec::new(),
         oorr_valid_ref: Some(0),
         sigex_ignored: HashSet::new(),
         sigex_custom_fail_defined: false,
