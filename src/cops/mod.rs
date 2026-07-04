@@ -3,6 +3,7 @@
 //! (`style`/`naming`/`lint`/`layout`), and the `lint()` entry point.
 mod breakable;
 mod bundler;
+mod gemspec;
 mod layout;
 mod lint_cops;
 mod metrics;
@@ -239,6 +240,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
+    "Gemspec/RubyVersionGlobalsUsage",
 ];
 
 impl Engine {
@@ -840,6 +842,17 @@ pub(crate) struct Cops<'a> {
     // whitequark namespace child is a non-nil `cbase`, not `nil?`), so only
     // ConstantReadNode offsets are ever inserted here.
     pub(crate) gss_gvasgn_skip: HashSet<usize>,
+    // Gemspec/RubyVersionGlobalsUsage: (start, end) byte ranges of
+    // ConstantPathNodes that are the assignment TARGET of an enclosing
+    // constant-path write (`Ruby::VERSION = x`, `+=`, `||=`, `&&=`) —
+    // whitequark folds the whole target into a `casgn`, so upstream's
+    // `on_const` never sees it, while prism traversal visits it as a plain
+    // ConstantPathNode. Populated eagerly in the visit_constant_path_*write
+    // overrides before descending. Keyed by (start, end), NOT just start,
+    // because the target's own namespace segments share its start offset
+    // (`Ruby::VERSION::FOO = 1` — the inner `Ruby::VERSION` scope IS still
+    // flagged by upstream) and must not be swallowed by the skip.
+    pub(crate) rvgu_write_target_skip: HashSet<(usize, usize)>,
     // Layout/MultilineArrayBraceLayout / MultilineHashBraceLayout: start
     // offsets of array/hash LITERALS that are either the RECEIVER of an
     // enclosing call (any flavor, incl. safe-navigation — rubocop's
@@ -1380,6 +1393,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         assignment_path_write!(self, node);
+        self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_write_node(self, node);
     }
     fn visit_constant_and_write_node(&mut self, node: &ruby_prism::ConstantAndWriteNode<'pr>) {
@@ -1393,15 +1407,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_constant_path_operator_write_node(&mut self, node: &ruby_prism::ConstantPathOperatorWriteNode<'pr>) {
         assignment_path_operator_write!(self, node);
+        self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_operator_write_node(self, node);
     }
     fn visit_constant_path_or_write_node(&mut self, node: &ruby_prism::ConstantPathOrWriteNode<'pr>) {
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
         assignment_path_write!(self, node);
+        self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_or_write_node(self, node);
     }
     fn visit_constant_path_and_write_node(&mut self, node: &ruby_prism::ConstantPathAndWriteNode<'pr>) {
         assignment_path_write!(self, node);
+        self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_and_write_node(self, node);
     }
     fn visit_regular_expression_node(&mut self, node: &ruby_prism::RegularExpressionNode<'pr>) {
@@ -1811,6 +1828,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         let l = node.location();
         self.check_global_std_stream(klass, l.start_offset(), l.end_offset());
+        self.check_ruby_version_globals_usage_read(node);
     }
     fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
         // only a bare ::-rooted constant counts, not a namespaced one
@@ -1825,6 +1843,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_global_std_stream(klass, l.start_offset(), l.end_offset());
             }
         }
+        self.check_ruby_version_globals_usage_path(node);
         ruby_prism::visit_constant_path_node(self, node);
     }
     fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
@@ -3082,6 +3101,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         metrics_ctor_block: false,
         metrics_in_struct_data_define_block: Vec::new(),
         gss_gvasgn_skip: HashSet::new(),
+        rvgu_write_target_skip: HashSet::new(),
         mlbl_call_child: HashSet::new(),
         dea_ignored: HashSet::new(),
         dea_parent: HashMap::new(),
