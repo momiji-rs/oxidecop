@@ -307,7 +307,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
     "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
     "Style/ExplicitBlockArgument",
-    "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments",
+    "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
 ];
 
 impl Engine {
@@ -3067,6 +3067,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_deprecated_class_methods(node);
         self.check_marshal_load(node);
         self.check_security_eval(node);
+        self.check_eval_with_location(node);
         self.check_redundant_self_assignment_call(node);
         self.check_each_with_object_argument(node);
         self.check_each_with_object(node);

@@ -272,6 +272,7 @@ COPS = {
   'Layout/FirstParameterIndentation' => 'layout/first_parameter_indentation',
   'Bundler/DuplicatedGroup'          => 'bundler/duplicated_group',
   'Layout/EmptyLinesAroundArguments' => 'layout/empty_lines_around_arguments',
+  'Style/EvalWithLocation'           => 'style/eval_with_location',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -16380,3 +16380,270 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+/// Style/EvalWithLocation receiver check — `valid_eval_receiver?`:
+/// `{ nil? (const {nil? cbase} :Kernel) }`. A missing receiver always
+/// matches; an explicit receiver only matches a bare `Kernel` or a
+/// top-level-rooted `::Kernel` (a namespaced `Foo::Kernel` does NOT match).
+fn eval_wl_kernel_receiver(recv: &ruby_prism::Node) -> bool {
+    if let Some(c) = recv.as_constant_read_node() {
+        return c.name().as_slice() == b"Kernel";
+    }
+    if let Some(p) = recv.as_constant_path_node() {
+        if p.parent().is_none() {
+            if let Some(n) = p.name() {
+                return n.as_slice() == b"Kernel";
+            }
+        }
+    }
+    false
+}
+
+/// `variable?`: `VARIABLES = %i[ivar gvar cvar lvar]` — a plain variable
+/// READ (not an assignment) of any of the four kinds.
+fn eval_wl_is_variable(node: &ruby_prism::Node) -> bool {
+    node.as_instance_variable_read_node().is_some()
+        || node.as_global_variable_read_node().is_some()
+        || node.as_class_variable_read_node().is_some()
+        || node.as_local_variable_read_node().is_some()
+}
+
+/// `special_file_keyword?`: node.str_type? && node.source == '__FILE__' —
+/// under prism this construct is its own dedicated node type, never a
+/// `StringNode` (a quoted string's source always carries its quotes, so it
+/// could never literally equal `__FILE__` anyway).
+fn eval_wl_is_file_keyword(node: &ruby_prism::Node) -> bool {
+    node.as_source_file_node().is_some()
+}
+
+/// `special_line_keyword?`: node.int_type? && node.source == '__LINE__' —
+/// same reasoning as above, but for `SourceLineNode`.
+fn eval_wl_is_line_keyword(node: &ruby_prism::Node) -> bool {
+    node.as_source_line_node().is_some()
+}
+
+/// An integer literal whose value is exactly `want`.
+fn eval_wl_int_is(node: &ruby_prism::Node, want: u32) -> bool {
+    node.as_integer_node()
+        .is_some_and(|i| i.value().try_into().is_ok_and(|v: i32| v == want as i32))
+}
+
+/// `line_with_offset?(node, sign, num)`:
+/// `{ (send #special_line_keyword? %1 (int %2)) (send (int %2) %1 #special_line_keyword?) }`
+/// — either operand order of a binary `sign` call between `__LINE__` and the
+/// literal integer `num` (e.g. `__LINE__ + 1` or `1 + __LINE__`).
+fn eval_wl_line_with_offset(node: &ruby_prism::Node, sign: u8, num: u32) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    if call.is_safe_navigation() {
+        return false;
+    }
+    if call.name().as_slice() != [sign] {
+        return false;
+    }
+    let Some(recv) = call.receiver() else { return false };
+    let args: Vec<ruby_prism::Node> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    if args.len() != 1 {
+        return false;
+    }
+    let arg0 = &args[0];
+    (eval_wl_is_line_keyword(&recv) && eval_wl_int_is(arg0, num)) || (eval_wl_int_is(&recv, num) && eval_wl_is_line_keyword(arg0))
+}
+
+/// `expected_line(sign, line_diff)`: `__LINE__` when the diff is zero,
+/// otherwise `__LINE__ <sign> <abs diff>`.
+fn eval_wl_expected_line(sign: u8, diff_abs: u32) -> String {
+    if diff_abs == 0 {
+        "__LINE__".to_string()
+    } else {
+        format!("__LINE__ {} {}", sign as char, diff_abs)
+    }
+}
+
+/// `string_first_line(str_node)`: for a heredoc, the first line of its BODY
+/// (the line right after the opening `<<~ID`/`<<-ID`/`<<ID` token, which is
+/// always on the same physical line as the token itself); otherwise the
+/// line the literal itself starts on.
+fn eval_wl_string_first_line(idx: &super::LineIndex, code: &ruby_prism::Node) -> usize {
+    let opening = if let Some(n) = code.as_string_node() {
+        n.opening_loc()
+    } else if let Some(n) = code.as_interpolated_string_node() {
+        n.opening_loc()
+    } else {
+        None
+    };
+    if let Some(o) = opening {
+        if o.as_slice().starts_with(b"<<") {
+            return idx.loc(o.end_offset()).0 + 1;
+        }
+    }
+    idx.loc(code.location().start_offset()).0
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/EvalWithLocation — `eval`/`class_eval`/`module_eval`/
+    /// `instance_eval` calls whose (string-literal) code argument isn't
+    /// accompanied by a correct `__FILE__`/`__LINE__` pair. Ported verbatim
+    /// from `lib/rubocop/cop/style/eval_with_location.rb` (rubocop 1.88.0):
+    /// `on_send` only fires for a string/dstr first argument (a variable or
+    /// method-call code argument, or a call with no code arg at all — e.g.
+    /// `class_eval do ... end` — is never checked), and only for `eval`
+    /// itself does the receiver have to be missing or `Kernel`/`::Kernel`
+    /// (any receiver, including none, is fine for the other three methods).
+    pub(crate) fn check_eval_with_location(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/EvalWithLocation";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name().as_slice();
+        if !matches!(name, b"eval" | b"class_eval" | b"module_eval" | b"instance_eval") {
+            return;
+        }
+        let is_eval = name == b"eval";
+        let method_name = String::from_utf8_lossy(name).into_owned();
+
+        if is_eval {
+            if let Some(recv) = node.receiver() {
+                if !eval_wl_kernel_receiver(&recv) {
+                    return;
+                }
+            }
+        }
+
+        let args: Vec<ruby_prism::Node> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let Some(code) = args.first() else { return };
+        if code.as_string_node().is_none() && code.as_interpolated_string_node().is_none() {
+            return;
+        }
+
+        // `file_and_line`: base = method?(:eval) ? 2 : 1 — `eval` reserves
+        // slot 1 for the optional `binding` argument that the other three
+        // methods don't take.
+        let base = if is_eval { 2 } else { 1 };
+        let file_node = args.get(base);
+        let line_node = args.get(base + 1);
+
+        if let Some(line_node) = line_node {
+            if let Some(file_node) = file_node {
+                self.eval_wl_check_file(&method_name, file_node);
+            }
+            self.eval_wl_check_line(code, line_node, &method_name);
+        } else if let Some(file_node) = file_node {
+            self.eval_wl_check_file(&method_name, file_node);
+            self.eval_wl_add_missing_line(node, code, &args, is_eval, &method_name);
+        } else {
+            self.eval_wl_add_missing_location(node, code, &args, is_eval, &method_name);
+        }
+    }
+
+    /// `register_offense`: `eval` always gets `MSG_EVAL` regardless of which
+    /// sub-check triggered it; the other three methods get the generic,
+    /// method-name-interpolated `MSG`. Anchored at the WHOLE call node.
+    fn eval_wl_register(&mut self, node: &ruby_prism::CallNode, is_eval: bool, method_name: &str, fix: Option<(usize, usize, Vec<u8>)>) {
+        const COP: &str = "Style/EvalWithLocation";
+        let msg = if is_eval {
+            "Pass a binding, `__FILE__`, and `__LINE__` to `eval`.".to_string()
+        } else {
+            format!("Pass `__FILE__` and `__LINE__` to `{method_name}`.")
+        };
+        self.push(node.location().start_offset(), COP, fix.is_some(), msg);
+        if let Some(f) = fix {
+            self.fixes.push(f);
+        }
+    }
+
+    /// `check_file`: skip an already-correct `__FILE__`; otherwise flag +
+    /// replace the whole file-argument node with `__FILE__`.
+    fn eval_wl_check_file(&mut self, method_name: &str, file_node: &ruby_prism::Node) {
+        const COP: &str = "Style/EvalWithLocation";
+        if eval_wl_is_file_keyword(file_node) {
+            return;
+        }
+        let l = file_node.location();
+        let actual = String::from_utf8_lossy(l.as_slice()).into_owned();
+        let msg = format!("Incorrect file for `{method_name}`; use `__FILE__` instead of `{actual}`.");
+        self.push(l.start_offset(), COP, true, msg);
+        self.fixes.push((l.start_offset(), l.end_offset(), b"__FILE__".to_vec()));
+    }
+
+    /// `check_line`: a variable or non-`+`/`-` method-call line argument is
+    /// left entirely alone (not even inspected further); otherwise its
+    /// actual line, relative to the code argument's first line, is compared
+    /// against what it claims to be.
+    fn eval_wl_check_line(&mut self, code: &ruby_prism::Node, line_node: &ruby_prism::Node, method_name: &str) {
+        if eval_wl_is_variable(line_node) {
+            return;
+        }
+        if let Some(call) = line_node.as_call_node() {
+            if call.name().as_slice() != b"+" {
+                return;
+            }
+        }
+        let code_line = eval_wl_string_first_line(self.idx, code);
+        let node_line = self.idx.loc(line_node.location().start_offset()).0;
+        let line_diff = code_line as i64 - node_line as i64;
+        if line_diff == 0 {
+            if eval_wl_is_line_keyword(line_node) {
+                return;
+            }
+            self.eval_wl_add_incorrect_line(method_name, line_node, b'+', 0);
+        } else {
+            let sign = if line_diff > 0 { b'+' } else { b'-' };
+            let diff_abs = line_diff.unsigned_abs() as u32;
+            if eval_wl_line_with_offset(line_node, sign, diff_abs) {
+                return;
+            }
+            self.eval_wl_add_incorrect_line(method_name, line_node, sign, diff_abs);
+        }
+    }
+
+    /// `add_offense_for_incorrect_line`: anchored at (and replacing) the
+    /// line-argument node itself.
+    fn eval_wl_add_incorrect_line(&mut self, method_name: &str, line_node: &ruby_prism::Node, sign: u8, diff_abs: u32) {
+        const COP: &str = "Style/EvalWithLocation";
+        let expected = eval_wl_expected_line(sign, diff_abs);
+        let l = line_node.location();
+        let actual = String::from_utf8_lossy(l.as_slice()).into_owned();
+        let msg = format!("Incorrect line number for `{method_name}`; use `{expected}` instead of `{actual}`.");
+        self.push(l.start_offset(), COP, true, msg);
+        self.fixes.push((l.start_offset(), l.end_offset(), expected.into_bytes()));
+    }
+
+    /// `add_offense_for_missing_line`: the file argument is present and
+    /// correct-or-flagged already; only the line argument is appended,
+    /// right after the (present) last argument.
+    fn eval_wl_add_missing_line(&mut self, node: &ruby_prism::CallNode, code: &ruby_prism::Node, args: &[ruby_prism::Node], is_eval: bool, method_name: &str) {
+        let last_arg = args.last().expect("file argument is present");
+        let code_line = eval_wl_string_first_line(self.idx, code);
+        let last_line = self.idx.loc(last_arg.location().start_offset()).0;
+        let line_diff = code_line as i64 - last_line as i64;
+        let sign = if line_diff > 0 { b'+' } else { b'-' };
+        let line_str = eval_wl_expected_line(sign, line_diff.unsigned_abs() as u32);
+        let end = last_arg.location().end_offset();
+        let fix = (end, end, format!(", {line_str}").into_bytes());
+        self.eval_wl_register(node, is_eval, method_name, Some(fix));
+    }
+
+    /// `add_offense_for_missing_location`: `eval` called with no `binding`
+    /// argument at all (`with_binding?` false — just the bare code string)
+    /// is flagged with NO autocorrection at all (rubocop won't guess a
+    /// binding); every other shape gets `, __FILE__, <line>` appended after
+    /// whatever the last argument currently is (the code string itself, if
+    /// there are no other arguments).
+    fn eval_wl_add_missing_location(&mut self, node: &ruby_prism::CallNode, code: &ruby_prism::Node, args: &[ruby_prism::Node], is_eval: bool, method_name: &str) {
+        let with_binding = if is_eval { args.len() >= 2 } else { true };
+        if is_eval && !with_binding {
+            self.eval_wl_register(node, is_eval, method_name, None);
+            return;
+        }
+        let last_arg = args.last().expect("code argument is present");
+        let code_line = eval_wl_string_first_line(self.idx, code);
+        let last_line = self.idx.loc(last_arg.location().start_offset()).0;
+        let line_diff = code_line as i64 - last_line as i64;
+        let sign = if line_diff > 0 { b'+' } else { b'-' };
+        let line_str = eval_wl_expected_line(sign, line_diff.unsigned_abs() as u32);
+        let end = last_arg.location().end_offset();
+        let fix = (end, end, format!(", __FILE__, {line_str}").into_bytes());
+        self.eval_wl_register(node, is_eval, method_name, Some(fix));
+    }
+}
