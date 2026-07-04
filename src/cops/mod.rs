@@ -389,7 +389,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
-    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment", "Lint/Syntax", "Layout/FirstArrayElementIndentation",
+    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment", "Lint/Syntax", "Layout/FirstArrayElementIndentation", "Layout/FirstHashElementIndentation",
 ];
 
 impl Engine {
@@ -2108,6 +2108,26 @@ pub(crate) struct Cops<'a> {
     // of this cop's ancestor-type nodes (same "stash by position, consume
     // by position" idiom as `rse_assignment_value` etc).
     pub(crate) rea_assign_wrap: std::collections::HashMap<usize, (usize, usize)>,
+    // Layout/FirstHashElementIndentation: hash-literal start offsets already
+    // claimed by an enclosing `on_send`'s `each_argument_node` walk (the
+    // hash's own `{` shares a line with that call's opening paren) —
+    // rubocop's `ignore_node`/`ignored_node?`, re-checked when that same
+    // `HashNode` is later reached through the normal `visit_hash_node` walk
+    // so it isn't processed (with the wrong, `nil`, `left_parenthesis`) a
+    // second time.
+    pub(crate) fhei_ignored: HashSet<usize>,
+    // Layout/FirstHashElementIndentation: a `HashNode`'s own start offset ->
+    // the start offset of an enclosing pair's KEY, populated from
+    // `visit_hash_node`/`visit_keyword_hash_node` (in pre-order, so every
+    // entry lands before that value `HashNode` is itself visited) whenever
+    // one of that hash's elements is a `pair` whose value is DIRECTLY this
+    // `HashNode` — mirrors `hash_pair_where_value_beginning_with`'s
+    // `first.parent&.parent&.pair_type?` check, already filtered down to
+    // just the cases where `key_and_value_begin_on_same_line?` and
+    // `right_sibling_begins_on_subsequent_line?` both hold (the ONLY two
+    // extra conditions `indent_base`'s `:parent_hash_key` branch needs), so
+    // a present entry always means "use this key's own column".
+    pub(crate) fhei_parent_pair: HashMap<usize, usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2583,6 +2603,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.closing_loc().start_offset(),
         );
         self.check_hash_alignment_hash(node);
+        self.check_first_hash_element_indentation_hash(node);
         if self.ll_active {
             let l = node.location();
             self.ll_enter_collection(
@@ -2610,6 +2631,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_keyword_hash_node(&mut self, node: &ruby_prism::KeywordHashNode<'pr>) {
         self.check_hash_syntax_keyword_hash(node);
         self.check_hash_alignment_keyword_hash(node);
+        self.check_first_hash_element_indentation_keyword_hash(node);
         ruby_prism::visit_keyword_hash_node(self, node);
     }
     fn visit_hash_pattern_node(&mut self, node: &ruby_prism::HashPatternNode<'pr>) {
@@ -5426,6 +5448,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        // Layout/FirstHashElementIndentation: `on_send`/`alias on_csend
+        // on_send` — must run before this call's own arguments are visited
+        // below, so any braced hash literal it claims (`fhei_ignored`) is
+        // marked before `visit_hash_node` later reaches that same node.
+        self.check_first_hash_element_indentation_send(node);
         // Layout/HashAlignment: `on_send`/`on_csend`'s `ignore_hash_argument?`
         // and `autocorrect_incompatible_with_other_cops?` both key off THIS
         // call's own shape — see the `ha_ignored`/`ha_incompatible` field docs.
@@ -6358,6 +6385,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         enda_case_arg: HashMap::new(),
         rea_ancestors: Vec::new(),
         rea_assign_wrap: HashMap::new(),
+        fhei_ignored: HashSet::new(),
+        fhei_parent_pair: HashMap::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),

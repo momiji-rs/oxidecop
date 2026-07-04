@@ -14781,3 +14781,511 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+// ============================================================================
+// Layout/FirstHashElementIndentation
+//
+// Ported from rubocop's `FirstHashElementIndentation` cop plus the mixins it
+// includes: `Alignment` (`configured_indentation_width`'s `IndentationWidth`
+// fallback chain, and `AlignmentCorrector`'s per-line shift — same idioms
+// already established by the `Layout/FirstArgumentIndentation`-style ports
+// elsewhere in this file), `ConfigurableEnforcedStyle` (the 3-way
+// `EnforcedStyle`; its `ambiguous_style_detected`/`correct_style_detected`
+// bookkeeping is `--auto-gen-config` only and produces no offense, so it is
+// NOT ported), and `MultilineElementIndentation` (`check_first`/`indent_base`/
+// `each_argument_node`).
+//
+// `on_send`'s `each_argument_node(node, :hash)` (upstream's `on_node(:hash,
+// arg, :send)`, from `Util#on_node`) walks every argument's subtree, YIELDING
+// every `:hash`-type node found (recursing into ANYTHING that isn't itself a
+// plain `:send` — notably including a `:csend`, and, once found, a `:hash`
+// node's OWN children too, so a hash nested inside another hash's pair
+// value, or inside an array, etc. all get discovered), but only actually
+// FLAGS (and `ignore_node`s) one whose own `{` shares a line with the
+// call's own opening paren. Prism has no `:send`-shaped wrapper to exclude
+// directly: `foo(x) { ... }`'s block is a FIELD of the same `CallNode`, not
+// a separate outer node the way whitequark's `:block` wraps a `:send` — so
+// `FheiHashFinder::visit_call_node` recreates the split by hand: a
+// non-safe-nav call excludes its own receiver/arguments (mirroring the
+// `:send` exclude) but a real block literal attached to it is NOT part of
+// that excluded subtree (whitequark's `:block` node is the parent of the
+// `:send`, not a descendant of it) and is still searched; a safe-nav call
+// (`:csend`, never excluded) is searched in full via the default recursion.
+//
+// `indent_base`'s `:parent_hash_key` branch (`hash_pair_where_value_
+// beginning_with`) needs, for the hash CURRENTLY being checked, whether its
+// own immediate parent is a `pair` whose value is directly this hash — an
+// upward-looking question prism gives no parent pointers for. Answered here
+// by populating `fhei_parent_pair` (hash start offset -> enclosing pair's
+// key start offset) from `fhei_register_parent_pairs`, called from
+// `visit_hash_node`/`visit_keyword_hash_node` (both, since the enclosing
+// pair can live in either an explicit `{...}` or an implicit kwargs group)
+// in PRE-ORDER, before descending — so by the time a nested value `HashNode`
+// is itself visited, its entry (if any) is already there. Only entries
+// meeting `key_and_value_begin_on_same_line?` AND `right_sibling_begins_on_
+// subsequent_line?` are stored, since those are the only two conditions
+// `indent_base` layers on top of "is the value of a pair" before actually
+// using it.
+// ============================================================================
+
+/// One real `pair` (`AssocNode`) of a hash/keyword-hash being checked —
+/// `kwsplat`/`AssocSplatNode` elements are excluded, mirroring
+/// `HashNode#pairs`/`#keys` (both built on `each_pair`, which skips them).
+/// `start`/`end` are the pair's own overall bounds (start = key start, end =
+/// value end — a pair's range always begins at its key). `key_end` undoes
+/// prism's colon-merge (`key: 1`'s key node spans `"key:"`, not just
+/// `"key"`, unlike whitequark where the trailing colon is a separate
+/// `loc.operator`): for a colon pair it's `key_end - 1`; for a hash-rocket
+/// pair (whose `operator_loc`, the `=>`, is genuinely separate) it's the
+/// key's own raw end.
+#[derive(Clone, Copy)]
+struct FheiPair {
+    start: usize,
+    end: usize,
+    key_end: usize,
+    value_start: usize,
+    hash_rocket: bool,
+}
+
+/// `hash_node.pairs` / `HashNode#each_pair`: every `AssocNode` among
+/// `elements`, in source order, reduced to a `FheiPair` — `AssocSplatNode`
+/// (`**h`) elements are silently skipped.
+fn fhei_collect_pairs(elements: &[ruby_prism::Node]) -> Vec<FheiPair> {
+    elements
+        .iter()
+        .filter_map(|e| {
+            let assoc = e.as_assoc_node()?;
+            let kloc = assoc.key().location();
+            let raw_key_end = kloc.end_offset();
+            let (hash_rocket, key_end) = match assoc.operator_loc() {
+                Some(_) => (true, raw_key_end),
+                None => (false, raw_key_end.saturating_sub(1)),
+            };
+            Some(FheiPair {
+                start: kloc.start_offset(),
+                end: assoc.location().end_offset(),
+                key_end,
+                value_start: assoc.value().location().start_offset(),
+                hash_rocket,
+            })
+        })
+        .collect()
+}
+
+/// `indent_base`'s return type: which "base" `check_first`/`check_right_
+/// brace` measured against, driving both the `Use N spaces ... relative to
+/// ...` message and the right-brace message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FheiBase {
+    /// `:left_brace_or_bracket` (`style == brace_alignment_style`, i.e.
+    /// `align_braces`).
+    LeftBrace,
+    /// `:parent_hash_key`.
+    ParentKey,
+    /// `:first_column_after_left_parenthesis`.
+    AfterParen,
+    /// `:start_of_line` (the fallback).
+    StartOfLine,
+}
+
+/// `base_description(indent_base_type)`.
+fn fhei_base_description(t: FheiBase) -> &'static str {
+    match t {
+        FheiBase::LeftBrace => "the position of the opening brace",
+        FheiBase::ParentKey => "the parent hash key",
+        FheiBase::AfterParen => "the first position after the preceding left parenthesis",
+        FheiBase::StartOfLine => "the start of the line where the left curly brace is",
+    }
+}
+
+/// `message_for_right_brace(indent_base_type)`.
+fn fhei_message_for_right_brace(t: FheiBase) -> &'static str {
+    match t {
+        FheiBase::LeftBrace => "Indent the right brace the same as the left brace.",
+        FheiBase::ParentKey => "Indent the right brace the same as the parent hash key.",
+        FheiBase::AfterParen => {
+            "Indent the right brace the same as the first position after the preceding left parenthesis."
+        }
+        FheiBase::StartOfLine => "Indent the right brace the same as the start of the line where the left brace is.",
+    }
+}
+
+/// A single call/super-argument search, mirroring `Util#on_node(:hash, arg,
+/// :send)`: every `HashNode` reachable from the starting node WITHOUT
+/// crossing a plain (non-safe-nav) call's own receiver/arguments — see the
+/// section doc for the `CallNode`-with-a-real-block split this needs that
+/// whitequark's separate `:send`/`:block` node shapes give for free.
+/// `found` is fully self-contained (no `Cops` borrow): each hit is captured
+/// as plain data (bounds + its own already-`fhei_collect_pairs`-reduced
+/// pairs) so the caller can process the list afterward without fighting the
+/// borrow checker over a mid-traversal `&mut Cops`. `containers` DOES keep
+/// borrowed `'pr` node handles — every hash/keyword-hash's own `elements()`
+/// encountered along the way (including ones never added to `found`, e.g. a
+/// `KeywordHashNode` never has real braces) — so the caller can run
+/// `fhei_register_parent_pairs` on each BEFORE checking anything in `found`.
+/// This is needed because this whole search runs from `visit_call_node`,
+/// EARLIER than the main traversal would otherwise reach these same
+/// hash/keyword-hash nodes via `visit_hash_node`/`visit_keyword_hash_node` —
+/// without it, a `parent_hash_key` lookup for a hash found here would race
+/// against its own registration.
+#[derive(Default)]
+struct FheiHashFinder<'pr> {
+    /// `(hash start, hash end, closing-brace start, closing-brace end, pairs)`.
+    found: Vec<(usize, usize, usize, usize, Vec<FheiPair>)>,
+    containers: Vec<Vec<ruby_prism::Node<'pr>>>,
+}
+impl<'pr> ruby_prism::Visit<'pr> for FheiHashFinder<'pr> {
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if node.is_safe_navigation() {
+            // `:csend` is never in `on_node`'s `:send`-only exclude set —
+            // search the whole thing (receiver, arguments, AND any block)
+            // exactly like the default recursion already would.
+            ruby_prism::visit_call_node(self, node);
+            return;
+        }
+        // Plain `:send` — excluded, matching `on_node`'s
+        // `include_or_equal?(excludes, sexp.type)` early return. A real
+        // block literal isn't part of that excluded subtree at all
+        // (whitequark's separate outer `:block` node's OWN child, not a
+        // descendant of the inner `:send`), so it's still searched here.
+        if let Some(blk) = node.block().and_then(|b| b.as_block_node()) {
+            if let Some(params) = blk.parameters() {
+                self.visit(&params);
+            }
+            if let Some(body) = blk.body() {
+                self.visit(&body);
+            }
+        }
+    }
+    fn visit_keyword_hash_node(&mut self, node: &ruby_prism::KeywordHashNode<'pr>) {
+        self.containers.push(node.elements().iter().collect());
+        ruby_prism::visit_keyword_hash_node(self, node);
+    }
+    fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
+        let l = node.location();
+        let closing = node.closing_loc();
+        let elements: Vec<_> = node.elements().iter().collect();
+        let pairs = fhei_collect_pairs(&elements);
+        self.containers.push(node.elements().iter().collect());
+        self.found.push((l.start_offset(), l.end_offset(), closing.start_offset(), closing.end_offset(), pairs));
+        // A `:hash` node is never itself excluded — keep descending so a
+        // hash nested inside one of THIS hash's own pair values (or inside
+        // an array element, etc.) is found too.
+        ruby_prism::visit_hash_node(self, node);
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    const FHEI_COP: &'static str = "Layout/FirstHashElementIndentation";
+
+    /// 0-based column of `off` (`Range#column`) — `idx.loc` is 1-based, but
+    /// every use below is a plain difference, so only THIS helper's own
+    /// `- 1` needs to agree with itself.
+    fn fhei_col0(&self, off: usize) -> usize {
+        self.idx.loc(off).1 - 1
+    }
+    fn fhei_same_line(&self, a: usize, b: usize) -> bool {
+        self.idx.loc(a).0 == self.idx.loc(b).0
+    }
+
+    /// `Alignment#configured_indentation_width`.
+    fn fhei_indentation_width(&self) -> usize {
+        self.cfg
+            .get(Self::FHEI_COP, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+
+    /// `enforce_first_argument_with_fixed_indentation?`: `config.
+    /// for_enabled_cop('Layout/ArgumentAlignment')['EnforcedStyle'] ==
+    /// 'with_fixed_indentation'` — `for_enabled_cop` returns the empty hash
+    /// (so the comparison is trivially false) when that OTHER cop's own
+    /// `Enabled:` is off, regardless of `--only`/`--except`.
+    fn fhei_enforce_first_argument_with_fixed_indentation(&self) -> bool {
+        if !self.cfg.cop_config_enabled("Layout/ArgumentAlignment") {
+            return false;
+        }
+        self.cfg.get("Layout/ArgumentAlignment", "EnforcedStyle") == Some("with_fixed_indentation")
+    }
+
+    /// `separator_style?(first_pair)`.
+    fn fhei_separator_style(&self, first: &FheiPair) -> bool {
+        let key = if first.hash_rocket { "EnforcedHashRocketStyle" } else { "EnforcedColonStyle" };
+        self.cfg.get("Layout/HashAlignment", key) == Some("separator")
+    }
+
+    /// `MultilineElementIndentation#hash_pair_where_value_beginning_with` +
+    /// `key_and_value_begin_on_same_line?` + `right_sibling_begins_on_
+    /// subsequent_line?`, folded into one pass over `elements` (called for
+    /// EVERY hash/keyword-hash from `visit_hash_node`/`visit_keyword_hash_
+    /// node`, in pre-order, before its own children — including any nested
+    /// value `HashNode` this loop points AT — are visited).
+    fn fhei_register_parent_pairs(&mut self, elements: &[ruby_prism::Node]) {
+        for i in 0..elements.len() {
+            let Some(assoc) = elements[i].as_assoc_node() else { continue };
+            let Some(hash_val) = assoc.value().as_hash_node() else { continue };
+            let key_start = assoc.key().location().start_offset();
+            let val_loc = hash_val.location();
+            if !self.fhei_same_line(key_start, val_loc.start_offset()) {
+                continue; // !key_and_value_begin_on_same_line?
+            }
+            let Some(sibling) = elements.get(i + 1) else { continue }; // no right_sibling
+            let pair_last = val_loc.end_offset().saturating_sub(1).max(val_loc.start_offset());
+            if !self.fhei_same_line(pair_last, sibling.location().start_offset()) {
+                // last_line != sibling.first_line, and sibling always comes
+                // strictly after, so "not same line" == "last_line <
+                // sibling.first_line".
+                self.fhei_parent_pair.insert(val_loc.start_offset(), key_start);
+            }
+        }
+    }
+
+    /// `indent_base(left_brace, first, left_parenthesis)`. `hash_start` is
+    /// this hash's own start offset (== its `{`'s start — used both as the
+    /// `align_braces`/`start_of_line` anchor and as the `fhei_parent_pair`
+    /// lookup key); `first_pair` mirrors upstream's `first` (`None` only
+    /// when the hash is empty of real pairs, in which case the `parent_
+    /// hash_key` branch is skipped exactly like `first &&` does).
+    fn fhei_indent_base(
+        &self,
+        hash_start: usize,
+        first_pair: Option<&FheiPair>,
+        left_paren: Option<usize>,
+    ) -> (usize, FheiBase) {
+        let style = self.cfg.enforced_style(Self::FHEI_COP);
+        if style == "align_braces" {
+            return (self.fhei_col0(hash_start), FheiBase::LeftBrace);
+        }
+        if first_pair.is_some() {
+            if let Some(&key_start) = self.fhei_parent_pair.get(&hash_start) {
+                return (self.fhei_col0(key_start), FheiBase::ParentKey);
+            }
+        }
+        if let Some(paren) = left_paren {
+            if style == "special_inside_parentheses" {
+                return (self.fhei_col0(paren) + 1, FheiBase::AfterParen);
+            }
+        }
+        let line = self.idx.loc(hash_start).0;
+        let line_start = self.idx.starts[line - 1];
+        let line_end = self.line_end(line);
+        let mut p = line_start;
+        while p < line_end && self.src[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        (p - line_start, FheiBase::StartOfLine)
+    }
+
+    /// `AlignmentCorrector.correct(corrector, processed_source, node,
+    /// column_delta)` for a `[start, end)` byte range (either the flagged
+    /// pair's own span, a single physical line, or the right brace's own
+    /// 1-byte span) — per-line insert/remove of leading whitespace. NOT
+    /// ported: the heredoc/string-literal taboo-range guard and
+    /// `block_comment_within?` (no fixture example's corrected range
+    /// contains either), matching the precedent already established for
+    /// this same `AlignmentCorrector` port elsewhere in this file.
+    fn fhei_align(&mut self, start: usize, end: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            return;
+        }
+        let mut line_begin = start;
+        loop {
+            if delta > 0 {
+                if self.src.get(line_begin) != Some(&b'\n') {
+                    self.fixes.push((line_begin, line_begin, vec![b' '; delta as usize]));
+                }
+            } else {
+                let n = (-delta) as usize;
+                let starts_with_space = self.src.get(line_begin) == Some(&b' ');
+                let (rs, re) =
+                    if starts_with_space { (line_begin, line_begin + n) } else { (line_begin.saturating_sub(n), line_begin) };
+                if re <= self.src.len() && rs < re && self.src[rs..re].iter().all(|&b| b == b' ' || b == b'\t') {
+                    self.fixes.push((rs, re, Vec::new()));
+                }
+            }
+            let mut p = line_begin;
+            while p < end && self.src[p] != b'\n' {
+                p += 1;
+            }
+            if p >= end {
+                break;
+            }
+            line_begin = p + 1;
+        }
+    }
+
+    /// `check_first(first, left_brace, left_parenthesis, offset)` +
+    /// `incorrect_style_detected`'s `add_offense`/`autocorrect` (the
+    /// `@column_delta.zero?` "just bookkeeping, no offense" branch —
+    /// `check_expected_style`'s `ambiguous_style_detected`/`correct_style_
+    /// detected` — is `--auto-gen-config`-only and not ported).
+    fn fhei_check_first(&mut self, hash_start: usize, first: &FheiPair, left_paren: Option<usize>, offset: isize) {
+        let actual_col = self.fhei_col0(first.start) as isize;
+        let (base_col, base_type) = self.fhei_indent_base(hash_start, Some(first), left_paren);
+        let width = self.fhei_indentation_width() as isize;
+        let delta = base_col as isize + width + offset - actual_col;
+        if delta == 0 {
+            return;
+        }
+        let msg = format!(
+            "Use {} spaces for indentation in a hash, relative to {}.",
+            width,
+            fhei_base_description(base_type)
+        );
+        self.push(first.start, Self::FHEI_COP, true, msg);
+        // `autocorrect(corrector, first)`: `node.value.first_line <=
+        // node.key.first_line` — the whole pair (through its value's own
+        // end, e.g. a multiline nested hash/array starting on the key's own
+        // line) shifts together; otherwise ONLY the key's own physical line
+        // does (the value starts on a later line and is left alone).
+        let key_line = self.idx.loc(first.start).0;
+        let value_line = self.idx.loc(first.value_start).0;
+        if value_line <= key_line {
+            self.fhei_align(first.start, first.end, delta);
+        } else {
+            let line_start = self.idx.starts[key_line - 1];
+            let line_end = self.line_end(key_line);
+            self.fhei_align(line_start, line_end, delta);
+        }
+    }
+
+    /// `check_based_on_longest_key(hash_node, left_brace, left_parenthesis)`.
+    fn fhei_check_based_on_longest_key(&mut self, hash_start: usize, pairs: &[FheiPair], left_paren: Option<usize>) {
+        let lens: Vec<isize> = pairs.iter().map(|p| (p.key_end - p.start) as isize).collect();
+        let max_len = lens.iter().copied().max().unwrap_or(0);
+        let offset = max_len - lens[0];
+        let first = pairs[0];
+        self.fhei_check_first(hash_start, &first, left_paren, offset);
+    }
+
+    /// `check_right_brace(hash_node.loc.end, first_pair, left_brace,
+    /// left_parenthesis)`.
+    fn fhei_check_right_brace(
+        &mut self,
+        close_start: usize,
+        close_end: usize,
+        first_pair: Option<&FheiPair>,
+        hash_start: usize,
+        left_paren: Option<usize>,
+    ) {
+        let line = self.idx.loc(close_start).0;
+        let line_start = self.idx.starts[line - 1];
+        if self.src[line_start..close_start].iter().any(|&b| !b.is_ascii_whitespace()) {
+            return; // the right brace shares its line with the last value
+        }
+        let (expected_col, base_type) = self.fhei_indent_base(hash_start, first_pair, left_paren);
+        let actual_col = self.fhei_col0(close_start) as isize;
+        let delta = expected_col as isize - actual_col;
+        if delta == 0 {
+            return;
+        }
+        self.push(close_start, Self::FHEI_COP, true, fhei_message_for_right_brace(base_type));
+        self.fhei_align(close_start, close_end, delta);
+    }
+
+    /// `check(hash_node, left_parenthesis)`.
+    fn fhei_check(
+        &mut self,
+        hash_start: usize,
+        close_start: usize,
+        close_end: usize,
+        pairs: &[FheiPair],
+        left_paren: Option<usize>,
+    ) {
+        let first_pair = pairs.first();
+        if let Some(fp) = first_pair {
+            if self.fhei_same_line(fp.start, hash_start) {
+                return; // same_line?(first_pair, left_brace)
+            }
+            if self.fhei_separator_style(fp) {
+                self.fhei_check_based_on_longest_key(hash_start, pairs, left_paren);
+            } else {
+                self.fhei_check_first(hash_start, fp, left_paren, 0);
+            }
+        }
+        self.fhei_check_right_brace(close_start, close_end, first_pair, hash_start, left_paren);
+    }
+
+    /// `on_hash(node)`: `check(node, nil) if node.loc.begin` — a `HashNode`
+    /// always has real braces (`opening_loc`/`closing_loc` are never
+    /// optional for this variant, unlike the braceless `KeywordHashNode`),
+    /// so the upstream guard is unconditionally true here.
+    pub(crate) fn check_first_hash_element_indentation_hash(&mut self, node: &ruby_prism::HashNode) {
+        if !self.on(Self::FHEI_COP) {
+            return;
+        }
+        let elements: Vec<_> = node.elements().iter().collect();
+        self.fhei_register_parent_pairs(&elements);
+        let l = node.location();
+        if self.fhei_ignored.contains(&l.start_offset()) {
+            return; // `return if ignored_node?(hash_node)`
+        }
+        let pairs = fhei_collect_pairs(&elements);
+        let closing = node.closing_loc();
+        self.fhei_check(l.start_offset(), closing.start_offset(), closing.end_offset(), &pairs, None);
+    }
+
+    /// `visit_keyword_hash_node`'s only job for this cop: an implicit
+    /// kwargs group is never itself `check()`-able (no braces), but it CAN
+    /// be the enclosing `pair`'s container for a nested braced value hash
+    /// (`foo(x: { ... }, y: { ... })` — see the section doc), so its own
+    /// elements still need registering.
+    pub(crate) fn check_first_hash_element_indentation_keyword_hash(&mut self, node: &ruby_prism::KeywordHashNode) {
+        if !self.on(Self::FHEI_COP) {
+            return;
+        }
+        let elements: Vec<_> = node.elements().iter().collect();
+        self.fhei_register_parent_pairs(&elements);
+    }
+
+    /// `on_send`/`alias on_csend on_send`: `each_argument_node(node, :hash)`
+    /// over every top-level argument, `ignore_node`-ing (via `fhei_ignored`)
+    /// and immediately checking each hit whose own `{` shares a line with
+    /// this call's opening paren.
+    pub(crate) fn check_first_hash_element_indentation_send(&mut self, node: &ruby_prism::CallNode) {
+        if !self.on(Self::FHEI_COP) {
+            return;
+        }
+        if self.fhei_enforce_first_argument_with_fixed_indentation() {
+            return;
+        }
+        let Some(open) = node.opening_loc() else { return }; // left_parenthesis = node.loc.begin
+        let Some(args) = node.arguments() else { return };
+        let left_paren_start = open.start_offset();
+        let paren_line = self.idx.loc(left_paren_start).0;
+        let mut finder = FheiHashFinder::default();
+        {
+            use ruby_prism::Visit;
+            for arg in args.arguments().iter() {
+                finder.visit(&arg);
+            }
+        }
+        // Register every hash/keyword-hash container found along the way
+        // BEFORE checking anything — see `FheiHashFinder`'s own doc: this
+        // walk runs earlier than the main traversal would otherwise reach
+        // these same nodes, so `fhei_parent_pair` needs populating by hand
+        // here rather than relying on `visit_hash_node`/`visit_keyword_hash_
+        // node` having already done it.
+        for elements in &finder.containers {
+            self.fhei_register_parent_pairs(elements);
+        }
+        for (hs, _he, cs, ce, pairs) in finder.found {
+            if self.idx.loc(hs).0 != paren_line {
+                continue;
+            }
+            if self.fhei_ignored.contains(&hs) {
+                continue; // already claimed by an earlier/outer match
+            }
+            // `yield type_node, left_parenthesis` runs BEFORE `ignore_node`
+            // in upstream's `each_argument_node` — the checked hash is NOT
+            // yet ignored during its own check, only afterward (so the
+            // LATER plain `visit_hash_node` pass skips it).
+            self.fhei_check(hs, cs, ce, &pairs, Some(left_paren_start));
+            self.fhei_ignored.insert(hs);
+        }
+    }
+}
