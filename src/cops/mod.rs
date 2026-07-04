@@ -387,7 +387,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
-    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing",
+    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation",
 ];
 
 impl Engine {
@@ -4166,6 +4166,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_expression(node);
         self.record_rescue_modifier_parens(node);
         self.check_redundant_parentheses(node);
+        self.check_closing_parenthesis_indentation_begin(node);
         // Style/HashSyntax: `parentheses?(dispatch.parent)` — whitequark
         // transparently unwraps a single-statement `StatementsNode` body, so
         // a lone statement inside `(...)` has the parens node itself, not
@@ -4606,6 +4607,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_non_nil_check_def(node);
         self.check_parameter_alignment(node);
         self.check_first_parameter_indentation(node);
+        self.check_closing_parenthesis_indentation_def(node);
         self.check_missing_super(node);
         self.check_method_def_parentheses(node);
         self.check_memoized_ivar_def(node);
@@ -5165,6 +5167,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_parentheses_as_grouped_expression(node);
         self.check_non_nil_check(node);
         self.check_multiline_method_call_brace_layout(node);
+        self.check_closing_parenthesis_indentation_call(node);
         // Naming/AsciiIdentifiers scans tIDENTIFIER tokens — method call
         // selectors included (weird.なまえ); operators/[] have no message_loc
         // worth checking and setters end in =, both ASCII-guarded anyway.

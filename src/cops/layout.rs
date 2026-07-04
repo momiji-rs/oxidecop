@@ -9148,3 +9148,262 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/ClosingParenthesisIndentation (+ the shared `Alignment` mixin).
+    /// Checks a HANGING closing `)`/`]` (preceded only by whitespace on its
+    /// own line — `begins_its_line?`) for three call sites, each supplying
+    /// its own `(left_paren, right_paren, elements)` triple before falling
+    /// into the one shared `cpi_check` core (`check`/`check_for_elements`/
+    /// `check_for_no_elements` collapsed together, since Rust doesn't need
+    /// the empty/non-empty split into two separate methods the way upstream
+    /// does for readability):
+    ///   - `on_send`/`on_csend` -> a `CallNode`'s own `opening_loc`/
+    ///     `closing_loc` (nil for a receiverless/braceless call, e.g.
+    ///     `foo bar` or the `x * (...)` operator call itself — the `(...)`
+    ///     there belongs to the ARGUMENT, a separate `ParenthesesNode`, not
+    ///     this send), `elements` = `node.arguments` PLUS a trailing
+    ///     `&block` `BlockArgumentNode` folded back in (prism keeps it out
+    ///     of `arguments()`, in `block()` instead — mirrors
+    ///     `check_multiline_method_call_brace_layout`'s identical fold).
+    ///     Also fires generically for `[]`/`[]=` index calls (their
+    ///     `opening_loc`/`closing_loc` are `[`/`]`) exactly as upstream's
+    ///     `on_send` does — the hardcoded `` `)` `` in both messages is a
+    ///     known upstream quirk carried over verbatim, not a bug in this
+    ///     port.
+    ///   - `on_begin` -> a `ParenthesesNode`'s `opening_loc`/`closing_loc`
+    ///     (always present — parens always have both delimiters), whose
+    ///     `elements` unwrap the `body` one level: `None` -> empty (bare
+    ///     `()`), a `StatementsNode` -> its own `body()` list (the common
+    ///     case, even for a SINGLE grouped expression like `(y + z)` —
+    ///     prism always wraps statement lists in `StatementsNode`
+    ///     regardless of length, confirmed live), anything else -> a
+    ///     one-element list of that bare node (mirrors
+    ///     `check_immutable_recursive`'s established fallback for the same
+    ///     "body isn't a StatementsNode" edge). This is the ONLY site that
+    ///     fires for whitequark's `:begin` node type; a `def`/top-level body
+    ///     with 2+ statements and NO parens is also whitequark `:begin`
+    ///     upstream, but never reaches prism's `visit_parentheses_node` at
+    ///     all (it's a bare `StatementsNode`), so the "accepts begin nodes
+    ///     that are not grouped expressions" fixture example is
+    ///     unobservable by construction here rather than needing an
+    ///     explicit guard.
+    ///   - `on_def` (aliased `on_defs` upstream; prism unifies both into one
+    ///     `DefNode` with an optional `receiver`, so one hook covers both)
+    ///     -> the def's OWN `lparen_loc`/`rparen_loc` (`None` for a
+    ///     paren-less def — `def foo a, b; end` — skipped entirely, whereas
+    ///     `def foo(); end` still has both, just empty `elements`),
+    ///     `elements` = `mlbl_ordered_params` (requireds/optionals/rest/
+    ///     posts/keywords/keyword_rest/block, ParameterAlignment's existing
+    ///     order-preserving flattener — identical grammar-order semantics to
+    ///     whitequark's `node.arguments.children`, confirmed empty for
+    ///     `parameters() == None` exactly when whitequark's `arguments.children`
+    ///     would be `[]` too).
+    ///
+    /// Column bookkeeping is plain BYTE offset from each line's own start
+    /// (matching every other alignment-family cop in this file, e.g.
+    /// `check_parameter_alignment`/`check_first_parameter_indentation`) —
+    /// NOT `display_column`'s Unicode-East-Asian-Width-aware count, because
+    /// upstream's OWN `expected_column`/`all_elements_aligned?`/
+    /// `correct_column_candidates` all read `.loc.column` directly (plain
+    /// parser column), never routing through the `Alignment` mixin's
+    /// `display_column` helper — that helper is only used by
+    /// `check_alignment`/`each_bad_alignment`, which THIS cop's `check`
+    /// override bypasses entirely (it has its own hand-rolled `check`/
+    /// `check_for_elements`/`check_for_no_elements`, not the mixin's shared
+    /// `check_alignment`).
+    ///
+    /// Autocorrect reuses `parameter_alignment_correct` verbatim (this
+    /// cop's own `autocorrect` is upstream's other exact one-liner call to
+    /// `AlignmentCorrector.correct`, and `right_paren` is always a
+    /// single-character, single-line range, so the shared per-line-loop
+    /// helper degenerates to exactly one iteration) — plus, unlike that
+    /// helper, an explicit `Layout/IndentationStyle: EnforcedStyle: tabs`
+    /// guard (`AlignmentCorrector.using_tabs?`), since this port's own
+    /// `cpi_check` is the natural place to add it back (not exercised by
+    /// the fixture, but a one-line addition for fidelity).
+    pub(crate) fn check_closing_parenthesis_indentation_call(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/ClosingParenthesisIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(open) = node.opening_loc() else { return };
+        let Some(close) = node.closing_loc() else { return };
+        let mut elements: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if let Some(block) = node.block() {
+            if block.as_block_argument_node().is_some() {
+                elements.push(block);
+            }
+        }
+        let node_col = self.cpi_column(node.location().start_offset());
+        self.cpi_check(open, close, &elements, node_col);
+    }
+
+    pub(crate) fn check_closing_parenthesis_indentation_begin(&mut self, node: &ruby_prism::ParenthesesNode) {
+        const COP: &str = "Layout/ClosingParenthesisIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let open = node.opening_loc();
+        let close = node.closing_loc();
+        let elements: Vec<ruby_prism::Node> = match node.body() {
+            None => Vec::new(),
+            Some(b) => match b.as_statements_node() {
+                Some(s) => s.body().iter().collect(),
+                None => vec![b],
+            },
+        };
+        // The `ParenthesesNode`'s own location always starts at `(`, so its
+        // "own start column" candidate (upstream: `node.loc.column` for the
+        // `check(node, node.children)` call site) is identical to
+        // `left_paren.column` — no separate computation needed.
+        let node_col = self.cpi_column(open.start_offset());
+        self.cpi_check(open, close, &elements, node_col);
+    }
+
+    pub(crate) fn check_closing_parenthesis_indentation_def(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Layout/ClosingParenthesisIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(open) = node.lparen_loc() else { return };
+        let Some(close) = node.rparen_loc() else { return };
+        let elements: Vec<ruby_prism::Node> = match node.parameters() {
+            Some(p) => mlbl_ordered_params(&p),
+            None => Vec::new(),
+        };
+        // Upstream calls `check(node.arguments, node.arguments)` — the
+        // whitequark `args` node's OWN location also starts at `(`, so its
+        // "own start column" candidate again coincides with
+        // `left_paren.column` exactly as in the `begin` case above.
+        let node_col = self.cpi_column(open.start_offset());
+        self.cpi_check(open, close, &elements, node_col);
+    }
+
+    /// 0-based BYTE column of `offset` on its own physical line.
+    fn cpi_column(&self, offset: usize) -> usize {
+        let (line, _) = self.idx.loc(offset);
+        offset - self.idx.starts[line - 1]
+    }
+
+    /// `processed_source.line_indentation(line)`: count of leading
+    /// space/tab bytes on physical line `line`.
+    fn cpi_line_indentation(&self, line: usize) -> usize {
+        let start = self.idx.starts[line - 1];
+        let mut p = start;
+        while p < self.src.len() && (self.src[p] == b' ' || self.src[p] == b'\t') {
+            p += 1;
+        }
+        p - start
+    }
+
+    /// `Alignment#configured_indentation_width`: cop-local `IndentationWidth`
+    /// (schema default `~`/nil — meaningful only when a user sets it
+    /// directly), else `Layout/IndentationWidth`'s `Width` (schema default
+    /// 2), else a hardcoded 2.
+    fn cpi_indentation_width(&self) -> usize {
+        self.cfg
+            .get("Layout/ClosingParenthesisIndentation", "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+
+    /// `all_elements_aligned?`: when the FIRST element is a hash-shaped node
+    /// (an explicit `{...}` `HashNode` OR the implicit bundled-trailing-
+    /// keyword-args `KeywordHashNode` — both are whitequark's single
+    /// `:hash` node type, hence the one `hash_type?` test upstream), compare
+    /// the columns of ITS OWN pair/splat elements instead of the outer
+    /// `elements` list; otherwise compare the outer elements' own columns
+    /// directly. `true` iff there's exactly one distinct column among them
+    /// (`.uniq.one?` — note this is `false`, not `true`, for an empty list,
+    /// though that's unreachable here since `elements` is already known
+    /// non-empty by the only call site).
+    fn cpi_all_elements_aligned(&self, elements: &[ruby_prism::Node]) -> bool {
+        let first = &elements[0];
+        let cols: Vec<usize> = if let Some(h) = first.as_hash_node() {
+            h.elements().iter().map(|c| self.cpi_column(c.location().start_offset())).collect()
+        } else if let Some(h) = first.as_keyword_hash_node() {
+            h.elements().iter().map(|c| self.cpi_column(c.location().start_offset())).collect()
+        } else {
+            elements.iter().map(|e| self.cpi_column(e.location().start_offset())).collect()
+        };
+        let mut uniq = cols.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        uniq.len() == 1
+    }
+
+    /// The shared core: `check`/`check_for_elements`/`check_for_no_elements`
+    /// collapsed into one, keyed on `elements.is_empty()` exactly like
+    /// upstream's own dispatch. `node_col` is the empty-branch's third
+    /// `correct_column_candidates` entry (`node.loc.column`) — see each call
+    /// site above for what it means per node kind.
+    fn cpi_check(
+        &mut self,
+        left_paren: ruby_prism::Location,
+        right_paren: ruby_prism::Location,
+        elements: &[ruby_prism::Node],
+        node_col: usize,
+    ) {
+        const COP: &str = "Layout/ClosingParenthesisIndentation";
+        let rstart = right_paren.start_offset();
+        let (rline, _) = self.idx.loc(rstart);
+        let rline_start = self.idx.starts[rline - 1];
+        // `begins_its_line?`: every byte before the closing delimiter on its
+        // own line must be whitespace.
+        if !self.src[rline_start..rstart].iter().all(|&b| b == b' ' || b == b'\t') {
+            return;
+        }
+        let right_col = rstart - rline_start;
+        let lstart = left_paren.start_offset();
+        let (lline, _) = self.idx.loc(lstart);
+        let left_col = lstart - self.idx.starts[lline - 1];
+
+        let correct_column = if elements.is_empty() {
+            // `correct_column_candidates`: line indentation of the opening
+            // delimiter's own line, the opening delimiter's own column, and
+            // the caller-supplied `node.loc.column`.
+            let line_indent = self.cpi_line_indentation(lline);
+            let candidates = [line_indent, left_col, node_col];
+            if candidates.contains(&right_col) {
+                return;
+            }
+            // "select the first one of candidates" — always the line
+            // indentation, never the other two.
+            candidates[0]
+        } else {
+            let first_start = elements[0].location().start_offset();
+            let (first_line, _) = self.idx.loc(first_start);
+            if first_line > lline {
+                // `line_break_after_left_paren?`
+                let source_indent = self.cpi_line_indentation(first_line);
+                let width = self.cpi_indentation_width();
+                source_indent.saturating_sub(width)
+            } else if self.cpi_all_elements_aligned(elements) {
+                left_col
+            } else {
+                self.cpi_line_indentation(first_line)
+            }
+        };
+
+        if correct_column == right_col {
+            return;
+        }
+
+        let message = if correct_column == left_col {
+            "Align `)` with `(`.".to_string()
+        } else {
+            format!("Indent `)` to column {correct_column} (not {right_col})")
+        };
+        self.push(rstart, COP, true, message);
+
+        if self.cfg.enforced_style("Layout/IndentationStyle") != "tabs" {
+            let delta = correct_column as isize - right_col as isize;
+            self.parameter_alignment_correct(rstart, rstart + 1, delta);
+        }
+    }
+}
