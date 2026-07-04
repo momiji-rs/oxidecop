@@ -1787,3 +1787,155 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Metrics/ClassLength — reuses the `ml_*` `CodeLengthCalculator` port above
+// (already generic over `class`/`module`) plus a real `class`/`class << self`
+// entry point and the `Foo = Class.new do ... end` / `Foo = Struct.new(...)
+// do ... end` casgn form (`class_definition?`'s `any_block` branch).
+//
+// Unlike `Metrics::ModuleLength#on_casgn` (which node-matches only a plain,
+// unnested `(casgn nil? _ (any_block (send Module :new) ...))` and calls
+// `check_code_length` on the CASGN node itself, anchoring at `node.loc.name`),
+// `ClassLength#on_casgn` re-derives the block via `find_expression_within_
+// parent` and calls `check_code_length` on the BLOCK itself — so it reaches
+// (and anchors on the block's own full source range, not the constant name)
+// through every constant-assignment SHAPE: plain `=` (including chained
+// `Foo = Bar = Class.new do ... end`, resolved via recursion into the
+// INNERMOST link — the outer link's own value is another assignment node,
+// never a block, so only the innermost one matches), `||=`/`&&=`, `Foo::Bar
+// = ...`, and multiple assignment (`Foo, Bar = Struct.new(...) do ... end`,
+// upstream re-derives the SAME block once per mlhs target and relies on
+// `add_offense` deduplicating identical location+message; we just check the
+// masgn's value once directly for the same result).
+//
+// Also unlike `module_definition?` (Module.new, no args, per this file's
+// `ml_module_new_block`), `class_definition?` allows ANY argument count on
+// the `.new` call — required for `Struct.new(:foo, :bar) do ... end`.
+//
+// Known gaps (none exercised by the spec fixture):
+//  - `Data.define do ... end` is NOT part of `class_definition?` (verified
+//    against rubocop-ast 1.49.1's own node pattern: only `Struct`/`Class`) —
+//    `Foo = Data.define do ... end` is correctly never checked, matching
+//    upstream.
+//  - Same `omit_length`/heredoc-body gaps as `Metrics/ModuleLength` (see
+//    that section's doc comment) apply identically here.
+// ---------------------------------------------------------------------------
+
+/// `class_definition?`'s `any_block` branch: `(any_block (send
+/// #global_const?({:Struct :Class}) :new ...) _ $_)` — bare or
+/// `::`-qualified `Class`/`Struct` receiver, `new` message, ANY argument
+/// count, followed by a literal block (do/end or `{}`; a block-PASS isn't
+/// this shape at all, matching `ml_module_new_block`'s same distinction).
+/// Returns the CALL node alongside the block: rubocop's whitequark `:block`
+/// node (what `class_definition?` actually matches and what `check_code_
+/// length`'s `else`-branch `node.source_range` anchors on) spans from the
+/// call's own start — prism's own `BlockNode::location` starts at the
+/// opening `do`/`{` instead (the documented prism-vs-whitequark block-range
+/// trap), so the anchor must come from the call, not the block.
+fn cl_class_new_block<'pr>(
+    value: &ruby_prism::Node<'pr>,
+) -> Option<(ruby_prism::CallNode<'pr>, ruby_prism::BlockNode<'pr>)> {
+    let call = value.as_call_node()?;
+    if call.name().as_slice() != b"new" {
+        return None;
+    }
+    let recv = call.receiver()?;
+    let is_class_or_struct = |name: &[u8]| name == b"Class" || name == b"Struct";
+    let ok = recv.as_constant_read_node().is_some_and(|c| is_class_or_struct(c.location().as_slice()))
+        || recv
+            .as_constant_path_node()
+            .is_some_and(|cp| cp.parent().is_none() && is_class_or_struct(cp.name_loc().as_slice()));
+    if !ok {
+        return None;
+    }
+    let block = call.block()?.as_block_node()?;
+    Some((call, block))
+}
+
+impl<'a> Cops<'a> {
+    /// `on_class` — a real `class Foo ... end` definition. `ml_classlike_length`
+    /// is already generic over `class`/`module` (the `namespace_module?`/
+    /// inner-classlike-exclusion logic keys on either type).
+    pub(crate) fn check_class_length_class(&mut self, node: &ruby_prism::ClassNode) {
+        const COP: &str = "Metrics/ClassLength";
+        if !self.on(COP) {
+            return;
+        }
+        let (max, count_comments, foldable) = self.ml_config(COP);
+        let mut length = self.ml_classlike_length(&node.as_node(), count_comments);
+        if foldable.any() {
+            let mut walker = MlFoldWalker { foldable, matches: Vec::new() };
+            ruby_prism::visit_class_node(&mut walker, node);
+            length = self.ml_apply_folding(length, walker.matches, count_comments);
+        }
+        if length > max {
+            let msg = format!("Class has too many lines. [{length}/{max}]");
+            self.push(node.location().start_offset(), COP, false, msg);
+        }
+    }
+
+    /// `on_sclass`, guarded by `node.each_ancestor(:class).any?` (skip when
+    /// already nested inside a REAL `class` — its lines are already counted
+    /// as part of that enclosing class's own length via the plain interior-
+    /// line walk; see `cl_class_depth`'s field doc). Unlike `class`/`module`,
+    /// `sclass` is NOT one of `CodeLengthCalculator::CLASSLIKE_TYPES`
+    /// (`class`/`module` only) — upstream's `code_length` takes the plain
+    /// `extract_body` branch for it (`body.source.lines`, counted as-is, with
+    /// NO nested-class-line exclusion — verified against real rubocop 1.88:
+    /// a top-level `class << self` containing a nested `class` counts that
+    /// nested class's lines for BOTH the outer sclass's total and the inner
+    /// class's own separate offense). Matches `ml_node_own_length` on the
+    /// sclass's own body node, exactly like the casgn/`Class.new` form below.
+    pub(crate) fn check_class_length_sclass(&mut self, node: &ruby_prism::SingletonClassNode) {
+        const COP: &str = "Metrics/ClassLength";
+        if !self.on(COP) || self.cl_class_depth > 0 {
+            return;
+        }
+        let (max, count_comments, foldable) = self.ml_config(COP);
+        let mut length = match node.body() {
+            Some(b) => self.ml_node_own_length(&b, count_comments),
+            None => 0,
+        };
+        if foldable.any() {
+            let mut walker = MlFoldWalker { foldable, matches: Vec::new() };
+            ruby_prism::visit_singleton_class_node(&mut walker, node);
+            length = self.ml_apply_folding(length, walker.matches, count_comments);
+        }
+        if length > max {
+            let msg = format!("Class has too many lines. [{length}/{max}]");
+            self.push(node.location().start_offset(), COP, false, msg);
+        }
+    }
+
+    /// `on_casgn`'s `class_definition?`-guarded branch, called from every
+    /// constant-assignment write-node hook in `mod.rs` with that node's own
+    /// RHS `value()` — see this section's module doc comment for how that
+    /// covers every shape upstream's `find_expression_within_parent` chases
+    /// down manually. Anchored on the BLOCK's own full source range
+    /// (`CodeLength#location`'s non-casgn `else` branch — the node actually
+    /// passed to `check_code_length` upstream is the `any_block`, which is
+    /// never casgn-shaped, so it never takes the `node.loc.name` branch).
+    pub(crate) fn check_class_length_casgn(&mut self, value: &ruby_prism::Node) {
+        const COP: &str = "Metrics/ClassLength";
+        if !self.on(COP) {
+            return;
+        }
+        let Some((call, block)) = cl_class_new_block(value) else { return };
+        let (max, count_comments, foldable) = self.ml_config(COP);
+        let mut length = match block.body() {
+            Some(b) => self.ml_node_own_length(&b, count_comments),
+            None => 0,
+        };
+        if foldable.any() {
+            let mut walker = MlFoldWalker { foldable, matches: Vec::new() };
+            ruby_prism::visit_block_node(&mut walker, &block);
+            length = self.ml_apply_folding(length, walker.matches, count_comments);
+        }
+        if length > max {
+            let msg = format!("Class has too many lines. [{length}/{max}]");
+            self.push(call.location().start_offset(), COP, false, msg);
+        }
+    }
+}

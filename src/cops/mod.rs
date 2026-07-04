@@ -312,7 +312,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
-    "Style/StringConcatenation", "Metrics/BlockLength",
+    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength",
 ];
 
 impl Engine {
@@ -1073,6 +1073,10 @@ pub(crate) struct Cops<'a> {
     // Style/PerlBackrefs: depth of enclosing class/module nodes — used to
     // determine if Regexp constant needs :: prefix.
     pub(crate) class_module_depth: usize,
+    // Metrics/ClassLength's `on_sclass` guard (`node.each_ancestor(:class)
+    // .any?`): count of REAL `class` node ancestors currently open (module/
+    // sclass/block nesting doesn't reset or contribute — only `class` does).
+    pub(crate) cl_class_depth: usize,
     // Style/NonNilCheck: (start, end) offset spans of nodes marked via
     // `ignore_node` —
     // the trailing (or sole) statement of a predicate method's (`foo?`)
@@ -1712,6 +1716,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
         let v = node.value();
         self.check_module_length_casgn(node);
+        self.check_class_length_casgn(&v);
         // Style/Alias's `alias_method_value_used?`: `node.parent&.assignment?`
         // — `NAME = alias_method :a, :b`.
         self.alias_value_offsets.insert(v.location().start_offset());
@@ -1727,6 +1732,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_constant_name(node.name().as_slice(), node.name_loc().start_offset(), Some(&v));
         self.check_self_assignment_const(node.location().start_offset(), node.name().as_slice(), &v);
         self.check_multiline_memoization(node.location().start_offset(), &v);
+        self.check_class_length_casgn(&v);
         assignment_write!(self, node);
         ruby_prism::visit_constant_or_write_node(self, node);
     }
@@ -1742,31 +1748,37 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.check_constant_name(name.as_slice(), t.name_loc().start_offset(), Some(&v));
         }
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
+        self.check_class_length_casgn(&node.value());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_write_node(self, node);
     }
     fn visit_constant_and_write_node(&mut self, node: &ruby_prism::ConstantAndWriteNode<'pr>) {
         self.check_self_assignment_const(node.location().start_offset(), node.name().as_slice(), &node.value());
+        self.check_class_length_casgn(&node.value());
         assignment_write!(self, node);
         ruby_prism::visit_constant_and_write_node(self, node);
     }
     fn visit_constant_operator_write_node(&mut self, node: &ruby_prism::ConstantOperatorWriteNode<'pr>) {
+        self.check_class_length_casgn(&node.value());
         assignment_operator_write!(self, node);
         ruby_prism::visit_constant_operator_write_node(self, node);
     }
     fn visit_constant_path_operator_write_node(&mut self, node: &ruby_prism::ConstantPathOperatorWriteNode<'pr>) {
+        self.check_class_length_casgn(&node.value());
         assignment_path_operator_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_operator_write_node(self, node);
     }
     fn visit_constant_path_or_write_node(&mut self, node: &ruby_prism::ConstantPathOrWriteNode<'pr>) {
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
+        self.check_class_length_casgn(&node.value());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_or_write_node(self, node);
     }
     fn visit_constant_path_and_write_node(&mut self, node: &ruby_prism::ConstantPathAndWriteNode<'pr>) {
+        self.check_class_length_casgn(&node.value());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_and_write_node(self, node);
@@ -2112,6 +2124,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_variable_name(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        self.check_class_length_casgn(&node.value());
         let lhs_start = node.location().start_offset();
         let op_end = node.operator_loc().end_offset();
         // Layout/ArrayAlignment's `node.parent&.masgn_type?` guard — the
@@ -2917,6 +2930,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_required_ruby_version_missing(has_code);
     }
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        self.check_class_length_class(node);
         self.check_ascii_class(node);
         let l = node.location();
         self.check_empty_class(l.start_offset(), l.end_offset(),
@@ -2954,11 +2968,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ms_scope_depth += 1;
         // Default walk — covers the superclass expression too, not just the body.
         self.class_module_depth += 1;
+        self.cl_class_depth += 1;
         self.alias_scope_stack.push(0);
         self.alias_cm_stack.push(true);
         ruby_prism::visit_class_node(self, node);
         self.alias_cm_stack.pop();
         self.alias_scope_stack.pop();
+        self.cl_class_depth -= 1;
         self.class_module_depth -= 1;
         self.ms_scope_depth -= 1;
         self.ms_class_stack.pop();
@@ -3229,6 +3245,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_forwarding_super_node(self, node);
     }
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        self.check_class_length_sclass(node);
         self.check_empty_lines_around_sclass_body(node);
         self.check_access_modifier_indentation_sclass(node);
         let l = node.location();
@@ -3900,6 +3917,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         ri_percent_array_child: HashSet::new(),
         interpolated_node_depth: 0,
         class_module_depth: 0,
+        cl_class_depth: 0,
         non_nil_ignored: HashSet::new(),
         mmcbl_heredoc_chain: HashMap::new(),
         se_ancestor_end_lines: Vec::new(),
