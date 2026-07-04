@@ -313,7 +313,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName",
 ];
 
 impl Engine {
@@ -881,6 +881,15 @@ pub(crate) struct Cops<'a> {
     // patterns only ever match a `send`/`csend` node, so those default to
     // "no receiver, not define_method" — never scoped, never chained.
     pub(crate) nle_pending: Option<(bool, bool, bool)>,
+    // Naming/MemoizedInstanceVariableName: the enclosing `define_method`/
+    // `define_singleton_method` call's method-name argument — rubocop's
+    // `method_definition?` pattern `(block (send _ %DYNAMIC_DEFINE_METHODS
+    // ({sym str} $_)) ...)` (any receiver, exactly one literal symbol/string
+    // arg). Stashed by `visit_call_node` right before descending into a
+    // block, consumed by the immediately following `visit_block_node`.
+    // `Some(None)` when the call has a block but doesn't qualify (wrong
+    // name/arity/arg shape); plain `None` when unset (non-block calls).
+    pub(crate) mivn_pending_method_name: Option<Option<Vec<u8>>>,
     // Lint/UselessTimes: start offsets of nodes that are the RECEIVER of, or a
     // direct positional ARGUMENT to, an enclosing (non-safe-navigation) call —
     // rubocop's `node.parent&.send_type?` guard (whitequark's `:block`/`:send`
@@ -2569,6 +2578,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             None => NleFrame::Block { has_args, is_define_method: false, chained: false },
         };
         self.nle_stack.push(nle_frame);
+        // Naming/MemoizedInstanceVariableName: consume the dynamic-define
+        // method name `visit_call_node` stashed right before this visit —
+        // see the `mivn_pending_method_name` field doc.
+        if let Some(mivn_name) = self.mivn_pending_method_name.take().flatten() {
+            self.check_memoized_ivar_block(&mivn_name, node);
+        }
         // Style/ExplicitBlockArgument: consume the owning call/super/zsuper
         // shape set right before this visit — see the `eba_pending` doc.
         if let Some(owner) = self.eba_pending.take() {
@@ -3147,6 +3162,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_first_parameter_indentation(node);
         self.check_missing_super(node);
         self.check_method_def_parentheses(node);
+        self.check_memoized_ivar_def(node);
         // Default walk (receiver, params, body) one def level deeper — matches
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
         // parameter default values, which a body-only walk silently skipped.
@@ -3780,6 +3796,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                     matches!(node.name().as_slice(), b"define_method" | b"define_singleton_method")
                         && node.arguments().is_some_and(|a| a.arguments().iter().count() == 1);
                 self.nle_pending = Some((is_lambda_call, node.receiver().is_some(), is_define_method));
+                // Naming/MemoizedInstanceVariableName: this call's dynamic-
+                // define method-name argument, if it qualifies — see the
+                // `mivn_pending_method_name` field doc.
+                self.mivn_pending_method_name = Some(naming::mivn_dynamic_define_name(node));
                 // Lint/MissingSuper: this block's `class_new_block` verdict —
                 // see the `ms_pending_block` field doc.
                 self.ms_pending_block = self.ms_class_new_pending(node);
@@ -3993,6 +4013,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         mcwap_optarg_default: HashSet::new(),
         nle_stack: Vec::new(),
         nle_pending: None,
+        mivn_pending_method_name: None,
         ut_call_child: HashSet::new(),
         ecc_no_offense: HashSet::new(),
         el_am_scope: Vec::new(),

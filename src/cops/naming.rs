@@ -1516,3 +1516,266 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Naming/MemoizedInstanceVariableName on a `def`/`defs` — checks its
+    /// own top-level body for the `@ivar ||= ...` or `defined?`-guarded
+    /// memoization shapes. rubocop's `method_definition?` node pattern
+    /// matches every `def`/`defs` node unconditionally.
+    pub(crate) fn check_memoized_ivar_def(&mut self, node: &ruby_prism::DefNode) {
+        let name = node.name().as_slice().to_vec();
+        self.check_memoized_ivar_body(&name, node.body());
+    }
+
+    /// Naming/MemoizedInstanceVariableName on a dynamically-defined method's
+    /// block (`define_method`/`define_singleton_method`) — `method_name` is
+    /// the literal symbol/string argument extracted by
+    /// `mivn_dynamic_define_name` at the owning call site.
+    pub(crate) fn check_memoized_ivar_block(&mut self, method_name: &[u8], node: &ruby_prism::BlockNode) {
+        self.check_memoized_ivar_body(method_name, node.body());
+    }
+
+    /// Shared body scan for both entry points above. rubocop's `on_or_asgn`/
+    /// `on_defined?` walk UP from the ivar node through ancestors
+    /// (`each_ancestor(:any_def, :block)`) to find the nearest enclosing
+    /// `def`/`defs`/dynamic-define block — transparently skipping any OTHER
+    /// kind of block along the way — then require the offending node to sit
+    /// EXACTLY at the top level of THAT method's own body (sole statement,
+    /// or literally the last element of its statement list). Scanning
+    /// top-down from each qualifying def/block's own immediate body,
+    /// instead of climbing up from the ivar, gives the identical result: a
+    /// nested non-qualifying block (e.g. `[1].each do ... end`) is simply
+    /// never itself a scan root, so an `@ivar ||= ...` inside one is
+    /// invisible here exactly as it is to rubocop's ancestor climb (the
+    /// found def/block's own body never has that nested statement as a
+    /// direct child).
+    fn check_memoized_ivar_body(&mut self, method_name: &[u8], body: Option<ruby_prism::Node>) {
+        const COP: &str = "Naming/MemoizedInstanceVariableName";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(body_node) = body else { return };
+        // Prism wraps a 2+-statement body in a `StatementsNode`; a
+        // `rescue`/`ensure` body is a `BeginNode` instead (its own
+        // `statements()` holds the "main" statement list) — see the known
+        // prism-vs-whitequark trap. Anything else is a lone non-Statements
+        // node — prism's shape for a single-statement body — and is itself
+        // the sole top-level "statement".
+        let stmts: Vec<ruby_prism::Node> = if let Some(sn) = body_node.as_statements_node() {
+            sn.body().iter().collect()
+        } else if let Some(bn) = body_node.as_begin_node() {
+            bn.statements().map(|s| s.body().iter().collect()).unwrap_or_default()
+        } else {
+            vec![body_node]
+        };
+        let Some(last) = stmts.last() else { return };
+
+        let style_raw = self.cfg.get(COP, "EnforcedStyleForLeadingUnderscores").unwrap_or("disallowed");
+        let style = match style_raw {
+            "required" => "required",
+            "optional" => "optional",
+            _ => "disallowed",
+        };
+
+        // `memoized?`: `@ivar ||= ...` as the sole/last top-level statement.
+        if let Some(orw) = last.as_instance_variable_or_write_node() {
+            self.mivn_check_or_asgn(style, method_name, &orw);
+        }
+
+        // `defined_memoized?`: `(begin (if (defined (ivar %1)) (return (ivar
+        // %1)) nil?) ... (ivasgn %1 _))` — needs at least 2 top-level
+        // statements (a "begin" shape), the FIRST being the if-defined guard
+        // and the LAST the matching assignment.
+        if stmts.len() >= 2 {
+            if let Some(if_node) = stmts[0].as_if_node() {
+                if let Some((defined_ivar, return_ivar)) = mivn_defined_shape(&if_node) {
+                    if let Some(ivar_assign) = last.as_instance_variable_write_node() {
+                        if ivar_assign.name().as_slice() == defined_ivar.name().as_slice() {
+                            self.mivn_check_defined(style, method_name, &defined_ivar, &return_ivar, &ivar_assign);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `on_or_asgn`'s offense/correction for the `@ivar ||= ...` shape.
+    fn mivn_check_or_asgn(
+        &mut self,
+        style: &str,
+        method_name: &[u8],
+        node: &ruby_prism::InstanceVariableOrWriteNode,
+    ) {
+        const COP: &str = "Naming/MemoizedInstanceVariableName";
+        let ivar_name = node.name().as_slice().to_vec();
+        if mivn_matches(style, method_name, &ivar_name) {
+            return;
+        }
+        let suggested = mivn_suggested_var(style, method_name);
+        let msg = mivn_message(style, &ivar_name, &suggested, method_name);
+        let loc = node.name_loc();
+        self.push(loc.start_offset(), COP, true, msg);
+        let mut repl = vec![b'@'];
+        repl.extend_from_slice(&suggested);
+        self.fixes.push((loc.start_offset(), loc.end_offset(), repl));
+    }
+
+    /// `on_defined?`'s three offenses/corrections for the
+    /// `return @ivar if defined?(@ivar); @ivar = ...` shape — one each for
+    /// the `defined?(...)`'s ivar, the `return`'s ivar, and the
+    /// assignment's name (matches upstream's three `add_offense` calls).
+    fn mivn_check_defined(
+        &mut self,
+        style: &str,
+        method_name: &[u8],
+        defined_ivar: &ruby_prism::InstanceVariableReadNode,
+        return_ivar: &ruby_prism::InstanceVariableReadNode,
+        ivar_assign: &ruby_prism::InstanceVariableWriteNode,
+    ) {
+        const COP: &str = "Naming/MemoizedInstanceVariableName";
+        let ivar_name = ivar_assign.name().as_slice().to_vec();
+        if mivn_matches(style, method_name, &ivar_name) {
+            return;
+        }
+        let suggested = mivn_suggested_var(style, method_name);
+        let msg = mivn_message(style, &ivar_name, &suggested, method_name);
+        let mut repl = vec![b'@'];
+        repl.extend_from_slice(&suggested);
+
+        let dloc = defined_ivar.location();
+        self.push(dloc.start_offset(), COP, true, msg.clone());
+        self.fixes.push((dloc.start_offset(), dloc.end_offset(), repl.clone()));
+
+        let rloc = return_ivar.location();
+        self.push(rloc.start_offset(), COP, true, msg.clone());
+        self.fixes.push((rloc.start_offset(), rloc.end_offset(), repl.clone()));
+
+        let aloc = ivar_assign.name_loc();
+        self.push(aloc.start_offset(), COP, true, msg);
+        self.fixes.push((aloc.start_offset(), aloc.end_offset(), repl));
+    }
+}
+
+/// rubocop's `method_definition?` node pattern for the dynamic-define arm:
+/// `(block (send _ %DYNAMIC_DEFINE_METHODS ({sym str} $_)) ...)` — ANY
+/// receiver, a call literally named `define_method`/`define_singleton_method`,
+/// with exactly one argument that's a literal symbol or string (a variable
+/// or interpolated name doesn't qualify — the block is simply not a method
+/// scope, matching upstream's climb skipping straight past it).
+pub(crate) fn mivn_dynamic_define_name(call: &ruby_prism::CallNode) -> Option<Vec<u8>> {
+    if !matches!(call.name().as_slice(), b"define_method" | b"define_singleton_method") {
+        return None;
+    }
+    let args = call.arguments()?;
+    let items: Vec<_> = args.arguments().iter().collect();
+    let [arg] = items.as_slice() else { return None };
+    if let Some(sym) = arg.as_symbol_node() {
+        Some(sym.value_loc()?.as_slice().to_vec())
+    } else if let Some(s) = arg.as_string_node() {
+        Some(s.content_loc().as_slice().to_vec())
+    } else {
+        None
+    }
+}
+
+/// `defined_memoized?`'s first-statement shape: `(if (defined (ivar $ivar))
+/// (return (ivar $ivar)) nil?)` — no `elsif`/`else`, the then-branch is
+/// EXACTLY a bare `return @ivar` (nothing else), and both ivars name the
+/// same variable. Returns the `defined?(...)`'s ivar and the `return`'s
+/// ivar (both offense anchors) once matched.
+fn mivn_defined_shape<'pr>(
+    if_node: &ruby_prism::IfNode<'pr>,
+) -> Option<(ruby_prism::InstanceVariableReadNode<'pr>, ruby_prism::InstanceVariableReadNode<'pr>)> {
+    if if_node.subsequent().is_some() {
+        return None;
+    }
+    let defined = if_node.predicate().as_defined_node()?;
+    let defined_ivar = defined.value().as_instance_variable_read_node()?;
+    let then_stmts = if_node.statements()?;
+    let then_body: Vec<_> = then_stmts.body().iter().collect();
+    let [only] = then_body.as_slice() else { return None };
+    let ret = only.as_return_node()?;
+    let args = ret.arguments()?;
+    let items: Vec<_> = args.arguments().iter().collect();
+    let [ret_arg] = items.as_slice() else { return None };
+    let return_ivar = ret_arg.as_instance_variable_read_node()?;
+    if return_ivar.name().as_slice() != defined_ivar.name().as_slice() {
+        return None;
+    }
+    Some((defined_ivar, return_ivar))
+}
+
+/// rubocop's `matches?`: is `ivar_name` (with leading `@`) an acceptable
+/// memoization variable for `method_name` under the given
+/// `EnforcedStyleForLeadingUnderscores`? `INITIALIZE_METHODS` are always
+/// exempt regardless of the ivar chosen.
+fn mivn_matches(style: &str, method_name: &[u8], ivar_name: &[u8]) -> bool {
+    const INITIALIZE_METHODS: &[&[u8]] =
+        &[b"initialize", b"initialize_clone", b"initialize_copy", b"initialize_dup"];
+    if INITIALIZE_METHODS.contains(&method_name) {
+        return true;
+    }
+    let stripped_method = mivn_strip_bang_q_eq(method_name);
+    let var = ivar_name.strip_prefix(b"@").unwrap_or(ivar_name);
+    mivn_variable_name_candidates(style, &stripped_method).iter().any(|c| c.as_slice() == var)
+}
+
+/// `method_name.to_s.delete('!?=')` — strips predicate/bang/setter
+/// punctuation from a method name (only ever trailing, for real Ruby
+/// identifiers).
+fn mivn_strip_bang_q_eq(name: &[u8]) -> Vec<u8> {
+    name.iter().copied().filter(|&b| b != b'!' && b != b'?' && b != b'=').collect()
+}
+
+/// rubocop's `variable_name_candidates` — `method_name` here is already
+/// stripped of `!?=`.
+fn mivn_variable_name_candidates(style: &str, method_name: &[u8]) -> Vec<Vec<u8>> {
+    let no_underscore = method_name.strip_prefix(b"_").unwrap_or(method_name).to_vec();
+    let mut with_underscore = Vec::with_capacity(method_name.len() + 1);
+    with_underscore.push(b'_');
+    with_underscore.extend_from_slice(method_name);
+    match style {
+        "required" => {
+            let mut v = vec![with_underscore];
+            if method_name.starts_with(b"_") {
+                v.push(method_name.to_vec());
+            }
+            v
+        }
+        "optional" => vec![method_name.to_vec(), with_underscore, no_underscore],
+        _ => vec![method_name.to_vec(), no_underscore],
+    }
+}
+
+/// rubocop's `suggested_var`: `method_name_raw` is the RAW (unstripped)
+/// method name — the `!?=` stripping happens inside, mirroring upstream's
+/// `method_name.to_s.delete('!?=')`.
+fn mivn_suggested_var(style: &str, method_name_raw: &[u8]) -> Vec<u8> {
+    let stripped = mivn_strip_bang_q_eq(method_name_raw);
+    if style == "required" {
+        let mut v = vec![b'_'];
+        v.extend_from_slice(&stripped);
+        v
+    } else {
+        stripped
+    }
+}
+
+/// rubocop's `message`: chooses `UNDERSCORE_REQUIRED` only in `required`
+/// style when the ACTUAL (offending) ivar doesn't already start with `_`;
+/// otherwise the generic mismatch message. `method_name_raw` keeps its
+/// punctuation (`foo?`/`foo!`/`foo=`) — only `suggested_var` is stripped.
+fn mivn_message(style: &str, ivar_name: &[u8], suggested_var: &[u8], method_name_raw: &[u8]) -> String {
+    let ivar_str = String::from_utf8_lossy(ivar_name);
+    let suggested_str = String::from_utf8_lossy(suggested_var);
+    let var_no_at = ivar_name.strip_prefix(b"@").unwrap_or(ivar_name);
+    if style == "required" && !var_no_at.starts_with(b"_") {
+        format!("Memoized variable `{ivar_str}` does not start with `_`. Use `@{suggested_str}` instead.")
+    } else {
+        let method_str = String::from_utf8_lossy(method_name_raw);
+        format!(
+            "Memoized variable `{ivar_str}` does not match method name `{method_str}`. Use `@{suggested_str}` instead."
+        )
+    }
+}

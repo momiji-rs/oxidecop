@@ -300,6 +300,7 @@ COPS = {
   'Style/TrailingCommaInArguments'   => 'style/trailing_comma_in_arguments',
   'Layout/HeredocIndentation'        => 'layout/heredoc_indentation',
   'Style/RescueStandardError'        => 'style/rescue_standard_error',
+  'Naming/MemoizedInstanceVariableName' => 'naming/memoized_instance_variable_name',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
