@@ -310,7 +310,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
     "Style/MethodCallWithoutArgsParentheses", "Style/Alias", "Style/RaiseArgs", "Style/MethodDefParentheses",
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
-    "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective",
+    "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral",
 ];
 
 impl Engine {
@@ -1590,6 +1590,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
         self.check_duplicate_hash_key(node);
         self.check_multiline_hash_brace_layout(node);
+        self.check_trailing_comma_in_hash_literal(node);
         if self.ll_active {
             let l = node.location();
             self.ll_enter_collection(

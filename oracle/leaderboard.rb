@@ -283,6 +283,7 @@ COPS = {
   'Style/HashTransformValues'        => 'style/hash_transform_values',
   'Layout/ArrayAlignment'            => 'layout/array_alignment',
   'Lint/RedundantCopEnableDirective' => 'lint/redundant_cop_enable_directive',
+  'Style/TrailingCommaInHashLiteral' => 'style/trailing_comma_in_hash_literal',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

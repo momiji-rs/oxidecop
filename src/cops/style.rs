@@ -18839,3 +18839,235 @@ fn htv_call_extent_excl_block(call: &ruby_prism::CallNode) -> (usize, usize) {
         .unwrap_or_else(|| loc.end_offset());
     (start, end)
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/TrailingCommaInHashLiteral — ported from the shared `TrailingComma`
+    /// mixin's `check_literal`/`check`/`should_have_comma?`/`avoid_comma`/
+    /// `put_comma` (also used by `TrailingCommaInArguments` and
+    /// `TrailingCommaInArrayLiteral`, which this port does not implement).
+    /// `on_hash` always invokes the mixin with the hash literal node itself
+    /// (never a call node), so the mixin's `call_type?`-gated branches
+    /// (`method_name_and_arguments_on_same_line?`, always false here; the
+    /// "braceless hash promoted to arguments" half of `elements`) never fire
+    /// and are omitted — `elements(node)` is simply `node.elements()`.
+    /// `brackets?(node)` (`node.loc.end`) is always true: prism's `HashNode`
+    /// carries non-optional `opening_loc`/`closing_loc` — a braceless
+    /// keyword hash (the last argument of a method call) is a distinct
+    /// `KeywordHashNode` that `visit_hash_node` never sees.
+    pub(crate) fn check_trailing_comma_in_hash_literal(&mut self, node: &ruby_prism::HashNode) {
+        const COP: &str = "Style/TrailingCommaInHashLiteral";
+        if !self.on(COP) {
+            return;
+        }
+        let elements: Vec<ruby_prism::Node> = node.elements().iter().collect();
+        if elements.is_empty() {
+            return;
+        }
+        let close = node.closing_loc();
+        let last = elements.last().expect("checked non-empty above");
+        let last_end = last.location().end_offset();
+        let close_start = close.start_offset();
+
+        let style = self.cfg.get(COP, "EnforcedStyleForMultiline").unwrap_or("no_comma");
+        let should_have_comma = self.tcihl_should_have_comma(style, node, &elements);
+
+        // `comma_offset`: is there a `,` between the last element and the
+        // closing brace, reachable only through whitespace? Heredoc items
+        // switch to the no-newline-skipping pattern (mixin's `any_heredoc?`).
+        let gap = &self.src[last_end..close_start];
+        let heredoc_mode = elements.iter().any(tcihl_heredoc);
+        let comma_rel = tcihl_comma_offset(gap, heredoc_mode);
+
+        // `inside_comment?`: a same-line comment starting before the comma
+        // position means this isn't really a trailing comma (e.g. `x #,`).
+        let (gap_line, _) = self.idx.loc(last_end);
+        let comma_abs = comma_rel.map(|rel| last_end + rel).filter(|&pos| {
+            !self.comments.iter().any(|&(l, s, _)| l == gap_line && s < pos)
+        });
+
+        match comma_abs {
+            Some(pos) => {
+                if !should_have_comma {
+                    self.tcihl_avoid_comma(COP, style, pos);
+                }
+            }
+            None => {
+                if should_have_comma {
+                    self.tcihl_put_comma(COP, last);
+                }
+            }
+        }
+    }
+
+    fn tcihl_should_have_comma(
+        &self,
+        style: &str,
+        node: &ruby_prism::HashNode,
+        elements: &[ruby_prism::Node],
+    ) -> bool {
+        match style {
+            "comma" => {
+                self.tcihl_multiline(node, elements) && self.tcihl_no_elements_on_same_line(node, elements)
+            }
+            "consistent_comma" => self.tcihl_multiline(node, elements),
+            "diff_comma" => {
+                self.tcihl_multiline(node, elements) && tcihl_last_item_precedes_newline(self.src, node, elements)
+            }
+            _ => false,
+        }
+    }
+
+    /// `multiline?`: `node.multiline?` (source spans more than one line)
+    /// minus the `allowed_multiline_argument?` carve-out — a single-element
+    /// literal whose closing brace does NOT begin its own line is not
+    /// "multiline" even though its content spans lines.
+    fn tcihl_multiline(&self, node: &ruby_prism::HashNode, elements: &[ruby_prism::Node]) -> bool {
+        let loc = node.location();
+        let first_line = self.idx.loc(loc.start_offset()).0;
+        let last_line = self.idx.loc(loc.end_offset().saturating_sub(1)).0;
+        if first_line == last_line {
+            return false;
+        }
+        let allowed = elements.len() == 1 && !self.tcihl_begins_its_line(node.closing_loc().start_offset());
+        !allowed
+    }
+
+    /// `Util.begins_its_line?`: no non-whitespace character precedes `offset`
+    /// on its own line.
+    fn tcihl_begins_its_line(&self, offset: usize) -> bool {
+        let (line, _) = self.idx.loc(offset);
+        let line_start = self.idx.starts[line - 1];
+        self.src[line_start..offset].iter().all(|&b| matches!(b, b' ' | b'\t' | b'\r' | 0x0c | 0x0b))
+    }
+
+    /// `no_elements_on_same_line?`: every element, plus the closing brace as
+    /// a final sentinel, starts on a line strictly after the previous one's
+    /// last line.
+    fn tcihl_no_elements_on_same_line(&self, node: &ruby_prism::HashNode, elements: &[ruby_prism::Node]) -> bool {
+        let mut ranges: Vec<(usize, usize)> =
+            elements.iter().map(|e| (e.location().start_offset(), e.location().end_offset())).collect();
+        let close = node.closing_loc();
+        ranges.push((close.start_offset(), close.end_offset()));
+        ranges.windows(2).all(|w| {
+            let a_last_line = self.idx.loc(w[0].1.saturating_sub(1)).0;
+            let b_line = self.idx.loc(w[1].0).0;
+            a_last_line != b_line
+        })
+    }
+
+    fn tcihl_avoid_comma(&mut self, cop: &'static str, style: &str, comma_pos: usize) {
+        let extra = match style {
+            "comma" => ", unless each item is on its own line",
+            "consistent_comma" => ", unless items are split onto multiple lines",
+            "diff_comma" => ", unless that item immediately precedes a newline",
+            _ => "",
+        };
+        self.push(comma_pos, cop, true, format!("Avoid comma after the last item of a hash{extra}."));
+        self.fixes.push((comma_pos, comma_pos + 1, Vec::new()));
+    }
+
+    /// `put_comma`/`autocorrect_range`: the range from the start of the last
+    /// element's OWN final source line (skipping leading indentation) through
+    /// its end — the fixture's `^^^^^^^` underline — with the fix inserting
+    /// `,` immediately after the element.
+    fn tcihl_put_comma(&mut self, cop: &'static str, last: &ruby_prism::Node) {
+        let loc = last.location();
+        let item_start = loc.start_offset();
+        let item_end = loc.end_offset();
+        let text = &self.src[item_start..item_end];
+        let ix = text.iter().rposition(|&b| b == b'\n').unwrap_or(0);
+        let rest = &text[ix..];
+        let non_ws =
+            rest.iter().position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)).unwrap_or(0);
+        let range_start = item_start + ix + non_ws;
+        self.push(range_start, cop, true, "Put a comma after the last item of a multiline hash.");
+        self.fixes.push((item_end, item_end, b",".to_vec()));
+    }
+}
+
+/// `any_heredoc?`/`heredoc?`/`heredoc_send?`: does this hash element
+/// (directly, or via its pair value / no-arg chained-call receiver / last
+/// call argument) terminate in a heredoc?
+fn tcihl_heredoc(node: &ruby_prism::Node) -> bool {
+    if tcihl_is_heredoc_leaf(node) {
+        return true;
+    }
+    if let Some(call) = node.as_call_node() {
+        let arg_count = call.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0);
+        return if arg_count == 0 {
+            call.receiver().is_some_and(|r| tcihl_heredoc(&r))
+        } else {
+            let args = call.arguments().expect("arg_count > 0 implies Some");
+            args.arguments().iter().last().is_some_and(|last| tcihl_heredoc(&last))
+        };
+    }
+    if let Some(assoc) = node.as_assoc_node() {
+        return tcihl_heredoc(&assoc.value());
+    }
+    if let Some(hash) = node.as_hash_node() {
+        return hash.elements().iter().last().is_some_and(|last| tcihl_heredoc(&last));
+    }
+    false
+}
+
+/// A heredoc-opened string family node (`<<~X`, `<<-X`, `<<X`).
+fn tcihl_is_heredoc_leaf(node: &ruby_prism::Node) -> bool {
+    let opening = if let Some(n) = node.as_string_node() {
+        n.opening_loc()
+    } else if let Some(n) = node.as_interpolated_string_node() {
+        n.opening_loc()
+    } else if let Some(n) = node.as_x_string_node() {
+        Some(n.opening_loc())
+    } else if let Some(n) = node.as_interpolated_x_string_node() {
+        Some(n.opening_loc())
+    } else {
+        None
+    };
+    opening.is_some_and(|o| o.as_slice().starts_with(b"<<"))
+}
+
+/// `comma_offset`: index of the first `,` in `gap` when reachable only
+/// through whitespace from the start — `[^\S\n]*` (no newline-skipping) when
+/// `heredoc_mode`, else `\s*` (newlines included too).
+fn tcihl_comma_offset(gap: &[u8], heredoc_mode: bool) -> Option<usize> {
+    let mut i = 0;
+    while i < gap.len() {
+        let ws = if heredoc_mode {
+            matches!(gap[i], b' ' | b'\t' | b'\r' | 0x0c | 0x0b)
+        } else {
+            matches!(gap[i], b' ' | b'\t' | b'\r' | b'\n' | 0x0c | 0x0b)
+        };
+        if !ws {
+            break;
+        }
+        i += 1;
+    }
+    if i < gap.len() && gap[i] == b',' { Some(i) } else { None }
+}
+
+/// `last_item_precedes_newline?`: the text from the last element's end
+/// through the node's own end starts with an optional comma, optional
+/// (non-newline) whitespace, an optional trailing comment, then a `\n`.
+fn tcihl_last_item_precedes_newline(src: &[u8], node: &ruby_prism::HashNode, elements: &[ruby_prism::Node]) -> bool {
+    let Some(last) = elements.last() else { return false };
+    let start = last.location().end_offset();
+    let end = node.location().end_offset();
+    if start > end {
+        return false;
+    }
+    let mut text = &src[start..end];
+    if text.first() == Some(&b',') {
+        text = &text[1..];
+    }
+    let mut i = 0;
+    while i < text.len() && matches!(text[i], b' ' | b'\t' | b'\r' | 0x0c | 0x0b) {
+        i += 1;
+    }
+    if i < text.len() && text[i] == b'#' {
+        while i < text.len() && text[i] != b'\n' {
+            i += 1;
+        }
+    }
+    i < text.len() && text[i] == b'\n'
+}
