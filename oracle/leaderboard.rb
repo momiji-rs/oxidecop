@@ -286,6 +286,7 @@ COPS = {
   'Style/TrailingCommaInHashLiteral' => 'style/trailing_comma_in_hash_literal',
   'Metrics/ModuleLength'             => 'metrics/module_length',
   'Style/SpecialGlobalVars'          => 'style/special_global_vars',
+  'Style/StringConcatenation'        => 'style/string_concatenation',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

@@ -19331,3 +19331,335 @@ impl<'a> super::Cops<'a> {
         items[0].as_string_node().is_some_and(|s| s.unescaped() == b"English")
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/StringConcatenation — flags `+` chains where at least one link
+    /// has an immediate string-literal operand, suggesting interpolation
+    /// instead. Ported from `on_send`/`string_concatenation?`/
+    /// `find_topmost_plus_node`/`collect_parts`/`replacement`.
+    ///
+    /// Traversal note: rubocop's own AST walk visits a node before its
+    /// children (preorder), so by the time `on_send` reaches an interior `+`
+    /// link of a chain, `find_topmost_plus_node` has already climbed back up
+    /// to the SAME topmost node upstream would have registered from the
+    /// outermost link — and `add_offense`'s `duplicate_location?` guard
+    /// collapses the repeats into one offense. We get the same effect by
+    /// only ever starting from a `+` CallNode that hasn't already been
+    /// claimed as an interior link by an ancestor (`sc_handled`), and, when
+    /// we do start, marking every interior link of the whole chain as
+    /// claimed before returning — so the traversal's later visits into the
+    /// receiver/argument subtree skip straight past them.
+    ///
+    /// `corrected_ancestor?` (upstream's guard against double-correcting a
+    /// leaf whose own topmost is nested inside another chain's
+    /// already-corrected range, e.g. `(cond ? greeting + ', ' : '') + name +
+    /// ...`) has no analog here: we simply emit BOTH corrections
+    /// independently. `apply_fixes` already discards an outer edit that
+    /// overlaps an inner one it already placed (it processes edits
+    /// right-to-left, by start offset, skipping anything whose range crosses
+    /// one already applied), and `apply_fixes_iter` reruns the whole lint
+    /// pass on the patched source until it stops changing — together these
+    /// reproduce upstream's own multi-pass autocorrect convergence (the
+    /// "nested concatenatable parts" spec example needs THREE passes to
+    /// reach its final form) without needing to track "already corrected"
+    /// state ourselves.
+    pub(crate) fn check_string_concatenation(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/StringConcatenation";
+        if !self.on(COP) {
+            return;
+        }
+        if sc_plus_arg(node).is_none() {
+            return;
+        }
+        let start = node.location().start_offset();
+        if self.sc_handled.contains(&start) {
+            return;
+        }
+        let mut chain: Vec<ruby_prism::CallNode> = Vec::new();
+        let mut leaves: Vec<ruby_prism::Node> = Vec::new();
+        sc_collect(node.as_node(), &mut chain, &mut leaves);
+        for c in &chain {
+            self.sc_handled.insert(c.location().start_offset());
+        }
+        let eligible =
+            chain.iter().any(|c| sc_string_concat_immediate(c) && !self.sc_line_end_concatenation(c));
+        if !eligible {
+            return;
+        }
+        if self.cfg.get(COP, "Mode") == Some("conservative")
+            && !leaves.first().is_some_and(|p| p.as_string_node().is_some())
+        {
+            return;
+        }
+        let end = node.location().end_offset();
+        let correctable = !leaves.iter().any(|p| self.sc_uncorrectable(p));
+        self.push(start, COP, correctable, "Prefer string interpolation to string concatenation.");
+        if correctable {
+            let replacement = self.sc_replacement(&leaves);
+            self.fixes.push((start, end, replacement));
+        }
+    }
+
+    /// `line_end_concatenation?`: both sides of THIS specific `+` link are
+    /// plain string literals, the call spans multiple source lines, and a
+    /// `+` sits at the end of one of those lines (only trailing horizontal
+    /// whitespace between it and the newline) — left to
+    /// `Style/LineEndConcatenation` instead.
+    fn sc_line_end_concatenation(&self, call: &ruby_prism::CallNode) -> bool {
+        let Some(recv) = call.receiver() else { return false };
+        if recv.as_string_node().is_none() {
+            return false;
+        }
+        let Some(arg) = sc_plus_arg(call) else { return false };
+        if arg.as_string_node().is_none() {
+            return false;
+        }
+        let loc = call.location();
+        let l1 = self.idx.loc(loc.start_offset()).0;
+        let l2 = self.idx.loc(loc.end_offset().saturating_sub(1).max(loc.start_offset())).0;
+        if l1 == l2 {
+            return false;
+        }
+        sc_has_trailing_plus_newline(&self.src[loc.start_offset()..loc.end_offset()])
+    }
+
+    /// `uncorrectable?`: a leaf that spans multiple source lines, is a
+    /// heredoc, or has any block (numbered-parameter blocks included)
+    /// nested anywhere inside it.
+    fn sc_uncorrectable(&self, part: &ruby_prism::Node) -> bool {
+        let loc = part.location();
+        let l1 = self.idx.loc(loc.start_offset()).0;
+        let l2 = self.idx.loc(loc.end_offset().saturating_sub(1).max(loc.start_offset())).0;
+        if l1 != l2 {
+            return true;
+        }
+        if sc_is_heredoc(part) {
+            return true;
+        }
+        sc_has_block_descendant(part)
+    }
+
+    /// `replacement`: join every leaf's `adjust_str` rendering and wrap in
+    /// double quotes; `handle_quotes` swaps a leaf that rendered to a bare
+    /// `"` for an escaped one so it can't prematurely close the new string.
+    fn sc_replacement(&self, leaves: &[ruby_prism::Node]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(b'"');
+        for leaf in leaves {
+            let part = self.sc_adjust_str(leaf);
+            if part == b"\"" {
+                out.extend_from_slice(b"\\\"");
+            } else {
+                out.extend_from_slice(&part);
+            }
+        }
+        out.push(b'"');
+        out
+    }
+
+    /// `adjust_str`: a plain string literal contributes its escaped VALUE
+    /// (single-quoted source: backslash-escape only `\`/`"`/`#{`/`#@`/`#$`;
+    /// otherwise Ruby `String#inspect`-style escaping); a string with parts
+    /// (real interpolation, or prism's folded adjacent-literal
+    /// concatenation) or a parenthesized/embedded group recurses over its
+    /// children with no wrapper of its own; anything else is embedded
+    /// verbatim as `#{<source>}`.
+    fn sc_adjust_str(&self, part: &ruby_prism::Node) -> Vec<u8> {
+        if let Some(s) = part.as_string_node() {
+            let loc = s.location();
+            let single_quoted = self.src.get(loc.start_offset()) == Some(&b'\'');
+            let val = s.unescaped();
+            return if single_quoted { sc_escape_single_quoted(val) } else { sc_inspect_body(val) };
+        }
+        if let Some(d) = part.as_interpolated_string_node() {
+            return d.parts().iter().flat_map(|p| self.sc_adjust_str(&p)).collect();
+        }
+        if let Some(p) = part.as_parentheses_node() {
+            return match p.body() {
+                Some(b) => self.sc_adjust_begin_like(&b),
+                None => Vec::new(),
+            };
+        }
+        if let Some(e) = part.as_embedded_statements_node() {
+            return match e.statements() {
+                Some(s) => s.body().iter().flat_map(|c| self.sc_adjust_str(&c)).collect(),
+                None => Vec::new(),
+            };
+        }
+        if let Some(e) = part.as_embedded_variable_node() {
+            return self.sc_adjust_str(&e.variable());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"#{");
+        out.extend_from_slice(self.node_src(part));
+        out.push(b'}');
+        out
+    }
+
+    /// A `begin`-shaped wrapper (parenthesized group / `#{...}` body): if it
+    /// holds a `StatementsNode`, recurse over each statement; otherwise
+    /// treat the single node as the whole content. Either way, no `#{}` of
+    /// its own is added here — that only happens once we bottom out on a
+    /// leaf that isn't itself str/dstr/begin-shaped.
+    fn sc_adjust_begin_like(&self, node: &ruby_prism::Node) -> Vec<u8> {
+        if let Some(stmts) = node.as_statements_node() {
+            stmts.body().iter().flat_map(|c| self.sc_adjust_str(&c)).collect()
+        } else {
+            self.sc_adjust_str(node)
+        }
+    }
+}
+
+/// `plus_node?` plus the arity/shape guard needed before treating a call as
+/// a chain link: a non-safe-nav `+` send with a receiver and EXACTLY one
+/// positional argument. Returns the argument.
+fn sc_plus_arg<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if call.is_safe_navigation() || call.name().as_slice() != b"+" {
+        return None;
+    }
+    call.receiver()?;
+    let args = call.arguments()?;
+    let mut it = args.arguments().iter();
+    let first = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// `string_concatenation?`'s immediate (non-recursive) check on ONE `+`
+/// link: either side is a plain string literal.
+fn sc_string_concat_immediate(call: &ruby_prism::CallNode) -> bool {
+    if call.receiver().is_some_and(|r| r.as_string_node().is_some()) {
+        return true;
+    }
+    sc_plus_arg(call).is_some_and(|a| a.as_string_node().is_some())
+}
+
+/// `find_topmost_plus_node` + `collect_parts` combined into one downward
+/// walk (the traversal already guarantees we only ever start this from the
+/// topmost link — see the caller): follow `+` links through
+/// receiver/argument, collecting every interior `+` CallNode into `chain`
+/// and every non-`+` operand into `leaves`, left-to-right.
+fn sc_collect<'pr>(
+    node: ruby_prism::Node<'pr>,
+    chain: &mut Vec<ruby_prism::CallNode<'pr>>,
+    leaves: &mut Vec<ruby_prism::Node<'pr>>,
+) {
+    if let Some(call) = node.as_call_node() {
+        if let Some(arg) = sc_plus_arg(&call) {
+            let recv = call.receiver().unwrap();
+            chain.push(call);
+            sc_collect(recv, chain, leaves);
+            sc_collect(arg, chain, leaves);
+            return;
+        }
+    }
+    leaves.push(node);
+}
+
+/// `heredoc?`: a plain or interpolated string literal whose opening is a
+/// `<<`-heredoc marker.
+fn sc_is_heredoc(node: &ruby_prism::Node) -> bool {
+    let opening = if let Some(s) = node.as_string_node() {
+        s.opening_loc()
+    } else if let Some(d) = node.as_interpolated_string_node() {
+        d.opening_loc()
+    } else {
+        None
+    };
+    opening.is_some_and(|o| o.as_slice().starts_with(b"<<"))
+}
+
+/// `each_descendant(:any_block).any?`: does a `do...end`/`{...}` block
+/// (numbered-parameter blocks included — prism has no separate numblock
+/// node type) occur anywhere inside this subtree? `&:sym` block-pass
+/// arguments are a distinct node type and don't count, matching upstream.
+fn sc_has_block_descendant(node: &ruby_prism::Node) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_block_node(&mut self, _node: &ruby_prism::BlockNode<'pr>) {
+            self.found = true;
+        }
+    }
+    let mut f = Finder { found: false };
+    use ruby_prism::Visit;
+    f.visit(node);
+    f.found
+}
+
+/// Does a `+` in `src` sit at the end of a line — only horizontal
+/// whitespace between it and the next `\n`? Mirrors Ruby's
+/// `source.match?(/\+\s*\n/)` for the realistic case (no stray blank lines
+/// or form-feeds between the operator and the line break).
+fn sc_has_trailing_plus_newline(src: &[u8]) -> bool {
+    for (i, &b) in src.iter().enumerate() {
+        if b != b'+' {
+            continue;
+        }
+        let mut j = i + 1;
+        while matches!(src.get(j), Some(b' ' | b'\t' | b'\r')) {
+            j += 1;
+        }
+        if src.get(j) == Some(&b'\n') {
+            return true;
+        }
+    }
+    false
+}
+
+/// `single_quoted?` branch of `adjust_str`: backslash-escape only the
+/// characters that would otherwise corrupt the new double-quoted literal —
+/// a literal backslash, a literal `"`, or the three interpolation sigils
+/// (`#{`, `#@`, `#$`, escaping just the `#`).
+fn sc_escape_single_quoted(val: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(val.len());
+    let mut i = 0;
+    while i < val.len() {
+        let b = val[i];
+        if b == b'\\' || b == b'"' {
+            out.push(b'\\');
+            out.push(b);
+        } else if b == b'#' && matches!(val.get(i + 1), Some(b'{') | Some(b'@') | Some(b'$')) {
+            out.push(b'\\');
+            out.push(b'#');
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Ruby `String#inspect`, minus the surrounding quotes — the non-single-
+/// quoted branch of `adjust_str` (`part.value.inspect[1..-2]`).
+fn sc_inspect_body(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            0x1b => out.extend_from_slice(b"\\e"),
+            0x07 => out.extend_from_slice(b"\\a"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0x0b => out.extend_from_slice(b"\\v"),
+            b'#' if matches!(bytes.get(i + 1), Some(b'{') | Some(b'@') | Some(b'$')) => {
+                out.push(b'\\');
+                out.push(b'#');
+            }
+            0x00..=0x1f | 0x7f => out.extend_from_slice(format!("\\x{b:02X}").as_bytes()),
+            _ => out.push(b),
+        }
+        i += 1;
+    }
+    out
+}

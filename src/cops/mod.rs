@@ -312,6 +312,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
+    "Style/StringConcatenation",
 ];
 
 impl Engine {
@@ -799,6 +800,11 @@ pub(crate) struct Cops<'a> {
     // Style/SingleArgumentDig: start offsets of dig calls known to be the
     // receiver of an outer dig (chain members, ceded to Style/DigChain).
     pub(crate) sad_chain_receivers: HashSet<usize>,
+    // Style/StringConcatenation: start offsets of `+` CallNodes already
+    // accounted for as an interior link of an ancestor's chain (so we don't
+    // re-process them as their own topmost when the default traversal
+    // descends into them).
+    pub(crate) sc_handled: HashSet<usize>,
     // Style/RedundantSelf: per-active def/block scope, the set of local
     // variable / parameter names known to disambiguate `self.x` from a bare
     // `x` — rubocop's `@local_variables_scopes` aliases ONE mutable Array
@@ -3310,6 +3316,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_binary_operator_with_identical_operands(node);
         self.check_float_comparison(node);
         self.check_line_end_concatenation(node);
+        self.check_string_concatenation(node);
         if self.ll_active {
             let (count, info) = breakable::call_break_facts(node);
             let l = node.location();
@@ -3854,6 +3861,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         sgv_climb: HashMap::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
+        sc_handled: HashSet::new(),
         rs_scope_stack: Vec::new(),
         rs_narrow: Vec::new(),
         rs_block_stack: Vec::new(),
