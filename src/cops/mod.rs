@@ -231,7 +231,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException",
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
-    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf",
+    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName",
 ];
 
 impl Engine {
@@ -910,6 +910,17 @@ pub(crate) struct Cops<'a> {
     // "populate ahead of time, keyed by the child's own start offset" idiom
     // (see `ut_call_child` etc. above).
     pub(crate) redundant_sort_logical_left: HashMap<usize, (usize, usize)>,
+    // Naming/VariableName: depth of enclosing pattern-match PATTERN subtrees
+    // (an `InNode`/`MatchRequiredNode`/`MatchPredicateNode`'s `.pattern()`,
+    // not its `.statements()`/guard) — prism represents a plain pattern bind
+    // (`in fooBar`) with the very same `LocalVariableTargetNode` used for
+    // masgn/rescue/for-loop targets, but upstream's `on_lvasgn` is never
+    // aliased from `on_match_var` (a DIFFERENT whitequark node type), so a
+    // bare pattern binding itself is never checked — only a later READ of it
+    // (an ordinary `lvar`) is. Non-zero while visiting such a `.pattern()`
+    // suppresses the WRITE-side check on any `LocalVariableTargetNode`
+    // reached along the way.
+    pub(crate) pattern_depth: usize,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1244,12 +1255,42 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.check_space_after_colon_kwoptarg(node);
         self.check_circular_argument_reference(node.name().as_slice(), &node.value());
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_optional_keyword_parameter_node(self, node);
     }
     fn visit_optional_parameter_node(&mut self, node: &ruby_prism::OptionalParameterNode<'pr>) {
         self.check_space_around_equals_in_parameter_default(node);
         self.check_circular_argument_reference(node.name().as_slice(), &node.value());
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_optional_parameter_node(self, node);
+    }
+    fn visit_required_parameter_node(&mut self, node: &ruby_prism::RequiredParameterNode<'pr>) {
+        // no `name_loc` — a required parameter IS just its identifier, so
+        // `location()` is already the exact name range.
+        self.check_variable_name(node.name().as_slice(), node.location().start_offset());
+    }
+    fn visit_rest_parameter_node(&mut self, node: &ruby_prism::RestParameterNode<'pr>) {
+        // anonymous `*` carries no name — nothing to check.
+        if let (Some(name), Some(loc)) = (node.name(), node.name_loc()) {
+            self.check_variable_name(name.as_slice(), loc.start_offset());
+        }
+    }
+    fn visit_required_keyword_parameter_node(&mut self, node: &ruby_prism::RequiredKeywordParameterNode<'pr>) {
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
+    }
+    fn visit_keyword_rest_parameter_node(&mut self, node: &ruby_prism::KeywordRestParameterNode<'pr>) {
+        // anonymous `**` carries no name — nothing to check.
+        if let (Some(name), Some(loc)) = (node.name(), node.name_loc()) {
+            self.check_variable_name(name.as_slice(), loc.start_offset());
+        }
+    }
+    fn visit_block_parameter_node(&mut self, node: &ruby_prism::BlockParameterNode<'pr>) {
+        // anonymous `&` (def or block) carries no name — nothing to check.
+        // Covers BOTH `def foo(&blk)` and `foo { |&blk| }` — prism (like
+        // whitequark) uses the identical node shape for both.
+        if let (Some(name), Some(loc)) = (node.name(), node.name_loc()) {
+            self.check_variable_name(name.as_slice(), loc.start_offset());
+        }
     }
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
         let v = node.value();
@@ -1424,11 +1465,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_self_assignment_cvar(node);
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         assignment_write!(self, node);
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_class_variable_write_node(self, node);
     }
     fn visit_class_variable_operator_write_node(&mut self, node: &ruby_prism::ClassVariableOperatorWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
         assignment_operator_write!(self, node);
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_class_variable_operator_write_node(self, node);
     }
     fn visit_class_variable_or_write_node(&mut self, node: &ruby_prism::ClassVariableOrWriteNode<'pr>) {
@@ -1436,18 +1479,21 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_cvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
         assignment_write!(self, node);
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_class_variable_or_write_node(self, node);
     }
     fn visit_class_variable_and_write_node(&mut self, node: &ruby_prism::ClassVariableAndWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
         self.check_self_assignment_cvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_class_variable_and_write_node(self, node);
     }
     fn visit_class_variable_target_node(&mut self, node: &ruby_prism::ClassVariableTargetNode<'pr>) {
         // a class var target in a multiple assignment (`@@a, @@b = 1, 2`) is a
         // cvasgn in whitequark, so upstream's on_cvasgn fires per target
         self.check_class_vars(node.name().as_slice(), node.location().start_offset());
+        self.check_variable_name(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
@@ -1460,11 +1506,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_global_std_stream_gvasgn(node.name().as_slice(), &node.value());
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         assignment_write!(self, node);
+        self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_global_variable_write_node(self, node);
     }
     fn visit_global_variable_operator_write_node(&mut self, node: &ruby_prism::GlobalVariableOperatorWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
         assignment_operator_write!(self, node);
+        self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_global_variable_operator_write_node(self, node);
     }
     fn visit_global_variable_or_write_node(&mut self, node: &ruby_prism::GlobalVariableOrWriteNode<'pr>) {
@@ -1472,16 +1520,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_gvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
         assignment_write!(self, node);
+        self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_global_variable_or_write_node(self, node);
     }
     fn visit_global_variable_and_write_node(&mut self, node: &ruby_prism::GlobalVariableAndWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
         self.check_self_assignment_gvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
+        self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_global_variable_and_write_node(self, node);
     }
     fn visit_global_variable_target_node(&mut self, node: &ruby_prism::GlobalVariableTargetNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
+        self.check_variable_name_gvasgn(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_numbered_reference_read_node(&mut self, node: &ruby_prism::NumberedReferenceReadNode<'pr>) {
         self.check_perl_backrefs_numbered(node);
@@ -1491,6 +1542,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
         self.check_ascii_identifiers_in_name(node.name().as_slice(), node.location().start_offset(), false);
+        // Naming/VariableName's `on_lvar` alias — a READ is checked
+        // unconditionally, even one reached from inside a pattern-match guard
+        // or a pin (`^x`) expression (rubocop's own AST has no such
+        // exception either: an `lvar` node is an `lvar` node).
+        self.check_variable_name(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
         self.check_ascii_local_variable_write(node);
@@ -1500,10 +1556,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_local_variable_write_node(self, node);
     }
     fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
         assignment_operator_write!(self, node);
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_local_variable_operator_write_node(self, node);
     }
     fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
@@ -1511,13 +1569,23 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_local_variable_or_write_node(self, node);
     }
     fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
         self.check_self_assignment_lvar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_local_variable_and_write_node(self, node);
+    }
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        // masgn/rescue/for-loop targets are lvasgn in whitequark (checked);
+        // a bare pattern-match binding (`in fooBar`) is NOT (see
+        // `pattern_depth`'s doc comment).
+        if self.pattern_depth == 0 {
+            self.check_variable_name(node.name().as_slice(), node.location().start_offset());
+        }
     }
     fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
         self.check_self_assignment_shorthand_ivar(node);
@@ -1525,6 +1593,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_self_assignment_ivar(node);
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         assignment_write!(self, node);
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_instance_variable_write_node(self, node);
     }
     fn visit_instance_variable_operator_write_node(
@@ -1532,18 +1601,27 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         node: &ruby_prism::InstanceVariableOperatorWriteNode<'pr>,
     ) {
         assignment_operator_write!(self, node);
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_instance_variable_operator_write_node(self, node);
     }
     fn visit_instance_variable_or_write_node(&mut self, node: &ruby_prism::InstanceVariableOrWriteNode<'pr>) {
         self.check_self_assignment_ivar(node.location().start_offset(), node.name().as_slice(), &node.value());
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
         assignment_write!(self, node);
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_instance_variable_or_write_node(self, node);
     }
     fn visit_instance_variable_and_write_node(&mut self, node: &ruby_prism::InstanceVariableAndWriteNode<'pr>) {
         self.check_self_assignment_ivar(node.location().start_offset(), node.name().as_slice(), &node.value());
         assignment_write!(self, node);
+        self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_instance_variable_and_write_node(self, node);
+    }
+    fn visit_instance_variable_target_node(&mut self, node: &ruby_prism::InstanceVariableTargetNode<'pr>) {
+        // an ivar target in a multiple assignment (`@a, @b = 1, 2`) or a
+        // `rescue => @e` is an ivasgn in whitequark, so upstream's
+        // on_ivasgn fires per target (ivars can never appear in a pattern).
+        self.check_variable_name(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
         let lhs_start = node.location().start_offset();
@@ -1634,7 +1712,30 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_in_node(&mut self, node: &ruby_prism::InNode<'pr>) {
         self.check_redundant_self_in_pattern(node);
-        ruby_prism::visit_in_node(self, node);
+        // Inlines `ruby_prism::visit_in_node`'s own default body (visit
+        // pattern, then statements) so only the PATTERN half runs under
+        // `pattern_depth` — see that field's doc comment on `Cops`.
+        self.pattern_depth += 1;
+        self.visit(&node.pattern());
+        self.pattern_depth -= 1;
+        if let Some(s) = node.statements() {
+            self.visit_statements_node(&s);
+        }
+    }
+    fn visit_match_required_node(&mut self, node: &ruby_prism::MatchRequiredNode<'pr>) {
+        // `expr => pattern` (rightward assignment) — same pattern-binding
+        // shape as `case/in`, so the same `pattern_depth` exemption applies.
+        self.visit(&node.value());
+        self.pattern_depth += 1;
+        self.visit(&node.pattern());
+        self.pattern_depth -= 1;
+    }
+    fn visit_match_predicate_node(&mut self, node: &ruby_prism::MatchPredicateNode<'pr>) {
+        // `expr in pattern` (boolean pattern match) — same as above.
+        self.visit(&node.value());
+        self.pattern_depth += 1;
+        self.visit(&node.pattern());
+        self.pattern_depth -= 1;
     }
     fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
         let klass = node.name().as_slice();
@@ -2838,6 +2939,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         mmcbl_heredoc_chain: HashMap::new(),
         se_ancestor_end_lines: Vec::new(),
         redundant_sort_logical_left: HashMap::new(),
+        pattern_depth: 0,
     };
 
     let t = tick(&T_PREP, t);

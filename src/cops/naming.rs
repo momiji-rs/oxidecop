@@ -1004,3 +1004,94 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Naming/VariableName — on every `lvasgn`-shaped node (local/instance/
+    /// class variable writes and reads, every `def`/block parameter kind,
+    /// masgn/rescue/for-loop local-variable targets): AllowedIdentifiers
+    /// exempts first (sigil-stripped exact match), then
+    /// ForbiddenIdentifiers/ForbiddenPatterns register the `is forbidden`
+    /// message, then the EnforcedStyle check (itself exempted by
+    /// AllowedPatterns) — mirrors upstream's `on_lvasgn`/`check_name` order
+    /// exactly. `class_emitter_method?` (the other `valid_name?` escape
+    /// hatch) never applies here: it only fires for `defs_type?` nodes, and
+    /// none of the node kinds that reach this are ever a `defs`.
+    pub(crate) fn check_variable_name(&mut self, name: &[u8], start: usize) {
+        const COP: &str = "Naming/VariableName";
+        if !self.on(COP) {
+            return;
+        }
+        if self.vn_allowed_identifier(name) {
+            return;
+        }
+        if let Some(msg) = self.vn_forbidden_message(name) {
+            self.push(start, COP, false, msg);
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        if name_matches_style(name, style) || self.allowed(COP, name) {
+            return;
+        }
+        self.push(start, COP, false, format!("Use {style} for variable names."));
+    }
+
+    /// Naming/VariableName on `gvasgn`-shaped nodes — upstream's `on_gvasgn`
+    /// runs ONLY the ForbiddenIdentifiers/ForbiddenPatterns check; globals
+    /// are exempt from both the style check and AllowedIdentifiers (upstream
+    /// never consults it there).
+    pub(crate) fn check_variable_name_gvasgn(&mut self, name: &[u8], start: usize) {
+        const COP: &str = "Naming/VariableName";
+        if !self.on(COP) {
+            return;
+        }
+        if let Some(msg) = self.vn_forbidden_message(name) {
+            self.push(start, COP, false, msg);
+        }
+    }
+
+    fn vn_list(&self, key: &str) -> Vec<String> {
+        match self.cfg.get("Naming/VariableName", key) {
+            Some(v) => crate::config::parse_allowed_list(v),
+            None => Vec::new(),
+        }
+    }
+
+    /// `AllowedIdentifiers#allowed_identifier?` — exact match against the
+    /// name with its `@`/`@@`/`$` sigil(s) stripped.
+    fn vn_allowed_identifier(&self, name: &[u8]) -> bool {
+        let ids = self.vn_list("AllowedIdentifiers");
+        if ids.is_empty() {
+            return false;
+        }
+        let stripped = vn_strip_sigils(name);
+        ids.iter().any(|id| id.as_bytes() == stripped.as_slice())
+    }
+
+    /// `ForbiddenIdentifiers#forbidden_identifier?` (sigil-stripped exact
+    /// match) OR `ForbiddenPattern#forbidden_pattern?` (raw name, regex,
+    /// sigil included, exactly like `AllowedPattern`) — the offense message
+    /// when either hits.
+    fn vn_forbidden_message(&self, name: &[u8]) -> Option<String> {
+        let stripped = vn_strip_sigils(name);
+        let by_id = {
+            let ids = self.vn_list("ForbiddenIdentifiers");
+            !ids.is_empty() && ids.iter().any(|id| id.as_bytes() == stripped.as_slice())
+        };
+        let hit = by_id || {
+            let s = String::from_utf8_lossy(name);
+            self.vn_list("ForbiddenPatterns")
+                .iter()
+                .any(|p| regex::Regex::new(p).map(|re| re.is_match(&s)).unwrap_or(false))
+        };
+        hit.then(|| format!("`{}` is forbidden, use another name instead.", String::from_utf8_lossy(name)))
+    }
+}
+
+/// `AllowedIdentifiers::SIGILS` = `'@$'` — ivar/cvar/gvar names carry their
+/// sigil(s) in `node.name` (prism's `name()`/`name_loc()` include them too,
+/// e.g. `@fooBar`/`@@fooBar`/`$fooBar`), but the Allowed/Forbidden
+/// IDENTIFIER lists (not the Pattern ones) compare against the bare name.
+fn vn_strip_sigils(name: &[u8]) -> Vec<u8> {
+    name.iter().copied().filter(|b| *b != b'@' && *b != b'$').collect()
+}
