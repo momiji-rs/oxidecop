@@ -1939,3 +1939,235 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Metrics/BlockNesting: a full-file recursive walk from `on_new_investigation`
+// ---------------------------------------------------------------------------
+//
+// Unlike the per-`def` cops above, rubocop's `check_nesting_level` walks the
+// ENTIRE file once from `processed_source.ast`, threading a `current_level`
+// counter through EVERY node — defs/classes DON'T reset it, so nesting depth
+// is continuous across method/class boundaries. Only `NESTING_BLOCKS` types
+// increment the level: `if`/`unless`/ternary (whitequark's unified `:if`
+// type), `case`, `case`/`in`, `while`/`until` (including the post-condition
+// `begin...end while`/`until` form — always counted, unlike
+// `CyclomaticComplexity`'s COUNTED_NODES which excludes it), `for`, and each
+// INDIVIDUAL `rescue` clause (`:resbody` — never the whole `:rescue`/`begin`
+// construct). When `CountBlocks` is set, any literal block (`do...end`/`{}`,
+// including numbered-param/`it`-param and lambda-literal forms — but NOT a
+// `&:sym`/`&blk` block-PASS argument) also increments.
+//
+// `elsif` nodes "consider" (they still match `:if`) but never themselves
+// increment (`count_if_block?`'s `node.elsif?` guard) — detected the same way
+// `ComplexityCounter` distinguishes ternaries above: `if_keyword_loc`'s slice.
+// Modifier `if`/`unless` only increment when `CountModifierForms` is set;
+// modifier `while`/`until`/ternary `if` always increment regardless (only
+// `if`/`unless` STATEMENT forms are gated by `count_if_block?`).
+//
+// Once a node is flagged, rubocop's `ignore_node` suppresses any FURTHER
+// offense whose source range is CONTAINED WITHIN it (`part_of_ignored_node?`)
+// — a violating outer node swallows violations nested inside it, but never a
+// sibling at the same depth. Multiple `rescue` clauses in one chain are true
+// AST siblings (evaluated at the SAME level) in rubocop's whitequark AST —
+// `visit_rescue_node` below threads the pre-increment `saved` level to
+// `.subsequent()`, not the incremented one used for THIS clause's own body,
+// to replicate that sibling (not nested) relationship.
+struct BlockNestingWalker {
+    level: i32,
+    max: i32,
+    count_blocks: bool,
+    count_modifier_forms: bool,
+    ignored: Vec<(usize, usize)>,
+    offenses: Vec<usize>,
+}
+
+impl BlockNestingWalker {
+    fn new(max: i32, count_blocks: bool, count_modifier_forms: bool) -> Self {
+        BlockNestingWalker { level: 0, max, count_blocks, count_modifier_forms, ignored: Vec::new(), offenses: Vec::new() }
+    }
+
+    /// `part_of_ignored_node?`: is `[start, end)` contained within a range
+    /// already flagged (and hence `ignore_node`-registered)?
+    fn part_of_ignored(&self, start: usize, end: usize) -> bool {
+        self.ignored.iter().any(|&(b, e)| b <= start && e >= end)
+    }
+
+    fn check(&mut self, start: usize, end: usize) {
+        if self.level > self.max && !self.part_of_ignored(start, end) {
+            self.offenses.push(start);
+            self.ignored.push((start, end));
+        }
+    }
+}
+
+impl<'pr> Visit<'pr> for BlockNestingWalker {
+    fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        let is_ternary = node.if_keyword_loc().is_none();
+        let is_elsif = node.if_keyword_loc().is_some_and(|l| l.as_slice() == b"elsif");
+        let is_modifier = !is_ternary && !is_elsif && node.end_keyword_loc().is_none();
+        let increment = if is_elsif { false } else if is_modifier { self.count_modifier_forms } else { true };
+        let saved = self.level;
+        if increment {
+            self.level += 1;
+        }
+        let loc = node.location();
+        self.check(loc.start_offset(), loc.end_offset());
+        ruby_prism::visit_if_node(self, node);
+        self.level = saved;
+    }
+
+    fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        let is_modifier = node.end_keyword_loc().is_none();
+        let increment = if is_modifier { self.count_modifier_forms } else { true };
+        let saved = self.level;
+        if increment {
+            self.level += 1;
+        }
+        let loc = node.location();
+        self.check(loc.start_offset(), loc.end_offset());
+        ruby_prism::visit_unless_node(self, node);
+        self.level = saved;
+    }
+
+    fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        let saved = self.level;
+        self.level += 1;
+        let loc = node.location();
+        self.check(loc.start_offset(), loc.end_offset());
+        ruby_prism::visit_while_node(self, node);
+        self.level = saved;
+    }
+
+    fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        let saved = self.level;
+        self.level += 1;
+        let loc = node.location();
+        self.check(loc.start_offset(), loc.end_offset());
+        ruby_prism::visit_until_node(self, node);
+        self.level = saved;
+    }
+
+    fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
+        let saved = self.level;
+        self.level += 1;
+        let loc = node.location();
+        self.check(loc.start_offset(), loc.end_offset());
+        ruby_prism::visit_case_node(self, node);
+        self.level = saved;
+    }
+
+    fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
+        let saved = self.level;
+        self.level += 1;
+        let loc = node.location();
+        self.check(loc.start_offset(), loc.end_offset());
+        ruby_prism::visit_case_match_node(self, node);
+        self.level = saved;
+    }
+
+    fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
+        let saved = self.level;
+        self.level += 1;
+        let loc = node.location();
+        self.check(loc.start_offset(), loc.end_offset());
+        ruby_prism::visit_for_node(self, node);
+        self.level = saved;
+    }
+
+    fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
+        let saved = self.level;
+        self.level = saved + 1;
+        let loc = node.location();
+        self.check(loc.start_offset(), loc.end_offset());
+        for exc in node.exceptions().iter() {
+            self.visit(&exc);
+        }
+        if let Some(r) = node.reference() {
+            self.visit(&r);
+        }
+        if let Some(s) = node.statements() {
+            self.visit_statements_node(&s);
+        }
+        self.level = saved;
+        // Sibling `rescue` clauses share the SAME ambient level — recurse at
+        // `saved`, not the incremented level used for this clause's own body.
+        if let Some(sub) = node.subsequent() {
+            self.visit_rescue_node(&sub);
+        }
+    }
+
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        let literal_block = self.count_blocks && node.block().is_some_and(|b| b.as_block_node().is_some());
+        if literal_block {
+            let saved = self.level;
+            self.level += 1;
+            let loc = node.location();
+            self.check(loc.start_offset(), loc.end_offset());
+            ruby_prism::visit_call_node(self, node);
+            self.level = saved;
+        } else {
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+
+    fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+        let literal_block = self.count_blocks && node.block().is_some_and(|b| b.as_block_node().is_some());
+        if literal_block {
+            let saved = self.level;
+            self.level += 1;
+            let loc = node.location();
+            self.check(loc.start_offset(), loc.end_offset());
+            ruby_prism::visit_super_node(self, node);
+            self.level = saved;
+        } else {
+            ruby_prism::visit_super_node(self, node);
+        }
+    }
+
+    fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+        if self.count_blocks && node.block().is_some() {
+            let saved = self.level;
+            self.level += 1;
+            let loc = node.location();
+            self.check(loc.start_offset(), loc.end_offset());
+            ruby_prism::visit_forwarding_super_node(self, node);
+            self.level = saved;
+        } else {
+            ruby_prism::visit_forwarding_super_node(self, node);
+        }
+    }
+
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        if self.count_blocks {
+            let saved = self.level;
+            self.level += 1;
+            let loc = node.location();
+            self.check(loc.start_offset(), loc.end_offset());
+            ruby_prism::visit_lambda_node(self, node);
+            self.level = saved;
+        } else {
+            ruby_prism::visit_lambda_node(self, node);
+        }
+    }
+}
+
+impl<'a> Cops<'a> {
+    /// `on_new_investigation`: one whole-file walk from `processed_source.ast`
+    /// (see `BlockNestingWalker`'s doc comment above for the full model).
+    pub(crate) fn check_block_nesting(&mut self, node: &ruby_prism::ProgramNode) {
+        const COP: &str = "Metrics/BlockNesting";
+        if !self.on(COP) {
+            return;
+        }
+        let max: i32 = self.cfg.get(COP, "Max").and_then(|v| v.parse().ok()).unwrap_or(3);
+        let count_blocks = self.cfg.get(COP, "CountBlocks") == Some("true");
+        let count_modifier_forms = self.cfg.get(COP, "CountModifierForms") == Some("true");
+        let mut walker = BlockNestingWalker::new(max, count_blocks, count_modifier_forms);
+        walker.visit_statements_node(&node.statements());
+        let msg = format!("Avoid more than {max} levels of block nesting.");
+        for start in walker.offenses {
+            self.push(start, COP, false, msg.clone());
+        }
+    }
+}

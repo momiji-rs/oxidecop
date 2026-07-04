@@ -290,6 +290,7 @@ COPS = {
   'Metrics/BlockLength'              => 'metrics/block_length',
   'Metrics/ClassLength'              => 'metrics/class_length',
   'Lint/NonDeterministicRequireOrder' => 'lint/non_deterministic_require_order',
+  'Metrics/BlockNesting'             => 'metrics/block_nesting',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
