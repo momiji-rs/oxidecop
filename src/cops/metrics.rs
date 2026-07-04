@@ -1563,7 +1563,12 @@ impl<'a> Cops<'a> {
             if excluded.lines.contains(&line) {
                 continue;
             }
-            if !self.ml_irrelevant_file_line(line, count_comments) {
+            // Upstream bug replicated verbatim: `classlike_code_length`
+            // indexes `@processed_source[line_number]` with the 1-BASED line
+            // number into the 0-based lines array, so the blank/comment
+            // relevance test actually inspects the FOLLOWING line (rails
+            // xml_mini.rb counts 153, not 152, because of this).
+            if !self.ml_irrelevant_file_line(line + 1, count_comments) {
                 length += 1;
             }
         }
