@@ -1095,3 +1095,222 @@ impl<'a> super::Cops<'a> {
 fn vn_strip_sigils(name: &[u8]) -> Vec<u8> {
     name.iter().copied().filter(|b| *b != b'@' && *b != b'$').collect()
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Naming/RescuedExceptionsVariableName — `rescue Foo => bad_name` should
+    /// name the variable `PreferredName` (default `e`), preserving a leading
+    /// `_` (unused-variable convention). Ported from rubocop's `on_resbody` +
+    /// `autocorrect`/`correct_node` (see the ruby source doc comment at the
+    /// top of this cop's spec for the exact algorithm this mirrors).
+    ///
+    /// NOTE on prism vs whitequark: a chain of `rescue A => a; rescue B => b`
+    /// is FLAT siblings in whitequark (both `resbody` nodes are direct
+    /// children of one `:rescue` node) but prism nests them via
+    /// `RescueNode::subsequent`. Every helper here that needs
+    /// whitequark's "each_ancestor"/"each_descendant" semantics (the nested-
+    /// rescue guard, and the shadow check) deliberately does NOT descend
+    /// into `.subsequent()` to compensate — see `check_rescued_exceptions_
+    /// variable_name`'s hand-rolled `visit_rescue_node` in mod.rs, and
+    /// `resbody_reads_lvar` below.
+    pub(crate) fn check_rescued_exceptions_variable_name(&mut self, node: &ruby_prism::RescueNode) {
+        const COP: &str = "Naming/RescuedExceptionsVariableName";
+        if !self.on(COP) {
+            return;
+        }
+        // `return if node.each_ancestor(:resbody).any?` — never consider a
+        // resbody nested inside another resbody's own statements (but DO
+        // still consider `subsequent` siblings, which `renv_resbody_depth`
+        // is never incremented for — see the hand-rolled `visit_rescue_node`).
+        if self.renv_resbody_depth > 0 {
+            return;
+        }
+        let Some(reference) = node.reference() else { return };
+        // Only a plain local-variable target has a rubocop-AST `#name` — a
+        // writer-method reference (`rescue => storage.exception`) doesn't
+        // (`respond_to?(:name)` is false there), so it's silently skipped,
+        // same as upstream's `variable_name`.
+        let Some(target) = reference.as_local_variable_target_node() else { return };
+        let offending = target.name();
+        let offending = offending.as_slice();
+
+        let base_preferred = self.cfg.get(COP, "PreferredName").unwrap_or("e");
+        let preferred = renv_preferred_name(offending, base_preferred);
+        if preferred.as_bytes() == offending {
+            return;
+        }
+        // `shadowed_variable_name?`: skip if the resbody's own subtree
+        // (exceptions/reference/statements — NOT `subsequent`) already reads
+        // a local variable literally named the BASE preferred name. Upstream
+        // reuses `preferred_name` here but passes it a Node, not a String —
+        // `node.to_s` is the s-expression dump and never starts with `_`, so
+        // the underscore-prefix branch never fires in that call and it
+        // always compares against the bare config value, regardless of
+        // whether `offending`/`preferred` themselves are `_`-prefixed. That
+        // (apparent upstream bug) is replicated verbatim here.
+        if resbody_reads_lvar(node, base_preferred.as_bytes()) {
+            return;
+        }
+
+        let range = target.location();
+        let msg = format!(
+            "Use `{preferred}` instead of `{}`.",
+            String::from_utf8_lossy(offending)
+        );
+        self.push(range.start_offset(), COP, true, msg);
+
+        // --- autocorrect ---
+        self.fixes.push((range.start_offset(), range.end_offset(), preferred.clone().into_bytes()));
+        if let Some(body) = node.statements() {
+            correct_rescue_refs(&body.as_node(), offending, preferred.as_bytes(), &mut self.fixes);
+        }
+        // Queue this rename for `kwbegin_node.right_siblings`: if this
+        // resbody sits inside an explicit `begin...end`, the nearest
+        // enclosing one's accumulator is the top of the stack (consumed by
+        // `visit_statements_node` right after that kwbegin's own traversal
+        // finishes). No active kwbegin (e.g. a bare `def...rescue...end`) —
+        // `last_mut` is `None` and nothing is queued, matching upstream's
+        // `return unless (kwbegin_node = ...)`.
+        if let Some(top) = self.renv_pending_kwbegin_stack.last_mut() {
+            top.push((offending.to_vec(), preferred.into_bytes()));
+        }
+    }
+}
+
+/// rubocop's `preferred_name`: the configured base name, `_`-prefixed when
+/// the offending variable itself was `_`-prefixed.
+fn renv_preferred_name(offending: &[u8], base: &str) -> String {
+    if offending.first() == Some(&b'_') {
+        format!("_{base}")
+    } else {
+        base.to_string()
+    }
+}
+
+/// Does `node`'s own exceptions/reference/statements (NOT `subsequent`)
+/// contain a read of a local variable literally named `name`?
+fn resbody_reads_lvar(node: &ruby_prism::RescueNode, name: &[u8]) -> bool {
+    struct V<'x> {
+        name: &'x [u8],
+        found: bool,
+    }
+    impl<'pr, 'x> ruby_prism::Visit<'pr> for V<'x> {
+        fn visit_local_variable_read_node(&mut self, n: &ruby_prism::LocalVariableReadNode<'pr>) {
+            if n.name().as_slice() == self.name {
+                self.found = true;
+            }
+        }
+        fn visit_rescue_node(&mut self, n: &ruby_prism::RescueNode<'pr>) {
+            for ex in &n.exceptions() {
+                self.visit(&ex);
+            }
+            if let Some(r) = n.reference() {
+                self.visit(&r);
+            }
+            if let Some(st) = n.statements() {
+                self.visit_statements_node(&st);
+            }
+            // deliberately skip n.subsequent() — see module doc comment.
+        }
+    }
+    let mut v = V { name, found: false };
+    use ruby_prism::Visit;
+    v.visit_rescue_node(node);
+    v.found
+}
+
+/// Does this mlhs target (a `masgn`/`MultiWriteNode` left/rest/right entry,
+/// possibly a nested destructure) bind a local variable named `name`? Mirrors
+/// upstream's `variable_name_matches?`'s masgn branch (`each_descendant(:lvasgn)`).
+fn renv_mlhs_matches(node: &ruby_prism::Node, name: &[u8]) -> bool {
+    if let Some(t) = node.as_local_variable_target_node() {
+        return t.name().as_slice() == name;
+    }
+    if let Some(m) = node.as_multi_target_node() {
+        return m.lefts().iter().any(|n| renv_mlhs_matches(&n, name))
+            || m.rest().is_some_and(|n| renv_mlhs_matches(&n, name))
+            || m.rights().iter().any(|n| renv_mlhs_matches(&n, name));
+    }
+    if let Some(s) = node.as_splat_node() {
+        return s.expression().is_some_and(|e| renv_mlhs_matches(&e, name));
+    }
+    false
+}
+
+/// Ports rubocop's `correct_node`: walks `node`'s subtree in the same order
+/// as `each_node(:lvar, :lvasgn, :masgn)`, renaming reads of the local
+/// variable `name` to `preferred`, and STOPS entirely (no further renames
+/// anywhere later in the traversal) the moment it hits a reassignment of
+/// `name` — after first recursing into just that reassignment's RHS. An
+/// omitted hash value (`do_something(error:)`, prism's `ImplicitNode`) is
+/// special-cased to an insertion (`error: e`) rather than a replacement,
+/// since replacing its (zero-content) span would eat the key/colon too.
+pub(crate) fn correct_rescue_refs(
+    node: &ruby_prism::Node,
+    name: &[u8],
+    preferred: &[u8],
+    fixes: &mut Vec<(usize, usize, Vec<u8>)>,
+) {
+    struct V<'x> {
+        name: &'x [u8],
+        preferred: &'x [u8],
+        fixes: &'x mut Vec<(usize, usize, Vec<u8>)>,
+        stop: bool,
+    }
+    impl<'pr, 'x> ruby_prism::Visit<'pr> for V<'x> {
+        fn visit_local_variable_read_node(&mut self, n: &ruby_prism::LocalVariableReadNode<'pr>) {
+            if self.stop {
+                return;
+            }
+            if n.name().as_slice() == self.name {
+                let l = n.location();
+                self.fixes.push((l.start_offset(), l.end_offset(), self.preferred.to_vec()));
+            }
+        }
+        fn visit_implicit_node(&mut self, n: &ruby_prism::ImplicitNode<'pr>) {
+            if self.stop {
+                return;
+            }
+            if let Some(lvar) = n.value().as_local_variable_read_node() {
+                if lvar.name().as_slice() == self.name {
+                    let end = n.location().end_offset();
+                    let mut ins = vec![b' '];
+                    ins.extend_from_slice(self.preferred);
+                    self.fixes.push((end, end, ins));
+                }
+            }
+            // Deliberately never descend — the wrapped read is fully
+            // handled (or intentionally left alone) above.
+        }
+        fn visit_local_variable_write_node(&mut self, n: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            if self.stop {
+                return;
+            }
+            if n.name().as_slice() == self.name {
+                let mut sub = V { name: self.name, preferred: self.preferred, fixes: self.fixes, stop: false };
+                sub.visit(&n.value());
+                self.stop = true;
+                return;
+            }
+            ruby_prism::visit_local_variable_write_node(self, n);
+        }
+        fn visit_multi_write_node(&mut self, n: &ruby_prism::MultiWriteNode<'pr>) {
+            if self.stop {
+                return;
+            }
+            let hit = n.lefts().iter().any(|t| renv_mlhs_matches(&t, self.name))
+                || n.rest().is_some_and(|t| renv_mlhs_matches(&t, self.name))
+                || n.rights().iter().any(|t| renv_mlhs_matches(&t, self.name));
+            if hit {
+                let mut sub = V { name: self.name, preferred: self.preferred, fixes: self.fixes, stop: false };
+                sub.visit(&n.value());
+                self.stop = true;
+                return;
+            }
+            ruby_prism::visit_multi_write_node(self, n);
+        }
+    }
+    let mut v = V { name, preferred, fixes, stop: false };
+    use ruby_prism::Visit;
+    v.visit(node);
+}

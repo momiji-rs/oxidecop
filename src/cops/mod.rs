@@ -231,7 +231,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException",
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
-    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName",
+    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
 ];
 
 impl Engine {
@@ -921,6 +921,20 @@ pub(crate) struct Cops<'a> {
     // suppresses the WRITE-side check on any `LocalVariableTargetNode`
     // reached along the way.
     pub(crate) pattern_depth: usize,
+    // Naming/RescuedExceptionsVariableName: depth of "inside a resbody's own
+    // statements" (NOT its `subsequent` sibling chain) — mirrors rubocop's
+    // `node.each_ancestor(:resbody).any?` nested-rescue guard.
+    pub(crate) renv_resbody_depth: usize,
+    // Stack of per-kwbegin accumulators: (offending_name, preferred_name)
+    // byte-string pairs for every offense found inside the currently-open
+    // kwbegin (explicit `begin...end`) block — rubocop's autocorrect also
+    // renames references in `kwbegin_node.right_siblings`. Byte strings
+    // only (never a borrowed `Node`) so these don't need to track the
+    // parse-tree lifetime. Popped into `renv_just_closed_kwbegin_renames`
+    // when the kwbegin's own traversal finishes, consumed right after by
+    // the loop in `visit_statements_node`.
+    pub(crate) renv_pending_kwbegin_stack: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
+    pub(crate) renv_just_closed_kwbegin_renames: Vec<(Vec<u8>, Vec<u8>)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1791,7 +1805,28 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_rescue_exception(node);
         self.check_rescue_type(node);
         self.check_suppressed_exception(node);
-        ruby_prism::visit_rescue_node(self, node);
+        self.check_rescued_exceptions_variable_name(node);
+        // Hand-rolled (rather than a plain `ruby_prism::visit_rescue_node`
+        // call) ONLY so `renv_resbody_depth` can bracket exactly the
+        // `.statements()` visit — traversal order/coverage is identical to
+        // the generated default (exceptions, reference, statements, then
+        // `subsequent`); see Naming/RescuedExceptionsVariableName's nested-
+        // rescue guard (`each_ancestor(:resbody)`), which must NOT treat a
+        // `subsequent` (sibling `elsif`-style rescue branch) as nesting.
+        for ex in &node.exceptions() {
+            self.visit(&ex);
+        }
+        if let Some(r) = node.reference() {
+            self.visit(&r);
+        }
+        if let Some(st) = node.statements() {
+            self.renv_resbody_depth += 1;
+            self.visit_statements_node(&st);
+            self.renv_resbody_depth -= 1;
+        }
+        if let Some(sub) = node.subsequent() {
+            self.visit_rescue_node(&sub);
+        }
     }
     fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
         self.check_suppressed_exception_modifier(node);
@@ -1830,7 +1865,33 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_unreachable_code(node);
         self.check_empty_line_between_defs(node);
         self.stmts_stack.push(node.location().start_offset());
-        ruby_prism::visit_statements_node(self, node);
+        if self.on("Naming/RescuedExceptionsVariableName") {
+            // Hand-rolled (rather than the plain default-visitor call) so
+            // that right after visiting a direct `kwbegin` (explicit
+            // `begin...end`) child, any rename requests it queued up (from
+            // offenses found anywhere inside it) can be immediately applied
+            // to the STATEMENTS THAT FOLLOW IT IN THIS SAME LIST — rubocop's
+            // `kwbegin_node.right_siblings` autocorrect step. Traversal
+            // order/coverage is identical to `ruby_prism::
+            // visit_statements_node`'s default (visit each child in order).
+            let list = node.body();
+            for (i, child) in list.iter().enumerate() {
+                self.visit(&child);
+                let is_kwbegin = child
+                    .as_begin_node()
+                    .is_some_and(|b| b.begin_keyword_loc().is_some());
+                if is_kwbegin {
+                    let renames = std::mem::take(&mut self.renv_just_closed_kwbegin_renames);
+                    for (name, preferred) in &renames {
+                        for sib in list.iter().skip(i + 1) {
+                            naming::correct_rescue_refs(&sib, name, preferred, &mut self.fixes);
+                        }
+                    }
+                }
+            }
+        } else {
+            ruby_prism::visit_statements_node(self, node);
+        }
         self.stmts_stack.pop();
     }
     // Lint/ConstantDefinitionInBlock: no other cop needs a general "what's my
@@ -2017,11 +2078,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 .map(|l| self.idx.loc(l.start_offset()).0)
                 .unwrap_or_else(|| self.idx.loc(node.location().end_offset()).0);
             self.se_ancestor_end_lines.push(end_line);
+            // Naming/RescuedExceptionsVariableName: open a fresh accumulator
+            // for offenses found anywhere inside this kwbegin — rubocop's
+            // autocorrect additionally renames references in
+            // `kwbegin_node.right_siblings`.
+            self.renv_pending_kwbegin_stack.push(Vec::new());
         }
         ruby_prism::visit_begin_node(self, node);
         if kwbegin {
             self.usage_block_depth -= 1;
             self.se_ancestor_end_lines.pop();
+            self.renv_just_closed_kwbegin_renames =
+                self.renv_pending_kwbegin_stack.pop().unwrap_or_default();
         }
     }
     fn visit_ensure_node(&mut self, node: &ruby_prism::EnsureNode<'pr>) {
@@ -2940,6 +3008,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         se_ancestor_end_lines: Vec::new(),
         redundant_sort_logical_left: HashMap::new(),
         pattern_depth: 0,
+        renv_resbody_depth: 0,
+        renv_pending_kwbegin_stack: Vec::new(),
+        renv_just_closed_kwbegin_renames: Vec::new(),
     };
 
     let t = tick(&T_PREP, t);
