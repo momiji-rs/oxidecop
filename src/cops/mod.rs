@@ -387,6 +387,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
+    "Layout/SpaceInsideHashLiteralBraces",
 ];
 
 impl Engine {
@@ -2334,6 +2335,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_duplicate_hash_key(node);
         self.check_multiline_hash_brace_layout(node);
         self.check_trailing_comma_in_hash_literal(node);
+        self.check_space_inside_hash_literal_braces(
+            node.opening_loc().start_offset(),
+            node.closing_loc().start_offset(),
+        );
         if self.ll_active {
             let l = node.location();
             self.ll_enter_collection(
@@ -2361,6 +2366,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_keyword_hash_node(&mut self, node: &ruby_prism::KeywordHashNode<'pr>) {
         self.check_hash_syntax_keyword_hash(node);
         ruby_prism::visit_keyword_hash_node(self, node);
+    }
+    fn visit_hash_pattern_node(&mut self, node: &ruby_prism::HashPatternNode<'pr>) {
+        // `SpaceInsideHashLiteralBraces#on_hash_pattern` (aliased to `on_hash`):
+        // a braceless pattern (`in a:, b:`) or the `Foo[a: 1]` constant-bracket
+        // form (brackets, not braces) has `opening_loc`/`closing_loc` either
+        // absent or pointing at `[`/`]` — `check_space_inside_hash_literal_braces`
+        // itself verifies the byte at `open_start` is really `{`.
+        if let (Some(open), Some(close)) = (node.opening_loc(), node.closing_loc()) {
+            self.check_space_inside_hash_literal_braces(open.start_offset(), close.start_offset());
+        }
+        ruby_prism::visit_hash_pattern_node(self, node);
     }
     fn visit_optional_keyword_parameter_node(&mut self, node: &ruby_prism::OptionalKeywordParameterNode<'pr>) {
         if self.ll_active {

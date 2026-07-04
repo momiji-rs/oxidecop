@@ -347,6 +347,7 @@ COPS = {
   'Style/AccessModifierDeclarations' => 'style/access_modifier_declarations',
   'Style/BlockDelimiters'            => 'style/block_delimiters',
   'Style/RedundantParentheses'       => 'style/redundant_parentheses',
+  'Layout/SpaceInsideHashLiteralBraces' => 'layout/space_inside_hash_literal_braces',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

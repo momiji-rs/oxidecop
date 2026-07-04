@@ -7130,3 +7130,177 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/SpaceInsideHashLiteralBraces — ports `SpaceInsideHashLiteralBraces#on_hash`
+    /// (aliased `on_hash_pattern`) together with the shared `SurroundingSpace` mixin's
+    /// `check`/`expect_space?`/`offense?`/`incorrect_style_detected`/`autocorrect` and
+    /// `check_whitespace_only_hash`.
+    ///
+    /// Callers pass just the byte offsets of the opening/closing brace characters —
+    /// `HashNode`'s `opening_loc`/`closing_loc` are non-optional (prism always gives a
+    /// braced hash literal its own node kind; a braceless keyword-argument hash is a
+    /// distinct `KeywordHashNode` that never reaches this check at all, matching
+    /// upstream's `tokens.first.left_brace?` guard being unconditionally true for
+    /// `on_hash`). `HashPatternNode`'s brace locations are optional (`in a:, b:` has none)
+    /// and, when present, may point at `[`/`]` for the `Foo[a: 1]` constant-bracket pattern
+    /// form instead of `{`/`}` — the explicit byte check below (`src[open_start] == '{'`)
+    /// is our equivalent of upstream's `token.left_brace?`/`right_curly_brace?` typed
+    /// guard.
+    ///
+    /// Upstream walks the raw *token* stream within the node (`tokens_within`) and
+    /// inspects only the first/last TWO tokens. We replicate this with byte scanning
+    /// directly on the source, which is equivalent because: (1) `token.space_after?` only
+    /// needs to know whether at least one space/tab character immediately follows a
+    /// token — a single boolean, not an exact count (rubocop accepts `bar = {    }` under
+    /// `EnforcedStyleForEmptyBraces: space` just as readily as `bar = { }`); (2) the "on a
+    /// different line" / "is a comment" early-outs (`token1.line < token2.line`,
+    /// `token2.comment?`) only need to distinguish a run of plain spaces/tabs from a run
+    /// that hits a newline or a `#` first, since a comment always extends to end-of-line;
+    /// (3) `is_same_braces` (which lets `compact` collapse successive braces in nested
+    /// hashes, e.g. `{{ a: 1 } => { b: 2 }}`) only needs to know whether the byte
+    /// immediately across the gap is itself `{`/`}` — true exactly when an adjacent hash
+    /// literal's own brace sits there, since string/heredoc literal delimiters are always
+    /// separated from a hash's brace by their own closing quote character (verified
+    /// against the `h = {a: '{'}` fixture case: the quote, not the string's inner `{`,
+    /// is what our scan actually sees adjacent to the hash's own brace).
+    ///
+    /// Each `HashNode`/`HashPatternNode` (nested ones included) is visited independently,
+    /// so the "successive braces collapse" behavior for nested hashes falls out for free:
+    /// the outer hash's own closing-brace-side check sees the inner hash's closing brace
+    /// as its immediate left neighbor, exactly as upstream's `tokens[-2]` would.
+    ///
+    /// NOT ported: `ConfigurableEnforcedStyle`'s `correct_style_detected`/
+    /// `ambiguous_style_detected`/`unexpected_style_detected` bookkeeping — it only feeds
+    /// `--auto-gen-config`'s `detected_style` tracking and never affects whether an offense
+    /// is registered or how autocorrect behaves.
+    ///
+    /// Residual risk not exercised by the fixture: a `%{...}` percent-string literal's OWN
+    /// closing delimiter is a raw `}` character. If that percent-literal is a hash value
+    /// sitting directly against the hash's own closing brace (e.g. `{a: %{str}}`), upstream
+    /// would NOT treat that adjacency as `is_same_braces` (the percent-literal's terminator
+    /// is a distinct token type, not `tRCURLY`), but our plain byte check would. This only
+    /// matters under `EnforcedStyle: compact`, and only changes whether that one adjacent
+    /// pair is required to have a space — not exercised anywhere in the spec fixture.
+    pub(crate) fn check_space_inside_hash_literal_braces(&mut self, open_start: usize, close_start: usize) {
+        const COP: &str = "Layout/SpaceInsideHashLiteralBraces";
+        if !self.on(COP) {
+            return;
+        }
+        let src = self.src;
+        if src.get(open_start) != Some(&b'{') || src.get(close_start) != Some(&b'}') {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP);
+        let no_space_for_empty =
+            self.cfg.get(COP, "EnforcedStyleForEmptyBraces").unwrap_or("no_space") == "no_space";
+        let open_end = open_start + 1;
+
+        let mut p1 = open_end;
+        while p1 < close_start && sihlb_is_space_tab(src[p1]) {
+            p1 += 1;
+        }
+        let has_content = src[open_end..close_start].iter().any(|&b| !sihlb_is_ws(b));
+
+        if p1 == close_start {
+            // `tokens.size == 2`: adjacent braces, or spaces/tabs only with no
+            // newline in between — the only token pair upstream ever checks
+            // for this hash is `(tokens[0], tokens[1])` == `({, })`, i.e. the
+            // `is_empty_braces` branch of `check`.
+            let has_space = close_start > open_end;
+            self.sihlb_apply(COP, true, open_start, open_end, close_start, has_space, false, true, style, no_space_for_empty);
+        } else if src[p1] == b'\n' {
+            if !has_content {
+                // `check_whitespace_only_hash`: the entire interior is
+                // whitespace (including at least one newline) — only fires
+                // under `no_space` for empty braces; `check()` itself never
+                // runs here either since `tokens.size == 2`.
+                if no_space_for_empty {
+                    self.push(open_end, COP, true, "Space inside empty hash literal braces detected.");
+                    self.fixes.push((open_end, close_start, Vec::new()));
+                }
+            }
+            // else: real content starts on a later line — `token1.line <
+            // token2.line`; no offense from the open-brace side.
+        } else if src[p1] == b'#' {
+            // `token2.comment?` — a comment right after the brace also
+            // implies a line break; no offense from the open-brace side.
+        } else {
+            let has_space = p1 > open_end;
+            let is_same_braces = src[p1] == b'{';
+            self.sihlb_apply(COP, true, open_start, open_end, p1, has_space, is_same_braces, false, style, no_space_for_empty);
+        }
+
+        if has_content {
+            let mut q = close_start;
+            while q > open_end && sihlb_is_space_tab(src[q - 1]) {
+                q -= 1;
+            }
+            if src[q - 1] != b'\n' {
+                let has_space = q < close_start;
+                let is_same_braces = src[q - 1] == b'}';
+                self.sihlb_apply(COP, false, close_start, q, close_start, has_space, is_same_braces, false, style, no_space_for_empty);
+            }
+            // else: the last real token before the closing brace sits on an
+            // earlier line; no offense from the close-brace side.
+        }
+    }
+
+    /// Shared offense/autocorrect logic for one brace side, porting
+    /// `SurroundingSpace`'s `expect_space?`/`offense?`/`incorrect_style_detected`/
+    /// `autocorrect`. `is_left` selects which physical brace anchors a "missing space"
+    /// offense (`{` at `brace_pos` for the open side, `}` at `brace_pos` for the close
+    /// side) and on which side of it a space gets inserted.
+    #[allow(clippy::too_many_arguments)]
+    fn sihlb_apply(
+        &mut self,
+        cop: &'static str,
+        is_left: bool,
+        brace_pos: usize,
+        gap_start: usize,
+        gap_end: usize,
+        has_space: bool,
+        is_same_braces: bool,
+        is_empty_braces: bool,
+        style: &str,
+        no_space_for_empty: bool,
+    ) {
+        let expect_space = if is_same_braces && style == "compact" {
+            false
+        } else if is_empty_braces {
+            !no_space_for_empty
+        } else {
+            style != "no_space"
+        };
+        let offense = if expect_space { !has_space } else { has_space };
+        if !offense {
+            return;
+        }
+        let inside_what = if is_empty_braces {
+            "empty hash literal braces"
+        } else if is_left {
+            "{"
+        } else {
+            "}"
+        };
+        let problem = if expect_space { "missing" } else { "detected" };
+        let msg = format!("Space inside {inside_what} {problem}.");
+        if expect_space {
+            self.push(brace_pos, cop, true, msg);
+            let ins = if is_left { brace_pos + 1 } else { brace_pos };
+            self.fixes.push((ins, ins, b" ".to_vec()));
+        } else {
+            self.push(gap_start, cop, true, msg);
+            self.fixes.push((gap_start, gap_end, Vec::new()));
+        }
+    }
+}
+
+fn sihlb_is_space_tab(b: u8) -> bool {
+    b == b' ' || b == b'\t'
+}
+
+fn sihlb_is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c)
+}
