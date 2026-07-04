@@ -725,7 +725,12 @@ def run_fix(poc, src, cfg, filename = nil, once: false)
     yml = File.join(d, 'c.yml')
     File.write(rb, src)
     File.write(yml, cfg)
-    out, = Open3.capture2(poc, rb, yml, once ? '--fix-once' : '--fix')
+    # rubocop's RSpec `expect_correction` applies ONLY the described cop's
+    # corrector — `other_cops` sections exist purely as config for the cop
+    # under test to read (e.g. EmptyMethod's Layout/LineLength Max gate) and
+    # never investigate. `--only` narrows the RUN set the same way while
+    # leaving config-level `Enabled` reads (cop_config_enabled) untouched.
+    out, = Open3.capture2(poc, rb, yml, once ? '--fix-once' : '--fix', '--only', COP)
     out
   end
 end
