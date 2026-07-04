@@ -631,11 +631,20 @@ def parse_val(v)
     # flat config carries no nested hashes and the cops read the default pair.
     # Guarded to hashes with NO unquoted array values so grouped-array configs
     # (`{ 'Pry' => %w[...] }`) keep the values.flatten behavior below.
-    if (dm = v.match(/['"]default['"]\s*=>\s*(['"])([^'"]*)\1/)) && v !~ /=>\s*%?[wi]{0,2}\[/
+    if v !~ /=>\s*%?[wi]{0,2}\[/
       pairs = v.scan(/['"]([^'"]+)['"]\s*=>\s*(['"])([^'"]*)\2/).map { |k, _, val| [k, val] }
-      # a single default-only hash still collapses to its value; per-type
-      # overrides survive as a real Hash (emitted as nested YAML keys).
-      return pairs.size <= 1 ? dm[2] : pairs.to_h
+      if (dm = v.match(/['"]default['"]\s*=>\s*(['"])([^'"]*)\1/))
+        # a single default-only hash still collapses to its value; per-type
+        # overrides survive as a real Hash (emitted as nested YAML keys).
+        return pairs.size <= 1 ? dm[2] : pairs.to_h
+      elsif !pairs.empty? && pairs.size == v.scan(/=>/).size
+        # an all-string-valued hash WITHOUT a default key (CommandLiteral's
+        # `{'%x' => '()'}` shape) survives whole as nested per-type keys —
+        # collapsing it to [] made a '()' override byte-indistinguishable
+        # from a genuine '[]' one. Guarded to hashes where EVERY pair was
+        # captured so mixed string/number hashes keep the old fall-through.
+        return pairs.to_h
+      end
     end
     return v.scan(/%[wi]\[([^\]]*)\]/).flat_map { |m| m[0].split(/\s+/) } +
            v.scan(/\[([^\]]*)\]/).flat_map { |m| split_top(m[0]).map { |x| normalize_pattern(x) } }
