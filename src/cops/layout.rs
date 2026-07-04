@@ -6252,3 +6252,100 @@ impl<'a> super::Cops<'a> {
         self.parameter_alignment_correct(first_start, first_end, delta);
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/EmptyLinesAroundArguments — flags a blank line sitting
+    /// directly inside a multi-line call's argument list: right before any
+    /// argument's own start, or right before the closing `)`. Mirrors
+    /// rubocop's `on_send`/`extra_lines`/`empty_range_for_starting_point`
+    /// verbatim.
+    ///
+    /// Both `.` and `&.` sends are the same prism `CallNode` (no separate
+    /// `csend`), so a single hook covers rubocop's `on_send`/`alias on_csend`
+    /// pair.
+    ///
+    /// The whole thing is a pure byte/line scan over the raw source text —
+    /// exactly like rubocop's own `RangeHelp#range_with_surrounding_space`,
+    /// which walks the buffer's characters, not the AST — so nested blank
+    /// lines (inside a literal argument, a block body, or a heredoc body)
+    /// are naturally exempt: the backward scan from each anchor point always
+    /// stops at the nearest non-whitespace byte, which is that argument's
+    /// own last token, never reaching past it into nested content. A
+    /// heredoc's own `StringNode` location in prism covers only its opening
+    /// token line (`<<~TAG`), never its body/terminator, so a call whose
+    /// only argument is a heredoc (`bar(<<-DOCS)`) is `single_line?` and
+    /// skipped outright — matching rubocop's real (non-heredoc-aware)
+    /// source for this cop.
+    pub(crate) fn check_empty_lines_around_arguments(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/EmptyLinesAroundArguments";
+        if !self.on(COP) {
+            return;
+        }
+        let loc = node.location();
+        let first_line = self.idx.loc(loc.start_offset()).0;
+        let last_line = self.idx.loc(loc.end_offset()).0;
+        if first_line == last_line {
+            return; // `node.single_line?`
+        }
+        let Some(args) = node.arguments() else { return };
+        let arg_list: Vec<_> = args.arguments().iter().collect();
+        if arg_list.is_empty() {
+            return;
+        }
+        // `receiver_and_method_call_on_different_lines?`: skip when there's
+        // a receiver whose own last line differs from the selector's line —
+        // a bare `nil&.line` selector (e.g. `foo.(args)`, no method name
+        // token) always counts as "different".
+        if let Some(receiver) = node.receiver() {
+            let recv_last_line = self.idx.loc(receiver.location().end_offset()).0;
+            let same_line = node
+                .message_loc()
+                .is_some_and(|m| self.idx.loc(m.start_offset()).0 == recv_last_line);
+            if !same_line {
+                return;
+            }
+        }
+        for arg in &arg_list {
+            self.elaa_check_starting_point(arg.location().start_offset());
+        }
+        if let Some(closing) = node.closing_loc() {
+            self.elaa_check_starting_point(closing.start_offset());
+        }
+    }
+
+    /// `empty_range_for_starting_point`: scan backward from `start` over a
+    /// `\s` run (rubocop's `range_with_surrounding_space(..., whitespace:
+    /// true, side: :left)` — spaces, tabs, and newlines all fold into one
+    /// walk). If that run crosses more than one line boundary, the line
+    /// just above `start`'s own line is a blank (or whitespace-only) line
+    /// sitting inside the call's argument list — flag it and remove it
+    /// whole (content plus its own trailing newline), same as rubocop's
+    /// `corrector.remove(range)` on `source_buffer.line_range(last_line -
+    /// 1).adjust(end_pos: 1)`.
+    fn elaa_check_starting_point(&mut self, start: usize) {
+        const COP: &str = "Layout/EmptyLinesAroundArguments";
+        let mut begin = start;
+        while begin > 0 && is_elaa_ws(self.src[begin - 1]) {
+            begin -= 1;
+        }
+        let first_line = self.idx.loc(begin).0;
+        let last_line = self.idx.loc(start).0;
+        if last_line <= first_line + 1 {
+            return;
+        }
+        let blank_line = last_line - 1;
+        let line_start = self.idx.starts[blank_line - 1];
+        let line_end = self.idx.starts.get(blank_line).copied().unwrap_or_else(|| self.line_end(blank_line));
+        self.push(line_start, COP, true, "Empty line detected around arguments.");
+        self.fixes.push((line_start, line_end, Vec::new()));
+    }
+}
+
+/// Ruby's `\s` (Onigmo): space, tab, newline, CR, form feed, vertical tab —
+/// the same set `range_with_surrounding_space(whitespace: true)` walks over,
+/// crucially including `\n` (unlike the single-line-only `is_ruby_ws` used by
+/// `IndentationStyle` above).
+fn is_elaa_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C | 0x0B)
+}

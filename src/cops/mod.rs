@@ -307,7 +307,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
     "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
     "Style/ExplicitBlockArgument",
-    "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup",
+    "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments",
 ];
 
 impl Engine {
@@ -3189,6 +3189,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.push(off, "Style/SymbolProc", true, msg);
         }
         self.check_slicing_with_range(node);
+        self.check_empty_lines_around_arguments(node);
         // recurse into children (we've overridden the default walk). Push this
         // call's name SPAN so descendants can see it as an ancestor.
         let name_span = node
