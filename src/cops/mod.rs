@@ -157,17 +157,17 @@ pub(crate) struct DnLastChild {
 /// Style/DoubleNegation: one entry per ancestor level that upstream's
 /// `allowed_in_returns?` climb (via rubocop-ast's real `node.parent`, which
 /// prism doesn't provide) actually cares about. Every OTHER node kind is
-/// transparently absent from the stack — none of the climbs
-/// (`find_def_node_from_ascendant`, `find_conditional_node_from_ascendant`,
-/// `find_parent_not_enumerable`) ever match on them, so skipping them is
-/// equivalent to including them as inert frames. The one exception is
-/// `find_parent_not_enumerable`, which upstream stops at the true immediate
-/// parent unconditionally (continuing only across `pair`/`hash`/`array`) —
-/// an intervening node kind of no interest to this cop (e.g. a plain method
-/// call's argument list) that happens to sit between an enumerable literal
-/// and its real non-enumerable parent would, in a pathological input, be
-/// skipped here where upstream would have stopped on it. Not exercised by
-/// the fixture.
+/// transparently absent from the stack — `find_def_node_from_ascendant` and
+/// `find_conditional_node_from_ascendant` never match on them, so skipping
+/// them is equivalent to including them as inert frames.
+/// `find_parent_not_enumerable`, however, stops at the true IMMEDIATE
+/// parent unconditionally (continuing only across `pair`/`hash`/`array`),
+/// so the `Enumerable`/`BeginGroup` frames carry their direct children's
+/// start offsets: the climb in `dn_end_of_method_definition` only crosses a
+/// frame when the current node really is one of its direct children —
+/// otherwise some unframed node (e.g. a plain method call) sits in between
+/// and upstream would have stopped there (rails corpus:
+/// `wr.write Marshal.dump [!!x, ...]` inside a def inside `unless`).
 pub(crate) enum DnFrame {
     /// A real `def`/`defs`. Carries the enclosing method's own
     /// `find_last_child(def_node.body)`, or `None` when it couldn't be
@@ -180,13 +180,13 @@ pub(crate) enum DnFrame {
     /// An `if`/`unless`/`while`/`until`/`case`/`case/in` — `conditional?`.
     /// Carries the node's own `last_line`.
     Conditional(usize),
-    /// A `hash`, `array`, or hash-pair (`assoc`) literal — always skipped
-    /// over by `find_parent_not_enumerable`.
-    Enumerable,
+    /// A `hash`, `array`, or hash-pair (`assoc`) literal — skipped over by
+    /// `find_parent_not_enumerable` (only when actually the direct parent).
+    Enumerable { start: usize, child_starts: Vec<usize> },
     /// A `StatementsNode` that groups 2+ statements — upstream's `:begin`
     /// node. Carries the group's own `last_line` (for `node.loc.line ==
     /// parent.loc.last_line`).
-    BeginGroup(usize),
+    BeginGroup { last_line: usize, child_starts: Vec<usize> },
 }
 
 /// Per-RUN state derived from the Config once — parsed patterns, resolved
@@ -1888,7 +1888,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             );
         }
         // Style/DoubleNegation: `find_parent_not_enumerable`'s `hash_type?`.
-        self.dn_ancestors.push(DnFrame::Enumerable);
+        self.dn_ancestors.push(DnFrame::Enumerable {
+            start: node.location().start_offset(),
+            child_starts: node.elements().iter().map(|e| e.location().start_offset()).collect(),
+        });
         ruby_prism::visit_hash_node(self, node);
         self.dn_ancestors.pop();
         self.ll_exit_collection();
@@ -2782,7 +2785,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let dn_pushed_begin = node.body().iter().count() > 1;
         if dn_pushed_begin {
             let last_line = self.idx.loc(node.location().end_offset().saturating_sub(1)).0;
-            self.dn_ancestors.push(DnFrame::BeginGroup(last_line));
+            self.dn_ancestors.push(DnFrame::BeginGroup {
+                last_line,
+                child_starts: node.body().iter().map(|s| s.location().start_offset()).collect(),
+            });
         }
         if self.on("Naming/RescuedExceptionsVariableName") {
             // Hand-rolled (rather than the plain default-visitor call) so
@@ -3275,7 +3281,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         // Style/DoubleNegation: `find_parent_not_enumerable`'s `array_type?`.
-        self.dn_ancestors.push(DnFrame::Enumerable);
+        self.dn_ancestors.push(DnFrame::Enumerable {
+            start: node.location().start_offset(),
+            child_starts: node.elements().iter().map(|e| e.location().start_offset()).collect(),
+        });
         ruby_prism::visit_array_node(self, node);
         self.dn_ancestors.pop();
         self.wa_matrix_stack.pop();
@@ -3295,7 +3304,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.check_space_after_colon_pair(node);
         // Style/DoubleNegation: `find_parent_not_enumerable`'s `pair_type?`.
-        self.dn_ancestors.push(DnFrame::Enumerable);
+        self.dn_ancestors.push(DnFrame::Enumerable {
+            start: node.location().start_offset(),
+            child_starts: vec![
+                node.key().location().start_offset(),
+                node.value().location().start_offset(),
+            ],
+        });
         ruby_prism::visit_assoc_node(self, node);
         self.dn_ancestors.pop();
     }

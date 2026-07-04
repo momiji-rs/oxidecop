@@ -21068,13 +21068,27 @@ impl<'a> super::Cops<'a> {
 
         if let Some(cond_last_line) = conditional_last_line {
             // `double_negative_condition_return_value?`: `find_parent_not_
-            // enumerable` — climb past consecutive `Enumerable` (hash/array/
-            // pair) frames; the first non-enumerable one is `parent`.
+            // enumerable` — climb past `Enumerable` (hash/array/pair) frames,
+            // but ONLY while each really is the current node's direct parent
+            // (its `child_starts` contains the node); anything unframed in
+            // between (a plain method call, an assignment, …) is where
+            // upstream's `node.parent` climb would have stopped, and such a
+            // parent is never `begin_type?`.
+            let mut cur_start = node.location().start_offset();
             let mut begin_last_line = None;
             for f in self.dn_ancestors.iter().rev() {
                 match f {
-                    DnFrame::Enumerable => continue,
-                    DnFrame::BeginGroup(l) => begin_last_line = Some(*l),
+                    DnFrame::Enumerable { start, child_starts } => {
+                        if child_starts.contains(&cur_start) {
+                            cur_start = *start;
+                            continue;
+                        }
+                    }
+                    DnFrame::BeginGroup { last_line, child_starts } => {
+                        if child_starts.contains(&cur_start) {
+                            begin_last_line = Some(*last_line);
+                        }
+                    }
                     _ => {}
                 }
                 break;
@@ -21179,8 +21193,59 @@ impl<'a> super::Cops<'a> {
             }
             return self.dn_classify_raw(n);
         }
+        // whitequark's `child_nodes.last` of ANY assignment node is its
+        // VALUE — a single-statement body `@opts ||= { ..., k: !!x, ... }`
+        // must classify the HASH (`type?(:pair, :hash)` → not allowed), not
+        // the assignment's own span (rails corpus, devcontainer_command.rb).
+        if let Some(v) = dn_assignment_value(n) {
+            return self.dn_classify_raw(&v);
+        }
         self.dn_classify_raw(n)
     }
+}
+
+/// The `value` child of every prism assignment-node family member —
+/// whitequark's `child_nodes.last` for all of them.
+fn dn_assignment_value<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    macro_rules! val {
+        ($($as_fn:ident),+ $(,)?) => {
+            $(if let Some(w) = n.$as_fn() { return Some(w.value()); })+
+        };
+    }
+    val!(
+        as_local_variable_write_node,
+        as_local_variable_or_write_node,
+        as_local_variable_and_write_node,
+        as_local_variable_operator_write_node,
+        as_instance_variable_write_node,
+        as_instance_variable_or_write_node,
+        as_instance_variable_and_write_node,
+        as_instance_variable_operator_write_node,
+        as_class_variable_write_node,
+        as_class_variable_or_write_node,
+        as_class_variable_and_write_node,
+        as_class_variable_operator_write_node,
+        as_global_variable_write_node,
+        as_global_variable_or_write_node,
+        as_global_variable_and_write_node,
+        as_global_variable_operator_write_node,
+        as_constant_write_node,
+        as_constant_or_write_node,
+        as_constant_and_write_node,
+        as_constant_operator_write_node,
+        as_constant_path_write_node,
+        as_constant_path_or_write_node,
+        as_constant_path_and_write_node,
+        as_constant_path_operator_write_node,
+        as_call_or_write_node,
+        as_call_and_write_node,
+        as_call_operator_write_node,
+        as_index_or_write_node,
+        as_index_and_write_node,
+        as_index_operator_write_node,
+        as_multi_write_node,
+    );
+    None
 }
 
 
