@@ -19663,3 +19663,188 @@ fn sc_inspect_body(bytes: &[u8]) -> Vec<u8> {
     }
     out
 }
+
+
+
+// Style/TrailingCommaInArrayLiteral ----------------------------------------
+//
+// Ported from the shared `TrailingComma` mixin's `check_literal`/`check`/
+// `should_have_comma?`/`avoid_comma`/`put_comma` — see
+// `check_trailing_comma_in_hash_literal` above (in this same file) for the
+// mixin's general shape and a fuller commentary; this cop reuses its
+// node-generic helpers verbatim (`tcihl_heredoc`/`tcihl_is_heredoc_leaf`/
+// `tcihl_comma_offset`) and its `&self` `tcihl_begins_its_line` helper
+// (pure offset math, no `HashNode` in its signature). The `HashNode`-typed
+// helpers (`tcihl_multiline`/`tcihl_no_elements_on_same_line`/
+// `tcihl_last_item_precedes_newline`/`tcihl_avoid_comma`/`tcihl_put_comma`)
+// are re-derived below against `ArrayNode` (whose `closing_loc()` is
+// `Option`, unlike `HashNode`'s non-optional one) with array-specific
+// message text ("an array" vs "a hash", per the mixin's `avoid_comma`
+// `article = kind.include?('array') ? 'an' : 'a'`, which is always `'an'`
+// for this cop's fixed `kind` of `'item of %<article>s array'`).
+impl<'a> super::Cops<'a> {
+    /// `on_array`/`check_literal`: `on_array` first gates on
+    /// `square_brackets?` (only `[...]`-delimited arrays; percent arrays
+    /// `%w`/`%i`/`%W`/`%I` and braceless arrays such as a multiple-assignment
+    /// RHS have no comma slot to add/remove and are skipped — their opening
+    /// delimiter, if any, is not literally `[`). `check_literal` then bails
+    /// on an empty literal (`node.children.empty?`); `brackets?(node)`
+    /// (`node.loc.end`) is always true once `square_brackets?` held, since a
+    /// `[`-opened array always has a matching `]` `closing_loc`. `elements(node)`
+    /// is simply `node.children`/`node.elements()`: `on_array` never receives
+    /// a call node, so the mixin's call-type-gated argument-promotion branch
+    /// never fires here (same reasoning as the hash cop).
+    pub(crate) fn check_trailing_comma_in_array_literal(&mut self, node: &ruby_prism::ArrayNode) {
+        const COP: &str = "Style/TrailingCommaInArrayLiteral";
+        if !self.on(COP) {
+            return;
+        }
+        let is_bracket = node.opening_loc().is_some_and(|o| o.as_slice() == b"[");
+        if !is_bracket {
+            return;
+        }
+        let elements: Vec<ruby_prism::Node> = node.elements().iter().collect();
+        if elements.is_empty() {
+            return;
+        }
+        let Some(close) = node.closing_loc() else { return };
+        let last = elements.last().expect("checked non-empty above");
+        let last_end = last.location().end_offset();
+        let close_start = close.start_offset();
+
+        let style = self.cfg.get(COP, "EnforcedStyleForMultiline").unwrap_or("no_comma");
+        let should_have_comma = self.tcial_should_have_comma(style, node, &elements);
+
+        // `comma_offset`: is there a `,` between the last element and the
+        // closing bracket, reachable only through whitespace? Heredoc items
+        // switch to the no-newline-skipping pattern (mixin's `any_heredoc?`).
+        let gap = &self.src[last_end..close_start];
+        let heredoc_mode = elements.iter().any(tcihl_heredoc);
+        let comma_rel = tcihl_comma_offset(gap, heredoc_mode);
+
+        // `inside_comment?`: a same-line comment starting before the comma
+        // position means this isn't really a trailing comma (e.g. `x #,`).
+        let (gap_line, _) = self.idx.loc(last_end);
+        let comma_abs = comma_rel.map(|rel| last_end + rel).filter(|&pos| {
+            !self.comments.iter().any(|&(l, s, _)| l == gap_line && s < pos)
+        });
+
+        match comma_abs {
+            Some(pos) => {
+                if !should_have_comma {
+                    self.tcial_avoid_comma(COP, style, pos);
+                }
+            }
+            None => {
+                if should_have_comma {
+                    self.tcial_put_comma(COP, last);
+                }
+            }
+        }
+    }
+
+    fn tcial_should_have_comma(
+        &self,
+        style: &str,
+        node: &ruby_prism::ArrayNode,
+        elements: &[ruby_prism::Node],
+    ) -> bool {
+        match style {
+            "comma" => {
+                self.tcial_multiline(node, elements) && self.tcial_no_elements_on_same_line(node, elements)
+            }
+            "consistent_comma" => self.tcial_multiline(node, elements),
+            "diff_comma" => {
+                self.tcial_multiline(node, elements) && tcial_last_item_precedes_newline(self.src, node, elements)
+            }
+            _ => false,
+        }
+    }
+
+    /// `multiline?`: `node.multiline?` (source spans more than one line)
+    /// minus the `allowed_multiline_argument?` carve-out — a single-element
+    /// literal whose closing bracket does NOT begin its own line is not
+    /// "multiline" even though its content spans lines.
+    fn tcial_multiline(&self, node: &ruby_prism::ArrayNode, elements: &[ruby_prism::Node]) -> bool {
+        let loc = node.location();
+        let first_line = self.idx.loc(loc.start_offset()).0;
+        let last_line = self.idx.loc(loc.end_offset().saturating_sub(1)).0;
+        if first_line == last_line {
+            return false;
+        }
+        let Some(close) = node.closing_loc() else { return true };
+        let allowed = elements.len() == 1 && !self.tcihl_begins_its_line(close.start_offset());
+        !allowed
+    }
+
+    /// `no_elements_on_same_line?`: every element, plus the closing bracket as
+    /// a final sentinel, starts on a line strictly after the previous one's
+    /// last line.
+    fn tcial_no_elements_on_same_line(&self, node: &ruby_prism::ArrayNode, elements: &[ruby_prism::Node]) -> bool {
+        let mut ranges: Vec<(usize, usize)> =
+            elements.iter().map(|e| (e.location().start_offset(), e.location().end_offset())).collect();
+        if let Some(close) = node.closing_loc() {
+            ranges.push((close.start_offset(), close.end_offset()));
+        }
+        ranges.windows(2).all(|w| {
+            let a_last_line = self.idx.loc(w[0].1.saturating_sub(1)).0;
+            let b_line = self.idx.loc(w[1].0).0;
+            a_last_line != b_line
+        })
+    }
+
+    fn tcial_avoid_comma(&mut self, cop: &'static str, style: &str, comma_pos: usize) {
+        let extra = match style {
+            "comma" => ", unless each item is on its own line",
+            "consistent_comma" => ", unless items are split onto multiple lines",
+            "diff_comma" => ", unless that item immediately precedes a newline",
+            _ => "",
+        };
+        self.push(comma_pos, cop, true, format!("Avoid comma after the last item of an array{extra}."));
+        self.fixes.push((comma_pos, comma_pos + 1, Vec::new()));
+    }
+
+    /// `put_comma`/`autocorrect_range`: the range from the start of the last
+    /// element's OWN final source line (skipping leading indentation) through
+    /// its end — the fixture's `^^^^^^^` underline — with the fix inserting
+    /// `,` immediately after the element.
+    fn tcial_put_comma(&mut self, cop: &'static str, last: &ruby_prism::Node) {
+        let loc = last.location();
+        let item_start = loc.start_offset();
+        let item_end = loc.end_offset();
+        let text = &self.src[item_start..item_end];
+        let ix = text.iter().rposition(|&b| b == b'\n').unwrap_or(0);
+        let rest = &text[ix..];
+        let non_ws =
+            rest.iter().position(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)).unwrap_or(0);
+        let range_start = item_start + ix + non_ws;
+        self.push(range_start, cop, true, "Put a comma after the last item of a multiline array.");
+        self.fixes.push((item_end, item_end, b",".to_vec()));
+    }
+}
+
+/// `last_item_precedes_newline?`: the text from the last element's end
+/// through the node's own end starts with an optional comma, optional
+/// (non-newline) whitespace, an optional trailing comment, then a `\n`.
+fn tcial_last_item_precedes_newline(src: &[u8], node: &ruby_prism::ArrayNode, elements: &[ruby_prism::Node]) -> bool {
+    let Some(last) = elements.last() else { return false };
+    let start = last.location().end_offset();
+    let end = node.location().end_offset();
+    if start > end {
+        return false;
+    }
+    let mut text = &src[start..end];
+    if text.first() == Some(&b',') {
+        text = &text[1..];
+    }
+    let mut i = 0;
+    while i < text.len() && matches!(text[i], b' ' | b'\t' | b'\r' | 0x0c | 0x0b) {
+        i += 1;
+    }
+    if i < text.len() && text[i] == b'#' {
+        while i < text.len() && text[i] != b'\n' {
+            i += 1;
+        }
+    }
+    i < text.len() && text[i] == b'\n'
+}

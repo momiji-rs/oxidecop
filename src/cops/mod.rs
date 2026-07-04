@@ -312,7 +312,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
-    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch",
+    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral",
 ];
 
 impl Engine {
@@ -2778,6 +2778,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_parentheses_node(self, node);
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+        self.check_trailing_comma_in_array_literal(node);
         self.check_hash_as_last_array_item(node);
         self.check_multiline_array_brace_layout(node);
         self.check_nested_percent_literal(node);
