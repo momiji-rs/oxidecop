@@ -350,6 +350,7 @@ COPS = {
   'Layout/SpaceInsideHashLiteralBraces' => 'layout/space_inside_hash_literal_braces',
   'Layout/SpaceInsideReferenceBrackets' => 'layout/space_inside_reference_brackets',
   'Layout/SpaceInsideBlockBraces'    => 'layout/space_inside_block_braces',
+  'Layout/SpaceInsideArrayLiteralBrackets' => 'layout/space_inside_array_literal_brackets',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

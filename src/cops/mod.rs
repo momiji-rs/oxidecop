@@ -387,7 +387,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
-    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces",
+    "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets",
 ];
 
 impl Engine {
@@ -3307,6 +3307,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.visit(&node.pattern());
         self.pattern_depth -= 1;
     }
+    fn visit_array_pattern_node(&mut self, node: &ruby_prism::ArrayPatternNode<'pr>) {
+        self.check_space_inside_array_pattern_literal_brackets(node);
+        ruby_prism::visit_array_pattern_node(self, node);
+    }
     fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
         let klass = node.name().as_slice();
         if matches!(klass, b"Fixnum" | b"Bignum") {
@@ -4178,6 +4182,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
         self.ium_register_collection(&node.as_node(), node.elements().iter().collect());
         self.check_trailing_comma_in_array_literal(node);
+        self.check_space_inside_array_literal_brackets(node);
         self.check_hash_as_last_array_item(node);
         self.check_multiline_array_brace_layout(node);
         self.check_nested_percent_literal(node);

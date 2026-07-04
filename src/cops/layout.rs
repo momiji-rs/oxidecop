@@ -7809,3 +7809,332 @@ impl<'a> Cops<'a> {
         self.sibb_space(begin_pos, end_pos, "Space inside } detected.");
     }
 }
+
+
+/// Layout/SpaceInsideArrayLiteralBrackets — verbatim-behavior port of the
+/// upstream `SurroundingSpace`-based token-pair logic (`on_array`/
+/// `on_array_pattern`, `issue_offenses`, `compact_offenses`, and the
+/// `SpaceCorrector`/`SurroundingSpace` mixin helpers it calls into), adapted
+/// to prism the same way `Layout/SpaceInsideParens` was (see that cop's doc
+/// comment): we don't have a real lexer token stream, so every place
+/// upstream walks `processed_source.tokens_within(node)` to find "the next
+/// real token" is replaced here with a byte-level whitespace skip — safe
+/// because a plain space/tab is NEVER itself a distinct token upstream (only
+/// comments and `tNL` newline-separators are), so "the next real token"
+/// always collapses to "the next non-whitespace byte", and "did we cross a
+/// `tNL`" collapses to "did that skip cross a `\n` byte".
+///
+/// Two upstream node-shape differences are already handled for free by
+/// prism: `find_node_with_brackets`'s ancestor climb (whitequark wraps
+/// `ADT[pattern]` in a separate `const-pattern` node whose OWN `array-
+/// pattern` child has no brackets of its own) doesn't apply — prism's
+/// `ArrayPatternNode` carries the leading constant directly (see
+/// `check_space_inside_array_pattern_literal_brackets`'s doc comment) — and
+/// a bracketless array/pattern (`a = 1, 2` / `in a, b, c, d`) has `None`
+/// opening/closing locations we just skip on, matching `array_brackets`
+/// returning `nil, nil` for it.
+///
+/// Every one of the four style branches below needs the SAME two low-level
+/// facts about each bracket's outward-facing byte: is there a plain space/
+/// tab immediately adjacent (`extra_space?`/`SINGLE_SPACE_REGEXP`, used for
+/// the offense DECISION), and where does that run of plain space/tab end
+/// (`side_space_range` with `include_newlines: false`, used for both the
+/// offense's anchor position and — for `no_space`/`space`/the compact
+/// "ordinary side" fallback — the correction range too, since upstream's
+/// `SpaceCorrector.remove_space`/`add_space` compute the exact same range).
+/// `compact`'s "collapse adjacent brackets" correction is the one exception:
+/// its OFFENSE anchor still uses the space/tab-only skip (hence the `^{}`
+/// zero-width offense when the gap is a bare newline with no leading space),
+/// but its CORRECTION range uses the full whitespace skip (crossing
+/// newlines), matching `compact()`'s `include_newlines: true`.
+impl<'a> Cops<'a> {
+    /// `on_array`: `node.array_type? && !node.square_brackets?` bails out on
+    /// a bracketless array (`a = 1, 2`, `opening_loc: None`) and on a
+    /// percent-literal array (`%w[...]`/`%i[...]`, whose `opening_loc` is
+    /// the multi-byte `%w`/`%i`/... marker, never the bare `[` this cop
+    /// cares about).
+    pub(crate) fn check_space_inside_array_literal_brackets(&mut self, node: &ruby_prism::ArrayNode) {
+        const COP: &str = "Layout/SpaceInsideArrayLiteralBrackets";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(open) = node.opening_loc() else { return };
+        if open.as_slice() != b"[" {
+            return;
+        }
+        let Some(close) = node.closing_loc() else { return };
+        self.silb_run(node.location().start_offset(), open.start_offset(), close.start_offset());
+    }
+
+    /// `on_array_pattern` (aliased to `on_array` upstream). Prism embeds a
+    /// leading constant directly on `ArrayPatternNode` — `ADT[*head, tail]`
+    /// parses with `constant: Some(ADT)` and `opening_loc`/`closing_loc`
+    /// pointing at the REAL `[`/`]`, spanning the pattern from `ADT` through
+    /// `]` — so there is no separate wrapper node to climb to and no
+    /// `square_brackets?` guard to apply (a `[`-delimited pattern is always
+    /// real brackets; the only bracketless shape, `in a, b, c, d`, simply has
+    /// `opening_loc: None` and is skipped below, same as upstream's
+    /// `array_brackets` returning `nil, nil` for it). `FindPatternNode`
+    /// (`in [*, x, *]`) is a distinct prism node kind never routed here,
+    /// matching upstream never aliasing `on_find_pattern`.
+    pub(crate) fn check_space_inside_array_pattern_literal_brackets(&mut self, node: &ruby_prism::ArrayPatternNode) {
+        const COP: &str = "Layout/SpaceInsideArrayLiteralBrackets";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(open) = node.opening_loc() else { return };
+        let Some(close) = node.closing_loc() else { return };
+        self.silb_run(node.location().start_offset(), open.start_offset(), close.start_offset());
+    }
+
+    fn silb_run(&mut self, node_start: usize, open_pos: usize, close_pos: usize) {
+        const COP: &str = "Layout/SpaceInsideArrayLiteralBrackets";
+        let src = self.src;
+        let open_end = open_pos + 1; // `[` is always exactly one byte.
+
+        // `empty_brackets?`: no token at all (not even a comment) between
+        // the two bracket tokens — collapses to "nothing but whitespace (of
+        // any kind, any amount, including zero)" between them.
+        if src[open_end..close_pos].iter().all(|&b| silb_is_ws(b)) {
+            self.silb_empty(open_pos, open_end, close_pos);
+            return;
+        }
+
+        let style = self.cfg.enforced_style(COP);
+        let (fwd_pos, fwd_crossed_nl) = silb_skip_ws_forward(src, open_end);
+        let (bwd_pos, bwd_crossed_nl) = silb_skip_ws_backward(src, close_pos);
+        // `node.single_line?`: the closing bracket is always the node's own
+        // last byte (for both `ArrayNode` and `ArrayPatternNode`), so
+        // comparing against it directly stands in for the node's own
+        // `location.end`.
+        let single_line = self.idx.loc(node_start).0 == self.idx.loc(close_pos).0;
+        // `end_has_own_line?`: on the closing bracket's OWN physical line,
+        // is everything before it whitespace? That's exactly "did the
+        // backward whitespace skip cross a `\n` to reach the previous real
+        // content" — if it didn't, real content sits on the SAME line as
+        // the bracket; if it did, the bracket's line has nothing before it
+        // but whitespace. `node.single_line?` forces this false outright,
+        // but a single-line node's backward skip can never cross a `\n`
+        // anyway (there isn't one inside it), so this is a redundant-but-
+        // harmless special case, not a distinct behavior.
+        let end_ok = !single_line && bwd_crossed_nl;
+
+        match style {
+            "space" => self.silb_space(open_pos, open_end, close_pos, fwd_crossed_nl, end_ok),
+            "compact" => self.silb_compact(open_pos, open_end, close_pos, fwd_pos, bwd_pos, fwd_crossed_nl, end_ok),
+            _ => {
+                // `next_to_comment?`: `no_space`'s `start_ok` override — the
+                // char immediately after the left bracket, once ALL
+                // whitespace is skipped, is a comment marker.
+                let next_to_comment = src[fwd_pos] == b'#';
+                self.silb_no_space(open_end, close_pos, next_to_comment, end_ok);
+            }
+        }
+    }
+
+    /// `empty_offenses`/`SpaceCorrector.empty_corrections`: exact-count
+    /// checks (`space_between?`/`no_character_between?`), not presence
+    /// checks, so unlike the non-empty branches this needs no start/end-of-
+    /// line reasoning at all.
+    fn silb_empty(&mut self, open_pos: usize, open_end: usize, close_pos: usize) {
+        const COP: &str = "Layout/SpaceInsideArrayLiteralBrackets";
+        let src = self.src;
+        // Resolved param, not `enforced_style` — `EnforcedStyleForEmptyBrackets`
+        // isn't one of this cop's `SupportedStyles` (that's the OTHER param,
+        // `EnforcedStyle`), so an invalid/unrecognized value must match
+        // neither `offending_empty_space?` nor `offending_empty_no_space?`
+        // (both do exact string equality) rather than silently falling back.
+        let empty_style = self.cfg.get(COP, "EnforcedStyleForEmptyBrackets").unwrap_or("no_space");
+        match empty_style {
+            "space" => {
+                let exactly_one_space = close_pos == open_end + 1 && src.get(open_end) == Some(&b' ');
+                if !exactly_one_space {
+                    self.push(open_pos, COP, true, "Use one space inside empty array brackets.");
+                    self.fixes.push((open_end, close_pos, b" ".to_vec()));
+                }
+            }
+            "no_space" => {
+                if open_end != close_pos {
+                    self.push(open_pos, COP, true, "Do not use space inside empty array brackets.");
+                    self.fixes.push((open_end, close_pos, Vec::new()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `space_offenses` (style `:space`). `extra_space?`'s restricted
+    /// space/tab-only check, OR'd with `start_ok`/`end_ok`
+    /// (`next_to_newline?`/`end_has_own_line?`) — both sides are otherwise
+    /// independent (no compact-style bracket-adjacency logic here). The fix
+    /// (`SpaceCorrector.add_space`) is safe to apply unconditionally
+    /// whenever the offense fires: reaching the `push` means the immediate
+    /// byte is neither a plain space/tab NOR (via `start_ok`/`end_ok`) does a
+    /// newline separate it from the next real content, so it's some other
+    /// non-whitespace byte — inserting exactly one space is always correct.
+    fn silb_space(&mut self, open_pos: usize, open_end: usize, close_pos: usize, start_ok: bool, end_ok: bool) {
+        const COP: &str = "Layout/SpaceInsideArrayLiteralBrackets";
+        let src = self.src;
+        if !(silb_is_sp_tab(src[open_end]) || start_ok) {
+            self.push(open_pos, COP, true, "Use space inside array brackets.");
+            self.fixes.push((open_end, open_end, b" ".to_vec()));
+        }
+        if !(silb_is_sp_tab(src[close_pos - 1]) || end_ok) {
+            self.push(close_pos, COP, true, "Use space inside array brackets.");
+            self.fixes.push((close_pos, close_pos, b" ".to_vec()));
+        }
+    }
+
+    /// `no_space_offenses` (style `:no_space`). `start_ok` here is
+    /// `next_to_comment?`, NOT `next_to_newline?` (see `silb_run`'s dispatch)
+    /// — a `[` immediately followed by a newline never trips `extra_space?`
+    /// in the first place (`SINGLE_SPACE_REGEXP` only matches ` `/`\t`), so
+    /// `no_space` style needs no newline-awareness at all, only the
+    /// comment-adjacency exemption (`a = [ # comment`). Offense range AND
+    /// fix range are the SAME space/tab-only span
+    /// (`SpaceCorrector.remove_space` uses the identical `side_space_range`
+    /// formula as the offense).
+    fn silb_no_space(&mut self, open_end: usize, close_pos: usize, next_to_comment: bool, end_ok: bool) {
+        const COP: &str = "Layout/SpaceInsideArrayLiteralBrackets";
+        let src = self.src;
+        let start_ok = next_to_comment;
+        if silb_is_sp_tab(src[open_end]) && !start_ok {
+            let end = silb_skip_sp_tab_forward(src, open_end);
+            self.push(open_end, COP, true, "Do not use space inside array brackets.");
+            self.fixes.push((open_end, end, Vec::new()));
+        }
+        if silb_is_sp_tab(src[close_pos - 1]) && !end_ok {
+            let start = silb_skip_sp_tab_backward(src, close_pos);
+            self.push(start, COP, true, "Do not use space inside array brackets.");
+            self.fixes.push((start, close_pos, Vec::new()));
+        }
+    }
+
+    /// `compact_offenses`/`compact_corrections` (style `:compact`). Each
+    /// side independently qualifies for the "collapse adjacent brackets"
+    /// treatment (`qualifies_for_compact?`: the next real byte outward,
+    /// after skipping ALL whitespace, is itself a bracket — `multi_dimensional_array?`
+    /// — AND at least one whitespace byte of any kind actually separates
+    /// them), falls back to the ordinary single-array `space_offenses`
+    /// handling when it ISN'T adjacent to another bracket at all, or (the
+    /// third, silent case: adjacent to another bracket with ZERO gap
+    /// already) needs nothing. Each side's offense-or-not is independent,
+    /// but upstream's per-node `autocorrect` always recomputes BOTH sides
+    /// once ANY offense fires on the node (guarded only by `ignore_node`,
+    /// not by which specific side triggered it) — safe to mirror by pushing
+    /// a fix for whichever side(s) actually need one (the "already fine"
+    /// cases only ever produce a no-op fix upstream too: a zero-length
+    /// removal, or a skipped insert).
+    #[allow(clippy::too_many_arguments)]
+    fn silb_compact(
+        &mut self,
+        open_pos: usize,
+        open_end: usize,
+        close_pos: usize,
+        fwd_pos: usize,
+        bwd_pos: usize,
+        start_ok: bool,
+        end_ok: bool,
+    ) {
+        const COP: &str = "Layout/SpaceInsideArrayLiteralBrackets";
+        let src = self.src;
+        let mut any_offense = false;
+        let mut left_fix: Option<(usize, usize, Vec<u8>)> = None;
+        let mut right_fix: Option<(usize, usize, Vec<u8>)> = None;
+
+        let multi_dim_left = src[fwd_pos] == b'[';
+        if multi_dim_left && silb_is_ws(src[open_end]) {
+            self.push(open_end, COP, true, "Do not use space inside array brackets.");
+            any_offense = true;
+            left_fix = Some((open_end, fwd_pos, Vec::new()));
+        } else if !multi_dim_left && !(silb_is_sp_tab(src[open_end]) || start_ok) {
+            self.push(open_pos, COP, true, "Use space inside array brackets.");
+            any_offense = true;
+            left_fix = Some((open_end, open_end, b" ".to_vec()));
+        }
+
+        let multi_dim_right = src[bwd_pos - 1] == b']';
+        if multi_dim_right && silb_is_ws(src[close_pos - 1]) {
+            let start = silb_skip_sp_tab_backward(src, close_pos);
+            self.push(start, COP, true, "Do not use space inside array brackets.");
+            any_offense = true;
+            right_fix = Some((bwd_pos, close_pos, Vec::new()));
+        } else if !multi_dim_right && !(silb_is_sp_tab(src[close_pos - 1]) || end_ok) {
+            self.push(close_pos, COP, true, "Use space inside array brackets.");
+            any_offense = true;
+            right_fix = Some((close_pos, close_pos, b" ".to_vec()));
+        }
+
+        if any_offense {
+            if let Some(f) = left_fix {
+                self.fixes.push(f);
+            }
+            if let Some(f) = right_fix {
+                self.fixes.push(f);
+            }
+        }
+    }
+}
+
+/// Ruby's `\s`: space, tab, newline, CR, form feed, vertical tab — the exact
+/// byte class `Parser::Source::Range`-based `\G\s` token-adjacency checks
+/// (`Token#space_after?`/`#space_before?`) match, broader than Rust's
+/// `u8::is_ascii_whitespace` (which omits vertical tab).
+fn silb_is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+}
+
+/// `SurroundingSpace::SINGLE_SPACE_REGEXP` (`/[ \t]/`) — the restricted class
+/// `extra_space?` tests the single adjacent byte against.
+fn silb_is_sp_tab(b: u8) -> bool {
+    matches!(b, b' ' | b'\t')
+}
+
+/// Skip a run of Ruby-whitespace bytes forward from `pos`, reporting whether
+/// a `\n` was among them — `reposition(src, pos, +1, include_newlines: true)`
+/// paired with the "did we cross a line" question upstream answers via
+/// separate token-line comparisons (`next_to_newline?`/`end_has_own_line?`).
+fn silb_skip_ws_forward(src: &[u8], mut pos: usize) -> (usize, bool) {
+    let mut crossed_nl = false;
+    while pos < src.len() && silb_is_ws(src[pos]) {
+        if src[pos] == b'\n' {
+            crossed_nl = true;
+        }
+        pos += 1;
+    }
+    (pos, crossed_nl)
+}
+
+/// Same as `silb_skip_ws_forward`, but backward: `pos` is an exclusive upper
+/// bound, and the result is the (still exclusive) position right after the
+/// nearest preceding non-whitespace byte.
+fn silb_skip_ws_backward(src: &[u8], mut pos: usize) -> (usize, bool) {
+    let mut crossed_nl = false;
+    while pos > 0 && silb_is_ws(src[pos - 1]) {
+        if src[pos - 1] == b'\n' {
+            crossed_nl = true;
+        }
+        pos -= 1;
+    }
+    (pos, crossed_nl)
+}
+
+/// `reposition(src, pos, +1, include_newlines: false)` — space/tab only,
+/// stopping at (not crossing) a newline.
+fn silb_skip_sp_tab_forward(src: &[u8], mut pos: usize) -> usize {
+    while pos < src.len() && silb_is_sp_tab(src[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+/// `reposition(src, pos, -1, include_newlines: false)` — space/tab only,
+/// backward; `pos` is an exclusive upper bound, result is the start of the
+/// trailing space/tab run (still exclusive-upper-bound convention, i.e. the
+/// range `[result, pos)` is exactly that run).
+fn silb_skip_sp_tab_backward(src: &[u8], mut pos: usize) -> usize {
+    while pos > 0 && silb_is_sp_tab(src[pos - 1]) {
+        pos -= 1;
+    }
+    pos
+}
