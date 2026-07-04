@@ -228,7 +228,7 @@ end
 
 # Parse `RuboCop::Config.new('Section' => {...}, ...)` out of a spec block:
 # returns { section => [hash_text, merges_cop_config] } or nil.
-def parse_config_sections(joined)
+def parse_config_sections(joined, lets = {})
   # \s* tolerates a chain split across lines (`RuboCop::Config\n  .new(...)`,
   # joined with a space by the block collector).
   m = joined.match(/RuboCop::Config\s*\.\s*new\((.*)\)/m)
@@ -241,11 +241,24 @@ def parse_config_sections(joined)
     sec = Regexp.last_match(1)
     val = Regexp.last_match(2).strip
     merges_cop_config = !val.sub!(/\.merge\(cop_config\)\s*\z/, '').nil?
-    # `cop_config.merge(H)` (reversed direction) — H's literal pairs plus the
-    # example's cop_config.
-    if (m2 = val.match(/\Acop_config\.merge\((.*)\)\z/m))
+    # `cop_config.merge(A).merge(B)...` — peel every trailing `.merge(...)`
+    # (rindex-based, so nested parens inside an arg don't fool it), resolve
+    # bare-identifier parts through the scope's lets, and join all pairs
+    # (later keys win, like chained Hash#merge).
+    if val =~ /\Acop_config(\.merge\(.*\))\z/m
       merges_cop_config = true
-      val = m2[1]
+      chain = val
+      parts = []
+      while chain.end_with?(')') && (idx = chain.rindex('.merge('))
+        parts.unshift(chain[(idx + 7)...-1].strip)
+        chain = chain[0...idx]
+      end
+      parts = [] unless chain == 'cop_config'
+      resolved = parts.map do |p|
+        p = lets[p] || LOCAL_HASHES[p] || p if p =~ /\A\w+\z/
+        p.sub(/\A\{\s*/, '').sub(/\s*\}\z/, '')
+      end
+      val = "{ #{resolved.reject(&:empty?).join(', ')} }"
     end
     # A bare `cop_config` reference: the section IS the example's cop_config.
     if val == 'cop_config'
@@ -598,7 +611,7 @@ while i < lines.length
       cfg_stack.last[3] = m[1]
     end
     if cfg_stack.any?
-      if (sections = parse_config_sections(joined))
+      if (sections = parse_config_sections(joined, cfg_stack.any? ? cfg_stack.last[7] : {}))
         cfg_stack.last[4] = sections
       elsif joined =~ /RuboCop::Config\s*\.\s*new\(\w+/
         # bare-identifier arg: resolve through lets now and again whenever a

@@ -389,7 +389,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
-    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment", "Lint/Syntax",
+    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment", "Lint/Syntax", "Layout/FirstArrayElementIndentation",
 ];
 
 impl Engine {
@@ -1600,6 +1600,27 @@ pub(crate) struct Cops<'a> {
     // (`register_offense(expr, nil)` -> `AlignmentCorrector.correct` no-ops
     // on a nil node) so the two rewrites don't collide in one pass.
     pub(crate) aa_registered_ranges: Vec<(usize, usize)>,
+    // Layout/FirstArrayElementIndentation: array node start offsets already
+    // consumed by an enclosing `on_send`/`on_csend`'s `each_argument_node`
+    // search (its own opening bracket sat on the same source line as that
+    // call's own left parenthesis) — rubocop's `ignore_node`/`ignored_node?`,
+    // preventing the SAME array node from being investigated a second time
+    // when the main traversal later reaches it directly via `on_array`.
+    pub(crate) faei_ignored: HashSet<usize>,
+    // Layout/FirstArrayElementIndentation: array node `(start, end)` -> the
+    // enclosing hash/keyword-hash PAIR it is the direct `value` of (when
+    // any), feeding `MultilineElementIndentation#hash_pair_where_value_
+    // beginning_with`'s `:parent_hash_key` indent base. `pair_start` is the
+    // pair's own start offset (== its key's own start offset, since a prism
+    // `AssocNode`'s range always begins exactly at its key); `right_sibling_
+    // key_line` is the following sibling element's own start line within the
+    // SAME hash/keyword-hash (`None` when this pair is the last element) —
+    // both computed once up front by `layout::faei_build_hash_pairs`, a
+    // whole-file pre-pass run alongside `HeredocFinder` in `lint()` — see
+    // its own doc for why "just in time" population from the main
+    // traversal's `visit_hash_node`/`visit_keyword_hash_node` (parent before
+    // children) is NOT early enough for this particular cop.
+    pub(crate) faei_hash_pair: HashMap<(usize, usize), layout::FaeiPairInfo>,
     // Layout/IndentationConsistency: start offset of the top-level Program's
     // own `StatementsNode` — rubocop's `node.parent` is `nil` exactly for the
     // outermost implicit `:begin`/`:kwbegin`, which `base_column_for_normal_
@@ -4593,6 +4614,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.check_array_alignment(node);
+        self.check_first_array_element_indentation_array(node);
         // Lint/SafeNavigationChain: `operator_inside_collection_literal?`'s
         // `type?(:array, :pair)` — the array-literal half.
         if self.on("Lint/SafeNavigationChain") {
@@ -5750,6 +5772,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_empty_lines_around_arguments(node);
         self.check_argument_alignment(node);
         self.check_first_argument_indentation_call(node);
+        self.check_first_array_element_indentation_send(node);
         self.check_format_parameter_mismatch(node);
         // Lint/SafeNavigationChain: the main per-node check (see its doc
         // comment for why this must run BEFORE this call's own arguments are
@@ -6205,6 +6228,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
 
     // Layout/FirstArgumentIndentation: see `layout::fai_build_maps`'s doc.
     let (fai_direct_parent, fai_splat_wrap) = layout::fai_build_maps(&result.node());
+    // Layout/FirstArrayElementIndentation: see `layout::faei_build_hash_
+    // pairs`'s doc for why this needs to be a real up-front pre-pass.
+    let faei_hash_pair = layout::faei_build_hash_pairs(&result.node(), &idx);
 
     let (hot, file_disabled) = eng.file_view(rel_path);
     let mut cops = Cops {
@@ -6416,6 +6442,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         aa_masgn_rhs: HashSet::new(),
         aa_unbracketed_rhs_parent: HashMap::new(),
         aa_registered_ranges: Vec::new(),
+        faei_ignored: HashSet::new(),
+        faei_hash_pair,
         ic_top_level_stmts_start: None,
         ic_parent_of_body: HashMap::new(),
         ic_macro_stack: Vec::new(),
