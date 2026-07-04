@@ -189,6 +189,21 @@ pub(crate) enum DnFrame {
     BeginGroup { last_line: usize, child_starts: Vec<usize> },
 }
 
+/// Style/FormatStringToken's per-ancestor stack frame — see `fst_stack`'s
+/// field doc for how each variant is pushed/popped and why plain start-
+/// offset equality stands in for `each_ancestor`/single-ascend node-pattern
+/// matching.
+pub(crate) enum FstFrame {
+    Call {
+        method: Vec<u8>,
+        receiver_start: Option<usize>,
+        first_arg_start: Option<usize>,
+        arg_count: usize,
+    },
+    Dstr(usize),
+    XstrOrRegexp,
+}
+
 /// Per-RUN state derived from the Config once — parsed patterns, resolved
 /// enablement, compiled exemption maps. lint() is called per file; nothing
 /// here should be rebuilt per file.
@@ -371,7 +386,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
-    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString",
+    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken",
 ];
 
 impl Engine {
@@ -1807,6 +1822,20 @@ pub(crate) struct Cops<'a> {
     // climb through intermediate non-`begin` ancestors (untested by the
     // fixture beyond the direct-sibling case).
     pub(crate) ium_right_sibling_line: HashMap<usize, usize>,
+    // Style/FormatStringToken: a hand-rolled ancestor stack (prism gives no
+    // parent pointers) pushed/popped by `visit_call_node` (`Call`, with the
+    // method name plus the receiver's/first-argument's own start offset —
+    // enough to answer `format_string_in_typical_context?`'s single-ascend
+    // node-pattern check via plain offset equality, since any REAL
+    // intervening node — a `hash`/`pair`/`array` wrapper, another nested
+    // call — necessarily shifts that offset away from the leaf/dstr node's
+    // own start), `visit_interpolated_string_node` (`Dstr`, the node's own
+    // start offset — `node.each_ancestor(:dstr)`), and
+    // `visit_interpolated_x_string_node`/`visit_interpolated_regular_expression_node`
+    // (`XstrOrRegexp` — `node.each_ancestor(:xstr, :regexp).any?`; a
+    // NON-interpolated xstr/regexp is a leaf with no `StringNode` children,
+    // so it never needs a frame). See `style::fst_typical_context`'s doc.
+    pub(crate) fst_stack: Vec<FstFrame>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2084,6 +2113,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_bare_percent_literals_str(node);
         self.check_percent_literal_delimiters_str(node);
         self.ll_check_str(node);
+        self.check_format_string_token(node);
     }
     fn visit_interpolated_string_node(&mut self, node: &ruby_prism::InterpolatedStringNode<'pr>) {
         // `'a' \` line-continuation concatenation parses as this node with
@@ -2137,7 +2167,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ium_dstr_depth += 1;
         let prev_brace_eligible = self.sgv_brace_eligible;
         self.sgv_brace_eligible = true;
+        // Style/FormatStringToken: `node.each_ancestor(:dstr)` — see
+        // `FstFrame`/`fst_stack`'s doc.
+        self.fst_stack.push(FstFrame::Dstr(node.location().start_offset()));
         ruby_prism::visit_interpolated_string_node(self, node);
+        self.fst_stack.pop();
         self.sgv_brace_eligible = prev_brace_eligible;
         self.ium_dstr_depth -= 1;
         self.interpolated_node_depth -= 1;
@@ -2168,7 +2202,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.interpolated_node_depth += 1;
         let prev_brace_eligible = self.sgv_brace_eligible;
         self.sgv_brace_eligible = true;
+        // Style/FormatStringToken: `node.each_ancestor(:regexp).any?` — a
+        // literal `StringNode` part inside here must never be treated as a
+        // format-string token. See `FstFrame`/`fst_stack`'s doc.
+        self.fst_stack.push(FstFrame::XstrOrRegexp);
         ruby_prism::visit_interpolated_regular_expression_node(self, node);
+        self.fst_stack.pop();
         self.sgv_brace_eligible = prev_brace_eligible;
         self.interpolated_node_depth -= 1;
     }
@@ -2196,7 +2235,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.interpolated_node_depth += 1;
         let prev_brace_eligible = self.sgv_brace_eligible;
         self.sgv_brace_eligible = true;
+        // Style/FormatStringToken: `node.each_ancestor(:xstr).any?` — see
+        // `FstFrame`/`fst_stack`'s doc.
+        self.fst_stack.push(FstFrame::XstrOrRegexp);
         ruby_prism::visit_interpolated_x_string_node(self, node);
+        self.fst_stack.pop();
         self.sgv_brace_eligible = prev_brace_eligible;
         self.interpolated_node_depth -= 1;
         self.xstr_interp_base.pop();
@@ -4988,6 +5031,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             .map(|l| (l.start_offset(), l.end_offset()))
             .unwrap_or((node_off, node_off));
         self.call_stack.push(name_span);
+        // Style/FormatStringToken: see `FstFrame`/`fst_stack`'s doc.
+        {
+            let args = node.arguments();
+            self.fst_stack.push(FstFrame::Call {
+                method: node.name().as_slice().to_vec(),
+                receiver_start: node.receiver().as_ref().map(|r| r.location().start_offset()),
+                first_arg_start: args
+                    .as_ref()
+                    .and_then(|a| a.arguments().iter().next())
+                    .map(|a| a.location().start_offset()),
+                arg_count: args.as_ref().map(|a| a.arguments().iter().count()).unwrap_or(0),
+            });
+        }
         let track_args = self.eng.debugger_on;
         // Lint/UselessTimes: a safe-navigation call's receiver/args don't
         // count as "parent is :send" (whitequark's `:csend` != `:send`).
@@ -5268,6 +5324,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.call_stack.pop();
+        self.fst_stack.pop();
         self.ll_exit_collection();
     }
     fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
@@ -5472,6 +5529,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         ium_collection_info: HashMap::new(),
         ium_ignored_ranges: Vec::new(),
         ium_right_sibling_line: HashMap::new(),
+        fst_stack: Vec::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),

@@ -479,7 +479,7 @@ while i < lines.length
   # A scalar `let(:name) { true/false/42/'str' }` — cop_config values often
   # reference these (`'SplitStrings' => split_strings`); record them per scope
   # so the reference resolves like RSpec would.
-  if cfg_stack.any? && l =~ /let\(:(\w+)\)\s*\{\s*(true|false|-?\d+|'[^']*'|"[^"]*"|\{.*\})\s*\}\s*\z/ &&
+  if cfg_stack.any? && l =~ /let\(:(\w+)\)\s*\{\s*(true|false|-?\d+|:\w+|\[[^\]]*\]|'[^']*'|"[^"]*"|\{.*\})\s*\}\s*\z/ &&
      !%w[cop_config config cop other_cops].include?(Regexp.last_match(1))
     cfg_stack.last[7][Regexp.last_match(1)] = Regexp.last_match(2)
   end
@@ -755,6 +755,10 @@ def parse_val(v)
     Regexp.last_match(2)
   elsif v =~ /\A[a-z_][A-Za-z0-9_.]*\z/ && !%w[true false nil].include?(v)
     VAR_SENTINEL + v
+  elsif v =~ /\A:(\w+)\z/
+    # a bare Ruby symbol literal (`let(:enforced_style) { :annotated }`) —
+    # the YAML config wants the bare word.
+    Regexp.last_match(1)
   elsif v == 'nil'
     # BARE nil (a quoted 'nil' — e.g. EmptyElse's EnforcedStyle — was already
     # returned as a plain string by the quote branch above): sentinel so
