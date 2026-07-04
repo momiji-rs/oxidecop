@@ -371,7 +371,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
-    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren",
+    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods",
 ];
 
 impl Engine {
@@ -1709,6 +1709,52 @@ pub(crate) struct Cops<'a> {
     // a `return`-wrapping `{`/`}` fix — a hash with 2+ shorthand-eligible
     // pairs would otherwise queue the identical wrap edit once per pair.
     pub(crate) hs_wrapped_return: HashSet<usize>,
+    // ---- Lint/DuplicateMethods state (see lint_cops.rs for the algorithm) ----
+    // Depth of enclosing if/unless/ternary ancestors (`node.each_ancestor.any?
+    // (&:if_type?)` — whitequark folds if/unless/ternary all into `:if`).
+    pub(crate) dm_if_depth: usize,
+    // Nearest enclosing rescue/ensure "scope" (nil = neither) — mirrors
+    // upstream's `node.each_ancestor(:rescue, :ensure).first&.type`, pushed
+    // around a `BeginNode`'s protected+rescue subtree (Rescue if it has a
+    // rescue clause, else Ensure if it has an ensure clause) and separately
+    // around its ensure clause (always Ensure).
+    pub(crate) dm_rescue_scope: Vec<lint_cops::DmScope>,
+    // `@scopes`: per rescue/ensure-scope-kind, the definition keys already
+    // silently re-baselined once inside that kind of scope — a SECOND
+    // redefinition of the same key within the SAME scope kind is a real
+    // offense (see `dm_found_method`'s doc).
+    pub(crate) dm_scope_seen: HashMap<lint_cops::DmScope, HashSet<lint_cops::DmKey>>,
+    // `@definitions`: definition key -> the anchor start offset of the most
+    // recent (non-offending) definition seen so far.
+    pub(crate) dm_definitions: HashMap<lint_cops::DmKey, usize>,
+    // `parent_module_name`'s ancestor chain (class/module/casgn/sclass/block),
+    // nearest-last — see `Cops::dm_pmn`'s doc.
+    pub(crate) dm_ns_stack: Vec<lint_cops::DmNsEntry>,
+    // Enclosing `sclass` ancestors (nearest last), regardless of subject
+    // shape — backs `found_sclass_method` and `anonymous_class_block`'s
+    // "any non-self sclass ancestor" exclusion.
+    pub(crate) dm_sclass_stack: Vec<lint_cops::DmSclass>,
+    // Enclosing block ancestors of ANY kind (nearest last) — mirrors
+    // `node.each_ancestor(:block).first` for `anonymous_class_block`.
+    pub(crate) dm_anon_stack: Vec<lint_cops::DmAnonFrame>,
+    // A `Class.new`/`Module.new` block's own start offset -> (receiver
+    // source, method name) of an OUTER call that has it as an argument AND
+    // has a real receiver (e.g. `A.prepend(Module.new do ... end)`) — see
+    // `anon_block_scope_id`'s doc on `Cops::dm_anonymous_class_block`.
+    pub(crate) dm_named_recv: HashMap<usize, (Vec<u8>, Vec<u8>)>,
+    // Start offsets that are the RHS value of a local-variable write —
+    // `anonymous_class_block`'s `first_block.parent&.type?(:lvasgn)` guard.
+    pub(crate) dm_lvasgn_rhs: HashSet<usize>,
+    // Set by `visit_call_node` right before descending into a block it owns
+    // — `(is_new_block, ns_frame)` for the `visit_block_node` call this
+    // triggers, mirroring the `ms_pending_block`-style idiom.
+    pub(crate) dm_pending_block: Option<(bool, lint_cops::DmNsFrame)>,
+    // One-shot flag set by `visit_constant_write_node`/
+    // `visit_constant_path_write_node` right before visiting a value that is
+    // DIRECTLY a `Class.new`/`Module.new` block — upstream's
+    // `new_class_or_module_block?` (the block itself contributes nothing to
+    // `parent_module_name`; the casgn ancestor already does).
+    pub(crate) dm_pending_casgn_new_block: bool,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2218,7 +2264,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.rse_assignment_value.insert(v.location().start_offset());
         self.check_mutable_constant(node.value());
         assignment_write!(self, node);
+        // Lint/DuplicateMethods: `A = Class.new do ... end` — the casgn
+        // ancestor contributes its own name to `parent_module_name` (the
+        // block itself contributes nothing — see `dm_pending_casgn_new_block`).
+        let dm_pushed = self.dm_check_casgn_value(&v, String::from_utf8_lossy(node.name().as_slice()).into_owned());
         ruby_prism::visit_constant_write_node(self, node);
+        if dm_pushed {
+            self.dm_ns_stack.pop();
+        }
     }
     fn visit_constant_or_write_node(&mut self, node: &ruby_prism::ConstantOrWriteNode<'pr>) {
         let v = node.value();
@@ -2249,7 +2302,27 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_mutable_constant(node.value());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
+        // Lint/DuplicateMethods: `self::A = Class.new do ... end` (or
+        // `Foo::A = ...`) — see the matching comment in
+        // `visit_constant_write_node`. `defined_module_name`'s `const_name`:
+        // a `self` qualifier isn't itself const-type, so it contributes an
+        // empty prefix (`::A`); any other (real constant) qualifier
+        // contributes its own source text (`Foo::A`); no qualifier at all
+        // (a bare `::A = ...` cbase path) contributes just the name.
+        let dm_frag = {
+            let t = node.target();
+            let name = t.name().map(|n| String::from_utf8_lossy(n.as_slice()).into_owned()).unwrap_or_default();
+            match t.parent() {
+                Some(p) if p.as_self_node().is_some() => format!("::{name}"),
+                Some(p) => format!("{}::{}", String::from_utf8_lossy(self.node_src(&p)), name),
+                None => name,
+            }
+        };
+        let dm_pushed = self.dm_check_casgn_value(&node.value(), dm_frag);
         ruby_prism::visit_constant_path_write_node(self, node);
+        if dm_pushed {
+            self.dm_ns_stack.pop();
+        }
     }
     fn visit_constant_and_write_node(&mut self, node: &ruby_prism::ConstantAndWriteNode<'pr>) {
         self.check_self_assignment_const(node.location().start_offset(), node.name().as_slice(), &node.value());
@@ -2414,7 +2487,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if hs_modifier {
             self.hs_modifier_depth += 1;
         }
+        // Lint/DuplicateMethods: whitequark folds if/unless/ternary all into
+        // one `:if` node type — `each_ancestor.any?(&:if_type?)` — so a def/
+        // alias/attr/delegate ANYWHERE inside this whole subtree (condition,
+        // branches, elsif chain) is exempted.
+        self.dm_if_depth += 1;
         ruby_prism::visit_if_node(self, node);
+        self.dm_if_depth -= 1;
         if hs_modifier {
             self.hs_modifier_depth -= 1;
         }
@@ -2495,7 +2574,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if hs_modifier {
             self.hs_modifier_depth += 1;
         }
+        // Lint/DuplicateMethods: see the matching comment in `visit_if_node`.
+        self.dm_if_depth += 1;
         ruby_prism::visit_unless_node(self, node);
+        self.dm_if_depth -= 1;
         if hs_modifier {
             self.hs_modifier_depth -= 1;
         }
@@ -2626,6 +2708,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Lint/RedundantSplatExpansion's `ASSIGNMENT_TYPES` (`lvasgn` here) —
         // see `rse_assignment_value`'s doc on `Cops`.
         self.rse_assignment_value.insert(node.value().location().start_offset());
+        // Lint/DuplicateMethods' `anonymous_class_block`: `first_block.parent&.
+        // type?(:lvasgn)` — mark this write's RHS start offset.
+        self.dm_lvasgn_rhs.insert(node.value().location().start_offset());
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
@@ -3067,7 +3152,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `on_resbody` hook prism's dedicated `RescueModifierNode` maps to.
         let kw = node.keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"rescue");
+        // Lint/DuplicateMethods: `expr rescue handler` folds into a `:rescue`
+        // node in whitequark too — both branches see a Rescue scope.
+        self.dm_rescue_scope.push(lint_cops::DmScope::Rescue);
         ruby_prism::visit_rescue_modifier_node(self, node);
+        self.dm_rescue_scope.pop();
     }
     fn visit_flip_flop_node(&mut self, node: &ruby_prism::FlipFlopNode<'pr>) {
         self.check_flip_flop(node);
@@ -3185,6 +3274,44 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let void_is_each = void_method_name.as_deref() == Some(&b"each"[..]);
         let void_is_tap = void_method_name.as_deref() == Some(&b"tap"[..]);
         self.void_each_stack.push(void_is_each);
+        // Lint/DuplicateMethods: consume the `(is_new_block, ns_frame)`
+        // classification `visit_call_node` stashed right before descending
+        // into us (`None` only if unreachable, treated as an ordinary,
+        // non-`Class`/`Module.new` block). Push this block's OWN
+        // `parent_module_name` ancestor frame, then a `dm_anon_stack` frame
+        // (every block, regardless of shape, is a candidate `each_ancestor
+        // (:block).first` for `anonymous_class_block`) — see `Cops::
+        // dm_anonymous_class_block`'s doc.
+        let (dm_is_new_block, mut dm_frame) = self
+            .dm_pending_block
+            .take()
+            .unwrap_or((false, lint_cops::DmNsFrame::Abort));
+        // A numbered-parameter (`_1`) or `it`-parameter block is a DISTINCT
+        // whitequark node type (`:numblock`/`:itblock`), not `:block` —
+        // `parent_module_name`'s `each_ancestor(:class, :module, :sclass,
+        // :casgn, :block)` filter never matches it at all, so it's fully
+        // transparent (contributes nothing, and — unlike an ordinary
+        // non-qualifying block — does NOT abort the walk either).
+        let dm_numbered_or_it = matches!(&node.parameters(),
+            Some(p) if p.as_numbered_parameters_node().is_some() || p.as_it_parameters_node().is_some());
+        if dm_numbered_or_it {
+            dm_frame = lint_cops::DmNsFrame::Skip;
+        }
+        let dm_ns_len_before = self.dm_ns_stack.len();
+        self.dm_ns_stack.push(lint_cops::DmNsEntry { frame: dm_frame, simple_name: None });
+        let dm_start = node.location().start_offset();
+        let dm_scope_id = self
+            .dm_named_recv
+            .get(&dm_start)
+            .cloned()
+            .map(|(r, m)| lint_cops::DmScopeId::Recv(r, m))
+            .unwrap_or(lint_cops::DmScopeId::Pos(dm_start));
+        self.dm_anon_stack.push(lint_cops::DmAnonFrame {
+            is_new_block: dm_is_new_block,
+            parent_lvasgn: self.dm_lvasgn_rhs.contains(&dm_start),
+            scope_id: dm_scope_id,
+            ns_len_at_entry: dm_ns_len_before,
+        });
         self.check_space_before_block_braces(&node.opening_loc(), &node.closing_loc());
         self.check_block_end_newline(node);
         self.check_access_modifier_indentation_block(node);
@@ -3330,6 +3457,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.visit(&body);
         }
         self.void_each_stack.pop();
+        self.dm_anon_stack.pop();
+        self.dm_ns_stack.pop();
         if dn_define_method.is_some() {
             self.dn_ancestors.pop();
         }
@@ -3591,7 +3720,50 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             // `kwbegin_node.right_siblings`.
             self.renv_pending_kwbegin_stack.push(Vec::new());
         }
-        ruby_prism::visit_begin_node(self, node);
+        // Lint/DuplicateMethods: `node.each_ancestor(:rescue, :ensure).first
+        // &.type` — hand-rolled (rather than a plain `ruby_prism::
+        // visit_begin_node` call) so a Rescue scope can bracket the
+        // protected body + rescue clause + else (nearest ancestor is the
+        // implicit/explicit `:rescue` node when there IS a rescue clause,
+        // matching whitequark's `s(:rescue, body, *resbodies, else)` — the
+        // WHOLE thing, both the protected part and every handler, sees
+        // `:rescue`), while a SEPARATE Ensure scope brackets just the
+        // ensure clause (`s(:ensure, inner, ensure_body)` — `ensure_body`'s
+        // direct parent is the `:ensure` node itself). When there's no
+        // rescue clause but there IS an ensure clause, the protected body's
+        // nearest ancestor is that `:ensure` node directly, so it gets the
+        // Ensure scope too (matching `dm_main_scope` below). Traversal order
+        // (statements, rescue_clause, else_clause, ensure_clause) is
+        // identical to the generated default.
+        let dm_has_rescue = node.rescue_clause().is_some();
+        let dm_has_ensure = node.ensure_clause().is_some();
+        let dm_main_scope = if dm_has_rescue {
+            Some(lint_cops::DmScope::Rescue)
+        } else if dm_has_ensure {
+            Some(lint_cops::DmScope::Ensure)
+        } else {
+            None
+        };
+        if let Some(sc) = dm_main_scope {
+            self.dm_rescue_scope.push(sc);
+        }
+        if let Some(st) = node.statements() {
+            self.visit_statements_node(&st);
+        }
+        if let Some(rc) = node.rescue_clause() {
+            self.visit_rescue_node(&rc);
+        }
+        if let Some(el) = node.else_clause() {
+            self.visit_else_node(&el);
+        }
+        if dm_main_scope.is_some() {
+            self.dm_rescue_scope.pop();
+        }
+        if let Some(ec) = node.ensure_clause() {
+            self.dm_rescue_scope.push(lint_cops::DmScope::Ensure);
+            self.visit_ensure_node(&ec);
+            self.dm_rescue_scope.pop();
+        }
         if kwbegin {
             self.usage_block_depth -= 1;
             self.se_ancestor_end_lines.pop();
@@ -3889,6 +4061,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_access_modifier_indentation_class(node);
         self.check_struct_inheritance(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
+        self.dm_enter_namespace(&node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
         self.respond_to_missing_stack.push(Self::scan_respond_to_missing(&node.body()));
@@ -3930,6 +4103,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.respond_to_missing_stack.pop();
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
+        self.dm_leave_namespace();
         self.leave_namespace();
     }
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
@@ -3949,6 +4123,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_accessor_grouping(node.body());
         self.check_access_modifier_indentation_module(node);
         self.enter_namespace(node.location().start_offset(), &node.constant_path());
+        self.dm_enter_namespace(&node.constant_path());
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
         self.respond_to_missing_stack.push(Self::scan_respond_to_missing(&node.body()));
@@ -3978,6 +4153,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.respond_to_missing_stack.pop();
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
+        self.dm_leave_namespace();
         self.leave_namespace();
     }
     fn visit_integer_node(&mut self, node: &ruby_prism::IntegerNode<'pr>) {
@@ -4046,6 +4222,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_method_def_parentheses(node);
         self.check_memoized_ivar_def(node);
         self.check_guard_clause_def(node.body());
+        self.check_duplicate_methods_def(node);
         // Default walk (receiver, params, body) one def level deeper — matches
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
         // parameter default values, which a body-only walk silently skipped.
@@ -4275,9 +4452,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // (see `ta_barrier`'s doc) — a nested def's ancestor walk stops here,
         // returning "not exempt", even under an outer `instance_eval`.
         self.ta_barrier.push(0);
+        self.dm_enter_sclass(&node.expression());
         if let Some(b) = node.body() {
             self.visit(&b);
         }
+        self.dm_leave_sclass();
         self.ta_barrier.pop();
         self.respond_to_missing_stack.pop();
         self.el_am_scope.pop();
@@ -4287,6 +4466,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_alias_method_node(&mut self, node: &ruby_prism::AliasMethodNode<'pr>) {
         self.check_method_name_alias(node);
         self.check_alias(node);
+        self.check_duplicate_methods_alias(node);
         ruby_prism::visit_alias_method_node(self, node);
     }
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
@@ -4369,6 +4549,31 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.receiver().as_ref(),
             node.arguments().as_ref(),
         );
+        self.check_duplicate_methods_send(node);
+        // Lint/DuplicateMethods' `anon_block_scope_id`: when THIS call has a
+        // receiver and one of its arguments is directly a `Class.new`/
+        // `Module.new do...end` block, record (receiver source, this call's
+        // method name) keyed by that block's own start offset — consumed by
+        // `visit_block_node` to give the block a receiver-based (rather than
+        // position-based) scope id, so e.g. two `A.prepend(Module.new do
+        // ... end)` calls at different lines collide but `A.prepend(...)`
+        // vs `B.prepend(...)` never do.
+        if let Some(recv) = node.receiver() {
+            if let Some(args) = node.arguments() {
+                for a in args.arguments().iter() {
+                    if let Some(c) = a.as_call_node() {
+                        if lint_cops::dm_new_block_call(&c, self.src) {
+                            if let Some(blk) = c.block().and_then(|b| b.as_block_node()) {
+                                self.dm_named_recv.insert(
+                                    blk.location().start_offset(),
+                                    (self.node_src(&recv).to_vec(), node.name().as_slice().to_vec()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Style/RegexpLiteral: mark a receiver/argument regexp literal as a
         // direct child of THIS call (`node.parent&.call_type?`), before
         // descending — see `rl_call_child`'s doc.
@@ -4902,6 +5107,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 // Lint/MissingSuper: this block's `class_new_block` verdict —
                 // see the `ms_pending_block` field doc.
                 self.ms_pending_block = self.ms_class_new_pending(node);
+                // Lint/DuplicateMethods: this block's own `parent_module_name`
+                // ancestor-chain contribution — see `dm_pending_block`'s doc
+                // and `Cops::dm_pmn`.
+                self.dm_pending_block = Some(self.dm_classify_block(node));
                 // Style/ExplicitBlockArgument: this call's own shape — see
                 // the `eba_pending` field doc.
                 self.eba_pending = Some(style::eba_call_owner(node));
@@ -5226,6 +5435,17 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         oorr_valid_ref: Some(0),
         sigex_ignored: HashSet::new(),
         sigex_custom_fail_defined: false,
+        dm_if_depth: 0,
+        dm_rescue_scope: Vec::new(),
+        dm_scope_seen: HashMap::new(),
+        dm_definitions: HashMap::new(),
+        dm_ns_stack: Vec::new(),
+        dm_sclass_stack: Vec::new(),
+        dm_anon_stack: Vec::new(),
+        dm_named_recv: HashMap::new(),
+        dm_lvasgn_rhs: HashSet::new(),
+        dm_pending_block: None,
+        dm_pending_casgn_new_block: false,
     };
 
     let t = tick(&T_PREP, t);

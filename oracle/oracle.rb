@@ -383,6 +383,15 @@ while i < lines.length
     it_lets = {}
     in_it_body = true
   end
+  # RSpec stubbing (`allow(Dir).to receive(:pwd)`, buffer-name mocks) inside
+  # a before block alters live-interpreter state the harness can't stage —
+  # the whole context is unrepresentable. Bare `allow(` at line start (the
+  # body of a multiline `before do`) or a single-line `before {{ allow(...)`
+  # both count; `allow(...)` inside a quoted SOURCE string (e.g.
+  # AmbiguousBlockAssociation's samples) never starts a line this way.
+  if l =~ /^\s*(?:before\b.*\s)?allow\(/ && cfg_stack.any?
+    cfg_stack.last[2] = true
+  end
   # `before { (cur_)cop_config[...][...] = ... }` mutates a NESTED key of the
   # config hash — unrepresentable statically; skip the context.
   if l =~ /before\s*\{\s*(cur_)?cop_config\[[^\]]*\]\[/ && cfg_stack.any?
@@ -881,7 +890,18 @@ def run_poc(poc, src, cfg, filename = nil)
     out.lines.filter_map do |line|
       if line =~ /\A[A-Z]:\s*(\d+):\s*(\d+):\s*(?:\[Correctable\]\s*)?(\S+):\s*(.*)/ &&
          Regexp.last_match(3) == COP
-        [Regexp.last_match(1).to_i, Regexp.last_match(2).to_i, Regexp.last_match(4).strip]
+        # capture BEFORE any further regex operation (gsub below clobbers
+        # Regexp.last_match, same trap as String#split)
+        line_no, col_no, msg = Regexp.last_match(1).to_i, Regexp.last_match(2).to_i, Regexp.last_match(4).strip
+        # `expect_offense` with no filename: RSpec's ProcessedSource buffer
+        # is literally named "(string)", and path-embedding messages
+        # (Lint/DuplicateMethods) quote it. The harness must stage a real
+        # temp file, so normalize its path/basename back to the sentinel.
+        # ... but ONLY for the generic ex.rb staging: Bundler/Gemspec depts
+        # stage a SEMANTIC name (Gemfile/ex.gemspec) their cops legitimately
+        # embed (Bundler/OrderedGems says "of the Gemfile").
+        msg = msg.gsub(rb, '(string)').gsub('ex.rb', '(string)') if filename.nil? && File.basename(rb) == 'ex.rb'
+        [line_no, col_no, msg]
       end
     end
   end
