@@ -336,6 +336,7 @@ COPS = {
   'Style/MutableConstant'            => 'style/mutable_constant',
   'Style/InverseMethods'             => 'style/inverse_methods',
   'Style/RedundantCondition'         => 'style/redundant_condition',
+  'Lint/RedundantSafeNavigation'     => 'lint/redundant_safe_navigation',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

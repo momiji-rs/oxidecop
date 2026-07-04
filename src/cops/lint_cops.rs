@@ -15397,3 +15397,628 @@ impl<'pr, 's> ruby_prism::Visit<'pr> for UamFold<'s> {
         self.handle_call(node);
     }
 }
+
+
+/// `nil.methods` on Ruby 3.4 (hand-copied — no runtime to query from a
+/// static-schema Rust port), the set upstream computes ONCE at cop-class
+/// load time as `RedundantSafeNavigation::NIL_METHODS` (used by
+/// `respond_to_nil_method?`) and again — identically, `:!` is already a
+/// member — as `Lint::Utils::NilReceiverChecker::NIL_METHODS` (used by
+/// `non_nil_method?`). One shared list backs both ports below.
+const RSN_NIL_METHODS: &[&[u8]] = &[
+    b"!", b"!=", b"!~", b"&", b"<=>", b"==", b"===", b"=~", b"^", b"__id__", b"__send__", b"class",
+    b"clone", b"define_singleton_method", b"display", b"dup", b"enum_for", b"eql?", b"equal?",
+    b"extend", b"freeze", b"frozen?", b"hash", b"inspect", b"instance_eval", b"instance_exec",
+    b"instance_of?", b"instance_variable_defined?", b"instance_variable_get",
+    b"instance_variable_set", b"instance_variables", b"is_a?", b"itself", b"kind_of?", b"method",
+    b"methods", b"nil?", b"object_id", b"private_methods", b"protected_methods", b"public_method",
+    b"public_methods", b"public_send", b"rationalize", b"remove_instance_variable", b"respond_to?",
+    b"send", b"singleton_class", b"singleton_method", b"singleton_methods", b"tap", b"then",
+    b"to_a", b"to_c", b"to_enum", b"to_f", b"to_h", b"to_i", b"to_r", b"to_s", b"yield_self", b"|",
+];
+
+impl<'a> super::Cops<'a> {
+    /// Lint/RedundantSafeNavigation — `on_csend`. Ported verbatim from
+    /// upstream's method of the same name: MSG_NON_NIL (gated behind the
+    /// `InferNonNilReceiver` config flag, and only when `rsn_scan_scope`
+    /// already proved this exact call's receiver can't be nil — see that
+    /// function's doc) takes priority; otherwise falls through to the
+    /// "plain" `guarded_by_nil_receiver?` port (`rsn_guarded_by_nil_receiver`)
+    /// for the default MSG. Anchor for both is `node.loc.dot` (prism:
+    /// `call_operator_loc()`) — just the `&.` text — and so is the
+    /// autocorrect (`replace(range, '.')`).
+    pub(crate) fn check_redundant_safe_navigation(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Lint/RedundantSafeNavigation";
+        if !self.on(COP) || !node.is_safe_navigation() {
+            return;
+        }
+        let Some(op) = node.call_operator_loc() else { return };
+        let anchor = op.start_offset();
+        if self.cfg.get(COP, "InferNonNilReceiver") == Some("true")
+            && self.rsn_infer_nonnil.contains(&node.location().start_offset())
+        {
+            self.push(
+                anchor,
+                COP,
+                true,
+                "Redundant safe navigation on non-nil receiver (detected by analyzing previous code/method invocations).",
+            );
+            self.fixes.push((anchor, op.end_offset(), b".".to_vec()));
+            return;
+        }
+        if self.rsn_guarded_by_nil_receiver(node) {
+            return;
+        }
+        self.push(anchor, COP, true, "Redundant safe navigation detected, use `.` instead.");
+        self.fixes.push((anchor, op.end_offset(), b".".to_vec()));
+    }
+
+    /// `guarded_by_nil_receiver?`: is the `&.` actually load-bearing?
+    fn rsn_guarded_by_nil_receiver(&self, node: &ruby_prism::CallNode) -> bool {
+        let Some(receiver) = node.receiver() else { return false };
+        if rsn_assume_receiver_instance_exists(&receiver) {
+            return false;
+        }
+        let guaranteed_instance = rsn_guaranteed_instance(&receiver);
+        if !guaranteed_instance && !self.rsn_check(node) {
+            return true;
+        }
+        self.rsn_respond_to_nil_method(node) && !guaranteed_instance
+    }
+
+    /// `check?`: the method must be one of `AllowedMethods`, AND this exact
+    /// `csend` call must sit directly in a "condition-ish" position — see
+    /// `Cops::rsn_cond_pos`'s doc for exactly which positions qualify and
+    /// where they're populated (prism gives no parent pointer).
+    fn rsn_check(&self, node: &ruby_prism::CallNode) -> bool {
+        const COP: &str = "Lint/RedundantSafeNavigation";
+        if !self.allowed_method_name(COP, node.name().as_slice()) {
+            return false;
+        }
+        self.rsn_cond_pos.contains(&node.location().start_offset())
+    }
+
+    /// `respond_to_nil_method?`: `(csend _ :respond_to? (sym %NIL_METHODS))`
+    /// — a `&.respond_to?(:sym)` call whose sole argument names a method
+    /// `nil` itself implements (so dropping `&.` would silently swap a
+    /// `nil` result for a real `true`/`false`, changing the truthiness of
+    /// unrelated-looking code).
+    fn rsn_respond_to_nil_method(&self, node: &ruby_prism::CallNode) -> bool {
+        if node.name().as_slice() != b"respond_to?" {
+            return false;
+        }
+        let Some(args) = node.arguments() else { return false };
+        let arglist = args.arguments();
+        let mut iter = arglist.iter();
+        let Some(first) = iter.next() else { return false };
+        if iter.next().is_some() {
+            return false;
+        }
+        let Some(sym) = first.as_symbol_node() else { return false };
+        RSN_NIL_METHODS.contains(&sym.unescaped())
+    }
+
+    /// Lint/RedundantSafeNavigation — `on_or`: `foo&.to_h || {}`-shaped
+    /// "conversion with default" redundancy (`conversion_with_default?`'s
+    /// six-way node-pattern `or`, ported as a per-method-name match since
+    /// prism's `CallNode` already carries an optional trailing `.block()`
+    /// as a plain field — unlike whitequark's separate wrapping `:block`
+    /// node type, so there's no separate "any_block" case to detect: a
+    /// `to_h` call's own `.block()` being present or absent is orthogonal
+    /// to whether it's the target of this pattern at all).
+    pub(crate) fn check_redundant_safe_navigation_or(&mut self, node: &ruby_prism::OrNode) {
+        const COP: &str = "Lint/RedundantSafeNavigation";
+        if !self.on(COP) {
+            return;
+        }
+        let lhs = node.left();
+        let Some(call) = lhs.as_call_node() else { return };
+        if !call.is_safe_navigation() || call.arguments().is_some() {
+            return;
+        }
+        let rhs = node.right();
+        let matches_default = match call.name().as_slice() {
+            b"to_h" => rhs.as_hash_node().is_some_and(|h| h.elements().iter().next().is_none()),
+            b"to_a" => {
+                call.block().is_none()
+                    && rhs.as_array_node().is_some_and(|a| a.elements().iter().next().is_none())
+            }
+            b"to_i" => call.block().is_none() && rsn_is_int_zero(&rhs),
+            b"to_f" => call.block().is_none() && rsn_is_float_zero(&rhs),
+            b"to_s" => {
+                call.block().is_none()
+                    && rhs.as_string_node().is_some_and(|s| s.unescaped().is_empty())
+            }
+            _ => false,
+        };
+        if !matches_default {
+            return;
+        }
+        let Some(op) = call.call_operator_loc() else { return };
+        self.push(
+            op.start_offset(),
+            COP,
+            true,
+            "Redundant safe navigation with default literal detected.",
+        );
+        self.fixes.push((op.start_offset(), op.end_offset(), b".".to_vec()));
+        self.fixes.push((lhs.location().end_offset(), node.location().end_offset(), Vec::new()));
+    }
+
+    /// Lint/RedundantSafeNavigation's `InferNonNilReceiver`: scan one
+    /// analysis scope (a `def`/`defs` body, or the top-level program body —
+    /// upstream's `NilReceiverChecker` stops climbing at `:def`/`:defs`/
+    /// `:class`/`:module`/`:sclass`, so those are exactly the scope
+    /// boundaries) and populate `self.rsn_infer_nonnil` with the start
+    /// offset of every `csend` call inside whose receiver is ALREADY
+    /// PROVEN non-nil by a real dereference (or, for an `if`'s own true
+    /// branch, by the condition itself) reachable along every path to it.
+    ///
+    /// Upstream computes this by climbing UP from each `csend`'s receiver
+    /// through `node.parent`/`node.left_siblings` (rubocop-ast gives real
+    /// parent pointers; prism gives none). This instead walks DOWN through
+    /// the scope exactly ONCE, threading a growing set of receiver-
+    /// expression SOURCE TEXTS already known non-nil ("evidence") — see
+    /// `rsn_scan`'s doc for why the two are equivalent and how each upstream
+    /// node-type case (`_cant_be_nil?`'s `case node.type`) maps to a branch
+    /// there, and `rsn_sole_condition_root` for the `sole_condition_of_parent_if?`
+    /// bonus. Guarded behind the config flag (default off) since it's an
+    /// O(scope size) walk of literally every scope in the file.
+    pub(crate) fn rsn_scan_scope(&mut self, body: &ruby_prism::Node) {
+        const COP: &str = "Lint/RedundantSafeNavigation";
+        if !self.on(COP) || self.cfg.get(COP, "InferNonNilReceiver") != Some("true") {
+            return;
+        }
+        let additional_owned = self
+            .cfg
+            .get(COP, "AdditionalNilMethods")
+            .map(crate::config::parse_allowed_list)
+            .unwrap_or_else(|| vec!["present?".to_string(), "blank?".to_string()]);
+        let additional: Vec<&[u8]> = additional_owned.iter().map(|s| s.as_bytes()).collect();
+        rsn_scan(body, &[], &additional, &mut self.rsn_infer_nonnil);
+    }
+}
+
+/// See `rsn_scan_scope`'s doc for the overall algorithm. Returns the
+/// evidence GUARANTEED to hold immediately after `node` finishes executing
+/// (used to fold across a sequential list by callers); flags every
+/// `InferNonNilReceiver`-redundant `csend` found ANYWHERE in `node`'s
+/// subtree into `out` (keyed by that call's own start offset) as a side
+/// effect, including inside non-guaranteed positions (a block body, an
+/// `and`/`or` RHS, an `if`/`case`/`when` branch, a `rescue`/`ensure`/`else`
+/// clause) — those are scanned with whatever evidence is available AT THAT
+/// POINT, but their OWN findings are discarded by the caller (never folded
+/// into the returned evidence), exactly mirroring upstream's per-node-type
+/// `case` in `_cant_be_nil?`: only a `:send`/`:begin`/`:if`/`:case`/`:and`/
+/// `:or`/`:pair`/`:when`/`*asgn` node's specific "always-runs-first" child
+/// contributes evidence that survives past it; a `def`/`class`/`module`/
+/// `sclass` found here is a scope boundary (stops immediately, contributing
+/// nothing) — its OWN interior gets scanned separately, fresh, when the
+/// main traversal's `visit_def_node`/etc. reaches it directly.
+fn rsn_scan(
+    node: &ruby_prism::Node,
+    evidence: &[Vec<u8>],
+    additional_nil: &[&[u8]],
+    out: &mut HashSet<usize>,
+) -> Vec<Vec<u8>> {
+    if node.as_def_node().is_some()
+        || node.as_class_node().is_some()
+        || node.as_module_node().is_some()
+        || node.as_singleton_class_node().is_some()
+    {
+        return evidence.to_vec();
+    }
+    if let Some(call) = node.as_call_node() {
+        let mut ev = evidence.to_vec();
+        if let Some(r) = call.receiver() {
+            ev = rsn_scan(&r, &ev, additional_nil, out);
+        }
+        if let Some(args) = call.arguments() {
+            for a in args.arguments().iter() {
+                ev = rsn_scan(&a, &ev, additional_nil, out);
+            }
+        }
+        if let Some(blk) = call.block() {
+            if let Some(b) = blk.as_block_node() {
+                if let Some(body) = b.body() {
+                    let _ = rsn_scan(&body, &ev, additional_nil, out);
+                }
+            }
+        }
+        if call.is_safe_navigation() {
+            if let Some(r) = call.receiver() {
+                if evidence_contains(&ev, r.location().as_slice()) {
+                    out.insert(call.location().start_offset());
+                }
+            }
+            return ev;
+        }
+        if let Some(r) = call.receiver() {
+            if rsn_non_nil_method(call.name().as_slice(), additional_nil) {
+                ev.push(r.location().as_slice().to_vec());
+            }
+        }
+        return ev;
+    }
+    if let Some(s) = node.as_statements_node() {
+        let mut ev = evidence.to_vec();
+        for stmt in s.body().iter() {
+            ev = rsn_scan(&stmt, &ev, additional_nil, out);
+        }
+        return ev;
+    }
+    if let Some(a) = node.as_array_node() {
+        let mut ev = evidence.to_vec();
+        for e in a.elements().iter() {
+            ev = rsn_scan(&e, &ev, additional_nil, out);
+        }
+        return ev;
+    }
+    if let Some(h) = node.as_hash_node() {
+        let mut ev = evidence.to_vec();
+        for e in h.elements().iter() {
+            ev = rsn_scan(&e, &ev, additional_nil, out);
+        }
+        return ev;
+    }
+    if let Some(a) = node.as_assoc_node() {
+        let ev = rsn_scan(&a.key(), evidence, additional_nil, out);
+        return rsn_scan(&a.value(), &ev, additional_nil, out);
+    }
+    if let Some(a) = node.as_assoc_splat_node() {
+        if let Some(v) = a.value() {
+            return rsn_scan(&v, evidence, additional_nil, out);
+        }
+        return evidence.to_vec();
+    }
+    if let Some(a) = node.as_arguments_node() {
+        let mut ev = evidence.to_vec();
+        for e in a.arguments().iter() {
+            ev = rsn_scan(&e, &ev, additional_nil, out);
+        }
+        return ev;
+    }
+    if let Some(a) = node.as_and_node() {
+        let ev_after_lhs = rsn_scan(&a.left(), evidence, additional_nil, out);
+        let _ = rsn_scan(&a.right(), &ev_after_lhs, additional_nil, out);
+        return ev_after_lhs;
+    }
+    if let Some(o) = node.as_or_node() {
+        let ev_after_lhs = rsn_scan(&o.left(), evidence, additional_nil, out);
+        let _ = rsn_scan(&o.right(), &ev_after_lhs, additional_nil, out);
+        return ev_after_lhs;
+    }
+    if let Some(i) = node.as_if_node() {
+        let cond = i.predicate();
+        let ev_after_cond = rsn_scan(&cond, evidence, additional_nil, out);
+        let mut ev_then = ev_after_cond.clone();
+        if let Some(root) = rsn_sole_condition_root(&cond) {
+            ev_then.push(root.to_vec());
+        }
+        if let Some(stmts) = i.statements() {
+            let _ = rsn_scan(&stmts.as_node(), &ev_then, additional_nil, out);
+        }
+        if let Some(sub) = i.subsequent() {
+            let _ = rsn_scan(&sub, &ev_after_cond, additional_nil, out);
+        }
+        return ev_after_cond;
+    }
+    if let Some(u) = node.as_unless_node() {
+        let cond = u.predicate();
+        let ev_after_cond = rsn_scan(&cond, evidence, additional_nil, out);
+        if let Some(stmts) = u.statements() {
+            let _ = rsn_scan(&stmts.as_node(), &ev_after_cond, additional_nil, out);
+        }
+        if let Some(e) = u.else_clause() {
+            let _ = rsn_scan(&e.as_node(), &ev_after_cond, additional_nil, out);
+        }
+        return ev_after_cond;
+    }
+    if let Some(e) = node.as_else_node() {
+        if let Some(stmts) = e.statements() {
+            return rsn_scan(&stmts.as_node(), evidence, additional_nil, out);
+        }
+        return evidence.to_vec();
+    }
+    if let Some(w) = node.as_when_node() {
+        let mut ev = evidence.to_vec();
+        for c in w.conditions().iter() {
+            ev = rsn_scan(&c, &ev, additional_nil, out);
+        }
+        if let Some(stmts) = w.statements() {
+            let _ = rsn_scan(&stmts.as_node(), &ev, additional_nil, out);
+        }
+        return ev;
+    }
+    if let Some(i) = node.as_in_node() {
+        let _ = rsn_scan(&i.pattern(), evidence, additional_nil, out);
+        if let Some(stmts) = i.statements() {
+            let _ = rsn_scan(&stmts.as_node(), evidence, additional_nil, out);
+        }
+        return evidence.to_vec();
+    }
+    if let Some(c) = node.as_case_node() {
+        let mut ev = match c.predicate() {
+            Some(p) => rsn_scan(&p, evidence, additional_nil, out),
+            None => evidence.to_vec(),
+        };
+        for w in c.conditions().iter() {
+            ev = rsn_scan(&w, &ev, additional_nil, out);
+        }
+        if let Some(e) = c.else_clause() {
+            let _ = rsn_scan(&e.as_node(), &ev, additional_nil, out);
+        }
+        return ev;
+    }
+    if let Some(c) = node.as_case_match_node() {
+        let ev = match c.predicate() {
+            Some(p) => rsn_scan(&p, evidence, additional_nil, out),
+            None => evidence.to_vec(),
+        };
+        for i in c.conditions().iter() {
+            let _ = rsn_scan(&i, &ev, additional_nil, out);
+        }
+        if let Some(e) = c.else_clause() {
+            let _ = rsn_scan(&e.as_node(), &ev, additional_nil, out);
+        }
+        return ev;
+    }
+    if let Some(w) = node.as_local_variable_write_node() {
+        return rsn_scan(&w.value(), evidence, additional_nil, out);
+    }
+    if let Some(w) = node.as_instance_variable_write_node() {
+        return rsn_scan(&w.value(), evidence, additional_nil, out);
+    }
+    if let Some(w) = node.as_class_variable_write_node() {
+        return rsn_scan(&w.value(), evidence, additional_nil, out);
+    }
+    if let Some(w) = node.as_global_variable_write_node() {
+        return rsn_scan(&w.value(), evidence, additional_nil, out);
+    }
+    if let Some(w) = node.as_constant_write_node() {
+        return rsn_scan(&w.value(), evidence, additional_nil, out);
+    }
+    if let Some(w) = node.as_constant_path_write_node() {
+        return rsn_scan(&w.value(), evidence, additional_nil, out);
+    }
+    if let Some(p) = node.as_parentheses_node() {
+        if let Some(b) = p.body() {
+            return rsn_scan(&b, evidence, additional_nil, out);
+        }
+        return evidence.to_vec();
+    }
+    if let Some(w) = node.as_while_node() {
+        let ev_after_cond = rsn_scan(&w.predicate(), evidence, additional_nil, out);
+        if let Some(stmts) = w.statements() {
+            let _ = rsn_scan(&stmts.as_node(), &ev_after_cond, additional_nil, out);
+        }
+        return ev_after_cond;
+    }
+    if let Some(w) = node.as_until_node() {
+        let ev_after_cond = rsn_scan(&w.predicate(), evidence, additional_nil, out);
+        if let Some(stmts) = w.statements() {
+            let _ = rsn_scan(&stmts.as_node(), &ev_after_cond, additional_nil, out);
+        }
+        return ev_after_cond;
+    }
+    if let Some(b) = node.as_begin_node() {
+        let mut ev = match b.statements() {
+            Some(s) => rsn_scan(&s.as_node(), evidence, additional_nil, out),
+            None => evidence.to_vec(),
+        };
+        if let Some(resc) = b.rescue_clause() {
+            let mut r = Some(resc);
+            while let Some(rn) = r {
+                if let Some(stmts) = rn.statements() {
+                    let _ = rsn_scan(&stmts.as_node(), evidence, additional_nil, out);
+                }
+                r = rn.subsequent();
+            }
+        }
+        if let Some(e) = b.else_clause() {
+            ev = rsn_scan(&e.as_node(), &ev, additional_nil, out);
+        }
+        if let Some(ens) = b.ensure_clause() {
+            if let Some(stmts) = ens.statements() {
+                ev = rsn_scan(&stmts.as_node(), evidence, additional_nil, out);
+            }
+        }
+        return ev;
+    }
+    if let Some(r) = node.as_rescue_modifier_node() {
+        let _ = rsn_scan(&r.expression(), evidence, additional_nil, out);
+        let _ = rsn_scan(&r.rescue_expression(), evidence, additional_nil, out);
+        return evidence.to_vec();
+    }
+    if let Some(r) = node.as_return_node() {
+        if let Some(args) = r.arguments() {
+            for a in args.arguments().iter() {
+                let _ = rsn_scan(&a, evidence, additional_nil, out);
+            }
+        }
+        return evidence.to_vec();
+    }
+    if let Some(b) = node.as_break_node() {
+        if let Some(args) = b.arguments() {
+            for a in args.arguments().iter() {
+                let _ = rsn_scan(&a, evidence, additional_nil, out);
+            }
+        }
+        return evidence.to_vec();
+    }
+    if let Some(n) = node.as_next_node() {
+        if let Some(args) = n.arguments() {
+            for a in args.arguments().iter() {
+                let _ = rsn_scan(&a, evidence, additional_nil, out);
+            }
+        }
+        return evidence.to_vec();
+    }
+    if let Some(y) = node.as_yield_node() {
+        if let Some(args) = y.arguments() {
+            for a in args.arguments().iter() {
+                let _ = rsn_scan(&a, evidence, additional_nil, out);
+            }
+        }
+        return evidence.to_vec();
+    }
+    if let Some(s) = node.as_splat_node() {
+        if let Some(e) = s.expression() {
+            let _ = rsn_scan(&e, evidence, additional_nil, out);
+        }
+        return evidence.to_vec();
+    }
+    if let Some(b) = node.as_block_argument_node() {
+        if let Some(e) = b.expression() {
+            let _ = rsn_scan(&e, evidence, additional_nil, out);
+        }
+        return evidence.to_vec();
+    }
+    if let Some(d) = node.as_defined_node() {
+        let _ = rsn_scan(&d.value(), evidence, additional_nil, out);
+        return evidence.to_vec();
+    }
+    // Anything else (literals, bare variable reads, pattern-match nodes,
+    // parameter lists, ...) has no "guaranteed-first" child upstream's
+    // `_cant_be_nil?` would recurse into either — matches its `case`
+    // falling through to the generic sibling/parent climb with nothing
+    // found, i.e. a no-op here.
+    evidence.to_vec()
+}
+
+fn evidence_contains(evidence: &[Vec<u8>], text: &[u8]) -> bool {
+    evidence.iter().any(|e| e.as_slice() == text)
+}
+
+/// `non_nil_method?`: not one of `nil`'s own methods, and not configured
+/// via `AdditionalNilMethods` (default `present?`/`blank?`).
+fn rsn_non_nil_method(name: &[u8], additional_nil: &[&[u8]]) -> bool {
+    if additional_nil.iter().any(|m| *m == name) {
+        return false;
+    }
+    !RSN_NIL_METHODS.contains(&name)
+}
+
+/// `sole_condition_of_parent_if?`'s per-branch bonus, restricted to the
+/// (single) case that matters here: `condition` is the enclosing `if`'s
+/// OWN, WHOLE predicate (never a sub-part of a compound one — callers only
+/// ever pass an `if`'s direct `predicate()`). If it's a bare reference
+/// (`if foo`) or a `csend` chain of any depth (`if foo&.bar&.baz`), entering
+/// the TRUE branch proves the chain's ROOT receiver truthy, hence non-nil.
+/// Callers never apply this to `unless` (a falsy condition there could
+/// still mean `nil`, so upstream's `unless parent.unless?` guard excludes
+/// it entirely).
+fn rsn_sole_condition_root<'x>(condition: &ruby_prism::Node<'x>) -> Option<&'x [u8]> {
+    if condition.as_local_variable_read_node().is_some() {
+        return Some(condition.location().as_slice());
+    }
+    let call = condition.as_call_node()?;
+    if call.is_safe_navigation() {
+        return Some(rsn_csend_root_receiver(&call));
+    }
+    if call.receiver().is_none() {
+        return Some(condition.location().as_slice());
+    }
+    None
+}
+
+/// `csend_root_receiver`: walk down a (possibly mixed send/csend) call
+/// chain's receivers to the innermost one that isn't itself a call with a
+/// receiver of its own.
+fn rsn_csend_root_receiver<'x>(call: &ruby_prism::CallNode<'x>) -> &'x [u8] {
+    let mut recv = match call.receiver() {
+        Some(r) => r,
+        None => return call.location().as_slice(),
+    };
+    loop {
+        let Some(inner) = recv.as_call_node() else { break };
+        match inner.receiver() {
+            Some(r) => recv = r,
+            None => break,
+        }
+    }
+    recv.location().as_slice()
+}
+
+/// `assume_receiver_instance_exists?`: a camelCase-named constant, `self`,
+/// or any non-`nil` literal is assumed to never actually be `nil` at
+/// runtime, so `&.` on one is unconditionally redundant.
+fn rsn_assume_receiver_instance_exists(receiver: &ruby_prism::Node) -> bool {
+    if rsn_is_camel_case_const(receiver) {
+        return true;
+    }
+    receiver.as_self_node().is_some() || (rsn_is_literal(receiver) && receiver.as_nil_node().is_none())
+}
+
+/// `receiver.const_type? && !receiver.short_name.match?(SNAKE_CASE)` — a
+/// constant (bare or namespaced) whose LAST segment isn't
+/// `SCREAMING_SNAKE_CASE` reads as a class/module name (rubocop's own
+/// `Naming/ConstantName` heuristic), which is never realistically `nil`.
+fn rsn_is_camel_case_const(receiver: &ruby_prism::Node) -> bool {
+    let short_name: Option<&[u8]> = if let Some(c) = receiver.as_constant_read_node() {
+        Some(c.name().as_slice())
+    } else if let Some(c) = receiver.as_constant_path_node() {
+        c.name().map(|n| n.as_slice())
+    } else {
+        None
+    };
+    let Some(name) = short_name else { return false };
+    !rsn_snake_case(name)
+}
+
+/// `SNAKE_CASE = /\A[[:digit:][:upper:]_]+\z/` — every byte is an ASCII
+/// digit, ASCII uppercase letter, or underscore.
+fn rsn_snake_case(name: &[u8]) -> bool {
+    !name.is_empty() && name.iter().all(|&b| b.is_ascii_digit() || b.is_ascii_uppercase() || b == b'_')
+}
+
+/// `receiver.literal? && !receiver.nil_type?` — a basic literal OTHER than
+/// the `nil` literal itself.
+fn rsn_is_literal(node: &ruby_prism::Node) -> bool {
+    node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_rational_node().is_some()
+        || node.as_imaginary_node().is_some()
+        || node.as_string_node().is_some()
+        || node.as_interpolated_string_node().is_some()
+        || node.as_x_string_node().is_some()
+        || node.as_interpolated_x_string_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_interpolated_symbol_node().is_some()
+        || node.as_regular_expression_node().is_some()
+        || node.as_interpolated_regular_expression_node().is_some()
+        || node.as_array_node().is_some()
+        || node.as_hash_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+        || node.as_nil_node().is_some()
+        || node.as_range_node().is_some()
+}
+
+/// `guaranteed_instance?`: a plain (non-safe-nav) `.to_s`/`.to_i`/`.to_f`/
+/// `.to_a`/`.to_h` call's RESULT can never be `nil` (each always returns a
+/// real instance of its type), so a further `&.` on it is redundant
+/// regardless of the method that follows. A SAFE-NAV predecessor doesn't
+/// count (`foo&.to_s&.strip`'s first `&.` might itself short-circuit to
+/// `nil` without ever calling `to_s` at all) — mirrored here by requiring
+/// `!is_safe_navigation()`, matching upstream's `receiver.send_type?`
+/// (`false` for a whitequark `csend`). Prism represents an attached block
+/// as a plain optional field on the SAME `CallNode` (unlike whitequark's
+/// separate wrapping `:block` node), so there's no separate "any_block"
+/// unwrap needed — `foo.to_h { ... }` already IS the `CallNode` this
+/// matches directly.
+fn rsn_guaranteed_instance(receiver: &ruby_prism::Node) -> bool {
+    let Some(call) = receiver.as_call_node() else { return false };
+    if call.is_safe_navigation() {
+        return false;
+    }
+    matches!(call.name().as_slice(), b"to_s" | b"to_i" | b"to_f" | b"to_a" | b"to_h")
+}
+
+fn rsn_is_int_zero(node: &ruby_prism::Node) -> bool {
+    node.as_integer_node().is_some_and(|n| TryInto::<i32>::try_into(n.value()) == Ok(0))
+}
+
+fn rsn_is_float_zero(node: &ruby_prism::Node) -> bool {
+    node.as_float_node().is_some_and(|n| n.value() == 0.0)
+}

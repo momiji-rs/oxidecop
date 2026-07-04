@@ -371,7 +371,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
-    "Style/RedundantCondition",
+    "Style/RedundantCondition", "Lint/RedundantSafeNavigation",
 ];
 
 impl Engine {
@@ -1440,6 +1440,26 @@ pub(crate) struct Cops<'a> {
     // `check_safe_navigation_chain`. See that function's doc comment for
     // the full mapping to upstream's `parent`-based predicates.
     pub(crate) snav_parent: HashMap<usize, lint_cops::SnavParent<'a>>,
+    // Lint/RedundantSafeNavigation: start offsets of expressions whose
+    // DIRECT structural parent is one of the "condition-ish" positions
+    // rubocop-ast's `check?` cares about — a conditional/post-condition-loop
+    // node's own `condition` slot (`if`/`unless`/`while`/`until`/`case`/
+    // `case`-with-pattern predicate), an `and`/`or` node's left OR right
+    // operand (`operator_keyword?` — true for the NODE TYPE `:and`/`:or`
+    // regardless of `&&`/`and` spelling), or the receiver of a `!`/`not`
+    // call (`negation_method?`). Populated pre-order in the relevant
+    // `visit_*` overrides (prism gives no parent pointer), consumed by
+    // `check_redundant_safe_navigation`'s `check?` port.
+    pub(crate) rsn_cond_pos: HashSet<usize>,
+    // Lint/RedundantSafeNavigation: start offsets of `csend` CALL nodes
+    // (keyed by the call's own `location().start_offset()`, i.e. covering
+    // the receiver+dot+message) that `InferNonNilReceiver` analysis
+    // determined have a guaranteed-non-nil receiver — populated once per
+    // enclosing scope (top-level `ProgramNode` body, or each `DefNode`
+    // body) by `rsn_scan_scope`, called BEFORE that scope's children are
+    // visited, so every entry a nested `visit_call_node` looks up is
+    // already present. See `rsn_scan_scope`'s doc for the algorithm.
+    pub(crate) rsn_infer_nonnil: HashSet<usize>,
     // Layout/ArrayAlignment: start offsets of bracketless `ArrayNode`s that
     // are the `value` of a `MultiWriteNode` — rubocop's `node.parent&
     // .masgn_type?` early return in `on_array` (a mass-assignment's bare
@@ -2257,6 +2277,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_regular_expression_node(self, node);
     }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        self.rsn_cond_pos.insert(node.predicate().location().start_offset());
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_and_or_conditional(&node.predicate());
         self.check_nested_ternary_operator(node);
@@ -2396,6 +2417,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        self.rsn_cond_pos.insert(node.predicate().location().start_offset());
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_else_layout_unless(node);
         // whitequark's parser has no distinct `unless` node type — `unless
@@ -2784,6 +2806,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_index_or_write_node(self, node);
     }
     fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
+        if let Some(pred) = node.predicate() {
+            self.rsn_cond_pos.insert(pred.location().start_offset());
+        }
         self.check_duplicate_case_condition(node);
         self.check_float_comparison_case(node);
         self.check_empty_when(node);
@@ -2808,6 +2833,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth -= 1;
     }
     fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
+        if let Some(pred) = node.predicate() {
+            self.rsn_cond_pos.insert(pred.location().start_offset());
+        }
         self.check_case_match_indentation(node);
         self.check_identical_conditional_branches_case_match(node);
         self.check_literal_as_condition_case_match(node);
@@ -3328,6 +3356,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.closing_loc(),
             node.is_begin_modifier(),
         );
+        self.rsn_cond_pos.insert(node.predicate().location().start_offset());
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_and_or_conditional(&node.predicate());
         self.check_assignment_in_condition(&node.predicate());
@@ -3411,6 +3440,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.closing_loc(),
             node.is_begin_modifier(),
         );
+        self.rsn_cond_pos.insert(node.predicate().location().start_offset());
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_and_or_conditional(&node.predicate());
         self.check_assignment_in_condition(&node.predicate());
@@ -3784,6 +3814,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.interp_depth -= 1;
     }
     fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
+        // Lint/RedundantSafeNavigation's `InferNonNilReceiver`: the top-level
+        // program body is its own scope too (see `visit_def_node`'s doc).
+        self.rsn_scan_scope(&node.statements().as_node());
         self.check_signal_exception_prescan(node);
         self.check_redundant_begin(node);
         self.check_block_nesting(node);
@@ -3940,6 +3973,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        // Lint/RedundantSafeNavigation's `InferNonNilReceiver`: a `def`/`defs`
+        // body is its own analysis scope (upstream's `NilReceiverChecker`
+        // stops climbing at `:def`/`:defs`/`:class`/`:module`/`:sclass`) —
+        // scan it fresh, BEFORE descending, so every nested `csend` call's
+        // verdict is already in `rsn_infer_nonnil` by the time `visit_call_node`
+        // reaches it.
+        if let Some(body) = node.body() {
+            self.rsn_scan_scope(&body);
+        }
         self.check_trivial_accessors(node);
         self.check_ascii_def(node);
         self.check_multiline_method_definition_brace_layout(node);
@@ -4227,6 +4269,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_alias_method_node(self, node);
     }
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
+        self.rsn_cond_pos.insert(node.left().location().start_offset());
+        self.rsn_cond_pos.insert(node.right().location().start_offset());
         self.check_and_or_and(node);
         self.check_and_with_identical_operands(node);
         self.check_literal_as_condition_and(node);
@@ -4255,6 +4299,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_and_node(self, node);
     }
     fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
+        self.rsn_cond_pos.insert(node.left().location().start_offset());
+        self.rsn_cond_pos.insert(node.right().location().start_offset());
+        self.check_redundant_safe_navigation_or(node);
         self.check_and_or_or(node);
         self.check_or_with_identical_operands(node);
         self.check_literal_as_condition_or(node);
@@ -4363,7 +4410,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                     self.sak_check(sel.start_offset(), sel.end_offset(), b"not");
                 }
             }
+            // Lint/RedundantSafeNavigation's `check?`: `parent.send_type? &&
+            // parent.negation_method?` — `negation_method?` itself requires
+            // a receiver (bare `!`/`not` with none is a syntax error anyway).
+            if let Some(r) = node.receiver() {
+                self.rsn_cond_pos.insert(r.location().start_offset());
+            }
         }
+        self.check_redundant_safe_navigation(node);
         self.check_double_negation(node);
         self.check_signal_exception_send(node);
         self.check_literal_as_condition_send(node);
@@ -5141,6 +5195,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         rescue_mod_parens: HashMap::new(),
         snc_offended: HashSet::new(),
         snav_parent: HashMap::new(),
+        rsn_cond_pos: HashSet::new(),
+        rsn_infer_nonnil: HashSet::new(),
         aa_masgn_rhs: HashSet::new(),
         aa_unbracketed_rhs_parent: HashMap::new(),
         aa_registered_ranges: Vec::new(),
