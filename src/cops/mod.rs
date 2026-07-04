@@ -371,7 +371,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
-    "Style/RedundantCondition", "Lint/RedundantSafeNavigation",
+    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren",
 ];
 
 impl Engine {
@@ -780,6 +780,18 @@ pub(crate) struct Cops<'a> {
     // rubocop's `class_node.left_siblings` (siblings with an earlier start
     // offset than the node being checked, since prism visits in source order).
     pub(crate) exception_siblings_stack: Vec<Vec<(usize, Vec<u8>)>>,
+    // Style/ClassAndModuleChildren: start offsets of class/module statements
+    // that are the SOLE statement of an enclosing class/module body —
+    // rubocop's `node.parent&.type?(:class, :module)` (prism always wraps a
+    // body in a `StatementsNode`, even a single-statement one, so this is
+    // computed structurally instead of via a real parent pointer).
+    pub(crate) cmc_sole_child: HashSet<usize>,
+    // Style/ClassAndModuleChildren: for a compact-named ("::") class/module
+    // statement, whether its immediately preceding sibling (searched
+    // recursively, like rubocop's `each_node(:class)`) already defines the
+    // namespace prefix as a real `class` — `replace_namespace_keyword`'s
+    // left-sibling lookup, keyed by the statement's start offset.
+    pub(crate) cmc_class_hint: HashMap<usize, bool>,
     // Style/MissingRespondToMissing: per enclosing class/module/sclass body,
     // whether a `respond_to_missing?` (plain `def`) and/or a `self.
     // respond_to_missing?` (`def self.`) exist ANYWHERE in that body's
@@ -3825,6 +3837,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_mixin_usage(&node.statements().as_node());
         self.class_children_stack.push(Self::direct_child_classes(&Some(node.statements().as_node())));
         self.exception_siblings_stack.push(Self::direct_child_defs(&Some(node.statements().as_node())));
+        self.cmc_precompute(&node.statements(), false);
         let top_body = node.statements().body();
         self.sgv_top_stmts = top_body
             .iter()
@@ -3865,6 +3878,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_class_methods(&node.constant_path(), node.body());
         self.check_documentation("class", node.location().start_offset(), &node.constant_path(), node.body());
         self.check_camel_case_name(&node.constant_path());
+        self.check_class_and_module_children_class(node);
         self.check_inherit_exception_class(node);
         self.check_ineffective_access_modifier(node.body());
         self.check_useless_access_modifier_scope(node.body());
@@ -3878,6 +3892,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
         self.respond_to_missing_stack.push(Self::scan_respond_to_missing(&node.body()));
+        if let Some(stmts) = node.body().as_ref().and_then(|b| b.as_statements_node()) {
+            self.cmc_precompute(&stmts, true);
+        }
         // Layout/EmptyLinesAroundAccessModifier's `@class_or_module_def_first_line`/
         // `@class_or_module_def_last_line` — `parent_class.first_line` (the
         // superclass expression) when there is one, else the class node's own
@@ -3922,6 +3939,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_class_methods(&node.constant_path(), node.body());
         self.check_documentation("module", node.location().start_offset(), &node.constant_path(), node.body());
         self.check_camel_case_name(&node.constant_path());
+        self.check_class_and_module_children_module(node);
         self.check_module_function(node);
         self.check_empty_lines_around_module_body(node);
         self.check_ineffective_access_modifier(node.body());
@@ -3934,6 +3952,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.class_children_stack.push(Self::direct_child_classes(&node.body()));
         self.exception_siblings_stack.push(Self::direct_child_defs(&node.body()));
         self.respond_to_missing_stack.push(Self::scan_respond_to_missing(&node.body()));
+        if let Some(stmts) = node.body().as_ref().and_then(|b| b.as_statements_node()) {
+            self.cmc_precompute(&stmts, true);
+        }
         let ml = node.location();
         self.el_am_class_first_line = Some(self.idx.loc(ml.start_offset()).0);
         self.el_am_class_last_line = Some(self.idx.loc(ml.end_offset().saturating_sub(1)).0);
@@ -5075,6 +5096,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         data_line: result.data_loc().map(|l| idx.loc(l.start_offset()).0),
         class_children_stack: Vec::new(),
         exception_siblings_stack: Vec::new(),
+        cmc_sole_child: HashSet::new(),
+        cmc_class_hint: HashMap::new(),
         respond_to_missing_stack: Vec::new(),
         comments: &comment_data,
         mod_stack: Vec::new(),

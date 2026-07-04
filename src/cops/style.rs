@@ -30066,3 +30066,577 @@ fn rc_evaluate<'pr>(
 
     Some((anchor, message, fixes))
 }
+
+
+// ---- Style/ClassAndModuleChildren -----------------------------------------
+// `nested` (default): `class Foo::Bar` -> `class Foo; class Bar; end; end`.
+// `compact`: the reverse, only when a class/module's SOLE child is itself a
+// class/module. Ports rubocop's `ClassAndModuleChildren` cop (mixins
+// `ConfigurableEnforcedStyle` + `Alignment` + `RangeHelp`) verbatim,
+// including its autocorrect quirks:
+//   - each add_offense/autocorrect only collapses or splits ONE nesting
+//     level; a deeply-nested chain relies on the harness's normal
+//     apply-fixes-until-stable loop (same as rubocop's own `-A`) to reach a
+//     fully flat/nested result over several rounds — verified against real
+//     rubocop 1.88 via ad hoc `RuboCop::Cop::Team` probes.
+//   - `Alignment`'s re-indent (`unindent`) only ever adjusts a line whose
+//     first byte is a literal SPACE (`String#start_with?(' ')`) — a
+//     TAB-indented line takes its buggy "characters before line start"
+//     branch, which never actually matches `/\A[ \t]+\z/` in practice, so
+//     tab-indented content is untouched no matter what `IndentationWidth`
+//     says (reproduced here as a plain "only touch space-led lines" rule
+//     rather than replaying that out-of-bounds arithmetic).
+//   - prism always wraps a class/module body in a `StatementsNode` (even a
+//     single statement), unlike whitequark's parser gem, which collapses a
+//     sole statement to the bare node — every place upstream leans on that
+//     whitequark collapsing (`node.parent&.type?(:class, :module)`,
+//     `needs_compacting?(body)`, `node.body.children.last`) is reconstructed
+//     here structurally (a `StatementsNode` of length 1) instead.
+impl<'a> super::Cops<'a> {
+    /// Per enclosing statement list (top-level program, or a class/module
+    /// body), precomputes two things every compact/nested child statement
+    /// needs from its PARENT's vantage point (prism gives no parent
+    /// pointer):
+    ///   - `cmc_sole_child`: this is rubocop's `node.parent&.type?(:class,
+    ///     :module)` — true when a class/module statement is the ONLY
+    ///     element of a class/module's body.
+    ///   - `cmc_class_hint`: for a compact-named ("::") class/module
+    ///     statement, `replace_namespace_keyword`'s left-sibling lookup —
+    ///     whether the immediately preceding sibling (searched recursively,
+    ///     like rubocop's `each_node(:class)`) already defines the
+    ///     namespace prefix as a real `class` (vs the `module` default).
+    /// `is_class_module_body` distinguishes an actual class/module body from
+    /// the top-level program's statement list — `cmc_sole_child` only ever
+    /// applies to the former (rubocop's `node.parent&.type?(:class,
+    /// :module)` requires the PARENT itself to be a class/module; the
+    /// top-level program is neither, so a lone top-level class/module is
+    /// never "sole child" in that sense, even though the left-sibling
+    /// lookup below still applies at the top level too).
+    pub(crate) fn cmc_precompute(&mut self, stmts: &ruby_prism::StatementsNode, is_class_module_body: bool) {
+        let list = stmts.body();
+        if is_class_module_body && list.len() == 1 {
+            if let Some(n) = list.first() {
+                if n.as_class_node().is_some() || n.as_module_node().is_some() {
+                    self.cmc_sole_child.insert(n.location().start_offset());
+                }
+            }
+        }
+        let mut prev: Option<ruby_prism::Node> = None;
+        for n in list.iter() {
+            let cpath_opt = n
+                .as_class_node()
+                .map(|c| c.constant_path())
+                .or_else(|| n.as_module_node().map(|m| m.constant_path()));
+            if let Some(cpath) = cpath_opt {
+                if let Some(target) = cmc_namespace_segments(&cpath) {
+                    let is_class = prev.as_ref().is_some_and(|p| cmc_class_defines(p, &target));
+                    self.cmc_class_hint.insert(n.location().start_offset(), is_class);
+                }
+            }
+            prev = Some(n);
+        }
+    }
+
+    pub(crate) fn check_class_and_module_children_class(&mut self, node: &ruby_prism::ClassNode) {
+        let kw = node.class_keyword_loc();
+        let end_kw = node.end_keyword_loc();
+        self.cmc_check(
+            "class",
+            node.constant_path(),
+            node.body(),
+            node.location().start_offset(),
+            (kw.start_offset(), kw.end_offset()),
+            (end_kw.start_offset(), end_kw.end_offset()),
+            node.superclass().is_some(),
+        );
+    }
+
+    pub(crate) fn check_class_and_module_children_module(&mut self, node: &ruby_prism::ModuleNode) {
+        let kw = node.module_keyword_loc();
+        let end_kw = node.end_keyword_loc();
+        self.cmc_check(
+            "module",
+            node.constant_path(),
+            node.body(),
+            node.location().start_offset(),
+            (kw.start_offset(), kw.end_offset()),
+            (end_kw.start_offset(), end_kw.end_offset()),
+            false,
+        );
+    }
+
+    /// `on_class`/`on_module` + `check_style`: resolves `EnforcedStyle`
+    /// (falling back from `EnforcedStyleForClasses`/`EnforcedStyleForModules`
+    /// to the base `EnforcedStyle`, schema default `nested`), applies the
+    /// namespace-shape guards (`identifier.namespace&.cbase_type?` /
+    /// `const_namespace?`), then dispatches to the nested or compact check.
+    /// The `has_superclass && base_style != "nested"` guard uses the BASE
+    /// style (not `style_for_classes`) even though the branch below uses the
+    /// per-kind override — matching upstream's `on_class`/`autocorrect`
+    /// verbatim (its early return reads plain `style`, not
+    /// `style_for_classes`).
+    fn cmc_check(
+        &mut self,
+        kind: &'static str,
+        cpath: ruby_prism::Node,
+        body: Option<ruby_prism::Node>,
+        node_start: usize,
+        kw: (usize, usize),
+        end_kw: (usize, usize),
+        has_superclass: bool,
+    ) {
+        const COP: &str = "Style/ClassAndModuleChildren";
+        const NESTED_MSG: &str = "Use nested module/class definitions instead of compact style.";
+        const COMPACT_MSG: &str = "Use compact module/class definition instead of nested style.";
+        if !self.on(COP) {
+            return;
+        }
+        let base_style = self.cfg.enforced_style(COP);
+        if kind == "class" && has_superclass && base_style != "nested" {
+            return;
+        }
+        let param = if kind == "class" { "EnforcedStyleForClasses" } else { "EnforcedStyleForModules" };
+        let style = self.cfg.get(COP, param).unwrap_or(base_style);
+
+        let ns = cmc_namespace_of(&cpath);
+        if matches!(ns, CmcNs::Cbase) {
+            return;
+        }
+        if !cmc_const_namespace_valid(&ns) {
+            return;
+        }
+
+        if style == "nested" {
+            // `compact_node_name?`: the identifier must itself contain a
+            // `::` — only true when prism parsed it as a `ConstantPathNode`.
+            if cpath.as_constant_path_node().is_none() {
+                return;
+            }
+            if self.cmc_sole_child.contains(&node_start) {
+                return;
+            }
+            let name_start = cpath.location().start_offset();
+            self.push(name_start, COP, true, NESTED_MSG);
+            self.cmc_nest_definition(&cpath, node_start, kw, end_kw);
+        } else {
+            if self.cmc_sole_child.contains(&node_start) {
+                return;
+            }
+            let Some(bar) = cmc_sole_cm_child(&body) else { return };
+            let name_start = cpath.location().start_offset();
+            self.push(name_start, COP, true, COMPACT_MSG);
+            self.cmc_compact_definition(&cpath, node_start, kw, &bar);
+        }
+    }
+
+    /// `nest_definition`: three independent edits (namespace keyword,
+    /// double-colon split, synthesized trailing `end`) — see the `padding`/
+    /// `padding_for_trailing_end` derivation in upstream's `Alignment`-based
+    /// `indentation`/`leading_spaces` helpers, replicated byte-for-byte via
+    /// `cmc_sub_first` (Ruby's `String#sub` with a literal pattern).
+    fn cmc_nest_definition(
+        &mut self,
+        cpath: &ruby_prism::Node,
+        node_start: usize,
+        kw: (usize, usize),
+        end_kw: (usize, usize),
+    ) {
+        let width = self.cmc_configured_indentation_width();
+        let node_col = self.idx.loc(node_start).1 - 1;
+        let leading = self.leading_spaces_at(node_start);
+        let mut padding = vec![b' '; node_col];
+        padding.extend(std::iter::repeat_n(b' ', width));
+        padding.extend_from_slice(&leading);
+        let end_col = self.idx.loc(end_kw.0).1 - 1;
+        let removal = vec![b' '; end_col];
+        let padding_for_trailing_end = cmc_sub_first(&padding, &removal);
+
+        // `replace_namespace_keyword`
+        let namespace_keyword = self.cmc_namespace_keyword(node_start);
+        self.fixes.push((kw.0, kw.1, namespace_keyword.as_bytes().to_vec()));
+
+        // `split_on_double_colon`
+        let cp = cpath.as_constant_path_node().expect("nested-style offense implies a compact constant path");
+        let delim = cp.delimiter_loc();
+        let orig_keyword = self.src[kw.0..kw.1].to_vec();
+        let mut repl2 = vec![b'\n'];
+        repl2.extend_from_slice(&padding);
+        repl2.extend_from_slice(&orig_keyword);
+        repl2.push(b' ');
+        self.fixes.push((delim.start_offset(), delim.end_offset(), repl2));
+
+        // `add_trailing_end`
+        let mut repl3 = padding_for_trailing_end;
+        repl3.extend_from_slice(b"end\n");
+        repl3.extend_from_slice(&leading);
+        repl3.extend_from_slice(b"end");
+        self.fixes.push((end_kw.0, end_kw.1, repl3));
+    }
+
+    /// `compact_definition`: merge the header line, drop the inner `end`,
+    /// then re-indent whatever body content is left (`unindent`).
+    fn cmc_compact_definition(
+        &mut self,
+        cpath: &ruby_prism::Node,
+        outer_node_start: usize,
+        kw: (usize, usize),
+        bar: &ruby_prism::Node,
+    ) {
+        let bar_kind = cmc_node_kind(bar);
+        let bar_cpath = if let Some(c) = bar.as_class_node() {
+            c.constant_path()
+        } else {
+            bar.as_module_node().expect("sole compactable child is a class or module").constant_path()
+        };
+        let bar_name_loc = cmc_name_loc(&bar_cpath);
+        let bar_body = cmc_node_body(bar);
+        let bar_end_loc = cmc_node_end_loc(bar);
+        let bar_header_line = self.idx.loc(bar.location().start_offset()).0;
+
+        // `compact_node` + `compact_replacement`
+        let outer_name = cmc_const_name(cpath);
+        let bar_name = cmc_const_name(&bar_cpath);
+        let replacement = self.cmc_compact_replacement(bar_kind, &outer_name, &bar_name, bar_header_line);
+        self.fixes.push((kw.0, bar_name_loc.1, replacement));
+
+        // `remove_end`
+        let (rm_start, rm_end) = self.cmc_remove_end_range(
+            bar.location().start_offset(),
+            bar_name_loc.1,
+            bar_end_loc.start_offset(),
+            bar_end_loc.end_offset(),
+        );
+        self.fixes.push((rm_start, rm_end, Vec::new()));
+
+        // `unindent`
+        self.cmc_unindent(outer_node_start, bar_body, bar_end_loc.start_offset());
+    }
+
+    /// `remove_end`: drop the merged-away child's own header remnant/`end` —
+    /// same line as its name means a one-liner (`class D; end`, dropping the
+    /// `; end` tail complete with the semicolon), otherwise the whole
+    /// closing-`end` LINE (its own leading indentation through the trailing
+    /// newline).
+    fn cmc_remove_end_range(&self, bar_start: usize, bar_name_end: usize, bar_end_start: usize, bar_end_end: usize) -> (usize, usize) {
+        let name_line = self.idx.loc(bar_start).0;
+        let end_line = self.idx.loc(bar_end_start).0;
+        let remove_begin = if name_line == end_line {
+            bar_name_end
+        } else {
+            let leading = self.leading_spaces_at(bar_start);
+            bar_end_start.saturating_sub(leading.len())
+        };
+        let adjustment = if self.src.get(remove_begin) == Some(&b';') { 0 } else { 1 };
+        (remove_begin, bar_end_end + adjustment)
+    }
+
+    /// `compact_replacement`: the merged-away child's own preceding comment
+    /// block (rubocop's `ast_with_comments`), each comment's own text
+    /// (dedented, since `Comment#text` starts at `#`), followed by the new
+    /// combined header line.
+    fn cmc_compact_replacement(&self, bar_kind: &str, outer_name: &[u8], bar_name: &[u8], bar_header_line: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for c in self.cmc_leading_comment_block(bar_header_line) {
+            out.extend_from_slice(&c);
+            out.push(b'\n');
+        }
+        out.extend_from_slice(bar_kind.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(outer_name);
+        out.extend_from_slice(b"::");
+        out.extend_from_slice(bar_name);
+        out
+    }
+
+    /// A contiguous run of comment lines directly above `header_line`
+    /// (top-to-bottom order) — rubocop-ast's comment association for a
+    /// node's own leading comment block.
+    fn cmc_leading_comment_block(&self, header_line: usize) -> Vec<Vec<u8>> {
+        let mut lines = Vec::new();
+        let mut line = header_line;
+        loop {
+            if line <= 1 {
+                break;
+            }
+            line -= 1;
+            if !self.comment_lines.contains(&line) {
+                break;
+            }
+            lines.push(line);
+        }
+        lines.reverse();
+        lines
+            .iter()
+            .filter_map(|l| self.comments.iter().find(|(cl, _, _)| cl == l).map(|(_, s, e)| self.src[*s..*e].to_vec()))
+            .collect()
+    }
+
+    /// `unindent`: re-indent whatever body content is left in the
+    /// merged-away child by `configured_indentation_width -
+    /// spaces_size(deepest remaining content's own indentation)` columns.
+    /// Only the lines STRICTLY inside that child's own body (between its
+    /// header and its own closing `end`, both exclusive) ever need a
+    /// distinct edit here — everything else is either already consumed by
+    /// `compact_node`/`remove_end`'s ranges above, or (the merged node's own
+    /// header/final-`end` lines) a proven no-op in real rubocop, since
+    /// `AlignmentCorrector`'s negative-delta branch only ever touches a line
+    /// whose first byte is a literal space.
+    fn cmc_unindent(&mut self, outer_node_start: usize, bar_body: Option<ruby_prism::Node>, bar_end_start: usize) {
+        let Some(stmts) = bar_body.as_ref().and_then(|b| b.as_statements_node()) else { return };
+        let Some(first_stmt) = stmts.body().first() else { return };
+        let last_leading = self.leading_spaces_at(first_stmt.location().start_offset());
+        let outer_leading = self.leading_spaces_at(outer_node_start);
+        if self.cmc_spaces_size(&outer_leading) == self.cmc_spaces_size(&last_leading) {
+            return;
+        }
+        let width = self.cmc_configured_indentation_width();
+        let delta = width as i64 - self.cmc_spaces_size(&last_leading) as i64;
+        if delta == 0 {
+            return;
+        }
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            return;
+        }
+        let content_start_line = self.idx.loc(first_stmt.location().start_offset()).0;
+        let content_end_line = self.idx.loc(bar_end_start).0;
+        for line in content_start_line..content_end_line {
+            let line_start = self.idx.starts[line - 1];
+            if delta > 0 {
+                if self.src.get(line_start) != Some(&b'\n') {
+                    self.fixes.push((line_start, line_start, b" ".repeat(delta as usize)));
+                }
+            } else {
+                let n = (-delta) as usize;
+                if self.src.get(line_start) == Some(&b' ') {
+                    let end = line_start + n;
+                    if end <= self.src.len() && self.src[line_start..end].iter().all(|&b| b == b' ' || b == b'\t') {
+                        self.fixes.push((line_start, end, Vec::new()));
+                    }
+                }
+                // A line not led by a literal space (a tab, a blank line, or
+                // already-consumed text) is a no-op — see the module doc.
+            }
+        }
+    }
+
+    /// The leading whitespace (`[ \t\v\f\r]*`, matching Ruby's `\s` minus
+    /// `\n`) of the LINE containing `offset` — rubocop's `leading_spaces`
+    /// (`source_range.source_line[/\A\s*/]`).
+    fn leading_spaces_at(&self, offset: usize) -> Vec<u8> {
+        let line = self.idx.loc(offset).0;
+        let start = self.idx.starts[line - 1];
+        let mut end = start;
+        while end < self.src.len() && matches!(self.src[end], b' ' | b'\t' | 0x0b | 0x0c | b'\r') {
+            end += 1;
+        }
+        self.src[start..end].to_vec()
+    }
+
+    /// `spaces_size`: a tab counts as `tab_indentation_width`, everything
+    /// else (plain spaces) counts as 1 column.
+    fn cmc_spaces_size(&self, spaces: &[u8]) -> usize {
+        let tab_width = self
+            .cfg
+            .get("Layout/IndentationStyle", "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| self.cmc_configured_indentation_width());
+        spaces.iter().map(|&b| if b == b'\t' { tab_width } else { 1 }).sum()
+    }
+
+    /// `Alignment#configured_indentation_width`: this cop's own
+    /// `IndentationWidth` (no schema default — meaningful only when a user
+    /// sets it directly), else `Layout/IndentationWidth`'s `Width` (schema
+    /// default 2).
+    fn cmc_configured_indentation_width(&self) -> usize {
+        self.cfg
+            .get("Style/ClassAndModuleChildren", "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+
+    /// `replace_namespace_keyword`'s left-sibling lookup result, precomputed
+    /// by `cmc_precompute`.
+    fn cmc_namespace_keyword(&self, node_start: usize) -> &'static str {
+        if *self.cmc_class_hint.get(&node_start).unwrap_or(&false) {
+            "class"
+        } else {
+            "module"
+        }
+    }
+}
+
+/// `node.identifier.namespace` (the value RIGHT BEFORE the identifier's own
+/// last `::` segment) as a tri-state: absent (a bare `Foo`, no `::` at all),
+/// exactly `cbase` (`::Foo` with nothing further out), or a real node to
+/// recurse into.
+enum CmcNs<'pr> {
+    None,
+    Cbase,
+    Node(ruby_prism::Node<'pr>),
+}
+
+fn cmc_namespace_of<'pr>(node: &ruby_prism::Node<'pr>) -> CmcNs<'pr> {
+    if node.as_constant_read_node().is_some() {
+        return CmcNs::None;
+    }
+    if let Some(cp) = node.as_constant_path_node() {
+        match cp.parent() {
+            None => CmcNs::Cbase,
+            Some(inner) => CmcNs::Node(inner),
+        }
+    } else {
+        CmcNs::None
+    }
+}
+
+/// `const_namespace?`: nil/cbase are valid terminals; a real node must
+/// itself be const-shaped (`ConstantReadNode`/`ConstantPathNode` — never a
+/// `send`/`self.class`-style receiver) and recursively valid.
+fn cmc_const_namespace_valid(ns: &CmcNs) -> bool {
+    match ns {
+        CmcNs::None | CmcNs::Cbase => true,
+        CmcNs::Node(n) => {
+            if n.as_constant_read_node().is_none() && n.as_constant_path_node().is_none() {
+                return false;
+            }
+            cmc_const_namespace_valid(&cmc_namespace_of(n))
+        }
+    }
+}
+
+/// Structural `(has_cbase_root, [segment, segment, ...])` for a const-shaped
+/// node — used for `replace_namespace_keyword`'s AST-equality comparison
+/// (`class_node.identifier == node.identifier.namespace`), where the cbase
+/// flag matters (`::Foo` and `Foo` are different nodes to `==`).
+fn cmc_segments_and_cbase(node: &ruby_prism::Node) -> (bool, Vec<Vec<u8>>) {
+    if let Some(c) = node.as_constant_read_node() {
+        return (false, vec![c.name().as_slice().to_vec()]);
+    }
+    if let Some(cp) = node.as_constant_path_node() {
+        let own = cp.name_loc().as_slice().to_vec();
+        match cp.parent() {
+            None => (true, vec![own]),
+            Some(inner) => {
+                let (cbase, mut segs) = cmc_segments_and_cbase(&inner);
+                segs.push(own);
+                (cbase, segs)
+            }
+        }
+    } else {
+        (false, Vec::new())
+    }
+}
+
+/// `identifier.namespace`'s segment form for the equality search — `None`
+/// when `cpath` isn't itself compact (shouldn't be called otherwise).
+fn cmc_namespace_segments(cpath: &ruby_prism::Node) -> Option<(bool, Vec<Vec<u8>>)> {
+    let cp = cpath.as_constant_path_node()?;
+    match cp.parent() {
+        None => Some((true, Vec::new())),
+        Some(inner) => Some(cmc_segments_and_cbase(&inner)),
+    }
+}
+
+/// `Node#const_name`: the FULL dotted name, cbase dropped entirely (`::Foo`
+/// and `Foo` both render as `"Foo"` — rubocop-ast's own behavior, verified
+/// against `RuboCop::AST::Node#const_name`).
+fn cmc_const_name(node: &ruby_prism::Node) -> Vec<u8> {
+    let (_, segs) = cmc_segments_and_cbase(node);
+    segs.join(&b"::"[..])
+}
+
+/// `node.identifier.namespace&.cbase_type?` / `check_compact_style`'s
+/// `needs_compacting?(body)` — reconstructed structurally (prism always
+/// wraps a body in a `StatementsNode`) as "this body is a lone class/module
+/// statement", returning that statement.
+fn cmc_sole_cm_child<'pr>(body: &Option<ruby_prism::Node<'pr>>) -> Option<ruby_prism::Node<'pr>> {
+    let stmts = body.as_ref()?.as_statements_node()?;
+    let list = stmts.body();
+    if list.len() != 1 {
+        return None;
+    }
+    let n = list.first()?;
+    if n.as_class_node().is_some() || n.as_module_node().is_some() {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// `replace_namespace_keyword`'s `node.left_sibling&.each_node(:class)&.find`
+/// — a recursive (self + all descendants, any depth) scan of `sib` for a
+/// `class` node whose own identifier structurally matches `target`.
+fn cmc_class_defines(sib: &ruby_prism::Node, target: &(bool, Vec<Vec<u8>>)) -> bool {
+    struct Finder<'t> {
+        target: &'t (bool, Vec<Vec<u8>>),
+        found: bool,
+    }
+    impl<'pr, 't> ruby_prism::Visit<'pr> for Finder<'t> {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            if !self.found && cmc_segments_and_cbase(&node.constant_path()) == *self.target {
+                self.found = true;
+            }
+            ruby_prism::visit_class_node(self, node);
+        }
+    }
+    let mut f = Finder { target, found: false };
+    ruby_prism::Visit::visit(&mut f, sib);
+    f.found
+}
+
+/// `node.loc.name` for a class/module identifier — just the last segment's
+/// own range for a compact (`ConstantPathNode`) identifier, or the whole
+/// thing for a bare (`ConstantReadNode`) one.
+fn cmc_name_loc(cpath: &ruby_prism::Node) -> (usize, usize) {
+    if let Some(c) = cpath.as_constant_read_node() {
+        let l = c.location();
+        (l.start_offset(), l.end_offset())
+    } else if let Some(p) = cpath.as_constant_path_node() {
+        let l = p.name_loc();
+        (l.start_offset(), l.end_offset())
+    } else {
+        let l = cpath.location();
+        (l.start_offset(), l.end_offset())
+    }
+}
+
+fn cmc_node_kind(n: &ruby_prism::Node) -> &'static str {
+    if n.as_class_node().is_some() {
+        "class"
+    } else {
+        "module"
+    }
+}
+
+fn cmc_node_body<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(c) = n.as_class_node() {
+        c.body()
+    } else {
+        n.as_module_node().and_then(|m| m.body())
+    }
+}
+
+fn cmc_node_end_loc<'pr>(n: &ruby_prism::Node<'pr>) -> ruby_prism::Location<'pr> {
+    if let Some(c) = n.as_class_node() {
+        c.end_keyword_loc()
+    } else {
+        n.as_module_node().expect("class/module node").end_keyword_loc()
+    }
+}
+
+/// Ruby's `String#sub(literal_needle, "")`: remove the FIRST occurrence of
+/// `needle` as a literal byte substring (an empty needle "matches" a
+/// zero-width span at the start, i.e. a no-op).
+fn cmc_sub_first(hay: &[u8], needle: &[u8]) -> Vec<u8> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return hay.to_vec();
+    }
+    if let Some(pos) = hay.windows(needle.len()).position(|w| w == needle) {
+        let mut out = hay[..pos].to_vec();
+        out.extend_from_slice(&hay[pos + needle.len()..]);
+        out
+    } else {
+        hay.to_vec()
+    }
+}
