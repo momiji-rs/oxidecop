@@ -5742,8 +5742,8 @@ impl<'a> Cops<'a> {
 impl<'a> Cops<'a> {
     const SAK_COP: &'static str = "Layout/SpaceAroundKeyword";
 
-    const SAK_ACCEPT_LEFT_PAREN: [&'static [u8]; 6] =
-        [b"break", b"defined?", b"next", b"not", b"rescue", b"super"];
+    const SAK_ACCEPT_LEFT_PAREN: [&'static [u8]; 7] =
+        [b"break", b"defined?", b"next", b"not", b"rescue", b"super", b"yield"];
     const SAK_ACCEPT_LEFT_BRACKET: [&'static [u8]; 2] = [b"super", b"yield"];
 
     /// rubocop-ast's `MethodIdentifierPredicates::OPERATOR_METHODS`.
