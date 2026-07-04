@@ -314,6 +314,7 @@ COPS = {
   'Style/YodaCondition'              => 'style/yoda_condition',
   'Style/TernaryParentheses'         => 'style/ternary_parentheses',
   'Style/SignalException'            => 'style/signal_exception',
+  'Style/RedundantBegin'             => 'style/redundant_begin',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

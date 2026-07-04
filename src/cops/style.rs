@@ -23982,3 +23982,679 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Style/RedundantBegin
+//
+// prism-vs-whitequark trap (see module-level notes elsewhere in this repo):
+// a `def`/block body's implicit rescue/ensure wrapper is a `BeginNode` with
+// `begin_keyword_loc() == None`; an explicit `begin ... end` (whitequark's
+// `:kwbegin`) is a `BeginNode` with `begin_keyword_loc().is_some()`. Only the
+// latter is ever a redundant-begin candidate.
+//
+// Upstream (`RuboCop::Cop::Style::RedundantBegin`) uses SIX entry points:
+// `on_def`/`on_defs`, `on_if` (covers `unless` too, since whitequark compiles
+// both to `:if`), `on_case`/`on_case_match`, `on_while`/`on_until`,
+// `on_block`/`on_numblock`/`on_itblock`, and a catch-all `on_kwbegin` that
+// runs a `def_node_search` over the WHOLE subtree (self included) and takes
+// the LAST match — meaning, of a chain of nested offending kwbegins reached
+// only generically (assignment RHS, method call argument/receiver,
+// `&&`/`||`/`and`/`or` operand, standalone statement, `begin...end
+// while`/`until` post-condition body, modifier-`if`/`unless` body), only the
+// INNERMOST one is ever registered (the others are "swallowed"). The five
+// dedicated entry points have no such swallowing — each fires independently
+// no matter what is nested inside or around it.
+//
+// This port reproduces that with a single self-contained recursive walker
+// (`rb_scan` + friends) invoked once from `visit_program_node`, rather than
+// hooking dozens of existing `visit_*_node` methods: `rb_scan` returns
+// whether an offense was registered anywhere in the subtree it was given, so
+// a generically-reached kwbegin can suppress itself when a nested kwbegin
+// (dedicated or generic) already claimed the position.
+//
+// `RbCtx` tracks the whitequark-equivalent "logical parent" of a candidate
+// kwbegin, reconstructed by hand since raw prism nodes carry no parent
+// pointer, and by collapsing prism's extra wrapper nodes the same way
+// upstream's whitequark-shaped AST already does: a `StatementsNode` (or a
+// `def`/block body slot) with exactly one child is transparent (the child's
+// logical parent is whatever wraps the collapsed slot); with 2+ children it
+// becomes an anonymous multi-statement parent that matches none of the
+// special contexts below but still counts as "a parent exists". Similarly a
+// call's `ArgumentsNode` is transparent — the logical parent of an argument
+// is the call itself, matching `parent&.send_type?`.
+#[derive(Clone, Copy)]
+enum RbCtx {
+    /// No logical parent at all (the sole top-level statement in the file).
+    NoParent,
+    /// A real parent exists but matches none of the special kinds below.
+    Other,
+    /// RHS of `lvasgn`/`ivasgn`/.../`or_asgn`/`and_asgn`/`op_asgn`/`masgn`
+    /// (any prism `*WriteNode`); carries the assignment node's own start
+    /// offset (`node.parent` for `restore_removed_comments`'s
+    /// `insert_before`).
+    Assignment(usize),
+    /// Receiver or argument of a method call (`parent&.send_type?`).
+    Send,
+    /// Operand of `&&`/`||`/`and`/`or` (`parent&.operator_keyword?`).
+    OperatorKeyword,
+    /// Body of a `begin...end while`/`until` post-condition loop
+    /// (`parent&.post_condition_loop?`; prism's `is_begin_modifier`).
+    PostConditionLoop,
+    /// Body of an endless `def foo = ...` (only reachable generically, since
+    /// `on_def` explicitly skips endless defs).
+    EndlessDef,
+    /// Body of a modifier-form `if`/`unless` (`EXPR if/unless cond`, no
+    /// `end` keyword); carries the keyword's start offset and the
+    /// condition's end offset, needed for the "hoist the kwbegin's single
+    /// statement, move the modifier clause onto its line" correction.
+    ModifierIf(usize, usize),
+}
+
+/// Collapsing a `StatementsNode`/body slot down to whitequark's shape: 0
+/// statements is empty, exactly 1 is transparent (the child takes on
+/// whatever logical parent wraps the slot), 2+ becomes an opaque
+/// "multi-statement" parent.
+enum RbCollapse<'pr> {
+    Empty,
+    Single(ruby_prism::Node<'pr>),
+    Multi(Vec<ruby_prism::Node<'pr>>),
+}
+
+fn rb_collapse_stmts<'pr>(stmts: Option<ruby_prism::StatementsNode<'pr>>) -> RbCollapse<'pr> {
+    let Some(s) = stmts else { return RbCollapse::Empty };
+    let mut body: Vec<ruby_prism::Node<'pr>> = s.body().iter().collect();
+    match body.len() {
+        0 => RbCollapse::Empty,
+        1 => RbCollapse::Single(body.pop().unwrap()),
+        _ => RbCollapse::Multi(body),
+    }
+}
+
+/// Same collapse, for a `def`/block/lambda body slot (`Option<Node>` rather
+/// than `Option<StatementsNode>` — prism only wraps in a `StatementsNode`
+/// when the body isn't already a single implicit-rescue `BeginNode`).
+fn rb_collapse_body<'pr>(body: Option<ruby_prism::Node<'pr>>) -> RbCollapse<'pr> {
+    let Some(n) = body else { return RbCollapse::Empty };
+    match n.as_statements_node() {
+        Some(s) => rb_collapse_stmts(Some(s)),
+        None => RbCollapse::Single(n),
+    }
+}
+
+/// `parent&.assignment?`'s prism equivalent: any `*WriteNode` type (matches
+/// whitequark's `lvasgn`/`ivasgn`/`cvasgn`/`gvasgn`/`casgn`/`masgn`/
+/// `op_asgn`/`or_asgn`/`and_asgn`) except `MatchWriteNode` (`/re/ =~ str`
+/// named-capture assignment — not in whitequark's `ASSIGNMENTS` set).
+fn rb_write_value<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    macro_rules! t {
+        ($m:ident) => {
+            if let Some(n) = node.$m() {
+                return Some(n.value());
+            }
+        };
+    }
+    t!(as_call_and_write_node);
+    t!(as_call_operator_write_node);
+    t!(as_call_or_write_node);
+    t!(as_class_variable_and_write_node);
+    t!(as_class_variable_operator_write_node);
+    t!(as_class_variable_or_write_node);
+    t!(as_class_variable_write_node);
+    t!(as_constant_and_write_node);
+    t!(as_constant_operator_write_node);
+    t!(as_constant_or_write_node);
+    t!(as_constant_path_and_write_node);
+    t!(as_constant_path_operator_write_node);
+    t!(as_constant_path_or_write_node);
+    t!(as_constant_path_write_node);
+    t!(as_constant_write_node);
+    t!(as_global_variable_and_write_node);
+    t!(as_global_variable_operator_write_node);
+    t!(as_global_variable_or_write_node);
+    t!(as_global_variable_write_node);
+    t!(as_index_and_write_node);
+    t!(as_index_operator_write_node);
+    t!(as_index_or_write_node);
+    t!(as_instance_variable_and_write_node);
+    t!(as_instance_variable_operator_write_node);
+    t!(as_instance_variable_or_write_node);
+    t!(as_instance_variable_write_node);
+    t!(as_local_variable_and_write_node);
+    t!(as_local_variable_operator_write_node);
+    t!(as_local_variable_or_write_node);
+    t!(as_local_variable_write_node);
+    t!(as_multi_write_node);
+    None
+}
+
+impl<'a> super::Cops<'a> {
+    /// Entry point, called once from `visit_program_node`. Upstream has no
+    /// single equivalent hook — this just seeds the recursive walk with the
+    /// file's top-level statement list (whose sole-statement case is the
+    /// ONLY place `RbCtx::NoParent` — whitequark's truly-parentless node —
+    /// can arise).
+    pub(crate) fn check_redundant_begin<'pr>(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
+        if !self.on("Style/RedundantBegin") {
+            return;
+        }
+        let stmts = node.statements();
+        self.rb_scan_stmt_list(&stmts, RbCtx::NoParent);
+    }
+
+    fn rb_scan_stmt_list<'pr>(&mut self, stmts: &ruby_prism::StatementsNode<'pr>, solo_ctx: RbCtx) -> bool {
+        let body: Vec<ruby_prism::Node<'pr>> = stmts.body().iter().collect();
+        if body.len() == 1 {
+            self.rb_scan(&body[0], solo_ctx)
+        } else {
+            let mut flagged = false;
+            for n in &body {
+                flagged |= self.rb_scan(n, RbCtx::Other);
+            }
+            flagged
+        }
+    }
+
+    fn rb_scan_opt_stmts<'pr>(&mut self, stmts: Option<ruby_prism::StatementsNode<'pr>>, ctx: RbCtx) -> bool {
+        match stmts {
+            None => false,
+            Some(s) => self.rb_scan_stmt_list(&s, ctx),
+        }
+    }
+
+    fn rb_scan_collapse<'pr>(&mut self, cr: RbCollapse<'pr>, ctx: RbCtx) -> bool {
+        match cr {
+            RbCollapse::Empty => false,
+            RbCollapse::Single(n) => self.rb_scan(&n, ctx),
+            RbCollapse::Multi(list) => {
+                let mut flagged = false;
+                for n in list {
+                    flagged |= self.rb_scan(&n, RbCtx::Other);
+                }
+                flagged
+            }
+        }
+    }
+
+    /// Generic recursive descent. Only node kinds that can plausibly lead to
+    /// a redundant-begin candidate are special-cased; everything else is a
+    /// deliberate stop (documented residual risk — a `begin...end` buried
+    /// inside e.g. an array/hash literal element or string interpolation
+    /// won't be found by this port).
+    fn rb_scan<'pr>(&mut self, node: &ruby_prism::Node<'pr>, ctx: RbCtx) -> bool {
+        if let Some(b) = node.as_begin_node() {
+            return self.rb_scan_begin(&b, ctx);
+        }
+        if let Some(s) = node.as_statements_node() {
+            return self.rb_scan_stmt_list(&s, ctx);
+        }
+        if let Some(d) = node.as_def_node() {
+            return self.rb_handle_def(&d);
+        }
+        if let Some(bl) = node.as_block_node() {
+            return self.rb_handle_block(&bl);
+        }
+        if let Some(lm) = node.as_lambda_node() {
+            return self.rb_scan_collapse(rb_collapse_body(lm.body()), RbCtx::Other);
+        }
+        if let Some(iff) = node.as_if_node() {
+            return self.rb_handle_if(&iff);
+        }
+        if let Some(u) = node.as_unless_node() {
+            return self.rb_handle_unless(&u);
+        }
+        if let Some(c) = node.as_case_node() {
+            return self.rb_handle_case(&c);
+        }
+        if let Some(cm) = node.as_case_match_node() {
+            return self.rb_handle_case_match(&cm);
+        }
+        if let Some(w) = node.as_while_node() {
+            return self.rb_handle_while(&w);
+        }
+        if let Some(u) = node.as_until_node() {
+            return self.rb_handle_until(&u);
+        }
+        if let Some(call) = node.as_call_node() {
+            return self.rb_handle_call(&call);
+        }
+        if let Some(s) = node.as_super_node() {
+            let mut flagged = false;
+            if let Some(args) = s.arguments() {
+                for a in args.arguments().iter() {
+                    flagged |= self.rb_scan(&a, RbCtx::Send);
+                }
+            }
+            if let Some(blk) = s.block() {
+                flagged |= self.rb_scan(&blk, RbCtx::Other);
+            }
+            return flagged;
+        }
+        if let Some(s) = node.as_forwarding_super_node() {
+            if let Some(blk) = s.block() {
+                return self.rb_scan(&blk.as_node(), RbCtx::Other);
+            }
+            return false;
+        }
+        if let Some(a) = node.as_and_node() {
+            let l = self.rb_scan(&a.left(), RbCtx::OperatorKeyword);
+            let r = self.rb_scan(&a.right(), RbCtx::OperatorKeyword);
+            return l || r;
+        }
+        if let Some(o) = node.as_or_node() {
+            let l = self.rb_scan(&o.left(), RbCtx::OperatorKeyword);
+            let r = self.rb_scan(&o.right(), RbCtx::OperatorKeyword);
+            return l || r;
+        }
+        if let Some(p) = node.as_parentheses_node() {
+            if let Some(body) = p.body() {
+                return self.rb_scan(&body, RbCtx::Other);
+            }
+            return false;
+        }
+        if let Some(value) = rb_write_value(node) {
+            let parent_start = node.location().start_offset();
+            return self.rb_scan(&value, RbCtx::Assignment(parent_start));
+        }
+        false
+    }
+
+    fn rb_scan_begin_children<'pr>(&mut self, b: &ruby_prism::BeginNode<'pr>) -> bool {
+        let mut flagged = false;
+        if let Some(s) = b.statements() {
+            flagged |= self.rb_scan_stmt_list(&s, RbCtx::Other);
+        }
+        if let Some(r) = b.rescue_clause() {
+            flagged |= self.rb_scan_rescue(&r);
+        }
+        if let Some(e) = b.else_clause() {
+            flagged |= self.rb_scan_opt_stmts(e.statements(), RbCtx::Other);
+        }
+        if let Some(en) = b.ensure_clause() {
+            flagged |= self.rb_scan_opt_stmts(en.statements(), RbCtx::Other);
+        }
+        flagged
+    }
+
+    fn rb_scan_rescue<'pr>(&mut self, r: &ruby_prism::RescueNode<'pr>) -> bool {
+        let mut flagged = self.rb_scan_opt_stmts(r.statements(), RbCtx::Other);
+        if let Some(sub) = r.subsequent() {
+            flagged |= self.rb_scan_rescue(&sub);
+        }
+        flagged
+    }
+
+    /// `on_kwbegin`'s generic path (via `offensive_kwbegins`/
+    /// `allowable_kwbegin?`) — reached for any kwbegin NOT already claimed
+    /// by one of the five dedicated contexts. Recurses into children FIRST
+    /// (post-order): if anything nested already registered an offense, this
+    /// node is swallowed (matches upstream's `.to_a.last` picking only the
+    /// deepest match in a chain of nested offending kwbegins).
+    fn rb_scan_begin<'pr>(&mut self, b: &ruby_prism::BeginNode<'pr>, ctx: RbCtx) -> bool {
+        if b.begin_keyword_loc().is_none() {
+            // Implicit rescue/ensure `BeginNode` (no `begin` keyword) — never
+            // itself a candidate; just look for real kwbegins inside it.
+            return self.rb_scan_begin_children(b);
+        }
+        if self.rb_scan_begin_children(b) {
+            return true;
+        }
+        if !self.rb_allowable(b, ctx) {
+            self.rb_register_offense(b, ctx);
+            return true;
+        }
+        false
+    }
+
+    /// `allowable_kwbegin?`: `empty_begin?` || `begin_block_has_multiline_statements?`
+    /// || `contain_rescue_or_ensure?` || `valid_context_using_only_begin?`.
+    fn rb_allowable<'pr>(&self, node: &ruby_prism::BeginNode<'pr>, ctx: RbCtx) -> bool {
+        let has_rescue_or_ensure = node.rescue_clause().is_some() || node.ensure_clause().is_some();
+        let n_children = if has_rescue_or_ensure {
+            1
+        } else {
+            node.statements().map(|s| s.body().iter().count()).unwrap_or(0)
+        };
+        if n_children == 0 {
+            return true; // empty_begin?
+        }
+        let has_parent = !matches!(ctx, RbCtx::NoParent);
+        if has_parent && n_children >= 2 {
+            return true; // begin_block_has_multiline_statements?
+        }
+        if has_rescue_or_ensure {
+            return true; // contain_rescue_or_ensure?
+        }
+        // valid_context_using_only_begin?
+        match ctx {
+            // valid_begin_assignment?: parent assignment && !children.one? —
+            // n_children is already known to be 1 here (0/2+ handled above).
+            RbCtx::Assignment(_) => false,
+            RbCtx::PostConditionLoop | RbCtx::Send | RbCtx::OperatorKeyword => true,
+            _ => false,
+        }
+    }
+
+    /// Dedicated-context branch shared by `on_if`/`on_case`/`on_while`
+    /// (`inspect_branches`/direct-body checks): if the collapsed slot is
+    /// literally an explicit kwbegin (and, when required, has no
+    /// `rescue`/`ensure` of its own), register unconditionally — no
+    /// `allowable_kwbegin?`/swallow logic applies to dedicated contexts.
+    /// Otherwise fall back to the generic scan (this also correctly handles
+    /// "guard failed because it has rescue/ensure" — the generic path
+    /// reaches the same "allowable" conclusion via `contain_rescue_or_ensure?`).
+    fn rb_dedicated_branch<'pr>(&mut self, collapsed: RbCollapse<'pr>, requires_no_rescue_ensure: bool) -> bool {
+        if let RbCollapse::Single(n) = &collapsed {
+            if let Some(b) = n.as_begin_node() {
+                if b.begin_keyword_loc().is_some() {
+                    let ok = !requires_no_rescue_ensure
+                        || (b.rescue_clause().is_none() && b.ensure_clause().is_none());
+                    if ok {
+                        self.rb_register_offense(&b, RbCtx::Other);
+                        self.rb_scan_begin_children(&b);
+                        return true;
+                    }
+                }
+            }
+        }
+        self.rb_scan_collapse(collapsed, RbCtx::Other)
+    }
+
+    /// `on_def`/`on_defs`: unconditional (no rescue/ensure guard — the whole
+    /// point is the def/block can natively carry its own rescue/ensure)
+    /// except endless defs, which `on_def` explicitly skips (`return if
+    /// node.endless?`) — an endless def's sole-kwbegin body is only ever
+    /// reached generically, with `RbCtx::EndlessDef`.
+    fn rb_handle_def<'pr>(&mut self, d: &ruby_prism::DefNode<'pr>) -> bool {
+        let is_endless = d.end_keyword_loc().is_none();
+        match rb_collapse_body(d.body()) {
+            RbCollapse::Single(n) => {
+                if !is_endless {
+                    if let Some(b) = n.as_begin_node() {
+                        if b.begin_keyword_loc().is_some() {
+                            self.rb_register_offense(&b, RbCtx::Other);
+                            self.rb_scan_begin_children(&b);
+                            return true;
+                        }
+                    }
+                }
+                let ctx = if is_endless { RbCtx::EndlessDef } else { RbCtx::Other };
+                self.rb_scan(&n, ctx)
+            }
+            other => self.rb_scan_collapse(other, RbCtx::Other),
+        }
+    }
+
+    /// `on_block`/`on_numblock`/`on_itblock`: unconditional (no
+    /// rescue/ensure guard, same reasoning as `on_def`) except `{}`-braces
+    /// blocks (`return if node.braces?`) and stabby lambdas — the latter
+    /// need no explicit guard here since prism gives `->` its own
+    /// `LambdaNode` type, never a `BlockNode`, so it never reaches this
+    /// method at all.
+    fn rb_handle_block<'pr>(&mut self, bl: &ruby_prism::BlockNode<'pr>) -> bool {
+        let braces = bl.opening_loc().as_slice() == b"{";
+        match rb_collapse_body(bl.body()) {
+            RbCollapse::Single(n) => {
+                if !braces {
+                    if let Some(b) = n.as_begin_node() {
+                        if b.begin_keyword_loc().is_some() {
+                            self.rb_register_offense(&b, RbCtx::Other);
+                            self.rb_scan_begin_children(&b);
+                            return true;
+                        }
+                    }
+                }
+                self.rb_scan(&n, RbCtx::Other)
+            }
+            other => self.rb_scan_collapse(other, RbCtx::Other),
+        }
+    }
+
+    /// `on_if` (also covers `unless` — whitequark compiles both to the same
+    /// `:if` node type; prism gives `unless` its own `UnlessNode`, handled
+    /// separately in `rb_handle_unless`). Ternaries (no `if`/`unless`
+    /// keyword at all) and modifier-form are excluded from the dedicated
+    /// path (`return if node.modifier_form?`) — modifier-form is only ever
+    /// reached generically, as `RbCtx::ModifierIf`.
+    fn rb_handle_if<'pr>(&mut self, iff: &ruby_prism::IfNode<'pr>) -> bool {
+        let Some(kw) = iff.if_keyword_loc() else {
+            // Ternary (`cond ? a : b`) — rare with a literal `begin/end`
+            // branch; best-effort generic scan.
+            let mut flagged = self.rb_scan_opt_stmts(iff.statements(), RbCtx::Other);
+            if let Some(sub) = iff.subsequent() {
+                flagged |= self.rb_scan(&sub, RbCtx::Other);
+            }
+            return flagged;
+        };
+        if iff.end_keyword_loc().is_none() {
+            // Modifier form: `EXPR if cond`.
+            let cond_end = iff.predicate().location().end_offset();
+            return self.rb_scan_opt_stmts(iff.statements(), RbCtx::ModifierIf(kw.start_offset(), cond_end));
+        }
+        let mut flagged = self.rb_dedicated_branch(rb_collapse_stmts(iff.statements()), true);
+        if let Some(sub) = iff.subsequent() {
+            if let Some(else_node) = sub.as_else_node() {
+                flagged |= self.rb_dedicated_branch(rb_collapse_stmts(else_node.statements()), true);
+            } else {
+                // A chained `elsif` is itself an `IfNode`, visited (and
+                // dedicated-checked) independently through this recursion.
+                flagged |= self.rb_scan(&sub, RbCtx::Other);
+            }
+        }
+        flagged
+    }
+
+    fn rb_handle_unless<'pr>(&mut self, u: &ruby_prism::UnlessNode<'pr>) -> bool {
+        if u.end_keyword_loc().is_none() {
+            let kw = u.keyword_loc();
+            let cond_end = u.predicate().location().end_offset();
+            return self.rb_scan_opt_stmts(u.statements(), RbCtx::ModifierIf(kw.start_offset(), cond_end));
+        }
+        let mut flagged = self.rb_dedicated_branch(rb_collapse_stmts(u.statements()), true);
+        if let Some(else_node) = u.else_clause() {
+            flagged |= self.rb_dedicated_branch(rb_collapse_stmts(else_node.statements()), true);
+        }
+        flagged
+    }
+
+    /// `on_case`/`on_case_match`: each `when`/`in` branch (and the optional
+    /// `else`) checked independently via `inspect_branches`.
+    fn rb_handle_case<'pr>(&mut self, c: &ruby_prism::CaseNode<'pr>) -> bool {
+        let mut flagged = false;
+        for cond in c.conditions().iter() {
+            if let Some(w) = cond.as_when_node() {
+                flagged |= self.rb_dedicated_branch(rb_collapse_stmts(w.statements()), true);
+            }
+        }
+        if let Some(e) = c.else_clause() {
+            flagged |= self.rb_dedicated_branch(rb_collapse_stmts(e.statements()), true);
+        }
+        flagged
+    }
+
+    fn rb_handle_case_match<'pr>(&mut self, c: &ruby_prism::CaseMatchNode<'pr>) -> bool {
+        let mut flagged = false;
+        for cond in c.conditions().iter() {
+            if let Some(i) = cond.as_in_node() {
+                flagged |= self.rb_dedicated_branch(rb_collapse_stmts(i.statements()), true);
+            }
+        }
+        if let Some(e) = c.else_clause() {
+            flagged |= self.rb_dedicated_branch(rb_collapse_stmts(e.statements()), true);
+        }
+        flagged
+    }
+
+    /// `on_while`/`on_until`: skipped entirely for genuine modifier form
+    /// (`return if node.modifier_form?`) and never invoked upstream for the
+    /// `begin...end while`/`until` post-condition-loop shape (a distinct
+    /// whitequark node type) — both cases fall back to the generic scan,
+    /// the latter with `RbCtx::PostConditionLoop` so `valid_context_using_only_begin?`
+    /// (`parent&.post_condition_loop?`) can allow it.
+    fn rb_handle_while<'pr>(&mut self, w: &ruby_prism::WhileNode<'pr>) -> bool {
+        if w.is_begin_modifier() {
+            return self.rb_scan_opt_stmts(w.statements(), RbCtx::PostConditionLoop);
+        }
+        let is_modifier = w
+            .statements()
+            .is_some_and(|st| st.location().start_offset() < w.keyword_loc().start_offset());
+        if is_modifier {
+            return self.rb_scan_opt_stmts(w.statements(), RbCtx::Other);
+        }
+        self.rb_dedicated_branch(rb_collapse_stmts(w.statements()), true)
+    }
+
+    fn rb_handle_until<'pr>(&mut self, u: &ruby_prism::UntilNode<'pr>) -> bool {
+        if u.is_begin_modifier() {
+            return self.rb_scan_opt_stmts(u.statements(), RbCtx::PostConditionLoop);
+        }
+        let is_modifier = u
+            .statements()
+            .is_some_and(|st| st.location().start_offset() < u.keyword_loc().start_offset());
+        if is_modifier {
+            return self.rb_scan_opt_stmts(u.statements(), RbCtx::Other);
+        }
+        self.rb_dedicated_branch(rb_collapse_stmts(u.statements()), true)
+    }
+
+    /// Reaches `parent&.send_type?`'s two possible positions (receiver and
+    /// argument — prism's `ArgumentsNode` is transparent here, same as
+    /// whitequark attaching call arguments directly to the `send` node) plus
+    /// the block, which may itself be a redundant-begin-bearing `do...end`.
+    fn rb_handle_call<'pr>(&mut self, call: &ruby_prism::CallNode<'pr>) -> bool {
+        let mut flagged = false;
+        if let Some(recv) = call.receiver() {
+            flagged |= self.rb_scan(&recv, RbCtx::Send);
+        }
+        if let Some(args) = call.arguments() {
+            for a in args.arguments().iter() {
+                flagged |= self.rb_scan(&a, RbCtx::Send);
+            }
+        }
+        if let Some(blk) = call.block() {
+            flagged |= self.rb_scan(&blk, RbCtx::Other);
+        }
+        flagged
+    }
+
+    /// Shared `register_offense`/`replace_begin_with_statement`/
+    /// `remove_begin`/`use_modifier_form_after_multiline_begin_block?`
+    /// correction logic — identical regardless of which path (dedicated or
+    /// generic) decided this kwbegin is offensive.
+    fn rb_register_offense<'pr>(&mut self, node: &ruby_prism::BeginNode<'pr>, ctx: RbCtx) {
+        let Some(begin_kw) = node.begin_keyword_loc() else { return };
+        let Some(end_kw) = node.end_keyword_loc() else { return };
+        self.push(begin_kw.start_offset(), "Style/RedundantBegin", true, "Redundant `begin` block detected.");
+
+        let mut end_consumed = false;
+
+        if let RbCtx::Assignment(parent_start) = ctx {
+            // replace_begin_with_statement: swap the `begin` keyword for the
+            // kwbegin's sole statement's own source text (parenthesized if
+            // it's itself a modifier-`if`), delete the original occurrence
+            // of that text, and hoist any comments that sat between `begin`
+            // and the statement up before the whole assignment.
+            if let Some(stmts) = node.statements() {
+                if let Some(first_child) = stmts.body().iter().next() {
+                    let fc_loc = first_child.location();
+                    let mut source = self.src[fc_loc.start_offset()..fc_loc.end_offset()].to_vec();
+                    if let Some(iff) = first_child.as_if_node() {
+                        if iff.if_keyword_loc().is_some() && iff.end_keyword_loc().is_none() {
+                            let mut wrapped = Vec::with_capacity(source.len() + 2);
+                            wrapped.push(b'(');
+                            wrapped.extend_from_slice(&source);
+                            wrapped.push(b')');
+                            source = wrapped;
+                        }
+                    }
+                    self.fixes.push((begin_kw.start_offset(), begin_kw.end_offset(), source));
+                    self.fixes.push((begin_kw.end_offset(), fc_loc.end_offset(), Vec::new()));
+                    let comments_start = begin_kw.end_offset();
+                    let comments_end = fc_loc.start_offset();
+                    if comments_end > comments_start {
+                        let comments = &self.src[comments_start..comments_end];
+                        if !comments.iter().all(u8::is_ascii_whitespace) {
+                            self.fixes.push((parent_start, parent_start, comments.to_vec()));
+                        }
+                    }
+                }
+            }
+        } else {
+            let mut range = (begin_kw.start_offset(), begin_kw.end_offset());
+            if matches!(ctx, RbCtx::EndlessDef) {
+                range = self.rb_expand_surrounding_space(range.0, range.1);
+            }
+            self.fixes.push((range.0, range.1, Vec::new()));
+        }
+
+        if let RbCtx::ModifierIf(kw_start, cond_end) = ctx {
+            if self.rb_multiline(node) {
+                if let Some(stmts) = node.statements() {
+                    if let Some(first_child) = stmts.body().iter().next() {
+                        let cond_text = &self.src[kw_start..cond_end];
+                        let mut insert = Vec::with_capacity(cond_text.len() + 1);
+                        insert.push(b' ');
+                        insert.extend_from_slice(cond_text);
+                        let fc_end = first_child.location().end_offset();
+                        self.fixes.push((fc_end, fc_end, insert));
+                        let (line_start, line_end) = self.rb_whole_line_range(kw_start);
+                        self.fixes.push((line_start, line_end, Vec::new()));
+                        end_consumed = true;
+                    }
+                }
+            }
+        }
+
+        if !end_consumed {
+            self.fixes.push((end_kw.start_offset(), end_kw.end_offset(), Vec::new()));
+        }
+    }
+
+    fn rb_multiline<'pr>(&self, node: &ruby_prism::BeginNode<'pr>) -> bool {
+        let loc = node.location();
+        let start_line = self.idx.loc(loc.start_offset()).0;
+        let end_line = self.idx.loc(loc.end_offset().saturating_sub(1)).0;
+        start_line != end_line
+    }
+
+    /// `range_with_surrounding_space(range, newlines: true)`: consume
+    /// `[ \t]` first (unconditionally), then a single run of `\n`, on both
+    /// sides — matching RuboCop's `RangeHelp#final_pos` exactly (it does
+    /// NOT loop back to re-consume spaces/tabs after crossing a newline, so
+    /// a following line's own indentation is left untouched).
+    fn rb_expand_surrounding_space(&self, mut start: usize, mut end: usize) -> (usize, usize) {
+        let src = self.src;
+        while start > 0 && matches!(src[start - 1], b' ' | b'\t') {
+            start -= 1;
+        }
+        while start > 0 && src[start - 1] == b'\n' {
+            start -= 1;
+        }
+        while end < src.len() && matches!(src[end], b' ' | b'\t') {
+            end += 1;
+        }
+        while end < src.len() && src[end] == b'\n' {
+            end += 1;
+        }
+        (start, end)
+    }
+
+    /// `range_by_whole_lines(range, include_final_newline: true)`, given
+    /// just an offset within the line: (start-of-line, end-of-line +
+    /// trailing `\n` if present).
+    fn rb_whole_line_range(&self, pos: usize) -> (usize, usize) {
+        let src = self.src;
+        let mut start = pos;
+        while start > 0 && src[start - 1] != b'\n' {
+            start -= 1;
+        }
+        let mut end = pos;
+        while end < src.len() && src[end] != b'\n' {
+            end += 1;
+        }
+        if end < src.len() {
+            end += 1;
+        }
+        (start, end)
+    }
+}
