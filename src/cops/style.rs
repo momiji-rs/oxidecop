@@ -34651,3 +34651,1330 @@ impl<'a> Cops<'a> {
         walker.visit(root);
     }
 }
+
+
+
+// ---------------------------------------------------------------------------
+// Style/RedundantParentheses
+//
+// Upstream drives entirely off `node.parent`/`each_ancestor` (whitequark's
+// AST). Prism gives no parent pointers, so this port maintains its OWN
+// generic ancestor stack (`Cops::rp_ancestors`, `RpKind` below) via the
+// shared `visit_branch_node_enter`/`_leave` hooks in mod.rs (same idiom as
+// `sak_ancestors`/`im_ancestors`) — populated for EVERY branch node in the
+// file, so `rp_parent`/`rp_grandparent`/arbitrary `each_ancestor` walks are
+// all just index arithmetic over one `Vec`.
+//
+// The stack models whitequark's node SHAPES, not prism's raw ones:
+//   - A `StatementsNode` contributes no frame at all (whitequark never
+//     wraps a lone statement) when it holds 0 or 1 statements — UNLESS it's
+//     the direct body of an explicit `(...)` or `begin...end`, where it's
+//     ALWAYS transparent regardless of count (those wrap their own
+//     children directly, unlike an `if`/`def`/block body, which gets an
+//     extra nested `:begin` once it holds 2+ statements).
+//     `rp_pending_transparent_stmts` (set when classifying the
+//     `ParenthesesNode`/explicit `BeginNode`, consumed by the very next
+//     `StatementsNode` — guaranteed to be that exact one by traversal
+//     order) implements the second half.
+//   - `ArgumentsNode`/`ElseNode` are always transparent (no whitequark
+//     wrapper for either).
+//   - An implicit rescue/ensure `BeginNode` (a def/block body with no
+//     `begin_keyword_loc`) is transparent; only an EXPLICIT `begin...end`
+//     gets a frame of its own.
+//   - `MatchWriteNode#call` (`/re/ =~ x`, upstream's `:match_with_lvasgn`)
+//     has no whitequark counterpart; `rp_pending_transparent_call` makes
+//     that one `CallNode` transparent so receiver/argument attach directly
+//     to the `MatchWithLvasgn` frame.
+//   - A `CallNode` is classified `Call` REGARDLESS of whether it owns a
+//     block. Upstream's prism-vs-whitequark translation flips block calls
+//     to be OUTERMOST (`s(:block, s(:send, ...), args, body)` — the "Known
+//     prism-vs-whitequark trap" noted elsewhere in this repo), but every
+//     predicate this cop applies to "the call with a block attached" reads
+//     equally well off prism's own (unflipped) `CallNode` directly — its
+//     `receiver`/`arguments`/message are unaffected by whether it has a
+//     block, and the block's own BODY is visited as a separate `BlockNode`/
+//     `LambdaNode` with its own `AnyBlock` frame regardless (no predicate
+//     here ever needs an ANCESTOR frame's braces/lambda-or-proc-ness — only
+//     a `begin_node`'s DIRECT sole child does, handled by direct inspection
+//     of the live node in `rp_lambda_or_proc_expression`/`rp_call_node`,
+//     never through this stack).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RpTag {
+    Begin,
+    AnyDef,
+    AnyBlock,
+    If,
+    WhilePost,
+    UntilPost,
+    MatchWithLvasgn,
+    Resbody,
+    Rescue,
+    Return,
+    Next,
+    Break,
+    Yield,
+    Super,
+    ZSuper,
+    Splat,
+    Kwsplat,
+    Or,
+    And,
+    Pin,
+    Range,
+    Dstr,
+    Call,
+    Array,
+    Pair,
+    AnyMatchPattern,
+    Other,
+}
+
+#[derive(Clone)]
+pub(crate) struct RpKind<'a> {
+    pub(crate) tag: RpTag,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) single_line: bool,
+    pub(crate) keyword: bool,
+    pub(crate) is_assignment: bool,
+    // Begin (both a real `(...)` and a bare 2+-statement implicit sequence)
+    pub(crate) open_s: usize,
+    pub(crate) open_e: usize,
+    pub(crate) close_s: usize,
+    pub(crate) close_e: usize,
+    pub(crate) num_children: usize,
+    pub(crate) first_child_start: usize,
+    pub(crate) last_child_end: usize,
+    // If / conditionals (if/unless/while/until/case/case_match)
+    pub(crate) ternary: bool,
+    pub(crate) is_conditional: bool,
+    pub(crate) condition_start: Option<usize>,
+    // AnyDef
+    pub(crate) endless_def: bool,
+    // Call / Super / Yield
+    pub(crate) receiver_start: Option<usize>,
+    pub(crate) parenthesized: bool,
+    pub(crate) operator_method: bool,
+    pub(crate) is_safe_nav: bool,
+    pub(crate) message: &'a [u8],
+    pub(crate) first_arg_start: Option<usize>,
+    pub(crate) arg_count: usize,
+}
+
+impl<'a> RpKind<'a> {
+    fn base(tag: RpTag, start: usize, end: usize, single_line: bool, keyword: bool) -> Self {
+        RpKind {
+            tag,
+            start,
+            end,
+            single_line,
+            keyword,
+            is_assignment: false,
+            open_s: start,
+            open_e: start,
+            close_s: end,
+            close_e: end,
+            num_children: 0,
+            first_child_start: start,
+            last_child_end: start,
+            ternary: false,
+            is_conditional: false,
+            condition_start: None,
+            endless_def: false,
+            receiver_start: None,
+            parenthesized: false,
+            operator_method: false,
+            is_safe_nav: false,
+            message: b"",
+            first_arg_start: None,
+            arg_count: 0,
+        }
+    }
+}
+
+/// `MethodIdentifierPredicates::OPERATOR_METHODS`.
+fn rp_is_operator_method(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"|" | b"^"
+            | b"&"
+            | b"<=>"
+            | b"=="
+            | b"==="
+            | b"=~"
+            | b">"
+            | b">="
+            | b"<"
+            | b"<="
+            | b"<<"
+            | b">>"
+            | b"+"
+            | b"-"
+            | b"*"
+            | b"/"
+            | b"%"
+            | b"**"
+            | b"~"
+            | b"+@"
+            | b"-@"
+            | b"!@"
+            | b"~@"
+            | b"[]"
+            | b"[]="
+            | b"!"
+            | b"!="
+            | b"!~"
+            | b"`"
+    )
+}
+
+fn rp_is_comparison_method(name: &[u8]) -> bool {
+    matches!(name, b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<")
+}
+
+fn rp_msg<'a>(src: &'a [u8], loc: Option<ruby_prism::Location<'_>>) -> &'a [u8] {
+    loc.map(|m| &src[m.start_offset()..m.end_offset()]).unwrap_or(b"")
+}
+
+impl<'a> super::Cops<'a> {
+    fn rp_single_line(&self, s: usize, e: usize) -> bool {
+        let end = if e > s { e - 1 } else { s };
+        self.idx.loc(s).0 == self.idx.loc(end).0
+    }
+
+    /// Populates one `rp_ancestors` frame per branch node — see the
+    /// module doc above. Called from `visit_branch_node_enter` in mod.rs,
+    /// BEFORE that node's own children are visited.
+    pub(crate) fn rp_classify(&mut self, node: &ruby_prism::Node<'_>) -> Option<RpKind<'a>> {
+        let loc = node.location();
+        let (start, end) = (loc.start_offset(), loc.end_offset());
+        let single_line = self.rp_single_line(start, end);
+
+        if let Some(p) = node.as_parentheses_node() {
+            let open = p.opening_loc();
+            let close = p.closing_loc();
+            let stmts = p.body().and_then(|b| b.as_statements_node());
+            let items: Vec<ruby_prism::Node<'_>> = stmts.as_ref().map(|s| s.body().iter().collect()).unwrap_or_default();
+            self.rp_pending_transparent_stmts = stmts.is_some();
+            let mut k = RpKind::base(RpTag::Begin, start, end, single_line, false);
+            k.open_s = open.start_offset();
+            k.open_e = open.end_offset();
+            k.close_s = close.start_offset();
+            k.close_e = close.end_offset();
+            k.num_children = items.len();
+            k.first_child_start = items.first().map(|n| n.location().start_offset()).unwrap_or(start);
+            k.last_child_end = items.last().map(|n| n.location().end_offset()).unwrap_or(start);
+            return Some(k);
+        }
+        if let Some(s) = node.as_statements_node() {
+            let force = std::mem::take(&mut self.rp_pending_transparent_stmts);
+            let items: Vec<ruby_prism::Node<'_>> = s.body().iter().collect();
+            if force || items.len() <= 1 {
+                return None;
+            }
+            let mut k = RpKind::base(RpTag::Begin, start, end, single_line, false);
+            k.num_children = items.len();
+            k.first_child_start = items.first().map(|n| n.location().start_offset()).unwrap_or(start);
+            k.last_child_end = items.last().map(|n| n.location().end_offset()).unwrap_or(start);
+            return Some(k);
+        }
+        if node.as_arguments_node().is_some() || node.as_else_node().is_some() || node.as_program_node().is_some() {
+            // `ProgramNode` has no whitequark counterpart at all — a
+            // top-level sole statement's `node.parent` is `nil`, not some
+            // synthetic "root" node.
+            return None;
+        }
+        if let Some(b) = node.as_begin_node() {
+            if b.begin_keyword_loc().is_none() {
+                return None; // implicit def/block rescue-or-ensure wrapper
+            }
+            self.rp_pending_transparent_stmts =
+                b.rescue_clause().is_none() && b.ensure_clause().is_none() && b.statements().is_some();
+            return Some(RpKind::base(RpTag::Other, start, end, single_line, true));
+        }
+        if node.as_embedded_statements_node().is_some() {
+            self.rp_pending_transparent_stmts = true;
+            return Some(RpKind::base(RpTag::Begin, start, end, single_line, false));
+        }
+        if node.as_ensure_node().is_some() {
+            return Some(RpKind::base(RpTag::Other, start, end, single_line, true));
+        }
+        if node.as_rescue_node().is_some() {
+            return Some(RpKind::base(RpTag::Resbody, start, end, single_line, false));
+        }
+        if node.as_rescue_modifier_node().is_some() {
+            return Some(RpKind::base(RpTag::Rescue, start, end, single_line, true));
+        }
+        if node.as_match_write_node().is_some() {
+            self.rp_pending_transparent_call = true;
+            return Some(RpKind::base(RpTag::MatchWithLvasgn, start, end, single_line, false));
+        }
+        if let Some(i) = node.as_if_node() {
+            let mut k = RpKind::base(RpTag::If, start, end, single_line, true);
+            k.ternary = i.if_keyword_loc().is_none();
+            k.is_conditional = true;
+            k.condition_start = Some(i.predicate().location().start_offset());
+            return Some(k);
+        }
+        if let Some(u) = node.as_unless_node() {
+            let mut k = RpKind::base(RpTag::If, start, end, single_line, true);
+            k.is_conditional = true;
+            k.condition_start = Some(u.predicate().location().start_offset());
+            return Some(k);
+        }
+        if let Some(w) = node.as_while_node() {
+            if w.is_begin_modifier() {
+                return Some(RpKind::base(RpTag::WhilePost, start, end, single_line, false));
+            }
+            let mut k = RpKind::base(RpTag::Other, start, end, single_line, true);
+            k.is_conditional = true;
+            k.condition_start = Some(w.predicate().location().start_offset());
+            return Some(k);
+        }
+        if let Some(u) = node.as_until_node() {
+            if u.is_begin_modifier() {
+                return Some(RpKind::base(RpTag::UntilPost, start, end, single_line, false));
+            }
+            let mut k = RpKind::base(RpTag::Other, start, end, single_line, true);
+            k.is_conditional = true;
+            k.condition_start = Some(u.predicate().location().start_offset());
+            return Some(k);
+        }
+        if let Some(c) = node.as_case_node() {
+            let mut k = RpKind::base(RpTag::Other, start, end, single_line, true);
+            k.is_conditional = true;
+            k.condition_start = c.predicate().map(|p| p.location().start_offset());
+            return Some(k);
+        }
+        if let Some(c) = node.as_case_match_node() {
+            let mut k = RpKind::base(RpTag::Other, start, end, single_line, true);
+            k.is_conditional = true;
+            k.condition_start = c.predicate().map(|p| p.location().start_offset());
+            return Some(k);
+        }
+        if let Some(d) = node.as_def_node() {
+            let mut k = RpKind::base(RpTag::AnyDef, start, end, single_line, true);
+            k.endless_def = d.equal_loc().is_some();
+            return Some(k);
+        }
+        if node.as_forwarding_super_node().is_some() {
+            return Some(RpKind::base(RpTag::ZSuper, start, end, single_line, true));
+        }
+        if let Some(s) = node.as_super_node() {
+            let mut k = RpKind::base(RpTag::Super, start, end, single_line, true);
+            k.parenthesized = s.lparen_loc().is_some();
+            let args = s.arguments();
+            k.arg_count = args.as_ref().map(|a| a.arguments().iter().count()).unwrap_or(0);
+            k.first_arg_start =
+                args.as_ref().and_then(|a| a.arguments().iter().next()).map(|n| n.location().start_offset());
+            return Some(k);
+        }
+        if let Some(y) = node.as_yield_node() {
+            let mut k = RpKind::base(RpTag::Yield, start, end, single_line, true);
+            k.parenthesized = y.lparen_loc().is_some();
+            let args = y.arguments();
+            k.arg_count = args.as_ref().map(|a| a.arguments().iter().count()).unwrap_or(0);
+            k.first_arg_start =
+                args.as_ref().and_then(|a| a.arguments().iter().next()).map(|n| n.location().start_offset());
+            return Some(k);
+        }
+        if let Some(r) = node.as_return_node() {
+            let mut k = RpKind::base(RpTag::Return, start, end, single_line, true);
+            k.arg_count = r.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0);
+            return Some(k);
+        }
+        if let Some(b) = node.as_break_node() {
+            let mut k = RpKind::base(RpTag::Break, start, end, single_line, true);
+            k.arg_count = b.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0);
+            return Some(k);
+        }
+        if let Some(n) = node.as_next_node() {
+            let mut k = RpKind::base(RpTag::Next, start, end, single_line, true);
+            k.arg_count = n.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0);
+            return Some(k);
+        }
+        if node.as_defined_node().is_some() {
+            return Some(RpKind::base(RpTag::Other, start, end, single_line, true));
+        }
+        if node.as_splat_node().is_some() {
+            return Some(RpKind::base(RpTag::Splat, start, end, single_line, false));
+        }
+        if node.as_assoc_splat_node().is_some() {
+            return Some(RpKind::base(RpTag::Kwsplat, start, end, single_line, false));
+        }
+        if node.as_pinned_expression_node().is_some() || node.as_pinned_variable_node().is_some() {
+            return Some(RpKind::base(RpTag::Pin, start, end, single_line, false));
+        }
+        if node.as_range_node().is_some() {
+            return Some(RpKind::base(RpTag::Range, start, end, single_line, false));
+        }
+        if node.as_interpolated_string_node().is_some() {
+            return Some(RpKind::base(RpTag::Dstr, start, end, single_line, false));
+        }
+        if let Some(o) = node.as_or_node() {
+            let kw = rp_msg(self.src, Some(o.operator_loc())) == b"or";
+            return Some(RpKind::base(RpTag::Or, start, end, single_line, kw));
+        }
+        if let Some(a) = node.as_and_node() {
+            let kw = rp_msg(self.src, Some(a.operator_loc())) == b"and";
+            return Some(RpKind::base(RpTag::And, start, end, single_line, kw));
+        }
+        if let Some(a) = node.as_array_node() {
+            let mut k = RpKind::base(RpTag::Array, start, end, single_line, false);
+            k.num_children = a.elements().iter().count();
+            return Some(k);
+        }
+        if node.as_when_node().is_some() {
+            // `when` is a real whitequark `KEYWORDS` entry (`when(Const)`
+            // touching the keyword with no space is exempted the same way
+            // `break(1)` is).
+            return Some(RpKind::base(RpTag::Other, start, end, single_line, true));
+        }
+        if node.as_assoc_node().is_some() {
+            return Some(RpKind::base(RpTag::Pair, start, end, single_line, false));
+        }
+        if node.as_match_predicate_node().is_some() {
+            return Some(RpKind::base(RpTag::AnyMatchPattern, start, end, single_line, false));
+        }
+        if node.as_match_required_node().is_some() {
+            return Some(RpKind::base(RpTag::AnyMatchPattern, start, end, single_line, false));
+        }
+        if node.as_lambda_node().is_some() || node.as_block_node().is_some() {
+            // No predicate this cop applies ever needs to know a block
+            // ANCESTOR's braces/lambda-or-proc-ness — only a `begin_node`'s
+            // DIRECT sole child (handled by `rp_lambda_or_proc_expression`/
+            // `rp_call_node` on the live node, never through this stack)
+            // cares about that. Just the bare tag is enough here.
+            return Some(RpKind::base(RpTag::AnyBlock, start, end, single_line, false));
+        }
+        if rp_is_assignment_node(node) {
+            let mut k = RpKind::base(RpTag::Other, start, end, single_line, false);
+            k.is_assignment = true;
+            return Some(k);
+        }
+        if let Some(c) = node.as_call_node() {
+            if std::mem::take(&mut self.rp_pending_transparent_call) {
+                return None;
+            }
+            let mut k = RpKind::base(RpTag::Call, start, end, single_line, false);
+            k.receiver_start = c.receiver().map(|r| r.location().start_offset());
+            k.parenthesized = c.opening_loc().is_some_and(|o| o.as_slice() == b"(");
+            k.is_safe_nav = c.is_safe_navigation();
+            let message = rp_msg(self.src, c.message_loc());
+            k.operator_method = rp_is_operator_method(message);
+            k.keyword = message == b"not";
+            k.message = message;
+            let args = c.arguments();
+            k.arg_count = args.as_ref().map(|a| a.arguments().iter().count()).unwrap_or(0);
+            k.first_arg_start =
+                args.as_ref().and_then(|a| a.arguments().iter().next()).map(|n| n.location().start_offset());
+            return Some(k);
+        }
+        Some(RpKind::base(RpTag::Other, start, end, single_line, false))
+    }
+
+    /// Real (non-transparent) ancestors of whatever is currently on top of
+    /// the stack, nearest-first. `rp_ancestors.last()` is that node's OWN
+    /// frame (pushed on entry, like `sak_ancestors`), so this skips it.
+    fn rp_ancestors_iter(&self) -> impl DoubleEndedIterator<Item = &RpKind<'a>> {
+        let len = self.rp_ancestors.len();
+        self.rp_ancestors[..len.saturating_sub(1)].iter().rev().filter_map(|f| f.as_ref())
+    }
+    fn rp_self_frame(&self) -> Option<&RpKind<'a>> {
+        self.rp_ancestors.last().and_then(|f| f.as_ref())
+    }
+    fn rp_parent(&self) -> Option<&RpKind<'a>> {
+        self.rp_ancestors_iter().next()
+    }
+    fn rp_grandparent(&self) -> Option<&RpKind<'a>> {
+        self.rp_ancestors_iter().nth(1)
+    }
+    /// `node.each_ancestor(:call).to_a.last` — the FURTHEST (closest to the
+    /// program root) `:send`/`:csend` ancestor.
+    fn rp_topmost_call_ancestor(&self) -> Option<&RpKind<'a>> {
+        let len = self.rp_ancestors.len();
+        self.rp_ancestors[..len.saturating_sub(1)].iter().filter_map(|f| f.as_ref()).find(|k| k.tag == RpTag::Call)
+    }
+    /// `first_argument?` (see upstream's recursive definition): walks
+    /// `start`, then each real ancestor's own start, checking at every step
+    /// whether the CURRENT position is literally the first argument of the
+    /// NEXT ancestor up (when that ancestor is a call/super/yield).
+    fn rp_first_argument(&self, start: usize) -> bool {
+        let mut cur = start;
+        for anc in self.rp_ancestors_iter() {
+            let hit =
+                matches!(anc.tag, RpTag::Call | RpTag::Super | RpTag::Yield) && anc.first_arg_start == Some(cur);
+            if hit {
+                return true;
+            }
+            cur = anc.start;
+        }
+        false
+    }
+    fn rp_begin_chained(&self) -> bool {
+        let Some(begin) = self.rp_self_frame() else { return false };
+        matches!(self.rp_parent(), Some(p) if p.tag == RpTag::Call && p.receiver_start == Some(begin.start))
+    }
+
+    /// `Style::RedundantParentheses#on_begin`.
+    pub(crate) fn check_redundant_parentheses(&mut self, node: &ruby_prism::ParenthesesNode<'_>) {
+        const COP: &str = "Style/RedundantParentheses";
+        if !self.on(COP) {
+            return;
+        }
+        let loc = node.location();
+        let (begin_start, begin_end) = (loc.start_offset(), loc.end_offset());
+        let _ = begin_end;
+        let open = node.opening_loc();
+        let close = node.closing_loc();
+
+        let children: Vec<ruby_prism::Node<'_>> =
+            node.body().and_then(|b| b.as_statements_node()).map(|s| s.body().iter().collect()).unwrap_or_default();
+
+        if self.rp_parens_allowed(&children) || self.rp_ignore_syntax() {
+            return;
+        }
+        let Some(first) = children.first() else { return };
+
+        if let Some(message) = self.rp_find_offense_message(first) {
+            if message == "block body" {
+                self.rp_offense(begin_start, open.start_offset(), open.end_offset(), close.start_offset(), close.end_offset(), &children, message);
+                return;
+            }
+            if first.as_range_node().is_some() && !self.rp_argument_of_parenthesized_method_call(first) {
+                if let Some(p) = self.rp_parent() {
+                    if p.tag == RpTag::Begin {
+                        let (ps, pos, poe, pcs, pce) = (p.start, p.open_s, p.open_e, p.close_s, p.close_e);
+                        self.rp_offense(ps, pos, poe, pcs, pce, &children, message);
+                        return;
+                    }
+                }
+            }
+            self.rp_offense(begin_start, open.start_offset(), open.end_offset(), close.start_offset(), close.end_offset(), &children, message);
+            return;
+        }
+
+        if rp_call_node(first) {
+            self.rp_check_send(first, open.start_offset(), open.end_offset(), close.start_offset(), close.end_offset(), &children);
+        }
+    }
+
+    fn rp_offense(
+        &mut self,
+        anchor: usize,
+        open_s: usize,
+        open_e: usize,
+        close_s: usize,
+        close_e: usize,
+        children: &[ruby_prism::Node<'_>],
+        message: &'static str,
+    ) {
+        const COP: &str = "Style/RedundantParentheses";
+        self.push(anchor, COP, true, format!("Don't use parentheses around {message}."));
+        self.rp_autocorrect(open_s, open_e, close_s, close_e, children);
+    }
+
+    /// `ParenthesesCorrector.correct`.
+    fn rp_autocorrect(&mut self, open_s: usize, open_e: usize, close_s: usize, close_e: usize, children: &[ruby_prism::Node<'_>]) {
+        let right_end = rp_right_ext(self.src, open_e);
+        self.fixes.push((open_s, right_end, Vec::new()));
+
+        let swallow = self.rp_comment_swallow(children, close_s);
+        let mut left_start = if swallow { rp_left_ext_same_line(self.src, close_s) } else { rp_left_ext(self.src, close_s) };
+        let mut close_removal_end = close_e;
+
+        // `handle_orphaned_comma`: the whole line containing `)` is just
+        // (whitespace) `)` (whitespace) `,` — deleting only the paren would
+        // leave the comma dangling on its own line.
+        let (line_start, line_end) = self.rp_line_range(close_s);
+        let _ = line_start;
+        let line = &self.src[self.rp_line_range(close_s).0..line_end];
+        if rp_only_closing_paren_before_comma(line) {
+            left_start = rp_left_ext_full(self.src, close_s);
+            if let Some(heredoc_after) = children.last().and_then(|c| rp_heredoc_closing(c)) {
+                // `extend_range_for_heredoc`: the removal ALSO swallows the
+                // `\s*,` immediately following `)` on this line (upstream's
+                // `COMMA_REGEXP` match) — the comma gets relocated instead
+                // of left dangling right after where `)` used to be.
+                let mut p = close_e;
+                while p < self.src.len() && matches!(self.src[p], b' ' | b'\t') {
+                    p += 1;
+                }
+                if self.src.get(p) == Some(&b',') {
+                    p += 1;
+                }
+                close_removal_end = p;
+                self.fixes.push((heredoc_after, heredoc_after, b",".to_vec()));
+            }
+        }
+        self.fixes.push((left_start, close_removal_end, Vec::new()));
+
+        if let Some(p) = self.rp_parent() {
+            if p.tag == RpTag::If && p.ternary && self.src.get(close_e) == Some(&b'?') {
+                self.fixes.push((close_e, close_e, b" ".to_vec()));
+            }
+        }
+    }
+
+    fn rp_line_range(&self, offset: usize) -> (usize, usize) {
+        let (line, _) = self.idx.loc(offset);
+        let start = self.idx.starts[line - 1];
+        let end = self.idx.starts.get(line).copied().unwrap_or(self.src.len());
+        (start, end)
+    }
+
+    fn rp_comment_swallow(&self, children: &[ruby_prism::Node<'_>], close_s: usize) -> bool {
+        let Some(last) = children.last() else { return false };
+        let body_end = last.location().end_offset();
+        if body_end >= close_s {
+            return false;
+        }
+        let between = &self.src[body_end..close_s];
+        if !rp_has_comment_then_newline(between) {
+            return false;
+        }
+        // `chained_after_close_paren?`: non-whitespace, non-`#` text after
+        // `)` on its own line. `source_line` excludes the trailing `\n`
+        // itself — without trimming it off here too, an empty remainder
+        // (the common case: nothing follows `)` but the newline) would
+        // wrongly count as "there's a newline character left to trim",
+        // never going empty.
+        let (_, line_end) = self.rp_line_range(close_s);
+        let content_end = if line_end > 0 && self.src.get(line_end - 1) == Some(&b'\n') { line_end - 1 } else { line_end };
+        let after_start = (close_s + 1).min(content_end);
+        let after = &self.src[after_start..content_end];
+        let trimmed = rp_ltrim(after);
+        !trimmed.is_empty() && trimmed[0] != b'#'
+    }
+
+    fn rp_parens_allowed(&self, children: &[ruby_prism::Node<'_>]) -> bool {
+        if children.is_empty() {
+            return true;
+        }
+        if self.rp_first_arg_begins_with_hash_literal(&children[0]) {
+            return true;
+        }
+        // `rescue?`: `{^resbody ^^resbody}`.
+        if matches!(self.rp_parent(), Some(p) if p.tag == RpTag::Resbody)
+            || matches!(self.rp_grandparent(), Some(p) if p.tag == RpTag::Resbody)
+        {
+            return true;
+        }
+        // `in_pattern_matching_in_method_argument?` — modern Ruby only
+        // checks `match_pattern_p_type?` (`in`, prism's `MatchPredicateNode`).
+        if matches!(self.rp_parent(), Some(p) if p.tag == RpTag::Call) && children[0].as_match_predicate_node().is_some() {
+            return true;
+        }
+        // `allowed_pin_operator?`: `^(pin (begin !{lvar ivar cvar gvar}))`.
+        if matches!(self.rp_parent(), Some(p) if p.tag == RpTag::Pin) && !rp_is_simple_variable(&children[0]) {
+            return true;
+        }
+        self.rp_allowed_expression(children)
+    }
+
+    fn rp_allowed_expression(&self, children: &[ruby_prism::Node<'_>]) -> bool {
+        // `allowed_ancestor?`.
+        if let Some(p) = self.rp_parent() {
+            if p.keyword && self.rp_parens_required() {
+                return true;
+            }
+        }
+        // `allowed_multiple_expression?`.
+        if children.len() > 1 {
+            match self.rp_parent() {
+                None => {}
+                Some(p) if !matches!(p.tag, RpTag::Begin | RpTag::AnyDef | RpTag::AnyBlock) => return true,
+                _ => {}
+            }
+        }
+        // `allowed_ternary?`.
+        if let Some(p) = self.rp_parent() {
+            if p.tag == RpTag::If && p.ternary && self.rp_ternary_parentheses_required() {
+                return true;
+            }
+        }
+        matches!(self.rp_parent(), Some(p) if p.tag == RpTag::Range)
+    }
+
+    /// `Parentheses#parens_required?`: is either the byte right before `(`
+    /// or the byte right after `)` a lowercase letter (removing the parens
+    /// would merge into an identifier)?
+    fn rp_parens_required(&self) -> bool {
+        let Some(top) = self.rp_self_frame() else { return false };
+        let before = top.open_s.checked_sub(1).and_then(|i| self.src.get(i));
+        let after = self.src.get(top.close_e);
+        before.is_some_and(u8::is_ascii_lowercase) || after.is_some_and(u8::is_ascii_lowercase)
+    }
+
+    fn rp_ternary_parentheses_required(&self) -> bool {
+        const OTHER: &str = "Style/TernaryParentheses";
+        if !self.cfg.cop_config_enabled(OTHER) {
+            return false;
+        }
+        matches!(self.cfg.get(OTHER, "EnforcedStyle"), Some("require_parentheses" | "require_parentheses_when_complex"))
+    }
+
+    fn rp_allow_in_multiline_conditions(&self) -> bool {
+        const OTHER: &str = "Style/ParenthesesAroundCondition";
+        self.cfg.cop_config_enabled(OTHER) && self.cfg.get(OTHER, "AllowInMultilineConditions") == Some("true")
+    }
+
+    /// `ignore_syntax?`.
+    fn rp_ignore_syntax(&self) -> bool {
+        let Some(p) = self.rp_parent() else { return false };
+        if matches!(p.tag, RpTag::WhilePost | RpTag::UntilPost | RpTag::MatchWithLvasgn) {
+            return true;
+        }
+        // `like_method_argument_parentheses?`: `type?(:send, :super,
+        // :yield)` — a plain array-inclusion check on the RAW type, so
+        // `:csend` (safe nav) is excluded, unlike the `:call` GROUP.
+        let is_send_super_yield =
+            (p.tag == RpTag::Call && !p.is_safe_nav) || matches!(p.tag, RpTag::Super | RpTag::Yield);
+        if is_send_super_yield && p.arg_count == 1 && !p.parenthesized && !p.operator_method {
+            return true;
+        }
+        // `multiline_control_flow_statements?`.
+        if matches!(p.tag, RpTag::Return | RpTag::Next | RpTag::Break) && !p.single_line {
+            return true;
+        }
+        false
+    }
+
+    fn rp_first_arg_begins_with_hash_literal(&self, first: &ruby_prism::Node<'_>) -> bool {
+        if !rp_chain_starts_with_hash(first) {
+            return false;
+        }
+        let Some(begin) = self.rp_self_frame() else { return false };
+        if !self.rp_first_argument(begin.start) {
+            return false;
+        }
+        !self.rp_topmost_call_ancestor().is_some_and(|p| p.parenthesized)
+    }
+
+    /// `find_offense_message`.
+    fn rp_find_offense_message(&self, node: &ruby_prism::Node<'_>) -> Option<&'static str> {
+        if self.rp_keyword_with_redundant_parentheses(node) {
+            return Some("a keyword");
+        }
+        if rp_is_literal(node) && self.rp_disallowed_literal(node) {
+            return Some("a literal");
+        }
+        if rp_is_variable(node) {
+            return Some("a variable");
+        }
+        if node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some() {
+            return Some("a constant");
+        }
+        if matches!(self.rp_parent(), Some(p) if p.tag == RpTag::AnyBlock) || self.rp_body_range(node) {
+            return Some("block body");
+        }
+        let node_is_assignment = rp_is_assignment_node(node);
+        if node_is_assignment && (self.rp_parent().is_none() || matches!(self.rp_parent(), Some(p) if p.tag == RpTag::Begin))
+        {
+            return Some("an assignment");
+        }
+        if rp_lambda_or_proc_expression(node) {
+            return Some("an expression");
+        }
+        if self.rp_disallowed_one_line_pattern_matching(node) {
+            return Some("a one-line pattern matching");
+        }
+        if self.rp_interpolation() {
+            return Some("an interpolated expression");
+        }
+        if self.rp_argument_of_parenthesized_method_call(node) {
+            return Some("a method argument");
+        }
+        if self.rp_oneline_rescue_parens_required(node) {
+            return Some("a one-line rescue");
+        }
+        if self.rp_begin_chained() {
+            return None;
+        }
+        if node.as_and_node().is_some() || node.as_or_node().is_some() {
+            let semantic = rp_semantic_operator(self.src, node);
+            if semantic && self.rp_parent().is_some() {
+                return None;
+            }
+            if !self.rp_single_line(node.location().start_offset(), node.location().end_offset())
+                && self.rp_allow_in_multiline_conditions()
+            {
+                return None;
+            }
+            // `ALLOWED_NODE_TYPES.include?(begin_node.parent&.type)`: a
+            // plain array-inclusion check on the RAW type — `:send` only,
+            // excluding `:csend`.
+            if matches!(
+                self.rp_parent(),
+                Some(p) if p.tag == RpTag::Or
+                    || (p.tag == RpTag::Call && !p.is_safe_nav)
+                    || p.tag == RpTag::Splat
+                    || p.tag == RpTag::Kwsplat
+            ) {
+                return None;
+            }
+            let is_and = node.as_and_node().is_some();
+            if !is_and && matches!(self.rp_parent(), Some(p) if p.tag == RpTag::And) {
+                return None;
+            }
+            if matches!(self.rp_parent(), Some(p) if p.tag == RpTag::If && p.ternary) {
+                return None;
+            }
+            return Some("a logical expression");
+        } else if rp_is_comparison_call(node) {
+            if self.rp_parent().is_some() {
+                return None;
+            }
+            return Some("a comparison expression");
+        }
+        None
+    }
+
+    fn rp_keyword_with_redundant_parentheses(&self, node: &ruby_prism::Node<'_>) -> bool {
+        if node.as_self_node().is_some()
+            || node.as_source_file_node().is_some()
+            || node.as_source_line_node().is_some()
+            || node.as_source_encoding_node().is_some()
+        {
+            return true;
+        }
+        if node.as_redo_node().is_some() || node.as_retry_node().is_some() {
+            return true;
+        }
+        if let Some(r) = node.as_return_node() {
+            return rp_keyword_args_check(r.arguments(), false);
+        }
+        if let Some(b) = node.as_break_node() {
+            return rp_keyword_args_check(b.arguments(), false);
+        }
+        if let Some(n) = node.as_next_node() {
+            return rp_keyword_args_check(n.arguments(), false);
+        }
+        if node.as_forwarding_super_node().is_some() {
+            return true; // zsuper: always zero explicit args
+        }
+        if let Some(s) = node.as_super_node() {
+            return rp_keyword_args_check(s.arguments(), s.rparen_loc().is_some());
+        }
+        if let Some(y) = node.as_yield_node() {
+            return rp_keyword_args_check(y.arguments(), y.rparen_loc().is_some());
+        }
+        if let Some(d) = node.as_defined_node() {
+            let value = d.value();
+            let only_begin = value.as_parentheses_node().is_some();
+            if only_begin {
+                return true;
+            }
+            return d.lparen_loc().is_some();
+        }
+        false
+    }
+
+    fn rp_disallowed_literal(&self, node: &ruby_prism::Node<'_>) -> bool {
+        if node.as_range_node().is_some() {
+            matches!(self.rp_parent(), Some(p) if p.tag == RpTag::Begin && p.num_children == 1)
+        } else {
+            !self.rp_raised_to_power_negative_numeric(node)
+        }
+    }
+
+    fn rp_raised_to_power_negative_numeric(&self, node: &ruby_prism::Node<'_>) -> bool {
+        if !rp_is_numeric(node) {
+            return false;
+        }
+        let Some(begin) = self.rp_self_frame() else { return false };
+        let is_power_receiver = matches!(
+            self.rp_parent(),
+            Some(p) if p.tag == RpTag::Call && p.message == b"**" && p.receiver_start == Some(begin.start)
+        );
+        is_power_receiver && self.node_src(node).first() == Some(&b'-')
+    }
+
+    fn rp_body_range(&self, node: &ruby_prism::Node<'_>) -> bool {
+        if self.rp_begin_chained() {
+            return false;
+        }
+        let Some(r) = node.as_range_node() else { return false };
+        let Some(p) = self.rp_parent() else { return false };
+        if p.tag != RpTag::Begin {
+            return false;
+        }
+        let Some(begin) = self.rp_self_frame() else { return false };
+        let is_first = begin.start == p.first_child_start;
+        let is_last = begin.end == p.last_child_end;
+        (r.left().is_none() && is_first) || (r.right().is_none() && is_last)
+    }
+
+    fn rp_disallowed_one_line_pattern_matching(&self, node: &ruby_prism::Node<'_>) -> bool {
+        if let Some(p) = self.rp_parent() {
+            if p.tag == RpTag::AnyDef && p.endless_def {
+                return false;
+            }
+            if p.is_assignment {
+                return false;
+            }
+        }
+        let is_match_pattern = node.as_match_predicate_node().is_some() || node.as_match_required_node().is_some();
+        is_match_pattern && !self.rp_ancestors_iter().any(|k| matches!(k.tag, RpTag::Or | RpTag::And))
+    }
+
+    fn rp_interpolation(&self) -> bool {
+        matches!(self.rp_parent(), Some(p) if p.tag == RpTag::Begin)
+            && matches!(self.rp_grandparent(), Some(p) if p.tag == RpTag::Dstr)
+    }
+
+    fn rp_argument_of_parenthesized_method_call(&self, node: &ruby_prism::Node<'_>) -> bool {
+        if rp_is_basic_conditional(node) || node.as_rescue_modifier_node().is_some() || rp_method_call_parens_required(node)
+        {
+            return false;
+        }
+        let Some(p) = self.rp_parent() else { return false };
+        let Some(begin) = self.rp_self_frame() else { return false };
+        p.tag == RpTag::Call && p.parenthesized && p.receiver_start != Some(begin.start)
+    }
+
+    fn rp_oneline_rescue_parens_required(&self, node: &ruby_prism::Node<'_>) -> bool {
+        if node.as_rescue_modifier_node().is_none() {
+            return false;
+        }
+        let Some(p) = self.rp_parent() else { return false };
+        if p.tag == RpTag::If && p.ternary {
+            return false;
+        }
+        let Some(begin) = self.rp_self_frame() else { return false };
+        if p.is_conditional && p.condition_start == Some(begin.start) {
+            return false;
+        }
+        !(p.tag == RpTag::Call || p.tag == RpTag::Array || p.tag == RpTag::Pair)
+    }
+
+    fn rp_check_send(
+        &mut self,
+        node: &ruby_prism::Node<'_>,
+        open_s: usize,
+        open_e: usize,
+        close_s: usize,
+        close_e: usize,
+        children: &[ruby_prism::Node<'_>],
+    ) {
+        if rp_unary_operation(node, self.src) {
+            self.rp_check_unary(node, open_s, open_e, close_s, close_e, children);
+            return;
+        }
+        if !self.rp_method_call_with_redundant_parentheses(node) {
+            return;
+        }
+        if self.rp_call_chain_starts_with_int(node) || self.rp_do_end_block_in_method_chain(node) {
+            return;
+        }
+        let anchor = self.rp_self_frame().map(|k| k.start).unwrap_or(open_s);
+        self.rp_offense(anchor, open_s, open_e, close_s, close_e, children, "a method call");
+    }
+
+    fn rp_check_unary(
+        &mut self,
+        node: &ruby_prism::Node<'_>,
+        open_s: usize,
+        open_e: usize,
+        close_s: usize,
+        close_e: usize,
+        children: &[ruby_prism::Node<'_>],
+    ) {
+        if self.rp_begin_chained() {
+            return;
+        }
+        let descended = rp_descend_unary(node, self.src);
+        if !self.rp_method_call_with_redundant_parentheses(&descended) {
+            return;
+        }
+        let anchor = self.rp_self_frame().map(|k| k.start).unwrap_or(open_s);
+        self.rp_offense(anchor, open_s, open_e, close_s, close_e, children, "a unary operation");
+    }
+
+    fn rp_method_call_with_redundant_parentheses(&self, node: &ruby_prism::Node<'_>) -> bool {
+        let is_relevant = node.as_call_node().is_some()
+            || node.as_super_node().is_some()
+            || node.as_forwarding_super_node().is_some()
+            || node.as_yield_node().is_some()
+            || node.as_defined_node().is_some();
+        if !is_relevant {
+            return false;
+        }
+        if rp_prefix_not(node, self.src) {
+            return false;
+        }
+        if self.rp_singular_parenthesized_parent() {
+            return true;
+        }
+        let (args_empty, parenthesized) = rp_call_shape(node);
+        args_empty || parenthesized || rp_square_brackets(node, self.src)
+    }
+
+    fn rp_singular_parenthesized_parent(&self) -> bool {
+        match self.rp_parent() {
+            None => true,
+            Some(p) if matches!(p.tag, RpTag::Splat | RpTag::Kwsplat) => false,
+            Some(p) if p.tag == RpTag::Pin => true,
+            Some(p) if matches!(p.tag, RpTag::Begin | RpTag::Array) => p.num_children == 1,
+            Some(p) if matches!(p.tag, RpTag::Return | RpTag::Next | RpTag::Break | RpTag::Super | RpTag::Yield) => {
+                p.arg_count == 1
+            }
+            _ => false,
+        }
+    }
+
+    fn rp_call_chain_starts_with_int(&self, node: &ruby_prism::Node<'_>) -> bool {
+        let Some(c) = node.as_call_node() else { return false };
+        let Some(recv) = rp_call_chain_bottom(&c) else { return false };
+        if recv.as_integer_node().is_none() {
+            return false;
+        }
+        let Some(begin) = self.rp_self_frame() else { return false };
+        matches!(
+            self.rp_parent(),
+            Some(p) if p.tag == RpTag::Call && p.receiver_start == Some(begin.start) && (p.message == b"-@" || p.message == b"+@")
+        )
+    }
+
+    /// `do_end_block_in_method_chain?`: does `node`'s own subtree (receiver
+    /// chain + arguments) contain a `do`...`end` block anywhere, AND does
+    /// `begin_node` itself sit somewhere inside another call chain
+    /// (`begin_node.each_ancestor(:call).any?`)?
+    fn rp_do_end_block_in_method_chain(&self, node: &ruby_prism::Node<'_>) -> bool {
+        if !rp_has_do_end_descendant(node) {
+            return false;
+        }
+        self.rp_ancestors_iter().any(|k| k.tag == RpTag::Call)
+    }
+}
+
+fn rp_ltrim(s: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i < s.len() && (s[i] == b' ' || s[i] == b'\t') {
+        i += 1;
+    }
+    &s[i..]
+}
+
+fn rp_has_comment_then_newline(s: &[u8]) -> bool {
+    if let Some(hash) = s.iter().position(|&b| b == b'#') {
+        s[hash..].contains(&b'\n')
+    } else {
+        false
+    }
+}
+
+fn rp_only_closing_paren_before_comma(line: &[u8]) -> bool {
+    let t = rp_ltrim(line);
+    let Some(rest) = t.strip_prefix(b")") else { return false };
+    rp_ltrim(rest).starts_with(b",")
+}
+
+/// Right-extend forward over ALL contiguous whitespace (spaces/tabs/newlines).
+fn rp_right_ext(src: &[u8], pos: usize) -> usize {
+    let mut p = pos;
+    while p < src.len() && matches!(src[p], b' ' | b'\t' | b'\n') {
+        p += 1;
+    }
+    p
+}
+/// Left-extend backward over same-line spaces/tabs, then contiguous newlines.
+fn rp_left_ext(src: &[u8], pos: usize) -> usize {
+    let mut p = pos;
+    while p > 0 && matches!(src[p - 1], b' ' | b'\t') {
+        p -= 1;
+    }
+    while p > 0 && src[p - 1] == b'\n' {
+        p -= 1;
+    }
+    p
+}
+/// Left-extend backward over same-line spaces/tabs ONLY (comment-swallow case).
+fn rp_left_ext_same_line(src: &[u8], pos: usize) -> usize {
+    let mut p = pos;
+    while p > 0 && matches!(src[p - 1], b' ' | b'\t') {
+        p -= 1;
+    }
+    p
+}
+/// `parens_range`: same as `rp_left_ext` but ALSO sweeps remaining generic
+/// whitespace (indentation on earlier lines too) — `whitespace: true`.
+fn rp_left_ext_full(src: &[u8], pos: usize) -> usize {
+    let mut p = rp_left_ext(src, pos);
+    while p > 0 && src[p - 1].is_ascii_whitespace() {
+        p -= 1;
+    }
+    p
+}
+
+/// Is the LAST top-level child of the parens' body a heredoc string? Returns
+/// the byte offset right after its opening declaration (where the comma
+/// gets re-inserted), mirroring `heredoc?`/`add_heredoc_comma`.
+fn rp_heredoc_closing(node: &ruby_prism::Node) -> Option<usize> {
+    let opening = if let Some(s) = node.as_string_node() {
+        s.opening_loc()
+    } else if let Some(s) = node.as_interpolated_string_node() {
+        s.opening_loc()
+    } else {
+        None
+    }?;
+    if !opening.as_slice().starts_with(b"<<") {
+        return None;
+    }
+    Some(opening.end_offset())
+}
+
+fn rp_is_simple_variable(node: &ruby_prism::Node) -> bool {
+    node.as_local_variable_read_node().is_none()
+        && node.as_instance_variable_read_node().is_none()
+        && node.as_class_variable_read_node().is_none()
+        && node.as_global_variable_read_node().is_none()
+}
+
+/// `call_node?`: `node.call_type? || (any_block_type? && braces? &&
+/// !lambda_or_proc?)`. The second disjunct is unreachable via prism's raw
+/// tree (a call-with-block is always `CallNode`, never a bare `BlockNode`,
+/// and a standalone `LambdaNode` is always `lambda_or_proc?`), so this
+/// reduces to the first.
+fn rp_call_node(node: &ruby_prism::Node) -> bool {
+    node.as_call_node().is_some()
+}
+
+/// `node.lambda_or_proc? && (node.braces? || node.send_node.lambda_literal?)`
+/// evaluated directly on a live node (always examined as `begin_node`'s
+/// sole child, never through the ancestor stack).
+fn rp_lambda_or_proc_expression(node: &ruby_prism::Node) -> bool {
+    if node.as_lambda_node().is_some() {
+        return true; // `send_node.lambda_literal?` is always true for `->`
+    }
+    let Some(c) = node.as_call_node() else { return false };
+    let Some(blk) = c.block() else { return false };
+    let message = c.message_loc().map(|m| m.as_slice()).unwrap_or(b"");
+    if c.receiver().is_some() || !matches!(message, b"lambda" | b"proc") {
+        return false;
+    }
+    blk.as_block_node().is_some_and(|b| b.opening_loc().as_slice() == b"{")
+}
+
+fn rp_is_literal(node: &ruby_prism::Node) -> bool {
+    node.as_string_node().is_some()
+        || node.as_interpolated_string_node().is_some()
+        || node.as_x_string_node().is_some()
+        || node.as_interpolated_x_string_node().is_some()
+        || node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_interpolated_symbol_node().is_some()
+        || node.as_array_node().is_some()
+        || node.as_hash_node().is_some()
+        || node.as_regular_expression_node().is_some()
+        || node.as_interpolated_regular_expression_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+        || node.as_nil_node().is_some()
+        || node.as_range_node().is_some()
+        || node.as_imaginary_node().is_some()
+        || node.as_rational_node().is_some()
+}
+
+fn rp_is_numeric(node: &ruby_prism::Node) -> bool {
+    node.as_integer_node().is_some() || node.as_float_node().is_some()
+}
+
+fn rp_is_variable(node: &ruby_prism::Node) -> bool {
+    node.as_local_variable_read_node().is_some()
+        || node.as_instance_variable_read_node().is_some()
+        || node.as_class_variable_read_node().is_some()
+        || node.as_global_variable_read_node().is_some()
+}
+
+fn rp_is_assignment_node(node: &ruby_prism::Node) -> bool {
+    node.as_local_variable_write_node().is_some()
+        || node.as_instance_variable_write_node().is_some()
+        || node.as_class_variable_write_node().is_some()
+        || node.as_global_variable_write_node().is_some()
+        || node.as_constant_write_node().is_some()
+        || node.as_constant_path_write_node().is_some()
+        || node.as_multi_write_node().is_some()
+        || node.as_local_variable_operator_write_node().is_some()
+        || node.as_local_variable_or_write_node().is_some()
+        || node.as_local_variable_and_write_node().is_some()
+        || node.as_instance_variable_operator_write_node().is_some()
+        || node.as_instance_variable_or_write_node().is_some()
+        || node.as_instance_variable_and_write_node().is_some()
+        || node.as_class_variable_operator_write_node().is_some()
+        || node.as_class_variable_or_write_node().is_some()
+        || node.as_class_variable_and_write_node().is_some()
+        || node.as_global_variable_operator_write_node().is_some()
+        || node.as_global_variable_or_write_node().is_some()
+        || node.as_global_variable_and_write_node().is_some()
+        || node.as_constant_operator_write_node().is_some()
+        || node.as_constant_or_write_node().is_some()
+        || node.as_constant_and_write_node().is_some()
+        || node.as_constant_path_operator_write_node().is_some()
+        || node.as_constant_path_or_write_node().is_some()
+        || node.as_constant_path_and_write_node().is_some()
+        || node.as_call_operator_write_node().is_some()
+        || node.as_call_or_write_node().is_some()
+        || node.as_call_and_write_node().is_some()
+        || node.as_index_operator_write_node().is_some()
+        || node.as_index_or_write_node().is_some()
+        || node.as_index_and_write_node().is_some()
+}
+
+fn rp_is_basic_conditional(node: &ruby_prism::Node) -> bool {
+    if node.as_if_node().is_some() || node.as_unless_node().is_some() {
+        return true;
+    }
+    if let Some(w) = node.as_while_node() {
+        return !w.is_begin_modifier();
+    }
+    if let Some(u) = node.as_until_node() {
+        return !u.is_begin_modifier();
+    }
+    false
+}
+
+fn rp_method_call_parens_required(node: &ruby_prism::Node) -> bool {
+    let Some(c) = node.as_call_node() else { return false };
+    let has_dot = c.call_operator_loc().is_some();
+    (c.receiver().is_none() || has_dot) && c.arguments().is_some_and(|a| a.arguments().iter().count() > 0)
+}
+
+fn rp_semantic_operator(src: &[u8], node: &ruby_prism::Node) -> bool {
+    let op = if let Some(o) = node.as_or_node() {
+        Some(o.operator_loc())
+    } else {
+        node.as_and_node().map(|a| a.operator_loc())
+    };
+    op.is_some_and(|o| &src[o.start_offset()..o.end_offset()] == b"and" || &src[o.start_offset()..o.end_offset()] == b"or")
+}
+
+fn rp_is_comparison_call(node: &ruby_prism::Node) -> bool {
+    let Some(c) = node.as_call_node() else { return false };
+    rp_is_comparison_method(c.message_loc().map(|m| m.as_slice()).unwrap_or(b""))
+}
+
+fn rp_prefix_not(node: &ruby_prism::Node, _src: &[u8]) -> bool {
+    let Some(c) = node.as_call_node() else { return false };
+    c.message_loc().map(|m| m.as_slice()) == Some(b"not")
+}
+
+/// `(node.arguments.empty?, parentheses?(node))` for the "type?(:call,
+/// :super, :yield, :defined?)" branch of `method_call_with_redundant_
+/// parentheses?`. `defined?`/forwarding-super never reach here in practice
+/// (see the doc on `rp_call_node`), so only call/super/yield matter.
+fn rp_call_shape(node: &ruby_prism::Node) -> (bool, bool) {
+    if let Some(c) = node.as_call_node() {
+        let empty = c.arguments().is_none_or(|a| a.arguments().iter().count() == 0);
+        let parens = c.opening_loc().is_some_and(|o| o.as_slice() == b"(");
+        return (empty, parens);
+    }
+    if let Some(s) = node.as_super_node() {
+        let empty = s.arguments().is_none_or(|a| a.arguments().iter().count() == 0);
+        return (empty, s.rparen_loc().is_some());
+    }
+    if let Some(y) = node.as_yield_node() {
+        let empty = y.arguments().is_none_or(|a| a.arguments().iter().count() == 0);
+        return (empty, y.rparen_loc().is_some());
+    }
+    if node.as_forwarding_super_node().is_some() {
+        return (true, false);
+    }
+    (true, false)
+}
+
+fn rp_square_brackets(node: &ruby_prism::Node, _src: &[u8]) -> bool {
+    let Some(c) = node.as_call_node() else { return false };
+    if c.message_loc().map(|m| m.as_slice()) != Some(b"[]") {
+        return false;
+    }
+    let Some(recv) = c.receiver() else { return false };
+    if recv.as_string_node().is_some()
+        || recv.as_interpolated_string_node().is_some()
+        || recv.as_array_node().is_some()
+        || recv.as_hash_node().is_some()
+        || recv.as_constant_read_node().is_some()
+        || recv.as_constant_path_node().is_some()
+        || rp_is_variable(&recv)
+    {
+        return true;
+    }
+    recv.as_call_node().is_some_and(|rc| rc.receiver().is_some())
+}
+
+fn rp_unary_operation(node: &ruby_prism::Node, src: &[u8]) -> bool {
+    let Some(c) = node.as_call_node() else { return false };
+    let Some(msg_loc) = c.message_loc() else { return false };
+    let message = &src[msg_loc.start_offset()..msg_loc.end_offset()];
+    if !rp_is_operator_method(message) && message != b"not" {
+        return false;
+    }
+    node.location().start_offset() == msg_loc.start_offset()
+}
+
+/// `node.children.first while suspect_unary?(node)`. Only ever called (via
+/// `rp_check_unary`) with a `node` already confirmed `as_call_node().is_some()`
+/// (that's how `check_send` got here) — `ruby_prism::Node` has no `Clone`
+/// impl, so returning "the same node" re-derives it cheaply via the
+/// concrete `CallNode`'s own `as_node()` instead of fighting the borrow
+/// checker across the recursion.
+fn rp_descend_unary<'a>(node: &ruby_prism::Node<'a>, src: &[u8]) -> ruby_prism::Node<'a> {
+    let c = node.as_call_node().expect("rp_descend_unary always receives a call-shaped node");
+    if !rp_unary_operation(node, src) || rp_prefix_not(node, src) {
+        return c.as_node();
+    }
+    match c.receiver() {
+        Some(recv) => rp_descend_unary(&recv, src),
+        None => c.as_node(),
+    }
+}
+
+fn rp_chain_starts_with_hash(node: &ruby_prism::Node) -> bool {
+    if node.as_hash_node().is_some() {
+        return true;
+    }
+    let Some(c) = node.as_call_node() else { return false };
+    let Some(recv) = c.receiver() else { return false };
+    rp_chain_starts_with_hash(&recv)
+}
+
+fn rp_call_chain_bottom<'a>(call: &ruby_prism::CallNode<'a>) -> Option<ruby_prism::Node<'a>> {
+    let mut cur = call.receiver()?;
+    loop {
+        match cur.as_call_node() {
+            Some(c) => match c.receiver() {
+                Some(r) => cur = r,
+                None => return Some(cur),
+            },
+            None => return Some(cur),
+        }
+    }
+}
+
+fn rp_has_do_end_descendant(node: &ruby_prism::Node) -> bool {
+    let Some(c) = node.as_call_node() else { return false };
+    let mut finder = RpBlockFinder { found_do_end: false };
+    finder.visit(&c.as_node());
+    finder.found_do_end
+}
+
+struct RpBlockFinder {
+    found_do_end: bool,
+}
+impl<'pr> ruby_prism::Visit<'pr> for RpBlockFinder {
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        if node.opening_loc().as_slice() == b"do" {
+            self.found_do_end = true;
+        }
+        ruby_prism::visit_block_node(self, node);
+    }
+}
+
+fn rp_keyword_args_check(args: Option<ruby_prism::ArgumentsNode>, has_own_parens: bool) -> bool {
+    let items: Vec<ruby_prism::Node<'_>> = args.map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    if items.len() == 1 && items[0].as_parentheses_node().is_some() {
+        return true;
+    }
+    items.is_empty() || has_own_parens
+}

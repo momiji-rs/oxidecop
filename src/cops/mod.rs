@@ -386,7 +386,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
-    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters",
+    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
 ];
 
 impl Engine {
@@ -1866,6 +1866,34 @@ pub(crate) struct Cops<'a> {
     // NON-interpolated xstr/regexp is a leaf with no `StringNode` children,
     // so it never needs a frame). See `style::fst_typical_context`'s doc.
     pub(crate) fst_stack: Vec<FstFrame>,
+    // Style/RedundantParentheses: a generic whitequark-shaped ancestor stack
+    // (parallel to `sak_ancestors`/`im_ancestors` — same
+    // `visit_branch_node_enter`/`_leave` hooks, since prism carries no
+    // parent pointers at all). Every entry is `None` for a node that is
+    // TRANSPARENT in whitequark's model (a `StatementsNode` that whitequark
+    // never wraps — 0 or 1 statements outside an explicit `(...)`/`kwbegin`,
+    // or an `ArgumentsNode`/`ElseNode`/implicit rescue-`BeginNode` wrapper,
+    // or a `MatchWriteNode`'s inner synthetic `CallNode` — see
+    // `Cops::rp_classify`'s doc) and `Some(RpKind)` otherwise. TOP entry is
+    // always the node currently being visited (pushed on entry, like
+    // `sak_ancestors`), so upstream's `node.parent` reads the nearest `Some`
+    // at index `len - 2` downward, skipping `None`s; `each_ancestor` walks
+    // the same way arbitrarily far.
+    pub(crate) rp_ancestors: Vec<Option<style::RpKind<'a>>>,
+    // Style/RedundantParentheses: pending flags consumed by `rp_classify`
+    // exactly once, by the very next node it's asked to classify (which is
+    // guaranteed, by traversal order, to be the one specific child that set
+    // the flag) — the same established "pending" idiom as `ms_pending_block`
+    // / `eba_pending` above. `rp_pending_transparent_stmts`: the next
+    // `StatementsNode` is transparent regardless of its own statement count
+    // (an explicit `(...)`'s or explicit `begin...end`'s body never gets an
+    // EXTRA nested `:begin` the way an `if`/`def`/block body would).
+    pub(crate) rp_pending_transparent_stmts: bool,
+    // `rp_pending_transparent_call`: the next `CallNode` is transparent —
+    // `MatchWriteNode#call` (upstream's `:match_with_lvasgn`, e.g. `/re/ =~
+    // x`) has no whitequark counterpart at all; its `receiver`/`arguments`
+    // must attach directly to the `MatchWithLvasgn` frame.
+    pub(crate) rp_pending_transparent_call: bool,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -4033,6 +4061,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_parentheses_node(&mut self, node: &ruby_prism::ParenthesesNode<'pr>) {
         self.check_empty_expression(node);
         self.record_rescue_modifier_parens(node);
+        self.check_redundant_parentheses(node);
         // Style/HashSyntax: `parentheses?(dispatch.parent)` — whitequark
         // transparently unwraps a single-statement `StatementsNode` body, so
         // a lone statement inside `(...)` has the parens node itself, not
@@ -4264,7 +4293,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_useless_assignment(node);
         self.check_space_inside_parens(node);
         self.check_useless_access_modifier_top_level(&node.statements());
+        // Style/RedundantParentheses: `ruby_prism::visit_program_node`'s
+        // DEFAULT body calls `visit_statements_node` directly (bypassing
+        // `self.visit()`'s dispatch table), which is the ONLY place
+        // `visit_branch_node_enter`/`_leave` (and so `rp_ancestors`'s push)
+        // ever fire. That's harmless for a single top-level statement
+        // (whitequark gives it no wrapper either — `rp_ancestors` staying
+        // one level "short" here is the CORRECT "no parent" shape), but a
+        // 2+-statement top-level program DOES get wrapped in a bare
+        // `:begin` upstream, and `rp_classify` needs an explicit push here
+        // to ever see that shape.
+        let rp_top = self.rp_classify(&node.statements().as_node());
+        self.rp_ancestors.push(rp_top);
         ruby_prism::visit_program_node(self, node);
+        self.rp_ancestors.pop();
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
         // Gemspec/RequiredRubyVersion's `on_new_investigation`: after the
@@ -5454,10 +5496,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
         self.sak_ancestors.push(Self::sak_classify(&node));
         self.im_ancestors.push(style::im_is_bang(&node));
+        let kind = self.rp_classify(&node);
+        self.rp_ancestors.push(kind);
     }
     fn visit_branch_node_leave(&mut self) {
         self.sak_ancestors.pop();
         self.im_ancestors.pop();
+        self.rp_ancestors.pop();
     }
     fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
         self.sak_ancestors.push(Self::sak_classify(&node));
@@ -5624,6 +5669,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         ium_ignored_ranges: Vec::new(),
         ium_right_sibling_line: HashMap::new(),
         fst_stack: Vec::new(),
+        rp_ancestors: Vec::new(),
+        rp_pending_transparent_stmts: false,
+        rp_pending_transparent_call: false,
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),
