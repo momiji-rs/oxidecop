@@ -6012,11 +6012,31 @@ fn apply_disable_directives(
         let Some(c) = re.captures(&t) else { continue };
         // a ` -- reason` trailer is a comment, not part of the cop list
         let cops_part = c[2].split(" -- ").next().unwrap_or(&c[2]).trim();
-        let list: Option<Vec<String>> = if cops_part == "all" {
-            None
-        } else {
-            Some(cops_part.split(',').map(|s| s.trim().to_string()).collect())
+        // rubocop's COPS_PATTERN is PREFIX-matched: capitalized cop/dept
+        // names (or `all`), comma-continued; anything after the last name
+        // that doesn't parse as one is prose and ignored (rails:
+        // `# rubocop:disable Lint/UselessAssignment avoid holding it`).
+        let names: Vec<String> = {
+            static NAME_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            let name_re =
+                NAME_RE.get_or_init(|| regex::Regex::new(r"^(all|(?:[A-Z]\w*/)*[A-Z]\w*)").unwrap());
+            let mut out = Vec::new();
+            let mut rest = cops_part;
+            while let Some(m) = name_re.find(rest) {
+                out.push(m.as_str().to_string());
+                rest = rest[m.end()..].trim_start();
+                match rest.strip_prefix(',') {
+                    Some(r) => rest = r.trim_start(),
+                    None => break,
+                }
+            }
+            out
         };
+        if names.is_empty() {
+            continue;
+        }
+        let list: Option<Vec<String>> =
+            if names.iter().any(|n| n == "all") { None } else { Some(names) };
         let standalone = src[idx.starts[line - 1]..*off].iter().all(|b| b.is_ascii_whitespace());
         match &c[1] {
             "enable" => {

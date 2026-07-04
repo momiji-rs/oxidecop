@@ -31235,8 +31235,16 @@ impl<'a> super::Cops<'a> {
             j += 1;
         }
         let same_line = &rest[j..];
+        // upstream's `chained?` is `parent&.call_type? && parent.receiver
+        // == self`: an ARITHMETIC/comparison operator after `end` is a send
+        // with the if as receiver (chained), but `&&`/`||` are control-flow
+        // NODE types, not sends — `if...end || x` (rails where_clause.rb)
+        // stays eligible and merely parenthesizes in the correction.
+        if same_line.starts_with(b"&&") || same_line.starts_with(b"||") {
+            return false;
+        }
         for op in [
-            &b"<=>"[..], b"===", b"**", b"<<", b">>", b"==", b"!=", b"<=", b">=", b"&&", b"||", b"=~", b"!~",
+            &b"<=>"[..], b"===", b"**", b"<<", b">>", b"==", b"!=", b"<=", b">=", b"=~", b"!~",
             b"+", b"-", b"*", b"/", b"%", b"&", b"|", b"^", b"<", b">",
         ] {
             if same_line.starts_with(op) {
@@ -32838,10 +32846,11 @@ impl<'a> Cops<'a> {
     /// and check whether `lhs + longest_line` would overflow `Max`.
     fn ca_correction_exceeds_line_limit(&self, node_start: usize, node_end: usize, lhs: &[u8]) -> bool {
         const LL: &str = "Layout/LineLength";
-        // the REAL enablement resolution (DisabledByDefault turns LineLength
-        // off for a --only run; the schema default alone says "true") —
-        // rails corpus false negatives on long assignment branches.
-        if !self.cfg.enabled(LL) {
+        // upstream reads config.for_cop('Layout/LineLength')['Enabled'] —
+        // the CONFIG-level resolution: DisabledByDefault turns it off, and
+        // crucially a --only listing does NOT turn it back on (rails corpus
+        // false negatives both ways).
+        if !self.cfg.cop_config_enabled(LL) {
             return false;
         }
         let max = self.cfg.get(LL, "Max").and_then(|v| v.parse::<usize>().ok()).unwrap_or(120);
