@@ -2434,30 +2434,27 @@ impl<'a> Cops<'a> {
     /// `source_range`/`location()` stops at its opener token and would
     /// otherwise silently drop the heredoc's body/closing-delimiter lines.
     fn ml_method_body_length(&self, body: &ruby_prism::Node, count_comments: bool) -> i64 {
+        // Whitequark's `extract_body` yields the SINGLE statement itself
+        // (no begin wrapper) — every downstream judgment (`node_with_
+        // heredoc?` looks at DESCENDANTS only; `source_from_node_with_
+        // heredoc` maxes descendant end lines; the plain branch slices the
+        // node's own span, which for a heredoc is just its opener token) is
+        // relative to that unwrapped node. Mirror it by unwrapping a
+        // one-child StatementsNode up front (snowflake.rb: a def whose body
+        // IS one heredoc counts as 1 line upstream).
+        let sole = body.as_statements_node().and_then(|st| {
+            let mut it = st.body().iter();
+            let first = it.next();
+            if it.next().is_none() { first } else { None }
+        });
+        let eff: &ruby_prism::Node = sole.as_ref().unwrap_or(body);
         let mut gate = MlPlainHeredocGate { is_root: true, found: false };
-        gate.visit(body);
+        gate.visit(eff);
         let start = ml_body_content_start(body);
         if gate.found {
             let first_line = self.idx.loc(start).0;
             let mut scanner = MlHeredocEndScanner { idx: self.idx, is_root: true, max_line: first_line };
-            // `source_from_node_with_heredoc` takes the max over DESCENDANTS
-            // only — the body node itself never contributes its own last
-            // line. Whitequark's unwrapped single-statement body (a do-block
-            // spanning the whole def) is therefore excluded, so a prism
-            // StatementsNode with ONE child must scan from that child as the
-            // root, or the block's own `end` line leaks into the count
-            // (rails releaser_test.rb: 20 vs upstream's 19).
-            let sole = body
-                .as_statements_node()
-                .and_then(|st| {
-                    let mut it = st.body().iter();
-                    let first = it.next();
-                    if it.next().is_none() { first } else { None }
-                });
-            match sole {
-                Some(child) => scanner.visit(&child),
-                None => scanner.visit(body),
-            }
+            scanner.visit(eff);
             let mut length = 0i64;
             for line in first_line..=scanner.max_line {
                 if !self.ml_irrelevant_file_line(line, count_comments) {
@@ -2466,9 +2463,9 @@ impl<'a> Cops<'a> {
             }
             length
         } else {
-            let end = match body.as_begin_node() {
+            let end = match eff.as_begin_node() {
                 Some(b) => ml_begin_node_content_end(&b),
-                None => body.location().end_offset(),
+                None => eff.location().end_offset(),
             };
             if end > start { ml_count_text_fragment(&self.src[start..end], count_comments) } else { 0 }
         }
