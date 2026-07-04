@@ -231,7 +231,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException",
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
-    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For",
+    "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort",
 ];
 
 impl Engine {
@@ -901,6 +901,15 @@ pub(crate) struct Cops<'a> {
     // :any_def, :any_block).first` needs only the NEAREST one's closing
     // line, so a simple stack (pushed on entry, popped on exit) suffices.
     pub(crate) se_ancestor_end_lines: Vec<usize>,
+    // Style/RedundantSort: start offset of the LEFT operand of every `and`/
+    // `or`/`&&`/`||` node in the file -> that logical node's operator
+    // location (start, end) — rubocop's `node.parent&.operator_keyword?`
+    // check needs the accessor node's PARENT, but prism gives no parent
+    // pointers; populated eagerly in `visit_and_node`/`visit_or_node` before
+    // descending into `left`, mirroring this file's established
+    // "populate ahead of time, keyed by the child's own start offset" idiom
+    // (see `ut_call_child` etc. above).
+    pub(crate) redundant_sort_logical_left: HashMap<usize, (usize, usize)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2292,10 +2301,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
         self.check_and_with_identical_operands(node);
+        let op = node.operator_loc();
+        self.redundant_sort_logical_left.insert(node.left().location().start_offset(), (op.start_offset(), op.end_offset()));
         ruby_prism::visit_and_node(self, node);
     }
     fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
         self.check_or_with_identical_operands(node);
+        let op = node.operator_loc();
+        self.redundant_sort_logical_left.insert(node.left().location().start_offset(), (op.start_offset(), op.end_offset()));
         ruby_prism::visit_or_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
@@ -2381,6 +2394,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_erb_new_arguments(node);
         self.check_expand_path_arguments(node);
         self.check_redundant_sort_by(node);
+        self.check_redundant_sort(node);
         self.check_ambiguous_block_association(node);
         self.check_space_before_first_arg(node);
         self.check_redundant_string_coercion_in_call(node);
@@ -2820,6 +2834,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         non_nil_ignored: HashSet::new(),
         mmcbl_heredoc_chain: HashMap::new(),
         se_ancestor_end_lines: Vec::new(),
+        redundant_sort_logical_left: HashMap::new(),
     };
 
     let t = tick(&T_PREP, t);

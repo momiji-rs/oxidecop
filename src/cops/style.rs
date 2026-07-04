@@ -12141,3 +12141,187 @@ impl<'a> super::Cops<'a> {
         self.fixes.push((start, end, correction));
     }
 }
+
+
+// ---- Style/RedundantSort helpers ----
+
+#[derive(Clone, Copy, PartialEq)]
+enum RsSorter {
+    Sort,
+    SortBy,
+}
+
+/// Ports `redundant_sort?`'s node-pattern alternation, read from the
+/// ACCESSOR call's point of view. Upstream's `on_send(:sort, :sort_by)` +
+/// `node.parent`/`node.parent.parent` climb exists only because whitequark's
+/// AST wraps a `sort { block }` receiver in a separate `block` node — prism
+/// keeps a call's block on the SAME `CallNode` (`.block()`) regardless, so
+/// the accessor's `.receiver()` is always, directly, the sort/sort_by call
+/// (block or no block). That collapses all three of upstream's alternatives
+/// (plain call, call-with-block-pass-arg, `any_block`-wrapped call) into one
+/// shape here, read in a single visit of the outer accessor.
+///
+/// Returns `(sort_node, sorter, wants_min)` — `wants_min` is `first`/`[0]`/
+/// `.at(0)`/`.slice(0)` (-> `min`/`min_by`) vs `last`/`[-1]`/`.at(-1)`/
+/// `.slice(-1)` (-> `max`/`max_by`).
+fn redundant_sort_match<'pr>(
+    node: &ruby_prism::CallNode<'pr>,
+) -> Option<(ruby_prism::CallNode<'pr>, RsSorter, bool)> {
+    let name = node.name();
+    let name = name.as_slice();
+    let is_bracket = matches!(name, b"[]" | b"at" | b"slice");
+    let wants_min = match name {
+        b"first" => {
+            // upstream's `(call $(call _ $:sort) ${:last :first})` etc. have
+            // fixed arity (receiver + selector only) — `first`/`last` must
+            // take NO arguments (`.first(1)` can't become `.min`: `min(1)`
+            // isn't equivalent).
+            if node.arguments().is_some() {
+                return None;
+            }
+            true
+        }
+        b"last" => {
+            if node.arguments().is_some() {
+                return None;
+            }
+            false
+        }
+        b"[]" | b"at" | b"slice" => {
+            // upstream's `{(int 0) (int -1)}` — exactly one argument, and it
+            // must be the literal integer 0 or -1 (a variable, `[1]`, or a
+            // negative-but-not-`-1` index all fall through unmatched).
+            let args = node.arguments()?;
+            let mut it = args.arguments().iter();
+            let only = it.next()?;
+            if it.next().is_some() {
+                return None;
+            }
+            let int_node = only.as_integer_node()?;
+            let v: i32 = int_node.value().try_into().ok()?;
+            match v {
+                0 => true,
+                -1 => false,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    let receiver = node.receiver()?;
+    let sort_node = receiver.as_call_node()?;
+    let sorter = match sort_node.name().as_slice() {
+        b"sort" => RsSorter::Sort,
+        b"sort_by" => RsSorter::SortBy,
+        _ => return None,
+    };
+    // Neither `sort` nor `sort_by` ever takes a real positional argument in
+    // any of upstream's alternatives (`mongo_client[...].sort(_id: 1)` has
+    // one, and is correctly never matched).
+    if sort_node.arguments().is_some() {
+        return None;
+    }
+    let has_literal_block = sort_node.block().is_some_and(|b| b.as_block_node().is_some());
+    let has_block_pass = sort_node.block().is_some_and(|b| b.as_block_argument_node().is_some());
+    match sorter {
+        RsSorter::Sort => {
+            // `sort(&:foo)` (a block-PASS, no literal block) isn't covered by
+            // any of upstream's `:sort` alternatives — only `:sort_by` has
+            // the "one arg = block-pass" alt. A literal comparator block (or
+            // no block at all) is fine either way.
+            if has_block_pass {
+                return None;
+            }
+        }
+        RsSorter::SortBy => {
+            // Bare `sort_by` (no block at all) never safely becomes
+            // `min_by`/`max_by` — upstream requires either a block-pass arg
+            // or a literal block.
+            if !has_literal_block && !has_block_pass {
+                return None;
+            }
+            // Upstream's node-pattern for the bracket/at/slice + block-pass
+            // (no literal block) combo is written with a bare `send` type,
+            // not `call` (the `{send csend}` alias) — so THAT ONE
+            // alternative only matches when BOTH the accessor and the
+            // sort_by call are plain (non-safe-navigation) sends. Every
+            // other combo (first/last, or a literal block) uses `call` and
+            // allows safe-navigation freely. Likely an upstream oversight,
+            // but ported verbatim.
+            if !has_literal_block
+                && is_bracket
+                && (node.is_safe_navigation() || sort_node.is_safe_navigation())
+            {
+                return None;
+            }
+        }
+    }
+
+    Some((sort_node, sorter, wants_min))
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/RedundantSort — `x.sort.first`/`.last`/`[0]`/`[-1]`/`.at(0/-1)`/
+    /// `.slice(0/-1)` -> `x.min`/`x.max`; likewise `sort_by` ->
+    /// `min_by`/`max_by`. See `redundant_sort_match` above for why hooking
+    /// the ACCESSOR call (instead of upstream's `on_send(:sort, :sort_by)` +
+    /// parent climb) is sufficient here.
+    pub(crate) fn check_redundant_sort(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/RedundantSort";
+        if !self.on(COP) {
+            return;
+        }
+        let Some((sort_node, sorter, wants_min)) = redundant_sort_match(node) else {
+            return;
+        };
+        // `sort_node.loc.selector` — the bare `sort`/`sort_by` identifier,
+        // excluding any receiver/dot/safe-nav-operator before it. Both the
+        // offense anchor and the autocorrect's method-name replacement use
+        // this same range.
+        let Some(sel) = sort_node.message_loc() else { return };
+        // The accessor's own `loc.selector` — for `.first`/`.last`/`.at(0)`/
+        // `.slice(0)` this is just the bare name; for index syntax (`[0]`)
+        // prism's `message_loc` already spans the whole `[0]`/`[-1]` text
+        // (there's no separate identifier token to point at).
+        let Some(accessor_sel) = node.message_loc() else { return };
+
+        let sorter_text = match sorter {
+            RsSorter::Sort => "sort",
+            RsSorter::SortBy => "sort_by",
+        };
+        let suggestion = match (wants_min, sorter) {
+            (true, RsSorter::Sort) => "min",
+            (false, RsSorter::Sort) => "max",
+            (true, RsSorter::SortBy) => "min_by",
+            (false, RsSorter::SortBy) => "max_by",
+        };
+        let node_end = node.location().end_offset();
+        let accessor_source = String::from_utf8_lossy(&self.src[accessor_sel.start_offset()..node_end]);
+        let message = format!("Use `{suggestion}` instead of `{sorter_text}...{accessor_source}`.");
+
+        self.push(sel.start_offset(), COP, true, message);
+
+        // Autocorrect: remove the accessor (`.first`/`[0]`/etc, including its
+        // dot or safe-nav operator when present — prism's `call_operator_loc`
+        // covers both `.` and `&.`), replace the sort/sort_by identifier with
+        // the suggested method name, then — when this whole expression is the
+        // LEFT side of a `&&`/`||`/`and`/`or` — hoist the operator to sit
+        // right after the (now-renamed) sort call instead of after the
+        // removed accessor, matching upstream's
+        // `replace_with_logical_operator`.
+        let accessor_start = node
+            .call_operator_loc()
+            .map(|l| l.start_offset())
+            .unwrap_or_else(|| accessor_sel.start_offset());
+        self.fixes.push((accessor_start, node_end, Vec::new()));
+        self.fixes.push((sel.start_offset(), sel.end_offset(), suggestion.as_bytes().to_vec()));
+
+        if let Some(&(op_start, op_end)) = self.redundant_sort_logical_left.get(&node.location().start_offset()) {
+            let receiver_end = sort_node.location().end_offset();
+            let mut insert = vec![b' '];
+            insert.extend_from_slice(&self.src[op_start..op_end]);
+            self.fixes.push((receiver_end, receiver_end, insert));
+            self.fixes.push((op_start, op_end, Vec::new()));
+        }
+    }
+}
