@@ -12206,3 +12206,593 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// ---- Layout/BlockAlignment ----
+//
+// Ported from `RuboCop::Cop::Layout::BlockAlignment` (mixins:
+// `ConfigurableEnforcedStyle`, `RangeHelp`). Checks whether a block's `end`
+// (or `}`) is aligned with an acceptable anchor, per `EnforcedStyleAlignWith`
+// (`either` default / `start_of_block` / `start_of_line`).
+//
+// The hard part is `block_end_align_target`: a climb up the whitequark
+// ancestor chain (assignment / `any_def` / `splat` / `and` / `or` / a `<<`
+// send / a same-receiver send-chain link) to find the node whose START the
+// `end` should align with. Prism gives no parent pointers, so this climb
+// runs over `Cops::ba_ancestors`, a generic per-node-kind stack maintained
+// exactly like `rp_ancestors` (`Style::RedundantParentheses`) via
+// `visit_branch_node_enter`/`_leave` in mod.rs — see `BaFrame`'s doc.
+
+/// One `ba_ancestors` stack frame. `None` in the stack means the underlying
+/// prism node is TRANSPARENT — whitequark has no corresponding tree node at
+/// all there (a single-statement `StatementsNode`, an `ArgumentsNode`, the
+/// `ProgramNode`, an implicit rescue/ensure-wrapping `BeginNode`) — so a
+/// climb or an outward search passes straight through it, same as
+/// `rp_ancestors`.
+#[derive(Clone)]
+pub(crate) struct BaFrame<'a> {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) first_line: usize,
+    /// `masgn_type?` — exempts this frame from `disqualified_parent?`'s
+    /// same-line requirement (a mass-assignment's `mlhs` may legitimately
+    /// sit on an earlier line than its value).
+    pub(crate) is_masgn: bool,
+    /// `Node#assignment?` — true for whitequark's `lvasgn`/`ivasgn`/
+    /// `cvasgn`/`gvasgn`/`casgn`/`masgn`/`op_asgn`/`or_asgn`/`and_asgn`
+    /// AND (via `MethodDispatchNode#setter_method?`, aliased `assignment?`)
+    /// any plain `=` setter/index-assignment send (`obj.attr = x`,
+    /// `obj[i] = x` — prism's `CallNode#is_attribute_write?`).
+    pub(crate) is_assignment: bool,
+    pub(crate) is_any_def: bool,
+    pub(crate) is_splat: bool,
+    pub(crate) is_and_or: bool,
+    /// Set only for a `send`-shaped node (prism `CallNode`, NOT safe-nav —
+    /// whitequark's pattern is `send`, never `csend`): the method-name text,
+    /// sliced from `self.src` (so its lifetime is `'a`, independent of the
+    /// node's own parser-arena lifetime) via `message_loc`.
+    pub(crate) send_method: Option<&'a [u8]>,
+    pub(crate) send_receiver: Option<(usize, usize)>,
+    /// `find_lhs_node`: for `op_asgn` (compound `+=`-style on a variable,
+    /// constant, attr, or index target) and `masgn`, whitequark shows just
+    /// the LHS pattern (not the whole assignment) in the offense message —
+    /// `Some((start, end))` gives that sub-range. `None` for every other
+    /// assignment shape (plain `=`, `&&=`, `||=`), which show the ENTIRE
+    /// node instead (`find_lhs_node` only special-cases `:op_asgn`/`:masgn`).
+    pub(crate) lhs_swap: Option<(usize, usize)>,
+}
+
+impl<'a> BaFrame<'a> {
+    fn other(start: usize, end: usize, first_line: usize) -> Self {
+        BaFrame {
+            start,
+            end,
+            first_line,
+            is_masgn: false,
+            is_assignment: false,
+            is_any_def: false,
+            is_splat: false,
+            is_and_or: false,
+            send_method: None,
+            send_receiver: None,
+            lhs_swap: None,
+        }
+    }
+}
+
+/// `MultiWriteNode`'s `mlhs` span (whitequark's separate `mlhs` node, which
+/// prism flattens into `lefts`/`rest`/`rights` fields directly): from the
+/// `(` if parenthesized, else the first target; through the `)` if
+/// parenthesized, else the last target — i.e. everything before the `=`.
+fn ba_masgn_lhs_range(m: &ruby_prism::MultiWriteNode) -> (usize, usize) {
+    let lefts: Vec<ruby_prism::Node> = m.lefts().iter().collect();
+    let rights: Vec<ruby_prism::Node> = m.rights().iter().collect();
+    let rest = m.rest();
+    let own = m.location();
+    let start = m
+        .lparen_loc()
+        .map(|l| l.start_offset())
+        .or_else(|| lefts.first().map(|n| n.location().start_offset()))
+        .or_else(|| rest.as_ref().map(|r| r.location().start_offset()))
+        .or_else(|| rights.first().map(|n| n.location().start_offset()))
+        .unwrap_or_else(|| own.start_offset());
+    let end = m
+        .rparen_loc()
+        .map(|l| l.end_offset())
+        .or_else(|| rights.last().map(|n| n.location().end_offset()))
+        .or_else(|| rest.as_ref().map(|r| r.location().end_offset()))
+        .or_else(|| lefts.last().map(|n| n.location().end_offset()))
+        .unwrap_or_else(|| own.end_offset());
+    (start, end)
+}
+
+/// Slices `src[loc.start..loc.end]` (like `RpKind::message` does) so the
+/// result's lifetime is `'a`, not the node's own parser-arena lifetime.
+fn ba_msg<'x>(src: &'x [u8], loc: Option<ruby_prism::Location<'_>>) -> Option<&'x [u8]> {
+    loc.map(|l| &src[l.start_offset()..l.end_offset()])
+}
+
+impl<'a> Cops<'a> {
+    fn ba_asgn_frame(&self, start: usize, end: usize, lhs_swap: Option<(usize, usize)>) -> BaFrame<'a> {
+        let first_line = self.idx.loc(start).0;
+        let mut f = BaFrame::other(start, end, first_line);
+        f.is_assignment = true;
+        f.lhs_swap = lhs_swap;
+        f
+    }
+
+    /// Populates one `ba_ancestors` frame per branch node — called from
+    /// `visit_branch_node_enter` in mod.rs, BEFORE that node's own children
+    /// are visited (so a `CallNode`'s frame is already on top of the stack
+    /// while its receiver/arguments/block are being visited).
+    pub(crate) fn ba_classify(&mut self, node: &ruby_prism::Node<'_>) -> Option<BaFrame<'a>> {
+        let loc = node.location();
+        let (start, end) = (loc.start_offset(), loc.end_offset());
+
+        // Transparent wrappers — whitequark has no corresponding tree node,
+        // so a climb or outward search must pass straight through. Mirrors
+        // `Cops::rp_classify`'s identical rules (`StatementsNode`/
+        // `ArgumentsNode`/`ProgramNode`/`ElseNode`/implicit `BeginNode`).
+        if let Some(s) = node.as_statements_node() {
+            let force = std::mem::take(&mut self.ba_pending_transparent_stmts);
+            let items: Vec<ruby_prism::Node> = s.body().iter().collect();
+            if force || items.len() <= 1 {
+                return None;
+            }
+            let first_line = self.idx.loc(start).0;
+            return Some(BaFrame::other(start, end, first_line));
+        }
+        if node.as_arguments_node().is_some() || node.as_else_node().is_some() || node.as_program_node().is_some() {
+            return None;
+        }
+        if let Some(b) = node.as_begin_node() {
+            if b.begin_keyword_loc().is_none() {
+                return None; // implicit def/block rescue-or-ensure wrapper
+            }
+            self.ba_pending_transparent_stmts =
+                b.rescue_clause().is_none() && b.ensure_clause().is_none() && b.statements().is_some();
+            let first_line = self.idx.loc(start).0;
+            return Some(BaFrame::other(start, end, first_line));
+        }
+
+        if let Some(m) = node.as_multi_write_node() {
+            let first_line = self.idx.loc(start).0;
+            let mut f = BaFrame::other(start, end, first_line);
+            f.is_assignment = true;
+            f.is_masgn = true;
+            f.lhs_swap = Some(ba_masgn_lhs_range(&m));
+            return Some(f);
+        }
+        if node.as_def_node().is_some() {
+            let first_line = self.idx.loc(start).0;
+            let mut f = BaFrame::other(start, end, first_line);
+            f.is_any_def = true;
+            return Some(f);
+        }
+        if node.as_splat_node().is_some() {
+            let first_line = self.idx.loc(start).0;
+            let mut f = BaFrame::other(start, end, first_line);
+            f.is_splat = true;
+            return Some(f);
+        }
+        if node.as_and_node().is_some() || node.as_or_node().is_some() {
+            let first_line = self.idx.loc(start).0;
+            let mut f = BaFrame::other(start, end, first_line);
+            f.is_and_or = true;
+            return Some(f);
+        }
+
+        // Plain `=` assignment to a variable/constant — `assignment?` true,
+        // never LHS-swapped (`find_lhs_node` only touches `op_asgn`/`masgn`).
+        if node.as_local_variable_write_node().is_some()
+            || node.as_instance_variable_write_node().is_some()
+            || node.as_class_variable_write_node().is_some()
+            || node.as_global_variable_write_node().is_some()
+            || node.as_constant_write_node().is_some()
+            || node.as_constant_path_write_node().is_some()
+        {
+            return Some(self.ba_asgn_frame(start, end, None));
+        }
+
+        // Compound `+=`-style (whitequark `op_asgn`) on a variable/constant
+        // — LHS-swapped down to just the name/path (`node.lhs`).
+        if let Some(w) = node.as_local_variable_operator_write_node() {
+            let nl = w.name_loc();
+            return Some(self.ba_asgn_frame(start, end, Some((nl.start_offset(), nl.end_offset()))));
+        }
+        if let Some(w) = node.as_instance_variable_operator_write_node() {
+            let nl = w.name_loc();
+            return Some(self.ba_asgn_frame(start, end, Some((nl.start_offset(), nl.end_offset()))));
+        }
+        if let Some(w) = node.as_class_variable_operator_write_node() {
+            let nl = w.name_loc();
+            return Some(self.ba_asgn_frame(start, end, Some((nl.start_offset(), nl.end_offset()))));
+        }
+        if let Some(w) = node.as_global_variable_operator_write_node() {
+            let nl = w.name_loc();
+            return Some(self.ba_asgn_frame(start, end, Some((nl.start_offset(), nl.end_offset()))));
+        }
+        if let Some(w) = node.as_constant_operator_write_node() {
+            let nl = w.name_loc();
+            return Some(self.ba_asgn_frame(start, end, Some((nl.start_offset(), nl.end_offset()))));
+        }
+        if let Some(w) = node.as_constant_path_operator_write_node() {
+            let t = w.target();
+            let tl = t.location();
+            return Some(self.ba_asgn_frame(start, end, Some((tl.start_offset(), tl.end_offset()))));
+        }
+        // Compound `+=`-style on an attr/index target — LHS-swapped down to
+        // just `recv.attr`/`recv[args]` (no fixture example exercises this;
+        // best-effort per the same `op_asgn`/`node.lhs` rule).
+        if let Some(w) = node.as_call_operator_write_node() {
+            let lhs_end = w.message_loc().map(|m| m.end_offset()).unwrap_or(end);
+            return Some(self.ba_asgn_frame(start, end, Some((start, lhs_end))));
+        }
+        if let Some(w) = node.as_index_operator_write_node() {
+            let lhs_end = w.closing_loc().end_offset();
+            return Some(self.ba_asgn_frame(start, end, Some((start, lhs_end))));
+        }
+
+        // `&&=`/`||=` (whitequark `and_asgn`/`or_asgn`) — `assignment?` true
+        // but NEVER LHS-swapped (unlike `op_asgn`).
+        if node.as_local_variable_and_write_node().is_some()
+            || node.as_local_variable_or_write_node().is_some()
+            || node.as_instance_variable_and_write_node().is_some()
+            || node.as_instance_variable_or_write_node().is_some()
+            || node.as_class_variable_and_write_node().is_some()
+            || node.as_class_variable_or_write_node().is_some()
+            || node.as_global_variable_and_write_node().is_some()
+            || node.as_global_variable_or_write_node().is_some()
+            || node.as_constant_and_write_node().is_some()
+            || node.as_constant_or_write_node().is_some()
+            || node.as_constant_path_and_write_node().is_some()
+            || node.as_constant_path_or_write_node().is_some()
+            || node.as_call_and_write_node().is_some()
+            || node.as_call_or_write_node().is_some()
+            || node.as_index_and_write_node().is_some()
+            || node.as_index_or_write_node().is_some()
+        {
+            return Some(self.ba_asgn_frame(start, end, None));
+        }
+
+        // A block/lambda literal — never itself matches any of the six
+        // `block_end_align_target?` alternatives, so it always terminates an
+        // inward climb; a REAL (non-`None`) frame is still needed so
+        // `start_for_line_node`'s outward same-line search can land on it.
+        // Prism's raw `BlockNode#location` starts at the `do`/`{` (see this
+        // cop's own header doc comment on the "Block nodes" trap) — borrow
+        // the owning `CallNode`'s chain-inclusive start (already stashed by
+        // `visit_call_node` right before descending here) so this frame's
+        // `first_line` matches whitequark's translated `:block` node.
+        if node.as_block_node().is_some() {
+            let owner_start = self.ba_pending_block_owner_start.take().unwrap_or(start);
+            let first_line = self.idx.loc(owner_start).0;
+            return Some(BaFrame::other(owner_start, end, first_line));
+        }
+        if node.as_lambda_node().is_some() {
+            let first_line = self.idx.loc(start).0;
+            return Some(BaFrame::other(start, end, first_line));
+        }
+
+        if let Some(c) = node.as_call_node() {
+            let first_line = self.idx.loc(start).0;
+            if c.is_attribute_write() {
+                let mut f = BaFrame::other(start, end, first_line);
+                f.is_assignment = true;
+                return Some(f);
+            }
+            let mut f = BaFrame::other(start, end, first_line);
+            // whitequark's pattern is `send`, never `csend` — a safe-nav
+            // call never satisfies the shovel/chain-receiver alternatives.
+            if !c.is_safe_navigation() {
+                f.send_method = ba_msg(self.src, c.message_loc());
+                f.send_receiver = c.receiver().map(|r| {
+                    let rl = r.location();
+                    (rl.start_offset(), rl.end_offset())
+                });
+            }
+            return Some(f);
+        }
+
+        let first_line = self.idx.loc(start).0;
+        Some(BaFrame::other(start, end, first_line))
+    }
+
+    /// `disqualified_parent?(parent, node)`.
+    fn ba_disqualified(parent: &BaFrame<'a>, child_first_line: usize) -> bool {
+        parent.first_line != child_first_line && !parent.is_masgn
+    }
+
+    /// `block_end_align_target?(parent, node)` — the six-alternative node
+    /// pattern, checked against `parent` (with `node`'s own range standing
+    /// in for `%1`/`equal?(%1)`).
+    fn ba_pattern_matches(parent: &BaFrame<'a>, child_start: usize, child_end: usize) -> bool {
+        parent.is_assignment
+            || parent.is_any_def
+            || parent.is_splat
+            || parent.is_and_or
+            || parent.send_method == Some(b"<<".as_slice())
+            || (parent.send_method.is_some()
+                && parent.send_method != Some(b"[]".as_slice())
+                && parent.send_receiver == Some((child_start, child_end)))
+    }
+
+    /// `end_align_target?(node, parent)`.
+    fn ba_end_align_target(parent: &BaFrame<'a>, child_first_line: usize, child_start: usize, child_end: usize) -> bool {
+        Self::ba_disqualified(parent, child_first_line) || !Self::ba_pattern_matches(parent, child_start, child_end)
+    }
+
+    /// `find_lhs_node(block_end_align_target(node))` folded together: climbs
+    /// `ba_ancestors` from just below the top (the top frame IS `node0` —
+    /// the block's owning `CallNode`, already pushed by `visit_branch_node_
+    /// enter`) while the pattern keeps matching, then applies the LHS swap
+    /// on whichever frame it lands on. Returns `(start, end, landed_index)`
+    /// — `landed_index` is `ba_ancestors`' index of the landed frame (or the
+    /// call's own top-of-stack index when nothing matched at all), needed so
+    /// `ba_outward_same_line` can continue the search from the right spot.
+    fn ba_climb(&self, node0_start: usize, node0_end: usize, node0_first_line: usize) -> (usize, usize, usize) {
+        let n = self.ba_ancestors.len();
+        let mut cur_start = node0_start;
+        let mut cur_end = node0_end;
+        let mut cur_first_line = node0_first_line;
+        let mut idx = n.saturating_sub(1);
+        let mut j = idx;
+        while j > 0 {
+            j -= 1;
+            let Some(frame) = self.ba_ancestors[j].as_ref() else { continue };
+            if Self::ba_end_align_target(frame, cur_first_line, cur_start, cur_end) {
+                break;
+            }
+            cur_start = frame.start;
+            cur_end = frame.end;
+            cur_first_line = frame.first_line;
+            idx = j;
+        }
+        if let Some(frame) = self.ba_ancestors.get(idx).and_then(|f| f.as_ref()) {
+            if let Some((ls, le)) = frame.lhs_swap {
+                return (ls, le, idx);
+            }
+        }
+        (cur_start, cur_end, idx)
+    }
+
+    /// `start_node.each_ancestor.to_a.reverse.find { same_line?(start_node,
+    /// anc) } || start_node`, then `find_lhs_node` again — walks EVERY real
+    /// ancestor (not just the six-pattern-matching ones) outward from
+    /// `landed_idx`, returning the OUTERMOST one sharing `t_first_line`.
+    fn ba_outward_same_line(&self, landed_idx: usize, t_first_line: usize) -> Option<(usize, usize)> {
+        for k in 0..landed_idx {
+            if let Some(frame) = self.ba_ancestors[k].as_ref() {
+                if frame.first_line == t_first_line {
+                    return Some(frame.lhs_swap.unwrap_or((frame.start, frame.end)));
+                }
+            }
+        }
+        None
+    }
+
+    /// `loc_to_source_line_column`: `(line, 0-based column, first source
+    /// line of [start, end))`.
+    fn ba_slc(&self, start: usize, end: usize) -> (usize, usize, Vec<u8>) {
+        let (line, col1) = self.idx.loc(start);
+        let end = end.max(start).min(self.src.len());
+        let text = &self.src[start..end];
+        let mut first_line: &[u8] = match text.iter().position(|&b| b == b'\n') {
+            Some(p) => &text[..p],
+            None => text,
+        };
+        if first_line.last() == Some(&b'\r') {
+            first_line = &first_line[..first_line.len() - 1];
+        }
+        (line, col1 - 1, first_line.to_vec())
+    }
+
+    /// `format_source_line_column`.
+    fn ba_format_slc(&self, slc: &(usize, usize, Vec<u8>)) -> String {
+        format!("`{}` at {}, {}", String::from_utf8_lossy(&slc.2), slc.0, slc.1)
+    }
+
+    /// `(line, 0-based column of the first non-whitespace byte, text from
+    /// there to end-of-line)` for the physical line containing `offset`.
+    fn ba_line_text(&self, offset: usize) -> (usize, usize, Vec<u8>) {
+        let (line, _) = self.idx.loc(offset);
+        let line_start = self.idx.starts[line - 1];
+        let line_end = self.line_end(line);
+        let line_bytes = &self.src[line_start..line_end];
+        let rel = line_bytes.iter().position(|&b| !b.is_ascii_whitespace()).unwrap_or(0);
+        (line, rel, line_bytes[rel.min(line_bytes.len())..].to_vec())
+    }
+
+    /// `do_line_begins_inside_argument?`: does the `do`/`{`'s own physical
+    /// line begin (at its first non-whitespace byte) strictly inside one of
+    /// `ranges` (the owning call's top-level arguments UNION the block's own
+    /// parameter nodes — `node.send_node.arguments + node.arguments`)?
+    fn ba_do_line_begins_inside_ranges(&self, do_start: usize, ranges: &[(usize, usize)]) -> bool {
+        let (line, _) = self.idx.loc(do_start);
+        let line_start = self.idx.starts[line - 1];
+        let line_end = self.line_end(line);
+        let line_bytes = &self.src[line_start..line_end];
+        let Some(rel) = line_bytes.iter().position(|&b| !b.is_ascii_whitespace()) else { return false };
+        let first_char_pos = line_start + rel;
+        ranges.iter().any(|&(s, e)| s <= first_char_pos && first_char_pos < e)
+    }
+
+    /// Individual parameter-node ranges of a block/lambda's OWN parameter
+    /// list (`requireds`/`optionals`/`rest`/`posts`/`keywords`/
+    /// `keyword_rest`/`block`), appended to `out` — the `node.arguments`
+    /// half of `do_line_begins_inside_argument?`'s union. `None`/anything
+    /// other than a `BlockParametersNode` (numbered/`it` params, or no
+    /// params at all) contributes nothing, matching an empty `node.arguments`.
+    fn ba_collect_param_ranges(params: Option<ruby_prism::Node>, out: &mut Vec<(usize, usize)>) {
+        let Some(p) = params else { return };
+        let Some(bp) = p.as_block_parameters_node() else { return };
+        let Some(pn) = bp.parameters() else { return };
+        let mut push = |n: ruby_prism::Node| {
+            let l = n.location();
+            out.push((l.start_offset(), l.end_offset()));
+        };
+        for n in pn.requireds().iter() {
+            push(n);
+        }
+        for n in pn.optionals().iter() {
+            push(n);
+        }
+        if let Some(r) = pn.rest() {
+            push(r);
+        }
+        for n in pn.posts().iter() {
+            push(n);
+        }
+        for n in pn.keywords().iter() {
+            push(n);
+        }
+        if let Some(r) = pn.keyword_rest() {
+            push(r);
+        }
+        if let Some(b) = pn.block() {
+            push(b.as_node());
+        }
+    }
+
+    /// Layout/BlockAlignment — checks whether a block's `end`/`}` is aligned
+    /// with an acceptable anchor, per `EnforcedStyleAlignWith`. Shared core
+    /// for both a `do...end`/`{}` block (`check_block_alignment`, called
+    /// with the owning `CallNode`'s chain-inclusive range as `node0`) and a
+    /// stabby lambda literal (`check_block_alignment_lambda`, whose own
+    /// range needs no such adjustment — it has no receiver chain).
+    fn ba_check_core(
+        &mut self,
+        node0_start: usize,
+        node0_end: usize,
+        do_start: usize,
+        end_start: usize,
+        end_end: usize,
+        anchor_start: usize,
+    ) {
+        const COP: &str = "Layout/BlockAlignment";
+        if !self.iw_begins_its_line(end_start) {
+            return;
+        }
+
+        let style = self.cfg.get(COP, "EnforcedStyleAlignWith").unwrap_or("either");
+        let node0_first_line = self.idx.loc(node0_start).0;
+
+        let (t_start, t_end, landed_idx) = self.ba_climb(node0_start, node0_end, node0_first_line);
+
+        let (s_start, s_end) = if style == "start_of_line" {
+            let t_first_line = self.idx.loc(t_start).0;
+            self.ba_outward_same_line(landed_idx, t_first_line).unwrap_or((t_start, t_end))
+        } else {
+            (t_start, t_end)
+        };
+
+        let start_col0 = self.idx.loc(s_start).1 - 1;
+        let end_col0 = self.idx.loc(end_start).1 - 1;
+        if !(start_col0 != end_col0 || style == "start_of_block") {
+            return;
+        }
+
+        // compute_do_source_line_column
+        let (anchor_line, anchor_col0, anchor_text) = self.ba_line_text(anchor_start);
+        let (_, do_own_col0, _) = self.ba_line_text(do_start);
+
+        let mut permitted = vec![anchor_col0];
+        if style == "either" {
+            permitted.push(do_own_col0);
+        }
+        if permitted.contains(&end_col0) && style != "start_of_line" {
+            return;
+        }
+        let do_slc = (anchor_line, anchor_col0, anchor_text);
+
+        let current = self.ba_slc(end_start, end_end);
+        let error_slc = if style == "start_of_block" { do_slc.clone() } else { self.ba_slc(s_start, s_end) };
+        let prefer = self.ba_format_slc(&error_slc);
+        let alt_prefer = if style != "either" {
+            String::new()
+        } else {
+            let s_slc = self.ba_slc(s_start, s_end);
+            if s_slc.0 == do_slc.0 && s_slc.1 == do_slc.1 {
+                String::new()
+            } else {
+                format!(" or {}", self.ba_format_slc(&do_slc))
+            }
+        };
+        let message = format!("{} is not aligned with {}{}.", self.ba_format_slc(&current), prefer, alt_prefer);
+        self.push(end_start, COP, true, message);
+
+        // autocorrect: `ancestor_node` is `start_for_block_node` for
+        // `start_of_block`, else ALWAYS `start_for_line_node` (even for
+        // `either`, regardless of what the message anchor above used).
+        let ancestor_col0 = if style == "start_of_block" {
+            anchor_col0
+        } else {
+            let t_first_line = self.idx.loc(t_start).0;
+            let (a_start, _) = self.ba_outward_same_line(landed_idx, t_first_line).unwrap_or((t_start, t_end));
+            self.idx.loc(a_start).1 - 1
+        };
+        let delta = ancestor_col0 as isize - end_col0 as isize;
+        if delta > 0 {
+            self.fixes.push((end_start, end_start, vec![b' '; delta as usize]));
+        } else if delta < 0 {
+            let n = (-delta) as usize;
+            if n <= end_col0 {
+                self.fixes.push((end_start - n, end_start, Vec::new()));
+            }
+        }
+    }
+
+    /// Layout/BlockAlignment — `on_block`/`on_numblock`/`on_itblock` for an
+    /// ordinary `do...end`/`{}` block attached to a call.
+    pub(crate) fn check_block_alignment(&mut self, call: &ruby_prism::CallNode, block: &ruby_prism::BlockNode) {
+        if !self.on("Layout/BlockAlignment") {
+            return;
+        }
+        let node0_start = call.location().start_offset();
+        let node0_end = call.location().end_offset();
+        let do_start = block.opening_loc().start_offset();
+        let end_loc = block.closing_loc();
+
+        let mut ranges: Vec<(usize, usize)> = call
+            .arguments()
+            .map(|a| a.arguments().iter().map(|n| (n.location().start_offset(), n.location().end_offset())).collect())
+            .unwrap_or_default();
+        Self::ba_collect_param_ranges(block.parameters(), &mut ranges);
+        let anchor_start = if self.ba_do_line_begins_inside_ranges(do_start, &ranges) {
+            call.message_loc().map(|m| m.start_offset()).unwrap_or_else(|| call.location().start_offset())
+        } else {
+            do_start
+        };
+
+        self.ba_check_core(node0_start, node0_end, do_start, end_loc.start_offset(), end_loc.end_offset(), anchor_start);
+    }
+
+    /// Layout/BlockAlignment — `on_block` for a stabby lambda literal
+    /// (`->(...) { ... }`/`->(...) do ... end`). Whitequark parses this as
+    /// the SAME `(block (send nil :lambda) args body)` shape as a `lambda
+    /// do...end` call, but prism gives it a dedicated `LambdaNode` with no
+    /// owning `CallNode` at all — its own range needs no chain adjustment
+    /// (a stabby lambda has no receiver to chain from), so `node0` is just
+    /// its own `location()`, and the do-line redirect anchor (when the
+    /// `do`/`{` sits on a multiline-parameter continuation line) is the `->`
+    /// operator itself, standing in for `send_node.selector`.
+    pub(crate) fn check_block_alignment_lambda(&mut self, node: &ruby_prism::LambdaNode) {
+        if !self.on("Layout/BlockAlignment") {
+            return;
+        }
+        let node0_start = node.location().start_offset();
+        let node0_end = node.location().end_offset();
+        let do_start = node.opening_loc().start_offset();
+        let end_loc = node.closing_loc();
+
+        let mut ranges = Vec::new();
+        Self::ba_collect_param_ranges(node.parameters(), &mut ranges);
+        let anchor_start = if self.ba_do_line_begins_inside_ranges(do_start, &ranges) {
+            node.operator_loc().start_offset()
+        } else {
+            do_start
+        };
+
+        self.ba_check_core(node0_start, node0_end, do_start, end_loc.start_offset(), end_loc.end_offset(), anchor_start);
+    }
+}

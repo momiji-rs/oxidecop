@@ -362,6 +362,7 @@ COPS = {
   'Lint/ScriptPermission'            => 'lint/script_permission',
   'Migration/DepartmentName'         => 'migration/department_name',
   'Layout/ElseAlignment'             => 'layout/else_alignment',
+  'Layout/BlockAlignment'            => 'layout/block_alignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

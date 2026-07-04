@@ -389,7 +389,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
-    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment",
+    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment",
 ];
 
 impl Engine {
@@ -2017,6 +2017,30 @@ pub(crate) struct Cops<'a> {
     // `assignment_write!`-family macros and `visit_multi_write_node` before
     // descending into the value.
     pub(crate) ea_block_assignment: HashMap<usize, (usize, usize, usize)>,
+    // Layout/BlockAlignment: a generic whitequark-shaped ancestor stack, the
+    // same `visit_branch_node_enter`/`_leave`-pushed idiom as `rp_ancestors`
+    // above (parallel, independent stack — see `layout::BaFrame`'s doc for
+    // exactly which node kinds get a real frame vs. `None` transparency).
+    // Needed because `block_end_align_target?`'s node-pattern climb walks
+    // arbitrarily far up the tree (through assignment/def/splat/and/or/send
+    // chains) and `start_for_line_node`'s outward same-line search walks
+    // EVERY ancestor kind — prism gives no parent pointers at all.
+    pub(crate) ba_ancestors: Vec<Option<layout::BaFrame<'a>>>,
+    // Layout/BlockAlignment: mirrors `rp_pending_transparent_stmts` — the
+    // next `StatementsNode` is transparent regardless of its own statement
+    // count (an explicit `(...)`'s or explicit `begin...end`'s body).
+    pub(crate) ba_pending_transparent_stmts: bool,
+    // Layout/BlockAlignment: the owning `CallNode`'s own start offset,
+    // stashed by `visit_call_node` right before its `self.visit(&b)` call
+    // descends into that call's block — consumed by `Cops::ba_classify` the
+    // moment it's asked to classify that exact `BlockNode`. Needed because
+    // prism's raw `BlockNode#location` starts at the `do`/`{` (see the
+    // "Block nodes" trap in this cop's own doc comment), never at the
+    // receiver chain the way whitequark's translated `:block` node's range
+    // does — but the owning `CallNode#location` (already pushed as ITS OWN
+    // `ba_ancestors` frame) is always chain-inclusive, so borrowing its
+    // start here reproduces whitequark's `block_node.first_line` exactly.
+    pub(crate) ba_pending_block_owner_start: Option<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -4961,6 +4985,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_stabby_lambda_parentheses(node);
         self.check_empty_lambda_parameter(node);
         self.check_lambda_literal(node);
+        self.check_block_alignment_lambda(node);
         if let Some(p) = node.parameters() {
             self.check_keyword_parameters_order_block(&p);
         }
@@ -5806,6 +5831,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_empty_lines_around_exception_handling_keywords_block(node, &bn);
                 self.check_else_alignment_rescue_block(node, &bn);
                 self.check_indentation_width_block(node, &bn);
+                self.check_block_alignment(node, &bn);
                 self.check_block_length(node, &bn);
                 self.check_next_block(node, &bn);
                 self.check_guard_clause_block(node, &bn);
@@ -5819,6 +5845,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             // doc. Left `None` for `&:sym` block-pass args, which never
             // trigger `visit_block_node`.
             if b.as_block_node().is_some() {
+                // Layout/BlockAlignment: see `ba_pending_block_owner_start`'s
+                // field doc.
+                self.ba_pending_block_owner_start = Some(node.location().start_offset());
                 // Lint/Void: see `void_pending_block_name`'s field doc.
                 self.void_pending_block_name = Some(node.name().as_slice().to_vec());
                 let is_lambda_call = node.name().as_slice() == b"lambda";
@@ -5939,11 +5968,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.im_ancestors.push(style::im_is_bang(&node));
         let kind = self.rp_classify(&node);
         self.rp_ancestors.push(kind);
+        let ba_kind = self.ba_classify(&node);
+        self.ba_ancestors.push(ba_kind);
     }
     fn visit_branch_node_leave(&mut self) {
         self.sak_ancestors.pop();
         self.im_ancestors.pop();
         self.rp_ancestors.pop();
+        self.ba_ancestors.pop();
     }
     fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
         self.sak_ancestors.push(Self::sak_classify(&node));
@@ -6113,6 +6145,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         rp_ancestors: Vec::new(),
         rp_pending_transparent_stmts: false,
         rp_pending_transparent_call: false,
+        ba_ancestors: Vec::new(),
+        ba_pending_transparent_stmts: false,
+        ba_pending_block_owner_start: None,
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),
