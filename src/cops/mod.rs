@@ -243,6 +243,7 @@ const IMPLEMENTED: &[&str] = &[
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
     "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops", "Style/SlicingWithRange",
+    "Style/RedundantInterpolation",
 ];
 
 impl Engine {
@@ -910,6 +911,18 @@ pub(crate) struct Cops<'a> {
     // Mirrors `ut_call_child`/`mlbl_call_child`; kept as its own field per
     // this file's one-field-per-cop convention.
     pub(crate) isc_send_child: HashSet<usize>,
+    // Style/RedundantInterpolation: start offsets of `InterpolatedStringNode`s
+    // that are a direct PART of an implicit-concatenation wrapper (an outer
+    // `InterpolatedStringNode` with no opening/closing quotes of its own,
+    // e.g. `"#{sparta}" ' this is'`) — rubocop's `implicit_concatenation?`
+    // (`node.parent&.dstr_type?`) guard. Populated eagerly in
+    // `visit_interpolated_string_node` before descending.
+    pub(crate) ri_concat_child: HashSet<usize>,
+    // Style/RedundantInterpolation: start offsets of `InterpolatedStringNode`s
+    // that are a direct ELEMENT of a percent-literal array (`%W(#{@var} foo)`)
+    // — rubocop's `embedded_in_percent_array?` guard. Populated eagerly in
+    // `visit_array_node` before descending.
+    pub(crate) ri_percent_array_child: HashSet<usize>,
     // Style/PerlBackrefs: depth of enclosing interpolated string/regexp/xstring
     // nodes (InterpolatedStringNode, InterpolatedRegularExpressionNode,
     // InterpolatedXStringNode) — used to determine if backrefs need to be
@@ -1287,6 +1300,21 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_lii_dstr(node);
         self.check_bare_percent_literals_dstr(node);
         self.ll_check_dstr(node);
+        self.check_redundant_interpolation(node);
+        // Mark direct parts of an implicit-concatenation wrapper (an outer
+        // `InterpolatedStringNode` with no quotes of its own gluing 2+
+        // adjacent literals, e.g. `"#{sparta}" ' this is'`) before
+        // descending, so `check_redundant_interpolation` can recognize a
+        // nested single-interpolation part as excluded (rubocop's
+        // `implicit_concatenation?`).
+        if self.on("Style/RedundantInterpolation") && node.opening_loc().is_none() {
+            let parts: Vec<ruby_prism::Node> = node.parts().iter().collect();
+            if parts.len() >= 2 {
+                for p in &parts {
+                    self.ri_concat_child.insert(p.location().start_offset());
+                }
+            }
+        }
         let delim = node.opening_loc().and_then(|o| match o.as_slice() {
             b"'" | b"\"" => Some(o.as_slice()[0]),
             _ => None,
@@ -2283,6 +2311,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if o.starts_with(b"%") {
                 let l = node.location();
                 self.percent_arr_spans.push((l.start_offset(), l.end_offset()));
+                // Style/RedundantInterpolation's `embedded_in_percent_array?`
+                // guard: an interpolated element with no quotes of its own
+                // directly inside ANY percent-literal array (`%W(#{@var}
+                // foo)`), mirroring upstream's generic `percent_literal?`
+                // (any `%`-prefixed array opening).
+                if self.on("Style/RedundantInterpolation") {
+                    for e in node.elements().iter() {
+                        self.ri_percent_array_child.insert(e.location().start_offset());
+                    }
+                }
             }
         }
         self.check_redundant_capital_w(node);
@@ -3187,6 +3225,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         chi_heredoc_ctx: HashMap::new(),
         isc_array_child: HashSet::new(),
         isc_send_child: HashSet::new(),
+        ri_concat_child: HashSet::new(),
+        ri_percent_array_child: HashSet::new(),
         interpolated_node_depth: 0,
         class_module_depth: 0,
         non_nil_ignored: HashSet::new(),

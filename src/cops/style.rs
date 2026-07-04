@@ -14913,3 +14913,196 @@ impl<'a> super::Cops<'a> {
 fn swr_int_eq(node: &ruby_prism::Node, value: i32) -> bool {
     node.as_integer_node().is_some_and(|i| matches!(TryInto::<i32>::try_into(i.value()), Ok(v) if v == value))
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/RedundantInterpolation — a string that is JUST a single
+    /// interpolated expression (`"#{@var}"`, `"#$var"`, `%Q(#{1 + 1})`)
+    /// should be the expression's own `to_s`. Ported from `on_dstr` +
+    /// `single_interpolation?`/`interpolation?`.
+    ///
+    /// In prism, a dstr's `parts` can only ever be a `StringNode` (plain
+    /// text), an `EmbeddedVariableNode` (shorthand `#@ivar`/`#@@cvar`/
+    /// `#$gvar`/`#$1`/`#$+`), or an `EmbeddedStatementsNode` (explicit
+    /// `#{...}`) — so upstream's `interpolation?(node.children.first)`
+    /// check (`variable_interpolation? || begin_type?`) collapses to just
+    /// "is the lone part one of the two interpolation node types", with no
+    /// separate check needed for a plain-text single part (that's simply
+    /// not one of those two types).
+    ///
+    /// Two guards mirror upstream's `implicit_concatenation?` /
+    /// `embedded_in_percent_array?`, both populated eagerly by
+    /// `visit_interpolated_string_node`/`visit_array_node` before
+    /// descending (this node has no parent pointer, so the parent has to
+    /// leave a breadcrumb): `"#{sparta}" ' this is'` parses as an OUTER
+    /// quote-less `InterpolatedStringNode` gluing two literal parts
+    /// together (`ri_concat_child`), and `%W(#{@var} foo)` parses `#{@var}`
+    /// as a quote-less `InterpolatedStringNode` that is a direct array
+    /// element (`ri_percent_array_child`) — in both cases the inner node
+    /// under test is excluded even though it otherwise looks like a lone
+    /// interpolation.
+    pub(crate) fn check_redundant_interpolation(&mut self, node: &ruby_prism::InterpolatedStringNode<'_>) {
+        const COP: &str = "Style/RedundantInterpolation";
+        const MSG: &str = "Prefer `to_s` over string interpolation.";
+        if !self.on(COP) {
+            return;
+        }
+        let parts: Vec<ruby_prism::Node> = node.parts().iter().collect();
+        if parts.len() != 1 {
+            return;
+        }
+        let node_start = node.location().start_offset();
+        if self.ri_concat_child.contains(&node_start) || self.ri_percent_array_child.contains(&node_start) {
+            return;
+        }
+        let part = &parts[0];
+        let node_end = node.location().end_offset();
+
+        // Shorthand `#@ivar`/`#@@cvar`/`#$gvar`/`#$1`/`#$+` — always a bare
+        // variable/reference read, so it's always `<var source>.to_s`
+        // (upstream's `autocorrect_variable_interpolation`).
+        if let Some(ev) = part.as_embedded_variable_node() {
+            self.push(node_start, COP, true, MSG);
+            let mut rep = self.node_src(&ev.variable()).to_vec();
+            rep.extend_from_slice(b".to_s");
+            self.fixes.push((node_start, node_end, rep));
+            return;
+        }
+
+        let Some(es) = part.as_embedded_statements_node() else {
+            // Anything else in `parts` is plain text (`StringNode`) — not an
+            // interpolation at all, so `single_interpolation?` is false.
+            return;
+        };
+        let stmts: Vec<ruby_prism::Node> =
+            es.statements().map(|s| s.body().iter().collect()).unwrap_or_default();
+
+        // `use_match_pattern?`: any embedded statement being a `expr =>
+        // pattern` rightward-assignment match (`MatchRequiredNode`)
+        // suppresses the offense OUTRIGHT — no `add_offense` at all, unlike
+        // every other guard here which merely changes which autocorrect
+        // branch runs. `expr in pattern` (`MatchPredicateNode`, a boolean
+        // predicate that can't raise) is NOT suppressed.
+        if stmts.iter().any(|s| s.as_match_required_node().is_some()) {
+            return;
+        }
+
+        self.push(node_start, COP, true, MSG);
+
+        if stmts.len() == 1 {
+            if let Some(mut rep) = ri_variable_or_call_source(self, &stmts[0]) {
+                rep.extend_from_slice(b".to_s");
+                self.fixes.push((node_start, node_end, rep));
+                return;
+            }
+        }
+
+        // `autocorrect_other`: strip the dstr's own opening/closing
+        // delimiters (quotes, `%Q(...)`, `%|...|`, etc.) and turn the
+        // embedded statements' own `#{`/`}` delimiters into `(`/`).to_s` —
+        // covers zero or 2+ statements, and a single statement that's
+        // neither a variable/reference read nor a plain (non-operator,
+        // non-block, non-safe-nav) method call.
+        if let Some(open) = node.opening_loc() {
+            self.fixes.push((open.start_offset(), open.end_offset(), Vec::new()));
+        }
+        if let Some(close) = node.closing_loc() {
+            self.fixes.push((close.start_offset(), close.end_offset(), Vec::new()));
+        }
+        let eo = es.opening_loc();
+        self.fixes.push((eo.start_offset(), eo.end_offset(), b"(".to_vec()));
+        let ec = es.closing_loc();
+        self.fixes.push((ec.start_offset(), ec.end_offset(), b").to_s".to_vec()));
+    }
+}
+
+/// The single embedded statement's own replacement SOURCE (without the
+/// trailing `.to_s` — callers append that) when it's either a bare
+/// variable/reference read (upstream's `variable_interpolation?`: ivar,
+/// cvar, gvar, lvar, plus nth-ref/back-ref like `$1`/`$+`) or a plain method
+/// call (upstream's `first_child.send_type? && !first_child.operator_method?`
+/// — excludes operator calls like `1 + 1`, and — since prism keeps a
+/// receiver chain flat on `CallNode` rather than wrapping block/safe-nav
+/// calls in a different node type the way whitequark's `:block`/`:csend`
+/// would — explicitly excludes a call with its own block or with `&.`, which
+/// upstream's `send_type?` check excludes for free). Returns `None` for
+/// anything else (falls through to `autocorrect_other`, e.g. `1 + 1`,
+/// `super`, `yield`, a multi-statement/pattern-match body).
+///
+/// For a bareword call with arguments and no parens (`do_something 42`,
+/// `foo.do_something 42`) rebuilds `receiver.selector(args)` from the call's
+/// own start through its message/selector end, plus each argument's own
+/// source joined with `, ` (upstream's `require_parentheses?` +
+/// `autocorrect_single_variable_interpolation`); an already-parenthesized or
+/// argument-less call, and every variable/reference read, just keeps its own
+/// source verbatim.
+fn ri_variable_or_call_source(cops: &super::Cops, stmt: &ruby_prism::Node) -> Option<Vec<u8>> {
+    if stmt.as_instance_variable_read_node().is_some()
+        || stmt.as_class_variable_read_node().is_some()
+        || stmt.as_global_variable_read_node().is_some()
+        || stmt.as_local_variable_read_node().is_some()
+        || stmt.as_numbered_reference_read_node().is_some()
+        || stmt.as_back_reference_read_node().is_some()
+    {
+        return Some(cops.node_src(stmt).to_vec());
+    }
+    let call = stmt.as_call_node()?;
+    if call.is_safe_navigation() || call.block().is_some() || ri_is_operator_method(call.name().as_slice()) {
+        return None;
+    }
+    let has_args = call.arguments().is_some_and(|a| a.arguments().iter().count() > 0);
+    let is_parenthesized = call.opening_loc().is_some();
+    if has_args && !is_parenthesized {
+        let sel_end = call.message_loc()?.end_offset();
+        let recv_start = call.location().start_offset();
+        let mut out = cops.src[recv_start..sel_end].to_vec();
+        out.push(b'(');
+        for (i, a) in call.arguments().unwrap().arguments().iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b", ");
+            }
+            out.extend_from_slice(cops.node_src(&a));
+        }
+        out.push(b')');
+        Some(out)
+    } else {
+        Some(cops.node_src(stmt).to_vec())
+    }
+}
+
+/// `MethodIdentifierPredicates::OPERATOR_METHODS` — the exact operator
+/// method-name set rubocop's `operator_method?` checks against.
+fn ri_is_operator_method(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"|" | b"^"
+            | b"&"
+            | b"<=>"
+            | b"=="
+            | b"==="
+            | b"=~"
+            | b">"
+            | b">="
+            | b"<"
+            | b"<="
+            | b"<<"
+            | b">>"
+            | b"+"
+            | b"-"
+            | b"*"
+            | b"/"
+            | b"%"
+            | b"**"
+            | b"~"
+            | b"+@"
+            | b"-@"
+            | b"!@"
+            | b"~@"
+            | b"[]"
+            | b"[]="
+            | b"!"
+            | b"!="
+            | b"!~"
+            | b"`"
+    )
+}
