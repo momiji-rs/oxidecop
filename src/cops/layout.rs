@@ -6638,3 +6638,255 @@ impl<'a> Cops<'a> {
         self.fixes.push((begin_off, end_off, Vec::new()));
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/SpaceAroundBlockParameters — checks the spacing inside and
+    /// after a block's parameter pipes `{ |a, b| }`, and after the closing
+    /// pipe before the body. Also covers a stabby lambda's `(...)` argument
+    /// list: upstream's `on_block` fires for BOTH shapes because whitequark
+    /// parses `->(x) { }` as a `:block` node whose args node uses `(`/`)` as
+    /// its delimiters instead of `|`/`|`; prism instead gives lambdas their
+    /// own `LambdaNode`, but its `BlockParametersNode` has the identical
+    /// `opening_loc`/`closing_loc` shape, so the same core check applies to
+    /// both `visit_block_node` and `visit_lambda_node`.
+    /// EnforcedStyleInsidePipes: no_space (default) or space.
+    pub(crate) fn check_space_around_block_parameters(&mut self, node: &ruby_prism::BlockNode) {
+        let Some(params) = node.parameters() else { return };
+        self.sabp_check(&params, node.body());
+    }
+
+    /// See `check_space_around_block_parameters` doc for why lambdas share
+    /// the same core check.
+    pub(crate) fn check_space_around_block_parameters_lambda(&mut self, node: &ruby_prism::LambdaNode) {
+        let Some(params) = node.parameters() else { return };
+        self.sabp_check(&params, node.body());
+    }
+
+    fn sabp_check(&mut self, params: &ruby_prism::Node, body: Option<ruby_prism::Node>) {
+        const COP: &str = "Layout/SpaceAroundBlockParameters";
+        if !self.on(COP) {
+            return;
+        }
+        // A numbered-param (`_1`) or `it`-param block has no `BlockParametersNode`
+        // at all (upstream's `pipes?` never applies to it either).
+        let Some(bp) = params.as_block_parameters_node() else { return };
+        let Some(opening) = bp.opening_loc() else { return };
+        let Some(closing) = bp.closing_loc() else { return };
+
+        // Flattened, source-ordered parameter list — regular params (in
+        // Ruby's fixed grammar order: required, optional, rest, post,
+        // keyword, keyword-rest, block) followed by any `; shadow` locals,
+        // matching whitequark's flat `args.children` (shadowargs included).
+        let args = sabp_flatten_args(&bp);
+        if args.is_empty() {
+            // `->() { }` / `{ || }`: upstream's `node.arguments?` is false.
+            return;
+        }
+
+        let space_style = self.cfg.get(COP, "EnforcedStyleInsidePipes") == Some("space");
+        let opening_end = opening.end_offset();
+        let closing_start = closing.start_offset();
+
+        let first_start = args[0].location().start_offset();
+        let last_loc = args[args.len() - 1].location();
+        let (last_start, last_end) = (last_loc.start_offset(), last_loc.end_offset());
+        // A trailing comma (`|x, |`) belongs to "last" for the gap check
+        // even though the insertion point below stays anchored to the bare
+        // arg — matches upstream's `last_end_pos_inside_pipes`.
+        let last_end_for_gap = sabp_last_end_pos_inside_pipes(self.src, last_end, closing_start);
+
+        if space_style {
+            // check_opening_pipe_space
+            self.sabp_check_space_missing(opening_end, first_start, first_start, "before first block parameter");
+            self.sabp_check_no_space(opening_end, first_start.saturating_sub(1), "Extra space before first");
+            // check_closing_pipe_space — `check_space` is called WITHOUT a
+            // node here (bare `last` range), so this is insert-AFTER, not
+            // insert-before: the space lands right after the bare arg,
+            // ahead of any trailing comma (`|x, |` -> `|x ,|`, not `|x, |`
+            // gaining a second space before `,`).
+            self.sabp_check_space_missing_range(
+                last_end_for_gap,
+                closing_start,
+                last_start,
+                last_end,
+                "after last block parameter",
+            );
+            self.sabp_check_no_space(last_end_for_gap + 1, closing_start, "Extra space after last");
+        } else {
+            // check_no_space_style_inside_pipes
+            self.sabp_check_no_space(opening_end, first_start, "Space before first");
+            self.sabp_check_no_space(last_end_for_gap, closing_start, "Space after last");
+        }
+
+        // check_after_closing_pipe — only when the block has a body.
+        if let Some(b) = &body {
+            let body_start = b.location().start_offset();
+            self.sabp_check_space_missing_range(
+                closing.end_offset(),
+                body_start,
+                closing.start_offset(),
+                closing.end_offset(),
+                "after closing `|`",
+            );
+        }
+
+        // check_each_arg — for EnforcedStyleInsidePipes: space, the first
+        // arg's "extra space before" is already fully handled above
+        // (`check_opening_pipe_space` computes the exact same range for it,
+        // and upstream's `current_offense_locations` dedup would otherwise
+        // silently drop this second, differently-worded, call).
+        for (i, arg) in args.iter().enumerate() {
+            self.sabp_check_arg(arg, space_style && i == 0);
+        }
+    }
+
+    /// `check_arg`: recurses into a destructured `(a, b)` parameter's own
+    /// sub-elements first (never skipped, even for the top-level first arg),
+    /// then — unless `skip_self` — flags more-than-one space immediately
+    /// preceding `arg` itself.
+    fn sabp_check_arg(&mut self, arg: &ruby_prism::Node, skip_self: bool) {
+        if let Some(mt) = arg.as_multi_target_node() {
+            for sub in mt.lefts().iter() {
+                self.sabp_check_arg(&sub, false);
+            }
+            // A bare trailing comma (`(x, )`) parses as a synthetic
+            // `ImplicitRestNode` marker, not a real child in whitequark's
+            // mlhs — skip it, same as `sabp_flatten_args` does at the top
+            // level.
+            if let Some(r) = mt.rest() {
+                if r.as_implicit_rest_node().is_none() {
+                    self.sabp_check_arg(&r, false);
+                }
+            }
+            for sub in mt.rights().iter() {
+                self.sabp_check_arg(&sub, false);
+            }
+        }
+        if skip_self {
+            return;
+        }
+        let expr_start = arg.location().start_offset();
+        let begin = sabp_left_space_begin(self.src, expr_start);
+        self.sabp_check_no_space(begin, expr_start.saturating_sub(1), "Extra space before");
+    }
+
+    /// `check_space` (the `node` overload): fires only when the gap is
+    /// exactly empty (no space at all), highlighting `node_start` itself and
+    /// inserting a single space immediately before it.
+    fn sabp_check_space_missing(&mut self, gap_begin: usize, gap_end: usize, node_start: usize, msg: &str) {
+        const COP: &str = "Layout/SpaceAroundBlockParameters";
+        if gap_begin != gap_end {
+            return;
+        }
+        self.push(node_start, COP, true, format!("Space {msg} missing."));
+        self.fixes.push((node_start, node_start, b" ".to_vec()));
+    }
+
+    /// `check_space` (the `range` overload): fires only when the gap is
+    /// exactly empty, highlighting `[anchor_start, anchor_end)` and
+    /// inserting a single space right after `anchor_end`.
+    fn sabp_check_space_missing_range(
+        &mut self,
+        gap_begin: usize,
+        gap_end: usize,
+        anchor_start: usize,
+        anchor_end: usize,
+        msg: &str,
+    ) {
+        const COP: &str = "Layout/SpaceAroundBlockParameters";
+        if gap_begin != gap_end {
+            return;
+        }
+        self.push(anchor_start, COP, true, format!("Space {msg} missing."));
+        self.fixes.push((anchor_end, anchor_end, b" ".to_vec()));
+    }
+
+    /// `check_no_space`: fires when `[begin, end)` is non-empty and doesn't
+    /// span a line break (upstream explicitly bails on a `\n`-containing
+    /// range — that's `Layout/MultilineBlockLayout`'s turf).
+    fn sabp_check_no_space(&mut self, begin: usize, end: usize, msg: &str) {
+        const COP: &str = "Layout/SpaceAroundBlockParameters";
+        if begin >= end {
+            return;
+        }
+        if self.src[begin..end].contains(&b'\n') {
+            return;
+        }
+        self.push(begin, COP, true, format!("{msg} block parameter detected."));
+        self.fixes.push((begin, end, Vec::new()));
+    }
+}
+
+/// Layout/SpaceAroundBlockParameters: flattens a `BlockParametersNode` into
+/// its source-ordered parameter list — required/optional/rest/post/keyword/
+/// keyword-rest/block (Ruby's fixed grammar order already matches physical
+/// source order for any legal parameter list), followed by `; shadow`
+/// locals. Mirrors whitequark's flat `args.children` (which interleaves
+/// shadowargs at the end, in source order, the same way).
+fn sabp_flatten_args<'pr>(bp: &ruby_prism::BlockParametersNode<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    let mut out = Vec::new();
+    if let Some(params) = bp.parameters() {
+        for n in params.requireds().iter() {
+            out.push(n);
+        }
+        for n in params.optionals().iter() {
+            out.push(n);
+        }
+        // A bare trailing comma (`|x, |`) parses as a synthetic
+        // `ImplicitRestNode` marker — whitequark's args node has no
+        // corresponding child for it at all, so it must not become "last".
+        if let Some(r) = params.rest() {
+            if r.as_implicit_rest_node().is_none() {
+                out.push(r);
+            }
+        }
+        for n in params.posts().iter() {
+            out.push(n);
+        }
+        for n in params.keywords().iter() {
+            out.push(n);
+        }
+        if let Some(kr) = params.keyword_rest() {
+            out.push(kr);
+        }
+        if let Some(b) = params.block() {
+            out.push(b.as_node());
+        }
+    }
+    for n in bp.locals().iter() {
+        out.push(n);
+    }
+    out
+}
+
+/// `last_end_pos_inside_pipes`: extends `last_end` past a single trailing
+/// comma (`|x, |`) up to (but not through) the closing pipe/paren — the only
+/// other token that can legally appear in that gap.
+fn sabp_last_end_pos_inside_pipes(src: &[u8], last_end: usize, closing_start: usize) -> usize {
+    match src[last_end..closing_start].iter().position(|&b| b == b',') {
+        Some(rel) => last_end + rel + 1,
+        None => last_end,
+    }
+}
+
+/// `range_with_surrounding_space(expr, side: :left)`'s default phases run in
+/// this fixed order — consume contiguous spaces/tabs, then contiguous
+/// `\`-newline continuations, then contiguous bare newlines — and are never
+/// re-run once a later phase advances past a boundary the earlier phase
+/// would have matched. Crossing a newline here is exactly what later makes
+/// `sabp_check_no_space` reject the range (a multi-line param list is
+/// `Layout/MultilineBlockLayout`'s turf, not this cop's).
+fn sabp_left_space_begin(src: &[u8], start: usize) -> usize {
+    let mut pos = start;
+    while pos > 0 && matches!(src[pos - 1], b' ' | b'\t') {
+        pos -= 1;
+    }
+    while pos >= 2 && &src[pos - 2..pos] == b"\\\n" {
+        pos -= 2;
+    }
+    while pos > 0 && src[pos - 1] == b'\n' {
+        pos -= 1;
+    }
+    pos
+}

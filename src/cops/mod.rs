@@ -312,7 +312,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
-    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray",
+    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters",
 ];
 
 impl Engine {
@@ -2476,6 +2476,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_space_before_block_braces(&node.opening_loc(), &node.closing_loc());
         self.check_block_end_newline(node);
         self.check_access_modifier_indentation_block(node);
+        self.check_space_around_block_parameters(node);
         // Layout/SpaceAroundKeyword: `do`/`end` — a numbered-param (`_1`) or
         // `it`-param block is still a plain `BlockNode` in prism (same as an
         // ordinary block), so this one hook covers `on_block`/`on_numblock`/
@@ -3158,6 +3159,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
         self.check_space_before_block_braces(&node.opening_loc(), &node.closing_loc());
         self.check_block_end_newline_lambda(node);
+        self.check_space_around_block_parameters_lambda(node);
         self.check_space_in_lambda_literal(node);
         self.check_empty_block_lambda(node);
         self.check_nil_lambda_stabby(node);
