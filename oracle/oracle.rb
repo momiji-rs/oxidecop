@@ -128,6 +128,11 @@ def parse_block(raw_lines, raw_heredoc, squiggly, lets = {})
       src << ln
     end
   end
+  # RSpec's AnnotatedSource.parse special case: when the annotated source is
+  # EMPTY (the `^{}` annotation is the only heredoc line — "empty file"
+  # examples), every annotation is forced onto line 1, matching the real
+  # `Offense::NO_LOCATION` line rubocop reports.
+  expected.each { |e| e[0] = 1 } if src.empty?
   [src.join("\n") + "\n", expected]
 end
 
@@ -326,9 +331,18 @@ cfg_stack = []
 it_skip = false
 it_cfg_mut = nil
 in_it_body = false
+# `%w[a b].each do |var|` wrappers around contexts: var -> first value, for
+# resolving `\#{var}` interpolations in positional FILENAME arguments (the
+# body's own interpolations stay unrepresentable as before). Last write wins;
+# never popped — collisions across sibling loops in one spec are unrealistic.
+cur_loopvars = {}
 while i < lines.length
   l = lines[i]
   indent = l[/\A */].length
+  if l =~ /%w\[([^\]]*)\]\.each do \|(\w+)\|/
+    vals = Regexp.last_match(1).split
+    cur_loopvars[Regexp.last_match(2)] = vals.first if vals.any?
+  end
   if l =~ /^\s*(RSpec\.describe|context|describe|shared_examples)\s/
     cur_ctx = l.strip
     in_it_body = false
@@ -437,7 +451,7 @@ while i < lines.length
   # array values like AllowedPatterns survive; sets the innermost context's cfg.
   if l =~ /let\(:cop_config\)\s*\{(.*)\}\s*\z/
     cfg_stack.last[1] = resolve_cop_config_text(Regexp.last_match(1), cfg_stack) if cfg_stack.any?
-  elsif l =~ /let\(:cop_config\)\s*do\s*\z/
+  elsif l =~ /let\(:cop_config\)\s*do\s*(?:#.*)?\z/ # trailing comment allowed
     blk = []
     i += 1
     while i < lines.length && lines[i].strip != 'end'
@@ -530,8 +544,21 @@ while i < lines.length
     raw_heredoc = Regexp.last_match(3) == "'"
     chomp = !(l =~ /chomp:\s*true/).nil? # expect_offense(<<~RUBY, chomp: true)
     # `expect_offense(<<~RUBY, 'config.ru')` — a positional filename the cop
-    # keys behavior on (Gemfile/config.ru rules); honor it when linting.
+    # keys behavior on (Gemfile/config.ru rules); honor it when linting. A
+    # `#{var}` interpolation from an enclosing `%w[...].each do |var|` loop
+    # (Naming/FileName's per-root-dir contexts) resolves to the loop's FIRST
+    # value — the expectation must hold for every iteration anyway, so one
+    # faithful instantiation is a sound subset. Still-unresolved
+    # interpolation makes the filename (and thus the example) untestable.
     fname = l[/RUBY'?,\s*['"]([^'"]+)['"]/, 1]
+    if fname&.include?('#' + '{')
+      vars = fname.scan(/\#\{(\w+)\}/).flatten
+      if vars.any? && vars.all? { |v| cur_loopvars.key?(v) }
+        fname = fname.gsub(/\#\{(\w+)\}/) { cur_loopvars[Regexp.last_match(1)] }
+      else
+        fname = nil # unresolvable interpolation -> untestable filename
+      end
+    end
     body = []
     i += 1
     until lines[i].strip == 'RUBY'
@@ -620,6 +647,7 @@ end
 # an RSpec `let` variable (e.g. `'EnforcedStyle' => enforced_style`), whose
 # value varies per loop iteration and cannot be resolved statically.
 VAR_SENTINEL = " VAR:"
+NIL_SENTINEL = " NIL:"
 
 def parse_val(v)
   v = v.strip
@@ -658,6 +686,11 @@ def parse_val(v)
     Regexp.last_match(2)
   elsif v =~ /\A[a-z_][A-Za-z0-9_.]*\z/ && !%w[true false nil].include?(v)
     VAR_SENTINEL + v
+  elsif v == 'nil'
+    # BARE nil (a quoted 'nil' — e.g. EmptyElse's EnforcedStyle — was already
+    # returned as a plain string by the quote branch above): sentinel so
+    # emit_pairs can drop the key (nil value == key absent to cop_config[]).
+    NIL_SENTINEL
   else
     v
   end
@@ -715,6 +748,12 @@ end
 # Array values (AllowedPatterns) are emitted as single-quoted YAML flow sequences.
 def emit_pairs(lines, h)
   h.each do |k, v|
+    # a literal `nil` value (`'Regex' => nil` in a spec's cop_config) is
+    # indistinguishable from key-absence to upstream (`cop_config['Regex']`
+    # returns nil either way); emitting the bare word would instead hand the
+    # engine the STRING "nil". A QUOTED 'nil' (EmptyElse's EnforcedStyle)
+    # is a real string value and passes through untouched.
+    next if v == NIL_SENTINEL
     if v.is_a?(Hash)
       lines << "  #{k}:"
       v.each { |kk, vv| lines << "    #{kk}: '#{vv}'" }

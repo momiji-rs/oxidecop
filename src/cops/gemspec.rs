@@ -1,5 +1,5 @@
 //! Gemspec department: cops that flag risky patterns inside `.gemspec` files.
-use super::{Cops, Offense};
+use super::Cops;
 use ruby_prism::Visit;
 use std::collections::HashSet;
 
@@ -491,29 +491,16 @@ impl<'a> Cops<'a> {
     /// specs without a gemspec filename, so it stays ungated — rubocop's
     /// spec DSL bypasses Include filtering entirely).
     ///
-    /// `has_code`: does the program have any statement? rubocop's
-    /// `processed_source.ast` is nil for blank source, and the spec DSL
-    /// renders a global offense on an empty file as an annotation BEFORE any
-    /// source line — which the oracle scores as line 0 (with code, the `^{}`
-    /// annotation under line 1 scores as 1:1, which `push(0)` yields).
-    pub(crate) fn check_required_ruby_version_missing(&mut self, has_code: bool) {
+    /// The whole-file offense is rubocop's `Offense::NO_LOCATION`, which
+    /// reports as 1:1 whether or not the file has any code (`push(0)` —
+    /// `LineIndex::loc(0)` is (1,1) even for empty source).
+    pub(crate) fn check_required_ruby_version_missing(&mut self, _has_code: bool) {
         const COP: &str = "Gemspec/RequiredRubyVersion";
         if !self.on(COP) || !self.rel_path.ends_with(".gemspec") {
             return;
         }
         if !self.grrv_seen {
-            let msg = "`required_ruby_version` should be specified.";
-            if has_code {
-                self.push(0, COP, false, msg);
-            } else {
-                self.offenses.push(Offense {
-                    line: 0,
-                    col: 1,
-                    cop: COP,
-                    correctable: false,
-                    message: msg.to_string(),
-                });
-            }
+            self.push(0, COP, false, "`required_ruby_version` should be specified.");
         }
     }
 }
