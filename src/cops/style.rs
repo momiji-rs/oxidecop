@@ -32574,6 +32574,12 @@ fn ca_value<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> 
     tryv!(as_constant_path_and_write_node);
     tryv!(as_constant_path_or_write_node);
     tryv!(as_multi_write_node);
+    tryv!(as_index_or_write_node);
+    tryv!(as_index_and_write_node);
+    tryv!(as_index_operator_write_node);
+    tryv!(as_call_or_write_node);
+    tryv!(as_call_and_write_node);
+    tryv!(as_call_operator_write_node);
     if let Some(n) = node.as_call_node() {
         return n.arguments().and_then(|a| a.arguments().last());
     }
@@ -32758,6 +32764,31 @@ impl<'a> Cops<'a> {
         if node.as_multi_write_node().is_some() {
             return Some((CaKind::Masgn, Vec::new()));
         }
+        // compound assignment on an index (`options[:column] ||=`) or an
+        // attribute call (`relation.select_values |=`) — whitequark's
+        // or/and/op-asgn on a send target (rails corpus). The lhs is the
+        // TARGET's source (node start through just before the operator,
+        // space-normalized) plus the operator.
+        macro_rules! target_opish {
+            ($as:ident, $kind:expr, $op:ident) => {
+                if let Some(n) = node.$as() {
+                    let op_loc = n.$op();
+                    let mut lhs = self.src[node.location().start_offset()..op_loc.start_offset()]
+                        .trim_ascii_end()
+                        .to_vec();
+                    lhs.push(b' ');
+                    lhs.extend_from_slice(op_loc.as_slice());
+                    lhs.push(b' ');
+                    return Some(($kind, lhs));
+                }
+            };
+        }
+        target_opish!(as_index_or_write_node, CaKind::OrAsgn, operator_loc);
+        target_opish!(as_index_and_write_node, CaKind::AndAsgn, operator_loc);
+        target_opish!(as_index_operator_write_node, CaKind::OpAsgn, binary_operator_loc);
+        target_opish!(as_call_or_write_node, CaKind::OrAsgn, operator_loc);
+        target_opish!(as_call_and_write_node, CaKind::AndAsgn, operator_loc);
+        target_opish!(as_call_operator_write_node, CaKind::OpAsgn, binary_operator_loc);
         if let Some(n) = node.as_call_node() {
             if ca_send_qualifies(n.name().as_slice()) {
                 return Some((CaKind::Send, self.ca_lhs_for_send(&n)));
