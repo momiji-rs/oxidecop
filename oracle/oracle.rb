@@ -335,6 +335,7 @@ cur_ctx = ''
 cfg_stack = []
 it_skip = false
 it_cfg_mut = nil
+it_lets = {}
 in_it_body = false
 # `%w[a b].each do |var|` wrappers around contexts: var -> first value, for
 # resolving `\#{var}` interpolations in positional FILENAME arguments (the
@@ -379,6 +380,7 @@ while i < lines.length
     # own prism runs skip it) — mark every capture until the next `it`.
     it_skip = l.include?('unsupported_on: :prism')
     it_cfg_mut = nil
+    it_lets = {}
     in_it_body = true
   end
   # `before { (cur_)cop_config[...][...] = ... }` mutates a NESTED key of the
@@ -411,6 +413,51 @@ while i < lines.length
   if in_it_body && cfg_stack.any? &&
      l =~ /^\s+cop_config\[(['"])([^'"]+)\1\]\s*=\s*((?:\[[^\]]*\]|[^\[\]{}]+?))\s*$/
     it_cfg_mut = [Regexp.last_match(2), Regexp.last_match(3).strip]
+  end
+  # An `it`-body local string assignment (`message = "..." \` + continuation
+  # lines) — RSpec fixtures interpolate these into annotation messages just
+  # like lets, so capture them into a per-example lets overlay.
+  if in_it_body && l =~ /^\s+(\w+)\s*=\s*['"]/
+    name = l[/^\s+(\w+)/, 1]
+    buf = l.sub(/^\s+\w+\s*=\s*/, '').rstrip
+    while buf.end_with?('\\')
+      i += 1
+      buf = buf.chomp('\\').rstrip + ' ' + lines[i].strip
+    end
+    # the assignment must be NOTHING but adjacent string literals (plus the
+    # continuation backslashes already stripped) — `args = 'a' * 10` and
+    # similar computed expressions are not statically resolvable.
+    lit = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/
+    if buf.gsub(lit, '').strip.empty?
+      pieces = buf.scan(/"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'/)
+      if pieces.any?
+        val = pieces.map { |d, sq| d ? unescape_dq(d) : sq }.join
+        it_lets[name] = "\"#{val}\"" unless val.include?('"')
+      end
+    end
+  end
+  # `(a_message, b_message) = %w[x y].map do |arg| "template #\{arg}" end` —
+  # statically expand the map: one string per name, template's `#\{arg}`
+  # replaced by the matching %w value.
+  if in_it_body && l =~ /^\s+\(?(\w+(?:,\s*\w+)+)\)?\s*=\s*%w\[([^\]]+)\]\.map do \|(\w+)\|\s*$/
+    names_raw, vals_raw, param = Regexp.last_match(1), Regexp.last_match(2), Regexp.last_match(3)
+    names = names_raw.split(/,\s*/)
+    vals = vals_raw.split
+    buf = +''
+    i += 1
+    while i < lines.length && lines[i].strip != 'end'
+      buf << lines[i].strip.chomp('\\').rstrip << ' '
+      i += 1
+    end
+    pieces = buf.scan(/"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'/)
+    lit = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/
+    if pieces.any? && names.size == vals.size && buf.gsub(lit, '').strip.empty?
+      tmpl = pieces.map { |d, sq| d ? d : sq }.join
+      names.zip(vals).each do |n, v|
+        resolved = unescape_dq(tmpl.gsub(/\#\{#{Regexp.escape(param)}\}/, v))
+        it_lets[n] = "\"#{resolved}\"" unless resolved.include?('"')
+      end
+    end
   end
   # A scalar `let(:name) { true/false/42/'str' }` — cop_config values often
   # reference these (`'SplitStrings' => split_strings`); record them per scope
@@ -570,7 +617,7 @@ while i < lines.length
       body << lines[i]
       i += 1
     end
-    src, expected = parse_block(body, raw_heredoc, squiggly, cur_lets)
+    src, expected = parse_block(body, raw_heredoc, squiggly, cur_lets.merge(it_lets))
     src = src.chomp if chomp
     examples << { kind: kind, context: cur_ctx, cfg: cur_cfg, skip: cur_skip, as: cur_as,
                   sections: cur_sec, override: cur_ovr, ruby: cur_rb, raw: raw_heredoc,
