@@ -18712,3 +18712,106 @@ fn sp_executable(path: &str) -> bool {
 fn sp_executable(_path: &str) -> bool {
     true
 }
+
+
+impl<'a> Cops<'a> {
+    /// Lint/Syntax — repacks the parser's own diagnostics as offenses.
+    ///
+    /// Ported against rubocop's PRISM parser engine (`ParserEngine:
+    /// parser_prism`, the default once `TargetRubyVersion >= 3.4`) since
+    /// oxidecop's own AST is always prism — the fixture's `parser_whitequark`
+    /// branch is a wholly different parser and out of scope; see the probes
+    /// in this port's final report for how the two engines' messages diverge.
+    ///
+    /// `Commissioner#investigate` calls `on_new_investigation` + walks the
+    /// AST for every cop ONLY when `processed_source.valid_syntax?` — else
+    /// the ONLY hook any cop gets is `on_other_file`, which just this cop
+    /// overrides. We mirror that at the `lint()` call site: this method
+    /// returns `true` when it recorded a syntax offense, and the caller
+    /// returns immediately without running anything else below — feeding a
+    /// broken parse's nonsense partial tree to every other cop produces
+    /// nothing but noise (confirmed empirically: upstream `rubocop` reports
+    /// ONLY `Lint/Syntax` offenses for a file that fails to parse).
+    ///
+    /// Two independent, mutually exclusive fatal-diagnostic sources — both
+    /// always severity `:fatal` regardless of a user's `Severity:` config
+    /// (`Syntax#find_severity` hardcodes it; see `Config::severity_word`'s
+    /// `Lint/Syntax` special case):
+    ///
+    ///  - `add_offense_from_error` (`processed_source.parser_error`): the
+    ///    `parser` gem's `Source::Buffer#source=` validates the WHOLE file is
+    ///    valid UTF-8 BEFORE prism ever runs (`(+source).force_encoding(...)`
+    ///    happens first in `ProcessedSource#initialize`) — prism itself is
+    ///    byte-oriented and does not flag stray invalid bytes inside e.g. a
+    ///    comment (`Prism.parse("# \xf9\n")` — confirmed live — yields ZERO
+    ///    errors). When this fires there are no OTHER diagnostics (parsing
+    ///    never even starts). Message: `error.message.capitalize` + a
+    ///    trailing `.` if missing — the only reachable message is "invalid
+    ///    byte sequence in UTF-8", capitalizing (Ruby's `capitalize`, which
+    ///    lowercases the rest) to "Invalid byte sequence in utf-8." Reported
+    ///    at `Offense::NO_LOCATION` (line 1 col 1, zero-length, confirmed via
+    ///    `rubocop --format json`) with NO `(Using Ruby ...)` suffix (that
+    ///    suffix is diagnostic-only, see `add_offense_from_diagnostic`) and
+    ///    NOT correctable.
+    ///  - `add_offense_from_diagnostic`, one per `result.errors()` (prism's
+    ///    own parse errors — `result.warnings()` is a distinct, non-fatal
+    ///    signal other cops ride, e.g. `check_ambiguous_regexp_literal`, and
+    ///    never surfaces here). `Prism::Translation::Parser#error_diagnostic`
+    ///    remaps ~20 rare error types (duplicate parameter name, singleton
+    ///    def on a literal, a forwarding param without its anonymous name,
+    ///    incomplete `@`/`@@`/`$` variable names, ...) to hardcoded
+    ///    `parser`-gem message templates; every other type — the overwhelming
+    ///    majority, and every case this port could probe live (unmatched
+    ///    `(`, missing `end`, ...) — passes prism's OWN message through
+    ///    unchanged, byte-for-byte confirmed against `Prism.parse(...).errors`
+    ///    and `rubocop --format json`. We always use the raw prism message:
+    ///    the `ruby-prism` Rust binding exposes `Diagnostic::message()`/
+    ///    `location()` only, not the `diag_id` the Ruby-side switch keys on,
+    ///    so replicating that minority remap isn't reachable from here (see
+    ///    the final report's risk note). Message: `"{prism message}\n(Using
+    ///    Ruby {X.Y} parser; configure using \`TargetRubyVersion\` parameter,
+    ///    under \`AllCops\`)"`. Location (`diagnostic_location`): a
+    ///    ZERO-length location is widened by 1 byte — forward if that stays
+    ///    in bounds, else backward (confirmed live: `Prism.parse("(").errors`
+    ///    reports a zero-length location AT the EOF byte offset; rubocop
+    ///    widens it backward since forward would run off the end). A
+    ///    non-empty location — the common case, e.g. prism's own EOF
+    ///    close-context error spans the trailing newline — passes through
+    ///    unchanged. Never correctable (no `Lint/Syntax` autocorrect exists
+    ///    upstream).
+    pub(crate) fn check_syntax(&mut self, result: &ruby_prism::ParseResult) -> bool {
+        const COP: &str = "Lint/Syntax";
+        // The `parser` gem's encoding validation runs before ANY parser
+        // (prism included) sees the source — independent of `result` above.
+        if std::str::from_utf8(self.src).is_err() {
+            if self.on(COP) {
+                self.push(0, COP, false, "Invalid byte sequence in utf-8.");
+            }
+            return true;
+        }
+        let mut errors = result.errors().peekable();
+        if errors.peek().is_none() {
+            return false;
+        }
+        if !self.on(COP) {
+            return true;
+        }
+        let ruby_version = self.cfg.target_ruby();
+        let len = self.src.len();
+        for e in errors {
+            let loc = e.location();
+            let (start, end) = (loc.start_offset(), loc.end_offset());
+            // `diagnostic_location`: a zero-length location widens forward by
+            // 1 byte if that stays in bounds (start unchanged — `resize(1)`
+            // keeps `begin_pos`), else backward (`adjust(begin_pos: -1)`,
+            // which DOES move the anchor). A non-empty location is untouched.
+            let start = if start == end && end >= len && start > 0 { start - 1 } else { start };
+            let message = format!(
+                "{}\n(Using Ruby {ruby_version:.1} parser; configure using `TargetRubyVersion` parameter, under `AllCops`)",
+                e.message()
+            );
+            self.push(start, COP, false, message);
+        }
+        true
+    }
+}

@@ -326,6 +326,11 @@ impl Config {
     /// A cop's severity name: the config's `Severity` param, else the
     /// department default (Lint & Security warn, the rest are conventions).
     pub fn severity_word(&self, cop: &str) -> &str {
+        // `Lint::Syntax#find_severity` hardcodes `:fatal` — unlike every
+        // other cop, its severity is NOT configurable via `Severity:`.
+        if cop == "Lint/Syntax" {
+            return "fatal";
+        }
         if let Some(v) = self.sections.get(cop).and_then(|s| s.get("Severity")) {
             return v;
         }
