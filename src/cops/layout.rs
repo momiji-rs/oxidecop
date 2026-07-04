@@ -5877,3 +5877,274 @@ impl<'a> Cops<'a> {
         }
     }
 }
+
+
+/// Layout/SpaceInsideParens collects every REAL round-paren token in the
+/// file — upstream scans `processed_source.sorted_tokens` (a lexer token
+/// stream), which we don't have; instead we walk the AST once and pull the
+/// paren locations off every node kind that can own a literal `(`/`)` pair:
+/// grouping (`ParenthesesNode`), call argument parens, `def`/`defined?`/
+/// `super`/`yield` parens, `(a, b)` multi-target/-write parens, a lambda's
+/// `BlockParametersNode` (`->(x) {}`), and a pattern-match pin (`^(expr)`).
+/// Each is guarded by an `as_slice() == "("/")" ` check so lookalikes that
+/// share the same `opening_loc`/`closing_loc` fields but are NOT `tLPAREN`/
+/// `tRPAREN` tokens upstream — `[]`/`[]=` index calls (bracket), block
+/// params written with pipes (`|...|`) — never get mistaken for real paren
+/// tokens. String/regexp/percent-literal delimiters (which can also be `(`/
+/// `)`, e.g. `%(...)`) are never visited here at all, since none of those
+/// node kinds are in this list.
+#[derive(Default)]
+struct SipParenFinder {
+    opens: Vec<usize>,
+    closes: Vec<usize>,
+}
+impl SipParenFinder {
+    fn add_pair(&mut self, open: ruby_prism::Location, close: ruby_prism::Location) {
+        if open.as_slice() == b"(" && close.as_slice() == b")" {
+            self.opens.push(open.start_offset());
+            self.closes.push(close.start_offset());
+        }
+    }
+}
+impl<'pr> ruby_prism::Visit<'pr> for SipParenFinder {
+    fn visit_parentheses_node(&mut self, node: &ruby_prism::ParenthesesNode<'pr>) {
+        self.add_pair(node.opening_loc(), node.closing_loc());
+        ruby_prism::visit_parentheses_node(self, node);
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if let (Some(o), Some(c)) = (node.opening_loc(), node.closing_loc()) {
+            self.add_pair(o, c);
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        if let (Some(o), Some(c)) = (node.lparen_loc(), node.rparen_loc()) {
+            self.add_pair(o, c);
+        }
+        ruby_prism::visit_def_node(self, node);
+    }
+    fn visit_defined_node(&mut self, node: &ruby_prism::DefinedNode<'pr>) {
+        if let (Some(o), Some(c)) = (node.lparen_loc(), node.rparen_loc()) {
+            self.add_pair(o, c);
+        }
+        ruby_prism::visit_defined_node(self, node);
+    }
+    fn visit_super_node(&mut self, node: &ruby_prism::SuperNode<'pr>) {
+        if let (Some(o), Some(c)) = (node.lparen_loc(), node.rparen_loc()) {
+            self.add_pair(o, c);
+        }
+        ruby_prism::visit_super_node(self, node);
+    }
+    fn visit_yield_node(&mut self, node: &ruby_prism::YieldNode<'pr>) {
+        if let (Some(o), Some(c)) = (node.lparen_loc(), node.rparen_loc()) {
+            self.add_pair(o, c);
+        }
+        ruby_prism::visit_yield_node(self, node);
+    }
+    fn visit_multi_target_node(&mut self, node: &ruby_prism::MultiTargetNode<'pr>) {
+        if let (Some(o), Some(c)) = (node.lparen_loc(), node.rparen_loc()) {
+            self.add_pair(o, c);
+        }
+        ruby_prism::visit_multi_target_node(self, node);
+    }
+    fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        if let (Some(o), Some(c)) = (node.lparen_loc(), node.rparen_loc()) {
+            self.add_pair(o, c);
+        }
+        ruby_prism::visit_multi_write_node(self, node);
+    }
+    fn visit_block_parameters_node(&mut self, node: &ruby_prism::BlockParametersNode<'pr>) {
+        if let (Some(o), Some(c)) = (node.opening_loc(), node.closing_loc()) {
+            self.add_pair(o, c);
+        }
+        ruby_prism::visit_block_parameters_node(self, node);
+    }
+    fn visit_pinned_expression_node(&mut self, node: &ruby_prism::PinnedExpressionNode<'pr>) {
+        self.add_pair(node.lparen_loc(), node.rparen_loc());
+        ruby_prism::visit_pinned_expression_node(self, node);
+    }
+}
+
+/// Skip a run of ASCII whitespace forward from `pos`; returns the resulting
+/// position and whether a `\n` was among the skipped bytes (upstream's
+/// `same_line?`, inverted).
+fn sip_skip_ws_forward(src: &[u8], mut pos: usize) -> (usize, bool) {
+    let mut crossed_nl = false;
+    while pos < src.len() && src[pos].is_ascii_whitespace() {
+        if src[pos] == b'\n' {
+            crossed_nl = true;
+        }
+        pos += 1;
+    }
+    (pos, crossed_nl)
+}
+
+/// Same as `sip_skip_ws_forward`, but backward: `pos` is an exclusive upper
+/// bound, and the result is the (still exclusive) position right after the
+/// nearest preceding non-whitespace byte.
+fn sip_skip_ws_backward(src: &[u8], mut pos: usize) -> (usize, bool) {
+    let mut crossed_nl = false;
+    while pos > 0 && src[pos - 1].is_ascii_whitespace() {
+        if src[pos - 1] == b'\n' {
+            crossed_nl = true;
+        }
+        pos -= 1;
+    }
+    (pos, crossed_nl)
+}
+
+impl<'a> Cops<'a> {
+    /// Layout/SpaceInsideParens — verbatim port of the upstream token-pair
+    /// scan (`on_new_investigation`/`correct_extraneous_space`/
+    /// `process_with_space_style`/`process_with_compact_style`, all walking
+    /// `processed_source.sorted_tokens` two at a time). We don't have a real
+    /// token stream, so this instead collects every real paren TOKEN once
+    /// (`SipParenFinder`, see above) and, for each one, walks outward to its
+    /// real neighboring token via `sip_skip_ws_forward`/`_backward` — safe
+    /// because upstream's `Token#space_after?`/`#space_before?` only ever
+    /// peek at the ONE byte just past a token's edge, and real tokens are
+    /// never separated by anything but whitespace (a comment or another
+    /// token would BE the neighbor, not something further away): so "is
+    /// there a gap" collapses exactly to "did whitespace-skipping move".
+    ///
+    /// Every paren is checked in exactly one direction to avoid double-
+    /// counting a shared gap between two adjacent parens: opens always look
+    /// RIGHTWARD (the pair is always `parens?`-relevant since `token1.
+    /// left_parens?`); closes look RIGHTWARD too, but ONLY act when that
+    /// lands on another close (the `))`-style double-close pair, relevant
+    /// via `token2.right_parens?` — that pair's `token1` is the FIRST close,
+    /// never producible by scanning outward from an open), and closes also
+    /// look LEFTWARD (the primary "space before `)`" check), but that scan
+    /// is skipped whenever the left neighbor is itself a collected paren
+    /// (open or close) — that gap was already handled from the OTHER
+    /// paren's rightward scan.
+    pub(crate) fn check_space_inside_parens(&mut self, node: &ruby_prism::ProgramNode) {
+        const COP: &str = "Layout/SpaceInsideParens";
+        if !self.on(COP) {
+            return;
+        }
+        let mut finder = SipParenFinder::default();
+        ruby_prism::visit_program_node(&mut finder, node);
+        let SipParenFinder { mut opens, mut closes } = finder;
+        opens.sort_unstable();
+        opens.dedup();
+        closes.sort_unstable();
+        closes.dedup();
+        let open_set: std::collections::HashSet<usize> = opens.iter().copied().collect();
+        let close_set: std::collections::HashSet<usize> = closes.iter().copied().collect();
+        let src = self.src;
+        let style = self.cfg.enforced_style(COP);
+        const MSG: &str = "Space inside parentheses detected.";
+        const MSG_SPACE: &str = "No space inside parentheses detected.";
+
+        for &o in &opens {
+            let end = o + 1;
+            let (f, crossed_nl) = sip_skip_ws_forward(src, end);
+            let has_gap = f > end;
+            let is_comment = src.get(f) == Some(&b'#');
+            let is_close = close_set.contains(&f);
+            let is_open2 = open_set.contains(&f);
+            let same_line = !crossed_nl;
+
+            if is_close {
+                // Adjacent open→close pair: `correct_extraneous_space_in_
+                // empty_parens` (space/compact — no `same_line?` check, it
+                // only compares the literal joined source to `"()"`) vs.
+                // the general no_space rule (DOES require `same_line?`).
+                let offense = if style == "space" || style == "compact" { has_gap } else { same_line && has_gap };
+                if offense {
+                    self.push(end, COP, true, MSG);
+                    self.fixes.push((end, f, Vec::new()));
+                }
+                continue;
+            }
+            if style == "compact" && is_open2 {
+                // Two adjacent opens under `compact`
+                // (`correct_extraneous_space_between_consecutive_parens`) —
+                // upstream only fixes when the gap is EXACTLY one plain
+                // space character; anything else (incl. 0, tabs, newlines,
+                // 2+ spaces) is left alone.
+                if has_gap && f == end + 1 && src[end] == b' ' {
+                    self.push(end, COP, true, MSG);
+                    self.fixes.push((end, f, Vec::new()));
+                }
+                continue;
+            }
+            match style {
+                "space" | "compact" => {
+                    if is_comment {
+                        continue;
+                    }
+                    if same_line && !has_gap {
+                        self.push(end, COP, true, MSG_SPACE);
+                        self.fixes.push((end, end, b" ".to_vec()));
+                    }
+                }
+                _ => {
+                    if !is_comment && same_line && has_gap {
+                        self.push(end, COP, true, MSG);
+                        self.fixes.push((end, f, Vec::new()));
+                    }
+                }
+            }
+        }
+
+        for &o in &closes {
+            // Rightward: only ever relevant when it lands on ANOTHER close
+            // (double-close adjacency) — a close followed by anything else
+            // is never `parens?`-relevant upstream.
+            let end = o + 1;
+            let (f2, crossed_nl2) = sip_skip_ws_forward(src, end);
+            let has_gap2 = f2 > end;
+            let is_close2 = close_set.contains(&f2);
+            let same_line2 = !crossed_nl2;
+            if is_close2 {
+                match style {
+                    "compact" => {
+                        if has_gap2 && f2 == end + 1 && src[end] == b' ' {
+                            self.push(end, COP, true, MSG);
+                            self.fixes.push((end, f2, Vec::new()));
+                        }
+                    }
+                    "space" => {
+                        if same_line2 && !has_gap2 {
+                            self.push(f2, COP, true, MSG_SPACE);
+                            self.fixes.push((f2, f2, b" ".to_vec()));
+                        }
+                    }
+                    _ => {
+                        if same_line2 && has_gap2 {
+                            self.push(end, COP, true, MSG);
+                            self.fixes.push((end, f2, Vec::new()));
+                        }
+                    }
+                }
+            }
+
+            // Leftward: the primary "space before `)`" check — skipped when
+            // the left neighbor is itself a collected paren, since that gap
+            // was already handled above from THAT paren's rightward scan.
+            let (b, crossed_nl) = sip_skip_ws_backward(src, o);
+            let has_gap_l = b < o;
+            let left_is_paren = b > 0 && (open_set.contains(&(b - 1)) || close_set.contains(&(b - 1)));
+            if left_is_paren {
+                continue;
+            }
+            let same_line_l = !crossed_nl;
+            match style {
+                "space" | "compact" => {
+                    if same_line_l && !has_gap_l {
+                        self.push(o, COP, true, MSG_SPACE);
+                        self.fixes.push((o, o, b" ".to_vec()));
+                    }
+                }
+                _ => {
+                    if same_line_l && has_gap_l {
+                        self.push(b, COP, true, MSG);
+                        self.fixes.push((b, o, Vec::new()));
+                    }
+                }
+            }
+        }
+    }
+}

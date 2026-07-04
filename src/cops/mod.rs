@@ -244,7 +244,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
     "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops", "Style/SlicingWithRange",
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
-    "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition",
+    "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
 ];
 
 impl Engine {
@@ -2549,6 +2549,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             None
         };
         self.check_underscore_prefixed_variable_name(node);
+        self.check_space_inside_parens(node);
         ruby_prism::visit_program_node(self, node);
         self.exception_siblings_stack.pop();
         self.class_children_stack.pop();
