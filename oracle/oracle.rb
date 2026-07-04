@@ -191,6 +191,11 @@ def resolve_cop_config_text(body, cfg_stack)
     parent = cfg_stack.last[1]
     base = parent == 'default' ? '' : parent.sub(/\A\{\s*/, '').sub(/\s*\}\z/, '')
     "{ #{[base, inner].reject(&:empty?).join(', ')} }"
+  elsif (m = body.match(/\}\s*\.merge\((\w+)\)\s*\z/))
+    # `{ literal }.merge(identifier)` — the identifier is a LAZY let,
+    # redefined per nested context, so keep the suffix verbatim for
+    # `resolve_merge_chain` to compose at example-scoring time.
+    "#{extract_hash(body)}.merge(#{m[1]})"
   else
     extract_hash(body)
   end
@@ -729,6 +734,25 @@ end
 # `ex[:cfg]` is the raw `let(:cop_config)` hash text (quotes preserved), e.g.
 # "{ 'EnforcedStyle' => single_quotes }" or
 # "{ 'Max' => 18, 'AllowedPatterns' => ['^\\s*test\\s'] }" or "default".
+# `{ ...literal... }.merge(identifier)` where `identifier` is a scalar let
+# holding a hash literal (HashSyntax's `cop_config_overrides` pattern) — the
+# let is LAZY, redefined per nested context, so it can only compose at
+# example-scoring time via that example's own lets. Later keys win, like
+# Hash#merge (parse_cfg keeps the last duplicate).
+def resolve_merge_chain(cfgstr, lets)
+  if (m = cfgstr.match(/\A\s*\{(.*)\}\s*\.merge\((\w+)\)\s*\z/m))
+    base = m[1].strip
+    if (ov = lets[m[2]]) && ov =~ /\A\{(.*)\}\z/m
+      inner = Regexp.last_match(1).strip
+      return inner.empty? ? "{ #{base} }" : "{ #{base}, #{inner} }"
+    end
+    # unresolvable merge arg: fall back to the literal alone (the old
+    # extract_hash behavior, which simply dropped the suffix)
+    return "{ #{base} }"
+  end
+  cfgstr
+end
+
 def parse_cfg(cfgstr)
   return {} if cfgstr == 'default'
 
@@ -848,7 +872,7 @@ examples.each_with_index do |ex, n|
     next
   end
 
-  cfg_hash = resolve_cfg_variables!(parse_cfg(ex[:cfg]), ex[:lets] || {})
+  cfg_hash = resolve_cfg_variables!(parse_cfg(resolve_merge_chain(ex[:cfg], ex[:lets] || {})), ex[:lets] || {})
 
   # A variable EnforcedStyle varies per loop run — unrepresentable statically,
   # like interpolated source.
