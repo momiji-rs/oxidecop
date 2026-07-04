@@ -8138,3 +8138,444 @@ fn silb_skip_sp_tab_backward(src: &[u8], mut pos: usize) -> usize {
     }
     pos
 }
+
+
+// ---- Layout/EmptyLineAfterGuardClause ----
+//
+// Ports `on_if` verbatim (fires for `if`/`unless`/ternary alike — whitequark
+// folds all three into one `:if` node type, so upstream's single `on_if`
+// hook already covers every case prism splits into `IfNode`/`UnlessNode`)
+// plus the `RangeHelp`/`Util`/`DirectiveComment` machinery it leans on.
+//
+// `node.right_sibling`/`node.parent` (needed by `correct_style?`'s
+// `next_line_rescue_or_ensure?`/`next_sibling_parent_empty_or_else?`/
+// `next_sibling_empty_or_guard_clause?` trio): whitequark leaves a SOLE
+// statement inside ANY body slot (an if/unless branch, a rescue/ensure
+// protected body, a resbody handler, a def/block body, the top-level
+// program) unwrapped — its `parent` is the owning construct directly, not a
+// `:begin` wrapper. Exhaustive case analysis against every fixture shape
+// shows this makes EVERY sole-statement guard clause exempt regardless of
+// what construct it's the sole statement of: an if/unless branch's sole
+// guard always resolves exempt whether or not the `if` has an `else`/`elsif`
+// (either the `nil`-sibling short-circuit or the `next_sibling_parent_
+// empty_or_else?` short-circuit fires — the latter is unconditionally true
+// whenever `subsequent` is present at all, since the "parent" of an
+// unwrapped else/elsif slot is always the SAME outer if-node, which by
+// definition has an else there); a rescue/ensure PROTECTED body's sole
+// guard is exempt via `next_line_rescue_or_ensure?` firing directly; a
+// resbody handler's sole guard, and a def/block/top-level sole body, are
+// exempt via the plain out-of-bounds/nil-parent case. And a guard that's the
+// LAST of 2+ statements in any body is likewise always exempt (the `:begin`
+// wrapper bounds `right_sibling` at nil there, regardless of what's outside
+// it). So the whole trio collapses to: within the STATEMENTS list this guard
+// is literally an element of, is there a FOLLOWING element? Prism, unlike
+// whitequark, wraps every body (even a 1-statement one) in a `StatementsNode`
+// uniformly, so this is exactly "the next element of `stmts.body()`, if
+// any" — computed directly in `check_empty_line_after_guard_clause`
+// (`visit_statements_node`), the same idiom `Layout/EmptyLinesAroundAttributeAccessor`
+// already established for this exact whitequark-unwrap mismatch, rather
+// than needing any parent/sibling tracking machinery. A guard embedded
+// elsewhere (a call receiver/argument, hash value, etc. — never a direct
+// `StatementsNode` element) is consequently never even examined here; this
+// matches upstream's own outcome for the one fixture example that exercises
+// it (`if cond then return end.then { 42 }`), since a non-list
+// `right_sibling` there resolves to something that isn't an `AST::Node` at
+// all. A contrived counterexample (a guard clause as a bare array literal
+// element, say) could in principle diverge from this since array elements
+// ARE real sibling `AST::Node`s — not exercised by the fixture, and not
+// reproduced here.
+//
+// `multiple_statements_on_line?` (`parent.begin_type? && same_line?(node,
+// node.right_sibling)`): "not sole" is already established by the moment
+// this runs (`correct_style?` already returned when there's no following
+// sibling), so it's just "does the immediate next element start on the same
+// physical line as this guard".
+//
+// Heredoc handling (`last_heredoc_argument`/`heredoc_line`/`autocorrect`'s
+// heredoc branch): only reachable for a genuine `if`/`unless` MODIFIER form
+// (`modifier_form?` — a ternary has no `if`/`unless` keyword at all, so it's
+// excluded even though it also lacks an `end`). The search root
+// (`last_heredoc_argument_node`) special-cases an `and`-wrapped branch (take
+// the LHS — deliberately NOT `or`, matching upstream: no fixture exercises
+// an `or`-wrapped guard needing heredoc search) and a heredoc literally
+// inside the condition, falling back to the branch's own last child (its
+// last call argument, or `return`/`break`/`next`'s wrapped value) otherwise;
+// the recursive descent (`elagc_find_heredoc`) then walks arguments (FORWARD
+// order — NOT `Style/GuardClause`'s `reverse_each`; a genuine difference
+// between the two cops' own upstream sources, confirmed against both) and
+// the receiver chain, unwrapping both `begin` (explicit `begin...end`/
+// implicit rescue bodies) and prism's distinct `ParenthesesNode` (whitequark
+// folds parenthesized groups into the SAME `begin_type?` the unwrap loop
+// already targets) at each step. The terminator's own physical line always
+// equals whitequark's computed `heredoc_line`: a heredoc's content can only
+// ever start on the line right after the statement's own (single, since
+// modifier-form) source line, so `heredoc_body.last_line`'s parser-boundary
+// quirk (confirmed via live `Prism.parse`/`RuboCop::ProcessedSource` probes
+// during porting) always lands exactly on the terminator's line — no
+// separate line-arithmetic needed, just `closing_loc`'s own start line.
+//
+// Offense anchor: `self.push` only tracks a start offset (line:col — no
+// end/length), so `heredoc_end`'s exact END coordinate never matters for
+// detection, only its START (confirmed live: it's column 0 of the
+// terminator's own line, i.e. `closing_loc.start_offset()` as-is, INCLUDING
+// leading indentation — not the bare delimiter text). The END only matters
+// for autocorrect's insertion point, which trims `closing_loc`'s trailing
+// `\n`/`\r\n` to land right where `corrector.insert_after` would.
+impl<'a> super::Cops<'a> {
+    /// `on_if`, hooked from `visit_statements_node` (see the module doc for
+    /// why prism's uniform `StatementsNode` wrapping makes that sufficient,
+    /// unlike upstream's generic `node.right_sibling` walk).
+    pub(crate) fn check_empty_line_after_guard_clause(&mut self, stmts: &ruby_prism::StatementsNode<'_>) {
+        const COP: &str = "Layout/EmptyLineAfterGuardClause";
+        if !self.on(COP) {
+            return;
+        }
+        let body: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        let len = body.len();
+        for i in 0..len {
+            let node = &body[i];
+            if !elagc_is_if_or_unless(node) {
+                continue;
+            }
+            let sibling = if len > 1 && i + 1 < len { Some(&body[i + 1]) } else { None };
+            self.elagc_check(node, sibling);
+        }
+    }
+
+    fn elagc_check(&mut self, node: &ruby_prism::Node<'_>, sibling: Option<&ruby_prism::Node<'_>>) {
+        const COP: &str = "Layout/EmptyLineAfterGuardClause";
+        const MSG: &str = "Add empty line after guard clause.";
+        if self.elagc_correct_style(node, sibling) {
+            return;
+        }
+        if self.elagc_multiple_statements_on_line(node, sibling) {
+            return;
+        }
+        if elagc_modifier_form(node) {
+            if let Some(root) = elagc_heredoc_search_root(node) {
+                if let Some(heredoc_node) = elagc_find_heredoc(root) {
+                    if let Some(closing) = elagc_heredoc_closing_loc(&heredoc_node) {
+                        let term_line = self.idx.loc(closing.start_offset()).0;
+                        if self.elagc_next_lines_ok(term_line) {
+                            return;
+                        }
+                        self.push(closing.start_offset(), COP, true, MSG);
+                        let mut end = closing.end_offset();
+                        if end > closing.start_offset() && self.src[end - 1] == b'\n' {
+                            end -= 1;
+                            if end > closing.start_offset() && self.src[end - 1] == b'\r' {
+                                end -= 1;
+                            }
+                        }
+                        let next_line = term_line + 1;
+                        let pos = if self.elagc_next_line_allowed_directive(next_line) {
+                            self.el_attr_comment_at(next_line).map(|(_, e)| e).unwrap_or(end)
+                        } else {
+                            end
+                        };
+                        self.fixes.push((pos, pos, b"\n".to_vec()));
+                        return;
+                    }
+                }
+            }
+        }
+        let last_line = self.idx.loc(node.location().end_offset().saturating_sub(1)).0;
+        if self.elagc_next_lines_ok(last_line) {
+            return;
+        }
+        let anchor =
+            elagc_end_kw_loc(node).map(|l| l.start_offset()).unwrap_or_else(|| node.location().start_offset());
+        self.push(anchor, COP, true, MSG);
+        let next_line = last_line + 1;
+        let pos = if self.elagc_next_line_allowed_directive(next_line) {
+            self.el_attr_comment_at(next_line).map(|(_, e)| e).unwrap_or_else(|| self.line_end(last_line))
+        } else {
+            self.line_end(last_line)
+        };
+        self.fixes.push((pos, pos, b"\n".to_vec()));
+    }
+
+    /// `correct_style?`: see the module doc for why the sibling-based trio
+    /// collapses to a single "does a following statement exist" check.
+    fn elagc_correct_style(&self, node: &ruby_prism::Node<'_>, sibling: Option<&ruby_prism::Node<'_>>) -> bool {
+        if !self.elagc_own_branch_is_guard(node) {
+            return true;
+        }
+        match sibling {
+            None => true,
+            Some(sib) => elagc_is_if_or_unless(sib) && self.elagc_contains_guard_clause(sib),
+        }
+    }
+
+    /// `multiple_statements_on_line?`.
+    fn elagc_multiple_statements_on_line(
+        &self,
+        node: &ruby_prism::Node<'_>,
+        sibling: Option<&ruby_prism::Node<'_>>,
+    ) -> bool {
+        let Some(sib) = sibling else { return false };
+        let node_line = self.idx.loc(node.location().start_offset()).0;
+        let sib_line = self.idx.loc(sib.location().start_offset()).0;
+        node_line == sib_line
+    }
+
+    /// `node.if_branch&.guard_clause?` (rubocop-ast's `Node#guard_clause?`:
+    /// and/or unwrap to the RHS, then `match_guard_clause?` — single-line
+    /// bare `raise`/`fail`, or `return`/`break`/`next`).
+    fn elagc_own_branch_is_guard(&self, node: &ruby_prism::Node<'_>) -> bool {
+        let Some(stmts) = elagc_statements(node) else { return false };
+        let mut it = stmts.body().iter();
+        let Some(branch) = it.next() else { return false };
+        if it.next().is_some() {
+            return false;
+        }
+        if let Some(op) = branch.as_and_node() {
+            let target = op.right();
+            return self.elagc_single_line(&target) && elagc_bare_guard_type(&target);
+        }
+        if let Some(op) = branch.as_or_node() {
+            let target = op.right();
+            return self.elagc_single_line(&target) && elagc_bare_guard_type(&target);
+        }
+        self.elagc_single_line(&branch) && elagc_bare_guard_type(&branch)
+    }
+
+    /// `contains_guard_clause?`: `branch.guard_clause?` (and/or unwrap +
+    /// single-line) OR `guard_clause_branch?` (the cop's own bare pattern —
+    /// no unwrap, no single-line restriction) — an intentional asymmetry
+    /// with `elagc_own_branch_is_guard` (confirmed against the "accepts
+    /// multiple guard clauses using `and return`" fixture example).
+    fn elagc_contains_guard_clause(&self, sibling: &ruby_prism::Node<'_>) -> bool {
+        let Some(stmts) = elagc_statements(sibling) else { return false };
+        let mut it = stmts.body().iter();
+        let Some(branch) = it.next() else { return false };
+        if it.next().is_some() {
+            return false;
+        }
+        if elagc_bare_guard_type(&branch) {
+            return true;
+        }
+        let target = if let Some(op) = branch.as_and_node() {
+            op.right()
+        } else if let Some(op) = branch.as_or_node() {
+            op.right()
+        } else {
+            return false;
+        };
+        self.elagc_single_line(&target) && elagc_bare_guard_type(&target)
+    }
+
+    fn elagc_single_line(&self, n: &ruby_prism::Node<'_>) -> bool {
+        let l = n.location();
+        self.idx.loc(l.start_offset()).0 == self.idx.loc(l.end_offset().saturating_sub(1)).0
+    }
+
+    /// `next_line_empty_or_allowed_directive_comment?`, expressed over plain
+    /// 1-based physical lines (same idiom as `Layout/EmptyLinesAroundAttributeAccessor`'s
+    /// `el_attr_next_lines_ok`) rather than upstream's 0-based-array-vs-
+    /// 1-based-line-number indexing trick.
+    fn elagc_next_lines_ok(&self, last_line: usize) -> bool {
+        if self.el_attr_line_blank(last_line + 1) {
+            return true;
+        }
+        self.elagc_next_line_allowed_directive(last_line + 1) && self.el_attr_line_blank(last_line + 2)
+    }
+
+    /// `next_line_allowed_directive_comment?`: `DirectiveComment#enabled?`
+    /// (a `# rubocop:enable ...` comment — `el_attr_enable_directive_at`
+    /// already implements this exact regex for
+    /// `Layout/EmptyLinesAroundAttributeAccessor`) OR a SimpleCov
+    /// `:nocov:`/`simplecov:disable`/`simplecov:enable` directive comment.
+    fn elagc_next_line_allowed_directive(&self, line: usize) -> bool {
+        let Some((s, e)) = self.el_attr_comment_at(line) else { return false };
+        if self.el_attr_enable_directive_at(line) {
+            return true;
+        }
+        let text = String::from_utf8_lossy(&self.src[s..e]);
+        elagc_is_simplecov_comment(&text)
+    }
+}
+
+/// `if_type?`/`unless_type?` — whitequark folds both (plus ternaries) into
+/// one `:if` node type; prism keeps `IfNode`/`UnlessNode` distinct.
+fn elagc_is_if_or_unless(n: &ruby_prism::Node<'_>) -> bool {
+    n.as_if_node().is_some() || n.as_unless_node().is_some()
+}
+
+/// `modifier_form?`: `(if? || unless?) && !loc?(:end)` — a ternary (no
+/// `if`/`unless` keyword at all) is explicitly excluded even though it also
+/// has no `end`.
+fn elagc_modifier_form(n: &ruby_prism::Node<'_>) -> bool {
+    if elagc_end_kw_loc(n).is_some() {
+        return false;
+    }
+    if let Some(i) = n.as_if_node() {
+        return i.if_keyword_loc().is_some();
+    }
+    n.as_unless_node().is_some()
+}
+
+fn elagc_end_kw_loc<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Location<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return i.end_keyword_loc();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return u.end_keyword_loc();
+    }
+    None
+}
+
+fn elagc_predicate<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return Some(i.predicate());
+    }
+    if let Some(u) = n.as_unless_node() {
+        return Some(u.predicate());
+    }
+    None
+}
+
+/// `if_branch` (normalized): the `then`-branch's statements, for either node
+/// kind.
+fn elagc_statements<'pr>(n: &ruby_prism::Node<'pr>) -> Option<ruby_prism::StatementsNode<'pr>> {
+    if let Some(i) = n.as_if_node() {
+        return i.statements();
+    }
+    if let Some(u) = n.as_unless_node() {
+        return u.statements();
+    }
+    None
+}
+
+/// `match_guard_clause?`'s node-shape half (no single-line check — callers
+/// apply that separately, since one caller — `guard_clause_branch?` — never
+/// does).
+fn elagc_bare_guard_type(n: &ruby_prism::Node<'_>) -> bool {
+    if n.as_return_node().is_some() || n.as_break_node().is_some() || n.as_next_node().is_some() {
+        return true;
+    }
+    if let Some(call) = n.as_call_node() {
+        return call.receiver().is_none() && matches!(call.name().as_slice(), b"raise" | b"fail");
+    }
+    false
+}
+
+fn elagc_is_simplecov_comment(text: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"^#\s*(?::nocov:|simplecov\s*:\s*(?:disable|enable)\b)").unwrap());
+    re.is_match(text)
+}
+
+/// `last_heredoc_argument_node`: the search-root selector, run ONCE against
+/// the top `if`/`unless` node itself (every recursive step afterward is a
+/// plain pass-through in upstream, since only an if/unless node
+/// `respond_to?(:if_branch)`).
+fn elagc_heredoc_search_root<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    let stmts = elagc_statements(node)?;
+    let body: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+    let branch = body.first()?;
+    if let Some(op) = branch.as_and_node() {
+        return Some(op.left());
+    }
+    if let Some(condition) = elagc_predicate(node) {
+        if mlbl_subtree_has_heredoc(&condition) {
+            return Some(condition);
+        }
+    }
+    elagc_last_branch_child(branch)
+}
+
+/// `node.if_branch.children.last`: the branch's own last argument (a bare
+/// `raise`/`fail` call) or wrapped value (`return`/`break`/`next`) — `None`
+/// for a bare no-argument guard (whitequark's `.last` on an empty/symbol-only
+/// children tail never resolves to anything heredoc-shaped either).
+fn elagc_last_branch_child<'pr>(branch: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    let args = if let Some(c) = branch.as_call_node() {
+        c.arguments()
+    } else if let Some(r) = branch.as_return_node() {
+        r.arguments()
+    } else if let Some(b) = branch.as_break_node() {
+        b.arguments()
+    } else if let Some(x) = branch.as_next_node() {
+        x.arguments()
+    } else {
+        None
+    };
+    args.and_then(|a| a.arguments().iter().last())
+}
+
+/// `last_heredoc_argument`'s recursive descent (begin/parens-unwrap, heredoc
+/// check, forward-order argument scan, receiver climb) — mirrors
+/// `Style/GuardClause`'s own heredoc finder, except this cop's upstream
+/// source iterates arguments FORWARD (`.each`), not `reverse_each` like
+/// `Style/GuardClause` does — a genuine difference between the two cops'
+/// own upstream sources, reproduced verbatim.
+fn elagc_find_heredoc<'pr>(node: ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    let mut n = node;
+    loop {
+        if let Some(b) = n.as_begin_node() {
+            if let Some(first) = b.statements().and_then(|s| s.body().iter().next()) {
+                n = first;
+                continue;
+            }
+        } else if let Some(p) = n.as_parentheses_node() {
+            if let Some(body) = p.body() {
+                if let Some(stmts) = body.as_statements_node() {
+                    if let Some(first) = stmts.body().iter().next() {
+                        n = first;
+                        continue;
+                    }
+                } else {
+                    n = body;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    if super::breakable::is_heredoc_node(&n) {
+        return Some(n);
+    }
+    let call = n.as_call_node();
+    let ret = n.as_return_node();
+    let brk = n.as_break_node();
+    let nxt = n.as_next_node();
+    if call.is_none() && ret.is_none() && brk.is_none() && nxt.is_none() {
+        return None;
+    }
+    let args = call
+        .as_ref()
+        .and_then(|c| c.arguments())
+        .or_else(|| ret.as_ref().and_then(|r| r.arguments()))
+        .or_else(|| brk.as_ref().and_then(|b| b.arguments()))
+        .or_else(|| nxt.as_ref().and_then(|x| x.arguments()));
+    if let Some(args) = args {
+        for arg in args.arguments().iter() {
+            if let Some(found) = elagc_find_heredoc(arg) {
+                return Some(found);
+            }
+        }
+    }
+    let recv = call?.receiver()?;
+    elagc_find_heredoc(recv)
+}
+
+/// `heredoc_node.loc.heredoc_end`'s LOCATION: prism's `closing_loc` for a
+/// heredoc string already starts at column 0 of the terminator's own
+/// physical line (matching whitequark's `heredoc_end`, which — confirmed
+/// live against real `RuboCop::ProcessedSource` output during porting —
+/// spans the WHOLE line including leading indentation, not just the bare
+/// delimiter text) through a trailing `\n`.
+fn elagc_heredoc_closing_loc<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Location<'pr>> {
+    if let Some(n) = node.as_string_node() {
+        n.closing_loc()
+    } else if let Some(n) = node.as_interpolated_string_node() {
+        n.closing_loc()
+    } else if let Some(n) = node.as_x_string_node() {
+        Some(n.closing_loc())
+    } else if let Some(n) = node.as_interpolated_x_string_node() {
+        Some(n.closing_loc())
+    } else {
+        None
+    }
+}
