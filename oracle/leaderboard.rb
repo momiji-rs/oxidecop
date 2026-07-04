@@ -365,6 +365,7 @@ COPS = {
   'Layout/BlockAlignment'            => 'layout/block_alignment',
   'Layout/FirstArgumentIndentation' => 'layout/first_argument_indentation',
   'Layout/EndAlignment'              => 'layout/end_alignment',
+  'Layout/RescueEnsureAlignment'     => 'layout/rescue_ensure_alignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

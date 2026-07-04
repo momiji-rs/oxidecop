@@ -389,7 +389,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
-    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment",
+    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment",
 ];
 
 impl Engine {
@@ -2075,6 +2075,18 @@ pub(crate) struct Cops<'a> {
     // conditional type with this special call-argument-based alignment path
     // (`if`/`while`/`until` never get it upstream either).
     pub(crate) enda_case_arg: HashMap<usize, (usize, bool)>,
+    // Layout/RescueEnsureAlignment: dedicated ancestor stack for
+    // `on_resbody`/`on_ensure`'s `each_ancestor(:kwbegin, :any_def, :class,
+    // :module, :sclass, :any_block)` lookup — kept independent of
+    // `rp_ancestors` (whose classification is Style/RedundantParentheses-
+    // specific). See `layout::ReaFrame`/`Cops::rea_push`.
+    pub(crate) rea_ancestors: Vec<layout::ReaFrame>,
+    // Layout/RescueEnsureAlignment: position-keyed `(own_start, name_end)`
+    // for an assignment/masgn, keyed by its OWN VALUE's start offset —
+    // consumed by `rea_push` when that value turns out to be directly one
+    // of this cop's ancestor-type nodes (same "stash by position, consume
+    // by position" idiom as `rse_assignment_value` etc).
+    pub(crate) rea_assign_wrap: std::collections::HashMap<usize, (usize, usize)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2310,6 +2322,7 @@ macro_rules! assignment_write {
             $node.location().end_offset(),
             $node.value(),
         );
+        $self.rea_note_assignment(lhs_start, $node.name_loc().end_offset(), $node.value().location().start_offset());
     }};
 }
 macro_rules! assignment_operator_write {
@@ -2328,6 +2341,7 @@ macro_rules! assignment_operator_write {
             $node.location().end_offset(),
             $node.value(),
         );
+        $self.rea_note_assignment(lhs_start, $node.name_loc().end_offset(), $node.value().location().start_offset());
     }};
 }
 macro_rules! assignment_path_write {
@@ -2345,6 +2359,8 @@ macro_rules! assignment_path_write {
             $node.location().end_offset(),
             $node.value(),
         );
+        let rea_name_end = $node.target().name_loc().end_offset();
+        $self.rea_note_assignment(lhs_start, rea_name_end, $node.value().location().start_offset());
     }};
 }
 macro_rules! assignment_path_operator_write {
@@ -2362,6 +2378,8 @@ macro_rules! assignment_path_operator_write {
             $node.location().end_offset(),
             $node.value(),
         );
+        let rea_name_end = $node.target().name_loc().end_offset();
+        $self.rea_note_assignment(lhs_start, rea_name_end, $node.value().location().start_offset());
     }};
 }
 
@@ -3299,6 +3317,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ea_note_block_assignment(node.location().start_offset(), node.location().end_offset(), &node.value());
         self.check_else_alignment_assignment(node.location().start_offset(), node.location().end_offset(), node.value());
         self.check_end_alignment_write(lhs_start, node.value());
+        self.rea_note_assignment(lhs_start, layout::rea_masgn_lhs_end(node), node.value().location().start_offset());
         self.check_self_assignment_masgn(node);
         self.check_trailing_underscore_variable(node);
         // Style/RedundantSelf: only plain local-var masgn targets carry a
@@ -3641,6 +3660,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         {
             let kw = node.keyword_loc();
             self.sak_check(kw.start_offset(), kw.end_offset(), b"rescue");
+            self.check_rescue_ensure_alignment(kw.start_offset(), kw.end_offset(), "rescue");
         }
         self.check_rescued_exceptions_variable_name(node);
         // Lint/RedundantSplatExpansion: `rescue *expr` — upstream's
@@ -4389,6 +4409,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             // autocorrect additionally renames references in
             // `kwbegin_node.right_siblings`.
             self.renv_pending_kwbegin_stack.push(Vec::new());
+            // Layout/RescueEnsureAlignment: this explicit `begin...end`
+            // becomes the nearest `ancestor_node` for any `rescue`/`ensure`
+            // reached while visiting its clauses below.
+            if let Some(begin_kw) = node.begin_keyword_loc() {
+                self.rea_push_kwbegin(begin_kw.start_offset(), begin_kw.end_offset());
+            }
         }
         // Lint/DuplicateMethods: `node.each_ancestor(:rescue, :ensure).first
         // &.type` — hand-rolled (rather than a plain `ruby_prism::
@@ -4446,6 +4472,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.se_ancestor_end_lines.pop();
             self.renv_just_closed_kwbegin_renames =
                 self.renv_pending_kwbegin_stack.pop().unwrap_or_default();
+            self.rea_ancestors.pop();
         }
     }
     fn visit_ensure_node(&mut self, node: &ruby_prism::EnsureNode<'pr>) {
@@ -4453,6 +4480,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_ensure_return(node);
         let kw = node.ensure_keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"ensure");
+        self.check_rescue_ensure_alignment(kw.start_offset(), kw.end_offset(), "ensure");
         // Lint/Void's `on_ensure`/`check_ensure`: `EnsureNode#void_context?`
         // is unconditionally `true` upstream. A single-statement clause body
         // (`node.branch` not `begin_type?`) is checked DIRECTLY — never
@@ -4799,7 +4827,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.alias_cm_stack.push(true);
         self.ta_barrier.push(0);
         self.ic_macro_stack.push(true);
+        // Layout/RescueEnsureAlignment: `each_ancestor(:kwbegin, :any_def,
+        // :class, :module, :sclass, :any_block)` — this `class` node.
+        self.rea_push(layout::ReaKind::Other, l.start_offset(), node.constant_path().location().end_offset(), l.start_offset());
         ruby_prism::visit_class_node(self, node);
+        self.rea_ancestors.pop();
         self.ic_macro_stack.pop();
         self.ta_barrier.pop();
         self.alias_cm_stack.pop();
@@ -4861,7 +4893,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.alias_cm_stack.push(false);
         self.ta_barrier.push(1);
         self.ic_macro_stack.push(true);
+        // Layout/RescueEnsureAlignment: this `module` node.
+        self.rea_push(layout::ReaKind::Other, ml.start_offset(), node.constant_path().location().end_offset(), ml.start_offset());
         ruby_prism::visit_module_node(self, node);
+        self.rea_ancestors.pop();
         self.ic_macro_stack.pop();
         self.ta_barrier.pop();
         self.alias_cm_stack.pop();
@@ -5010,7 +5045,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.void_pending_ctx = Some(void_ctx);
         }
         self.ic_macro_stack.push(false);
+        // Layout/RescueEnsureAlignment: this `def`/`defs` node (inline
+        // access-modifier wraps like `private def foo; end` are handled by
+        // this same generic branch — see `Cops::rea_push`'s doc for why a
+        // separate `access_modifier_node` override isn't needed).
+        {
+            let dl = node.location();
+            self.rea_push(layout::ReaKind::Other, dl.start_offset(), node.name_loc().end_offset(), dl.start_offset());
+        }
         ruby_prism::visit_def_node(self, node);
+        self.rea_ancestors.pop();
         self.ic_macro_stack.pop();
         self.dn_ancestors.pop();
         if alias_plain_def {
@@ -5069,7 +5113,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // see `void_each_stack`'s doc.
         self.void_each_stack.push(false);
         self.ic_macro_stack.push(true);
+        // Layout/RescueEnsureAlignment: a stabby `->(){}` is an `any_block`
+        // ancestor too (same rewrite noted above).
+        {
+            let ll = node.location();
+            self.rea_push(layout::ReaKind::AnyBlock, ll.start_offset(), node.opening_loc().end_offset(), ll.start_offset());
+        }
         ruby_prism::visit_lambda_node(self, node);
+        self.rea_ancestors.pop();
         self.ic_macro_stack.pop();
         self.void_each_stack.pop();
         self.alias_scope_stack.pop();
@@ -5106,6 +5157,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let first = spans.first().map(|(s, _)| *s).unwrap_or(0);
             self.bare_arg_frames.push((first, spans));
         }
+        let mut rea_active = false;
         if let Some(b) = node.block() {
             if let Some(bn) = b.as_block_node() {
                 self.check_empty_block_parameter(&bn);
@@ -5116,6 +5168,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 // Style/ExplicitBlockArgument: this `super(...)`'s own
                 // shape — see the `eba_pending` field doc.
                 self.eba_pending = Some(style::eba_super_owner(node));
+                // Layout/RescueEnsureAlignment: `super do ... end`/
+                // `super(...) do ... end` is an `any_block` ancestor too —
+                // no receiver-chain trap here (a `super` keyword is a single
+                // token, never itself multi-line before the block).
+                let sl = node.location();
+                self.rea_push(layout::ReaKind::AnyBlock, sl.start_offset(), bn.opening_loc().end_offset(), sl.start_offset());
+                rea_active = true;
             }
             let has_args = node.arguments().is_some_and(|a| a.arguments().iter().count() > 0);
             let last_end = if node.lparen_loc().is_some() {
@@ -5128,6 +5187,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         ruby_prism::visit_super_node(self, node);
+        if rea_active {
+            self.rea_ancestors.pop();
+        }
         if framed {
             self.bare_arg_frames.pop();
         }
@@ -5142,6 +5204,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let start = node.location().start_offset();
             self.sak_check(start, start + 5, b"super");
         }
+        let mut rea_active = false;
         if let Some(b) = node.block() {
             self.check_empty_block_parameter(&b);
             self.check_block_parameter_name(&b);
@@ -5154,8 +5217,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             // Style/ExplicitBlockArgument: bare zsuper's own shape — see
             // the `eba_pending` field doc.
             self.eba_pending = Some(style::eba_zsuper_owner(node));
+            // Layout/RescueEnsureAlignment: `super do ... end` (bare zsuper)
+            // is an `any_block` ancestor too.
+            let sl = node.location();
+            self.rea_push(layout::ReaKind::AnyBlock, sl.start_offset(), b.opening_loc().end_offset(), sl.start_offset());
+            rea_active = true;
         }
         ruby_prism::visit_forwarding_super_node(self, node);
+        if rea_active {
+            self.rea_ancestors.pop();
+        }
     }
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
         // Layout/IndentationConsistency: see `ic_parent_of_body`'s doc.
@@ -5194,9 +5265,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ta_barrier.push(0);
         self.dm_enter_sclass(&node.expression());
         self.ic_macro_stack.push(true);
+        // Layout/RescueEnsureAlignment: this `sclass` node — `.loc.name` is
+        // upstream's `identifier.source_range` (the `<<` expression, e.g.
+        // `self`), not the `class` keyword.
+        self.rea_push(layout::ReaKind::Other, l.start_offset(), node.expression().location().end_offset(), l.start_offset());
         if let Some(b) = node.body() {
             self.visit(&b);
         }
+        self.rea_ancestors.pop();
         self.ic_macro_stack.pop();
         self.dm_leave_sclass();
         self.ta_barrier.pop();
@@ -5303,6 +5379,28 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                         node.location().end_offset(),
                         last,
                     );
+                }
+            }
+        }
+        // Layout/RescueEnsureAlignment: `MethodDispatchNode#assignment?` is
+        // ALIASED to `setter_method?` (`loc?(:operator)`) — a plain `=`
+        // attribute/index writer (`obj.attr = x`, `obj[i] = x`) counts as an
+        // `assignment_node` override target too, NOT just the `*WriteNode`
+        // family (compound `+=`/`||=` forms on a setter are prism's
+        // `Call(Operator|And|Or)WriteNode`s — real assignment shorthand
+        // types, `assignment?` true via the base `ASSIGNMENTS` list, but
+        // those never wrap a rescue/ensure-bearing ancestor as their OWN
+        // value in this fixture and aren't separately hooked here). `equal_loc`
+        // is prism's `setter_method?` signal (the same `equal_loc`-gated
+        // idiom used throughout this codebase for that predicate).
+        if node.equal_loc().is_some() {
+            if let Some(args) = node.arguments() {
+                if let Some(last) = args.arguments().iter().last() {
+                    let name_end = node
+                        .receiver()
+                        .map(|r| r.location().end_offset())
+                        .unwrap_or_else(|| node.location().start_offset());
+                    self.rea_note_assignment(node.location().start_offset(), name_end, last.location().start_offset());
                 }
             }
         }
@@ -5878,6 +5976,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // matters (mirrors whitequark's node shape, where a block's body is
         // never a child of the `:send` node itself).
         self.check_out_of_range_regexp_ref_after_send(node);
+        let mut rea_block_active = false;
         if let Some(b) = node.block() {
             if let Some(bn) = b.as_block_node() {
                 self.check_empty_block_parameter(&bn);
@@ -5894,6 +5993,21 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_guard_clause_block(node, &bn);
                 self.check_useless_access_modifier_block(node, &bn);
                 self.check_inverse_block(node, &bn);
+                // Layout/RescueEnsureAlignment: this do-end/`{}` block is an
+                // `any_block` ancestor — anchored on the enclosing call's own
+                // SELECTOR (`message_loc`), not the receiver chain, per the
+                // prism-vs-whitequark block-range trap (see `Cops::
+                // check_empty_lines_around_exception_handling_keywords_block`'s
+                // doc for the same rule applied elsewhere).
+                let owner_off =
+                    node.message_loc().map(|l| l.start_offset()).unwrap_or_else(|| node.location().start_offset());
+                self.rea_push(
+                    layout::ReaKind::AnyBlock,
+                    owner_off,
+                    bn.opening_loc().end_offset(),
+                    node.location().start_offset(),
+                );
+                rea_block_active = true;
             }
             // Lint/NonLocalExitFromIterator: stash this call's shape
             // (`send_node.method?(:lambda)`, `define_method?`,
@@ -5973,6 +6087,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
             self.usage_block_depth += 1;
             self.visit(&b);
+            if rea_block_active {
+                self.rea_ancestors.pop();
+            }
             self.usage_block_depth -= 1;
             if uc_instance_eval {
                 self.uc_instance_eval_depth -= 1;
@@ -6213,6 +6330,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         ba_pending_block_owner_start: None,
         enda_ignored: HashSet::new(),
         enda_case_arg: HashMap::new(),
+        rea_ancestors: Vec::new(),
+        rea_assign_wrap: HashMap::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),

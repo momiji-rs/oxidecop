@@ -14013,3 +14013,260 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// ============================================================================
+// Layout/RescueEnsureAlignment
+// ============================================================================
+
+/// A resolved `each_ancestor(:kwbegin, :any_def, :class, :module, :sclass,
+/// :any_block)` frame for `Layout/RescueEnsureAlignment`'s `ancestor_node`/
+/// `alignment_node` lookup. Pushed once per real ancestor (see `Cops::
+/// rea_push`/`rea_push_kwbegin`, called from each of the six matching
+/// `visit_*` hooks in `mod.rs`) and popped again on the way back out, so a
+/// `rescue`/`ensure` node's own check only ever needs the STACK TOP —
+/// `each_ancestor(...).first` collapsed into O(1).
+#[derive(Clone, Copy)]
+pub(crate) enum ReaKind {
+    /// An explicit `begin...end` (`node.begin_keyword_loc.is_some?`).
+    /// Reached unconditionally, before any `assignment_node`/
+    /// `access_modifier_node` override is even considered upstream.
+    KwBegin,
+    /// A `def`/`defs`/`class`/`module`/`sclass`, or a do-end/`{}` block —
+    /// none of which was itself the RHS of a same-line assignment (or, for
+    /// a `def`/`defs`, wasn't distinguished from an inline access-modifier
+    /// wrap — see `Cops::rea_push`'s doc for why that's a documented
+    /// simplification rather than a separate variant).
+    Other,
+    /// The immediate parent turned out to be a same-line assignment/masgn
+    /// (`x = <ancestor>`) — `alignment_node` upstream becomes the
+    /// ASSIGNMENT node itself, not the original ancestor.
+    Assignment,
+    /// Same as `Other`, but specifically a block (do-end/`{}`), which needs
+    /// its own branch in `alignment_location`'s non-`start_of_line` styles
+    /// (`alignment_node.any_block_type?`) — see `rea_alignment_loc`.
+    AnyBlock,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReaFrame {
+    kind: ReaKind,
+    /// Offset whose OWN LINE anchors `start_of_line` style (rescanned for
+    /// that physical line's first non-whitespace column — never used at its
+    /// own column directly, see `Cops::rea_line_trim`), and — for a
+    /// non-`start_of_line` `Other`/`Assignment` frame — the RAW begin_pos
+    /// upstream's `alignment_node.source_range` would report.
+    anchor: usize,
+    /// End offset of the case-by-node-type "ending_loc" upstream's
+    /// `alignment_source` computes (`.loc.name.end_pos` for
+    /// def/class/module/sclass/lvasgn-family, `.loc.begin.end_pos` for
+    /// kwbegin/block, the masgn LHS group's end, or — when overridden by an
+    /// assignment — that assignment's own `.loc.name.end_pos`).
+    msg_end: usize,
+}
+
+impl<'a> super::Cops<'a> {
+    /// Layout/RescueEnsureAlignment — checks whether a `rescue`/`ensure`
+    /// keyword lines up with the "beginning" of its enclosing construct
+    /// (ported from `on_resbody`/`on_ensure` + `check`). `kw_word` is
+    /// `"rescue"` or `"ensure"` (the two call sites in `mod.rs`, both of
+    /// which already have the keyword's own `Location` in hand).
+    ///
+    /// The `RuboCop::AST` "each_ancestor" walk this needs (`kwbegin`,
+    /// `any_def`, `class`, `module`, `sclass`, `any_block`, PLUS — one level
+    /// further — whether that ancestor's own immediate parent is a same-line
+    /// assignment) is reconstructed here as an O(1) top-of-stack read off
+    /// `Cops::rea_ancestors`, a dedicated stack pushed/popped by six
+    /// `visit_*` hooks in `mod.rs` (see `ReaFrame`'s doc) rather than a
+    /// literal parent-pointer walk (prism carries none).
+    ///
+    /// `Style/RescueModifier`'s dedicated `RescueModifierNode` means
+    /// `modifier?(node)`'s token-position guard (upstream's `on_resbody
+    /// unless modifier?(node)`) needs no replica: a modifier `expr rescue
+    /// handler` never reaches `visit_rescue_node` at all here.
+    ///
+    /// `aligned_with_line_break_method?`/`aligned_with_leading_dot?`
+    /// (upstream's special-case ACCEPTING a `rescue`/`ensure` that lines up
+    /// with a chained call's leading/trailing `.` or its selector, even when
+    /// that differs from the block's own plain start-of-line column) is
+    /// deliberately NOT ported as separate logic: for
+    /// `Layout/BeginEndAlignment`'s default `start_of_line` style (the only
+    /// style ever exercised here against a block ancestor), that shortcut's
+    /// verdict always coincides with plain start-of-line column comparison
+    /// — the leading/trailing dot IS the first non-whitespace character of
+    /// the block's own reported line whenever the special-case would have
+    /// fired — so the two paths are behaviorally identical for every such
+    /// case. See the final port report for the residual (untested) risk.
+    pub(crate) fn check_rescue_ensure_alignment(&mut self, kw_start: usize, kw_end: usize, kw_word: &'static str) {
+        const COP: &str = "Layout/RescueEnsureAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(frame) = self.rea_ancestors.last().copied() else { return };
+        let (align_line, align_col, align_begin) = self.rea_alignment_loc(&frame);
+        let (kw_line, kw_col) = self.idx.loc(kw_start);
+        // `return if alignment_loc.column == kw_loc.column || same_line?(alignment_loc, kw_loc)`.
+        if align_col == kw_col || align_line == kw_line {
+            return;
+        }
+        let _ = kw_end;
+        let align_text = String::from_utf8_lossy(&self.src[align_begin..frame.msg_end]).into_owned();
+        let msg = format!(
+            "`{kw_word}` at {kw_line}, {} is not aligned with `{align_text}` at {align_line}, {}.",
+            kw_col - 1,
+            align_col - 1,
+        );
+        self.push(kw_start, COP, true, msg);
+        // `autocorrect`/`whitespace_range`: replace the keyword's own
+        // leading indentation with `new_column` spaces — but only when that
+        // whole span is blank (an inline statement before the keyword on
+        // the same line, e.g. `'foo'; rescue`, blocks the fix entirely,
+        // matching `return nil unless whitespace.source.strip.empty?`).
+        let line_start = kw_start - (kw_col - 1);
+        if self.src[line_start..kw_start].iter().all(|&b| matches!(b, b' ' | b'\t')) {
+            self.fixes.push((line_start, kw_start, vec![b' '; align_col - 1]));
+        }
+    }
+
+    /// `begin_end_alignment_style == 'start_of_line'`: `Layout/
+    /// BeginEndAlignment` must be enabled (config `Enabled`) AND its
+    /// `EnforcedStyleAlignWith` must equal that string — a disabled cop is
+    /// (falsy && ...) upstream, never equal to the string either way.
+    ///
+    /// Deliberately reads BOTH params RAW (`cfg.param`, never `cfg.get`'s
+    /// schema-default fallback, `cfg.cop_config_enabled`, or `self.on`): the
+    /// real spec's `:config` shared context builds `config` as a bare
+    /// `RuboCop::Config.new(hash, ...)` — NOT `ConfigLoader`'s normal
+    /// default.yml merge — so an `other_cops` section that sets one
+    /// `Layout/BeginEndAlignment` key (or omits the section entirely) really
+    /// does leave every OTHER key nil, not schema-default-backed; only
+    /// `Enabled` gets a computed fallback at all (`Config#enable_cop?`'s
+    /// `cop_options.fetch('Enabled') { !for_all_cops['DisabledByDefault'] }`,
+    /// true here since a real spec's `AllCops` never carries that flag) —
+    /// which is exactly `!= Some("false")` once nil-vs-explicit-false is the
+    /// only distinction that matters. The oracle harness's OWN `AllCops:
+    /// DisabledByDefault: true` (scoping which cop THIS run investigates)
+    /// has no equivalent in that real shared context, and `cfg.get`'s
+    /// schema-default fallback would likewise wrongly manufacture a
+    /// `start_of_line` EnforcedStyleAlignWith the real spec never has. See
+    /// `Cops::hi_line_too_long`'s identical doc for the matching `Enabled` trap.
+    fn rea_style_start_of_line(&self) -> bool {
+        self.cfg.param("Layout/BeginEndAlignment", "Enabled") != Some("false")
+            && self.cfg.param("Layout/BeginEndAlignment", "EnforcedStyleAlignWith") == Some("start_of_line")
+    }
+
+    /// `EndKeywordAlignment#start_line_range`: the physical line containing
+    /// `offset`, trimmed to its own first-through-last non-whitespace
+    /// column — independent of `offset`'s own column within that line (only
+    /// its LINE matters), matching upstream re-deriving the line's own
+    /// indentation from scratch rather than trusting the node's reported
+    /// start column.
+    fn rea_line_trim(&self, offset: usize) -> (usize, usize, usize) {
+        let (line, _) = self.idx.loc(offset);
+        let line_start = self.idx.starts[line - 1];
+        let line_end = self.line_end(line);
+        let line_src = &self.src[line_start..line_end];
+        let col0 = line_src.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(0);
+        (line, col0 + 1, line_start + col0)
+    }
+
+    /// `alignment_location`: the anchor's own (line, 1-based column,
+    /// begin_pos).
+    ///
+    /// A block frame ALWAYS resolves via `rea_line_trim`, regardless of
+    /// style: upstream's OWN non-`start_of_line` branch for a block
+    /// (`send_node.last_line`, trimmed) lands on the exact same physical
+    /// line as `start_of_line`'s `alignment_node.source_range.line` would
+    /// (both are "the block's owning call's own line" — the prism-vs-
+    /// whitequark block-range trap already anchors `anchor` there) for
+    /// every shape this fixture exercises (no call whose OWN arguments span
+    /// past its selector's line) — so the two branches coincide, and only
+    /// ONE needs implementing.
+    ///
+    /// Every other kind's non-`start_of_line` case uses its own raw anchor
+    /// untouched (`alignment_node.source_range`'s begin_pos, e.g. the
+    /// literal `begin` keyword's own column for `EnforcedStyleAlignWith:
+    /// begin`, or a plain `:send`-shaped assignment/masgn/def/class/module/
+    /// sclass node's own start).
+    fn rea_alignment_loc(&self, frame: &ReaFrame) -> (usize, usize, usize) {
+        if self.rea_style_start_of_line() || matches!(frame.kind, ReaKind::AnyBlock) {
+            return self.rea_line_trim(frame.anchor);
+        }
+        let (line, col) = self.idx.loc(frame.anchor);
+        (line, col, frame.anchor)
+    }
+
+    /// `assignment_node`'s stash side: called from every `*WriteNode`
+    /// (via the shared `assignment_write!`-family macros) and
+    /// `MultiWriteNode` visitor in `mod.rs`, right where `own_start`/
+    /// `name_end` (or the masgn LHS group's own start/end) are already in
+    /// hand. Keyed by the VALUE's own start offset — consumed by `rea_push`
+    /// only when that exact position is about to become one of this cop's
+    /// ancestor-type nodes (kwbegin excluded — see `rea_push_kwbegin`'s
+    /// doc), so an unrelated `x = 5` just leaves an unread, harmless entry.
+    pub(crate) fn rea_note_assignment(&mut self, own_start: usize, name_end: usize, value_start: usize) {
+        self.rea_assign_wrap.insert(value_start, (own_start, name_end));
+    }
+
+    /// Push an explicit `begin...end` ancestor frame. Never overridden by
+    /// `assignment_node`/`access_modifier_node` — upstream's `alignment_node`
+    /// returns a `kwbegin_type?` ancestor immediately, before either check
+    /// ever runs.
+    pub(crate) fn rea_push_kwbegin(&mut self, begin_kw_start: usize, begin_kw_end: usize) {
+        self.rea_ancestors.push(ReaFrame { kind: ReaKind::KwBegin, anchor: begin_kw_start, msg_end: begin_kw_end });
+    }
+
+    /// Push a `def`/`defs`/`class`/`module`/`sclass`/block ancestor frame,
+    /// resolving `assignment_node`'s override: if this exact node's start
+    /// (`wrap_key` — the call's own start for a block ancestor, this node's
+    /// own start otherwise) was stashed by `rea_note_assignment` as some
+    /// assignment/masgn's VALUE, and that assignment sits on the SAME LINE
+    /// as this ancestor's own natural anchor (`same_line?`), the pushed
+    /// frame becomes that assignment instead.
+    ///
+    /// `access_modifier_node` (`private def foo; end` naming the WRAPPING
+    /// call, not the `def`, as the alignment source) is deliberately NOT
+    /// separately modeled: the modifier and the `def` it wraps can only
+    /// ever share one physical line (Ruby's grammar has no way to split an
+    /// inline access-modifier call from its sole `def` argument across
+    /// lines without parentheses/backslash-continuation, neither of which
+    /// the fixture exercises), so `start_of_line` alignment — the only
+    /// style this fixture ever combines with a `def` ancestor — already
+    /// rescans that SAME physical line regardless of which of the two
+    /// tokens is treated as the anchor, and `def`'s own `.loc.name` end
+    /// offset is identical to what upstream's `child_nodes.first.loc.name`
+    /// resolves to for the wrapping call. Both branches are therefore
+    /// byte-for-byte identical for every case this cop's fixture covers; a
+    /// multi-line access-modifier wrap (`private(\n def foo\n end\n)`) is
+    /// the one, untested, place this could theoretically diverge.
+    pub(crate) fn rea_push(&mut self, natural_kind: ReaKind, natural_anchor: usize, natural_msg_end: usize, wrap_key: usize) {
+        if let Some(&(assign_start, name_end)) = self.rea_assign_wrap.get(&wrap_key) {
+            if self.idx.loc(assign_start).0 == self.idx.loc(natural_anchor).0 {
+                self.rea_ancestors.push(ReaFrame { kind: ReaKind::Assignment, anchor: assign_start, msg_end: name_end });
+                return;
+            }
+        }
+        self.rea_ancestors.push(ReaFrame { kind: natural_kind, anchor: natural_anchor, msg_end: natural_msg_end });
+    }
+}
+
+/// `MultiWriteNode`'s rubocop-ast `.lhs.source_range.end_pos` equivalent: the
+/// parenthesized target group's own closing paren when present, else the
+/// rightmost (by position, not field order — `rest` may sit between
+/// `lefts`/`rights`) end offset among `lefts`/`rest`/`rights`.
+pub(crate) fn rea_masgn_lhs_end(node: &ruby_prism::MultiWriteNode) -> usize {
+    if let Some(rparen) = node.rparen_loc() {
+        return rparen.end_offset();
+    }
+    let mut end = node.location().start_offset();
+    for t in node.lefts().iter() {
+        end = end.max(t.location().end_offset());
+    }
+    if let Some(r) = node.rest() {
+        end = end.max(r.location().end_offset());
+    }
+    for t in node.rights().iter() {
+        end = end.max(t.location().end_offset());
+    }
+    end
+}
