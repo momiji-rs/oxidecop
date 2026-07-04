@@ -264,6 +264,7 @@ COPS = {
   'Style/BisectedAttrAccessor'       => 'style/bisected_attr_accessor',
   'Layout/SpaceAroundKeyword'        => 'layout/space_around_keyword',
   'Style/MixinGrouping'              => 'style/mixin_grouping',
+  'Style/ClassEqualityComparison'    => 'style/class_equality_comparison',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

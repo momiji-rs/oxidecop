@@ -15421,3 +15421,148 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/ClassEqualityComparison — `var.class == Foo` (also `.equal?`/
+    /// `.eql?`), and `var.class.name == 'Foo'`/`.to_s ==`/`.inspect ==`
+    /// (string, `Module#name`, or bare constant RHS) → `var.instance_of?(Foo)`.
+    /// Ported from rubocop's `Style::ClassEqualityComparison`.
+    ///
+    /// Mirrors the Ruby `class_comparison_candidate?` node pattern: the
+    /// comparison node, its receiver's receiver (the `.class` call), and (in
+    /// the indirect `.name`/`.to_s`/`.inspect` case) the RHS's receiver must
+    /// ALL be plain `send` — safe navigation (`&.`) anywhere in that chain
+    /// disqualifies the match entirely (verified against real rubocop).
+    pub(crate) fn check_class_equality_comparison(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/ClassEqualityComparison";
+        if !self.on(COP) {
+            return;
+        }
+        // The comparison call itself must be a plain `send` (RESTRICT_ON_SEND
+        // is `== equal? eql?`, and the node pattern's outermost `send` never
+        // matches a `csend`).
+        if node.is_safe_navigation() {
+            return;
+        }
+        let method = node.name().as_slice();
+        if !matches!(method, b"==" | b"equal?" | b"eql?") {
+            return;
+        }
+        // Exactly one argument (the node pattern's trailing `$_`).
+        let Some(args) = node.arguments() else { return };
+        let mut arg_iter = args.arguments().iter();
+        let Some(class_node) = arg_iter.next() else { return };
+        if arg_iter.next().is_some() {
+            return;
+        }
+
+        // receiver_node = the innermost `.class` call, always. `is_indirect`
+        // = the comparison's immediate receiver is `.class.name`/`.to_s`/
+        // `.inspect` rather than bare `.class`.
+        let Some(outer_recv) = node.receiver().and_then(|r| r.as_call_node()) else { return };
+        if outer_recv.is_safe_navigation() || outer_recv.arguments().is_some() {
+            return;
+        }
+        let outer_name = outer_recv.name().as_slice().to_vec();
+        let (receiver_node, is_indirect) = if outer_name == b"class" {
+            (outer_recv, false)
+        } else if matches!(outer_name.as_slice(), b"name" | b"to_s" | b"inspect") {
+            let Some(inner_recv) = outer_recv.receiver().and_then(|r| r.as_call_node()) else { return };
+            if inner_recv.is_safe_navigation()
+                || inner_recv.arguments().is_some()
+                || inner_recv.name().as_slice() != b"class"
+            {
+                return;
+            }
+            (inner_recv, true)
+        } else {
+            return;
+        };
+
+        // `class_node.dstr_type?` — an interpolated string RHS is skipped
+        // entirely, no offense at all (no valid `instance_of?` rewrite AND
+        // rubocop doesn't even flag it).
+        if class_node.as_interpolated_string_node().is_some() {
+            return;
+        }
+
+        // `def_node = node.each_ancestor(:any_def).first` — the NEAREST
+        // enclosing method def (through any number of intervening blocks);
+        // `AllowedMethods`/`AllowedPatterns` (default `== equal? eql?`)
+        // exempt it entirely.
+        if let Some(name) = self.def_name_stack.last() {
+            if self.allowed(COP, name) {
+                return;
+            }
+        }
+
+        let Some(sel) = receiver_node.message_loc() else { return };
+        let start = sel.start_offset();
+        let end = node.location().end_offset();
+
+        let class_name = self.cec_class_name(&class_node, is_indirect);
+        let class_argument = class_name.as_deref().map(|n| format!("({n})")).unwrap_or_default();
+        let message = format!("Use `instance_of?{class_argument}` instead of comparing classes.");
+        self.push(start, COP, class_name.is_some(), message);
+        if let Some(name) = class_name {
+            self.fixes.push((start, end, format!("instance_of?({name})").into_bytes()));
+        }
+    }
+
+    /// The Ruby cop's private `class_name` — what to put inside
+    /// `instance_of?(...)`, or `None` when no correction can be suggested
+    /// (message then omits the `(...)` entirely).
+    fn cec_class_name(&self, class_node: &ruby_prism::Node, indirect: bool) -> Option<String> {
+        if !indirect {
+            // `var.class == <class_node>`: comparing a `Class` to a `String`
+            // is always false and has no `instance_of?` rewrite; anything
+            // else (constant, variable, arbitrary expression) is used
+            // verbatim as rubocop takes the raw source unconditionally here.
+            if class_node.as_string_node().is_some() {
+                return None;
+            }
+            return Some(String::from_utf8_lossy(self.node_src(class_node)).into_owned());
+        }
+
+        // `var.class.name == <class_node>` (also `.to_s`/`.inspect`): RHS
+        // shaped like `Date.name` (receiver + the SAME class-name method) —
+        // use the receiver's source (`Date`).
+        if let Some(call) = class_node.as_call_node() {
+            if let Some(recv) = call.receiver() {
+                if matches!(call.name().as_slice(), b"name" | b"to_s" | b"inspect") {
+                    return Some(String::from_utf8_lossy(self.node_src(&recv)).into_owned());
+                }
+            }
+        }
+
+        if let Some(s) = class_node.as_string_node() {
+            return Some(self.cec_string_class_name(s));
+        }
+
+        // `unable_to_determine_type?`: a bare variable read, or any method
+        // call (including safe-navigation) — the runtime type is unknown.
+        let is_variable = class_node.as_local_variable_read_node().is_some()
+            || class_node.as_instance_variable_read_node().is_some()
+            || class_node.as_class_variable_read_node().is_some()
+            || class_node.as_global_variable_read_node().is_some();
+        if is_variable || class_node.as_call_node().is_some() {
+            return None;
+        }
+
+        Some(String::from_utf8_lossy(self.node_src(class_node)).into_owned())
+    }
+
+    /// `string_class_name`: strip quote characters from the plain string
+    /// literal's raw source, then prepend `::` when lexically inside a
+    /// `class`/`module` body and not already fully qualified.
+    fn cec_string_class_name(&self, s: ruby_prism::StringNode) -> String {
+        let src = self.node_src(&s.as_node());
+        let value: Vec<u8> = src.iter().copied().filter(|&b| b != b'"' && b != b'\'').collect();
+        let mut out = String::from_utf8_lossy(&value).into_owned();
+        if self.class_module_depth > 0 && !out.starts_with("::") {
+            out = format!("::{out}");
+        }
+        out
+    }
+}

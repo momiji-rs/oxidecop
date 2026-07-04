@@ -244,7 +244,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
     "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops", "Style/SlicingWithRange",
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
-    "Layout/SpaceAroundKeyword", "Style/MixinGrouping",
+    "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison",
 ];
 
 impl Engine {
@@ -525,6 +525,10 @@ pub(crate) struct Cops<'a> {
     // offense iff def_depth >= 1 and scoping_depth == 0.
     pub(crate) def_depth: usize,
     pub(crate) scoping_depth: usize,
+    // Style/ClassEqualityComparison: enclosing `def`/`defs` method names
+    // (innermost last), mirroring `node.each_ancestor(:any_def).first` —
+    // `AllowedMethods`/`AllowedPatterns` exempt the NEAREST enclosing def.
+    pub(crate) def_name_stack: Vec<Vec<u8>>,
     // Inside a `#{...}` interpolation (rubocop's `inside_interpolation?`) —
     // string-literal style is not enforced there.
     pub(crate) interp_depth: usize,
@@ -2713,7 +2717,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Lint/NonLocalExitFromIterator: a `def`/`defs` always stops
         // upstream's ancestor climb (`scoped_node?`'s `any_def_type?`).
         self.nle_stack.push(NleFrame::Def);
+        self.def_name_stack.push(node.name().as_slice().to_vec());
         ruby_prism::visit_def_node(self, node);
+        self.def_name_stack.pop();
         self.nle_stack.pop();
         self.se_ancestor_end_lines.pop();
         self.el_am_scope.pop();
@@ -2952,6 +2958,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_multiple_comparison(node);
         self.check_identity_comparison(node);
         self.check_class_check(node);
+        self.check_class_equality_comparison(node);
         self.check_redundant_file_extension_in_require(node);
         self.check_proc_new(node);
         self.check_strip(node);
@@ -3359,6 +3366,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         call_stack: Vec::new(),
         def_depth: 0,
         scoping_depth: 0,
+        def_name_stack: Vec::new(),
         interp_depth: 0,
         xstr_interp_base: Vec::new(),
         str_ignore: Vec::new(),
