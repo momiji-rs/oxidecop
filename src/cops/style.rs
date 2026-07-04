@@ -10611,3 +10611,217 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/EmptyCaseCondition: a `case` with no subject expression (`case`
+    /// with no predicate — the "empty case" idiom, `case; when a; ...; end`)
+    /// should be an `if`/`elsif` chain instead. Ports upstream's `on_case`
+    /// guard-for-guard:
+    ///
+    /// - `case_node.condition` (prism: `predicate()`) must be absent.
+    /// - `NOT_SUPPORTED_PARENT_TYPES` (`%i[return break next send csend]`,
+    ///   i.e. `case_node.parent&.type`): the case must not be the value of an
+    ///   enclosing `return`/`break`/`next`, nor the receiver/argument of a
+    ///   method call. `self.ecc_no_offense` stands in for this — it's
+    ///   populated eagerly (before the nested `case` node is itself
+    ///   visited) by `visit_return_node`/`visit_break_node`/`visit_next_node`
+    ///   and by `visit_call_node` in mod.rs, via `ecc_mark_not_supported_parent`
+    ///   / `ecc_mark_not_supported_parent_call` below. Verified live against
+    ///   real `rubocop` (`RuboCop::ProcessedSource`, `parser_engine:
+    ///   parser_prism`) that `case_node.parent.type` is `:return` for
+    ///   `return case...end` even though prism's own AST nests a transparent
+    ///   `ArgumentsNode` in between — RuboCop's AST wrapping skips it, so a
+    ///   direct "is this case the return/break/next's sole argument" check
+    ///   (past that wrapper) matches upstream exactly. `break`/`next` before
+    ///   an empty case are exercised by the fixture but tagged
+    ///   `unsupported_on: :prism` (excluded from oracle scoring) — ported
+    ///   anyway since live probing shows Prism's parent type still comes out
+    ///   `:break`/`:next` (the tag is presumably about something else, e.g.
+    ///   argument-parsing differences pre-Ruby-3.2, not this guard).
+    /// - No `when`/`else` branch body may itself be a `return`, nor contain
+    ///   one anywhere in its descendant tree (`ecc_contains_return`) —
+    ///   upstream's `body.return_type? || body.each_descendant.any?
+    ///   (&:return_type?)`. Verified live that this is a bare structural
+    ///   check (traverses into nested `def`s/blocks unconditionally, no
+    ///   scope-awareness) — a `return` inside a `def` nested in a `when`
+    ///   branch still suppresses the offense.
+    ///
+    /// Autocorrect (`autocorrect` -> `correct_case_when` +
+    /// `correct_when_conditions`) ports verbatim; see the per-step comments
+    /// below.
+    pub(crate) fn check_empty_case_condition(&mut self, node: &ruby_prism::CaseNode) {
+        const COP: &str = "Style/EmptyCaseCondition";
+        if !self.on(COP) {
+            return;
+        }
+        if node.predicate().is_some() {
+            return;
+        }
+        let case_start = node.location().start_offset();
+        if self.ecc_no_offense.contains(&case_start) {
+            return;
+        }
+
+        let when_branches: Vec<ruby_prism::WhenNode> =
+            node.conditions().iter().filter_map(|c| c.as_when_node()).collect();
+
+        let mut branch_bodies: Vec<ruby_prism::StatementsNode> =
+            when_branches.iter().filter_map(ruby_prism::WhenNode::statements).collect();
+        if let Some(s) = node.else_clause().and_then(|e| e.statements()) {
+            branch_bodies.push(s);
+        }
+        if branch_bodies.iter().any(|b| ecc_contains_return(&b.as_node())) {
+            return;
+        }
+
+        let kw = node.case_keyword_loc();
+        self.push(
+            kw.start_offset(),
+            COP,
+            true,
+            "Do not use empty `case` condition, instead use an `if` expression.",
+        );
+
+        // Autocorrect. A `case` with zero `when` branches can't legally
+        // exist here (a bare `case`/`end` with no `when` is degenerate,
+        // unexercised by the fixture, and upstream's own `when_nodes.first`
+        // would itself blow up on it) — guard rather than panic.
+        let Some(first_when) = when_branches.first() else { return };
+        // `when_node.parent.parent` (== `case_node.parent`): whether this
+        // `case` has ANY enclosing node at all, vs. being the sole top-level
+        // statement in the whole file (`top_level_sole_stmt`, shared with
+        // Lint/EmptyConditionalBody — see its definition).
+        let case_has_parent = self.top_level_sole_stmt != Some(case_start);
+
+        // `correct_case_when`: the `case`..first-`when`-KEYWORD span
+        // collapses to the literal text `if` (swallowing everything between,
+        // blank lines/comments included — `keep_first_when_comment` below
+        // re-inserts any comments from that span ahead of it).
+        let first_kw = first_when.keyword_loc();
+        self.fixes.push((kw.start_offset(), first_kw.end_offset(), b"if".to_vec()));
+        self.ecc_keep_first_when_comment(kw.start_offset(), first_kw.start_offset());
+        for w in when_branches.iter().skip(1) {
+            let wk = w.keyword_loc();
+            self.fixes.push((wk.start_offset(), wk.end_offset(), b"elsif".to_vec()));
+        }
+
+        // `correct_when_conditions`.
+        for w in &when_branches {
+            let conditions: Vec<ruby_prism::Node> = w.conditions().iter().collect();
+            // `replace_then_with_line_break`: swallow from the end of the
+            // last condition through the end of the `then` keyword,
+            // replacing with a newline — but only when the enclosing `case`
+            // has some parent (see `case_has_parent` above); when the whole
+            // file IS just this `case` expression, upstream's guard leaves
+            // any `then` untouched (verified against the fixture's "with
+            // when branches using then" example, whose corrected source
+            // keeps every `then` literally).
+            if case_has_parent {
+                if let (Some(then_kw), Some(last_cond)) = (w.then_keyword_loc(), conditions.last()) {
+                    self.fixes.push((last_cond.location().end_offset(), then_kw.end_offset(), b"\n".to_vec()));
+                }
+            }
+            // Comma-delimited alternatives (`when a, b, c`) join with ` || `.
+            if conditions.len() > 1 {
+                let start = conditions.first().expect("len > 1").location().start_offset();
+                let end = conditions.last().expect("len > 1").location().end_offset();
+                let mut joined = Vec::new();
+                for (i, c) in conditions.iter().enumerate() {
+                    if i > 0 {
+                        joined.extend_from_slice(b" || ");
+                    }
+                    joined.extend_from_slice(self.node_src(c));
+                }
+                self.fixes.push((start, end, joined));
+            }
+        }
+    }
+
+    /// Marks a `case`-with-no-predicate that is the sole argument of a
+    /// `return`/`break`/`next` (past prism's transparent `ArgumentsNode`
+    /// wrapper) so `check_empty_case_condition` skips it — see that method's
+    /// doc comment. Called from `visit_return_node`/`visit_break_node`/
+    /// `visit_next_node` in mod.rs, BEFORE they recurse into their argument
+    /// (so the mark is already in place by the time `visit_case_node` fires
+    /// on it).
+    pub(crate) fn ecc_mark_not_supported_parent(&mut self, args: Option<ruby_prism::ArgumentsNode>) {
+        if !self.on("Style/EmptyCaseCondition") {
+            return;
+        }
+        let Some(a) = args else { return };
+        for arg in a.arguments().iter() {
+            if arg.as_case_node().is_some() {
+                self.ecc_no_offense.insert(arg.location().start_offset());
+            }
+        }
+    }
+
+    /// Same marking for a `case` used as the RECEIVER or an ARGUMENT of a
+    /// method call — `send`/`csend` in `NOT_SUPPORTED_PARENT_TYPES`. Prism
+    /// represents both as `CallNode` (safe-navigation is just a flag), and
+    /// upstream doesn't distinguish them for this guard either, so both
+    /// receiver and argument positions mark unconditionally regardless of
+    /// `is_safe_navigation`. Called from `visit_call_node` in mod.rs before
+    /// it recurses into the receiver/arguments.
+    pub(crate) fn ecc_mark_not_supported_parent_call(&mut self, node: &ruby_prism::CallNode) {
+        if !self.on("Style/EmptyCaseCondition") {
+            return;
+        }
+        if let Some(r) = node.receiver() {
+            if r.as_case_node().is_some() {
+                self.ecc_no_offense.insert(r.location().start_offset());
+            }
+        }
+        if let Some(a) = node.arguments() {
+            for arg in a.arguments().iter() {
+                if arg.as_case_node().is_some() {
+                    self.ecc_no_offense.insert(arg.location().start_offset());
+                }
+            }
+        }
+    }
+
+    /// `keep_first_when_comment`: every comment on a line from the `case`
+    /// keyword's own line (inclusive — this is how an inline `case #
+    /// comment` gets hoisted onto its own line) through the line BEFORE the
+    /// first `when` keyword's line (exclusive), reindented to the `case`
+    /// keyword's column, inserted as whole lines immediately ahead of the
+    /// `case`-keyword's line (i.e. ahead of where `if` ends up).
+    fn ecc_keep_first_when_comment(&mut self, case_kw_start: usize, first_when_kw_start: usize) {
+        let (case_line, case_col) = self.idx.loc(case_kw_start);
+        let (when_line, _) = self.idx.loc(first_when_kw_start);
+        let indent = vec![b' '; case_col - 1];
+        let mut block = Vec::new();
+        for &(line, start, end) in self.comments {
+            if line >= case_line && line < when_line {
+                block.extend_from_slice(&indent);
+                block.extend_from_slice(&self.src[start..end]);
+                block.push(b'\n');
+            }
+        }
+        if block.is_empty() {
+            return;
+        }
+        let line_start = self.idx.starts[case_line - 1];
+        self.fixes.push((line_start, line_start, block));
+    }
+}
+
+/// `body.return_type? || body.each_descendant.any?(&:return_type?)`: does
+/// `node` itself, or anything beneath it — unconditionally, nested
+/// `def`s/blocks included (verified live) — contain a `return`?
+fn ecc_contains_return(node: &ruby_prism::Node) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+            self.found = true;
+            ruby_prism::visit_return_node(self, node);
+        }
+    }
+    let mut f = Finder { found: false };
+    f.visit(node);
+    f.found
+}

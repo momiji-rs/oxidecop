@@ -193,7 +193,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/KeywordParametersOrder", "Style/PerlBackrefs",
     "Style/NonNilCheck", "Style/MixinUsage", "Lint/UnderscorePrefixedVariableName", "Lint/MissingCopEnableDirective",
     "Layout/MultilineMethodCallBraceLayout", "Style/CommentAnnotation", "Lint/SuppressedException", "Style/TrailingUnderscoreVariable",
-    "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
+    "Lint/NonLocalExitFromIterator", "Layout/EmptyComment", "Style/EmptyCaseCondition",
 ];
 
 impl Engine {
@@ -682,6 +682,18 @@ pub(crate) struct Cops<'a> {
     // parent types). Populated eagerly in `visit_call_node` before descending,
     // so it's already complete by the time a nested `send` is visited.
     pub(crate) ut_call_child: HashSet<usize>,
+    // Style/EmptyCaseCondition: start offsets of empty-condition `case` nodes
+    // found in a structural position upstream's `NOT_SUPPORTED_PARENT_TYPES`
+    // forbids (`case_node.parent&.type` in `%i[return break next send csend]`)
+    // — a `case` that's the value of a `return`/`break`/`next`, or the
+    // receiver/argument of a method call (`send`/`csend` are both prism
+    // `CallNode`, so both track here regardless of safe-navigation).
+    // Populated eagerly, before the nested `case` node is itself visited, by
+    // `visit_return_node`/`visit_break_node`/`visit_next_node` (the case is
+    // the return/break/next's sole argument, past the transparent
+    // `ArgumentsNode` wrapper) and by `visit_call_node`'s existing
+    // receiver/argument loops.
+    pub(crate) ecc_no_offense: HashSet<usize>,
     // Layout/EmptyLinesAroundAccessModifier: whether the bare access
     // modifier currently under consideration sits somewhere that traces
     // back — through class/module/sclass/block/kwbegin/if branches — to a
@@ -1472,6 +1484,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_case_indentation(node);
         self.check_empty_else_case(node);
         self.check_hash_like_case(node);
+        self.check_empty_case_condition(node);
         self.cond_depth += 1;
         ruby_prism::visit_case_node(self, node);
         self.cond_depth -= 1;
@@ -1519,7 +1532,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_min_max_return(node);
         self.check_top_level_return_with_argument(node);
         self.check_non_local_exit_from_iterator(node);
+        self.ecc_mark_not_supported_parent(node.arguments());
         ruby_prism::visit_return_node(self, node);
+    }
+    fn visit_break_node(&mut self, node: &ruby_prism::BreakNode<'pr>) {
+        self.ecc_mark_not_supported_parent(node.arguments());
+        ruby_prism::visit_break_node(self, node);
+    }
+    fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
+        self.ecc_mark_not_supported_parent(node.arguments());
+        ruby_prism::visit_next_node(self, node);
     }
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
         self.check_rescue_exception(node);
@@ -2153,6 +2175,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        self.ecc_mark_not_supported_parent_call(node);
         self.check_def_end_alignment_send(node);
         self.check_redundant_self(node);
         self.check_binary_operator_with_identical_operands(node);
@@ -2621,6 +2644,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         nle_stack: Vec::new(),
         nle_pending: None,
         ut_call_child: HashSet::new(),
+        ecc_no_offense: HashSet::new(),
         el_am_scope: Vec::new(),
         el_am_class_first_line: None,
         el_am_class_last_line: None,

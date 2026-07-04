@@ -223,6 +223,7 @@ COPS = {
   'Style/TrailingUnderscoreVariable' => 'style/trailing_underscore_variable',
   'Lint/NonLocalExitFromIterator'    => 'lint/non_local_exit_from_iterator',
   'Layout/EmptyComment'              => 'layout/empty_comment',
+  'Style/EmptyCaseCondition'         => 'style/empty_case_condition',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
