@@ -1605,6 +1605,12 @@ pub(crate) struct Cops<'a> {
     // scope (e.g. a bare `private` sitting inside a plain `if`/`begin` inside
     // a class body) — no fixture example nests a modifier that way.
     pub(crate) ic_parent_of_body: HashMap<usize, usize>,
+    // Layout/IndentationConsistency: rubocop-ast macro-scope semantics —
+    // the NEAREST hard scope (class/module/sclass/block/lambda pushes true,
+    // def/defs pushes false; if/unless/begin are TRANSPARENT). Top of stack
+    // (default true at top level) answers "is a bare send here a macro?"
+    // (rails: bare `private` inside `if current_adapter?` inside a class).
+    pub(crate) ic_macro_stack: Vec<bool>,
     // Layout/IndentationConsistency: byte ranges of every offense node
     // registered so far THIS RUN, in traversal order — rubocop's cop-instance
     // -wide `@current_offenses`, consulted by `Alignment#check_alignment`'s
@@ -3951,7 +3957,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                     self.void_pending_ctx = Some(void_is_each || void_is_tap);
                 }
             }
+            self.ic_macro_stack.push(true);
             self.visit(&body);
+            self.ic_macro_stack.pop();
         }
         self.void_each_stack.pop();
         self.dm_anon_stack.pop();
@@ -4660,7 +4668,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.alias_scope_stack.push(0);
         self.alias_cm_stack.push(true);
         self.ta_barrier.push(0);
+        self.ic_macro_stack.push(true);
         ruby_prism::visit_class_node(self, node);
+        self.ic_macro_stack.pop();
         self.ta_barrier.pop();
         self.alias_cm_stack.pop();
         self.alias_scope_stack.pop();
@@ -4719,7 +4729,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.alias_scope_stack.push(0);
         self.alias_cm_stack.push(false);
         self.ta_barrier.push(1);
+        self.ic_macro_stack.push(true);
         ruby_prism::visit_module_node(self, node);
+        self.ic_macro_stack.pop();
         self.ta_barrier.pop();
         self.alias_cm_stack.pop();
         self.alias_scope_stack.pop();
@@ -4865,7 +4877,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 || lint_cops::void_is_assignment_method_name(name.as_slice());
             self.void_pending_ctx = Some(void_ctx);
         }
+        self.ic_macro_stack.push(false);
         ruby_prism::visit_def_node(self, node);
+        self.ic_macro_stack.pop();
         self.dn_ancestors.pop();
         if alias_plain_def {
             self.alias_def_depth -= 1;
@@ -4921,7 +4935,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // stop too (same rewrite noted above), but never `each`/`tap` —
         // see `void_each_stack`'s doc.
         self.void_each_stack.push(false);
+        self.ic_macro_stack.push(true);
         ruby_prism::visit_lambda_node(self, node);
+        self.ic_macro_stack.pop();
         self.void_each_stack.pop();
         self.alias_scope_stack.pop();
         self.ms_block_stack.pop();
@@ -5042,9 +5058,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // returning "not exempt", even under an outer `instance_eval`.
         self.ta_barrier.push(0);
         self.dm_enter_sclass(&node.expression());
+        self.ic_macro_stack.push(true);
         if let Some(b) = node.body() {
             self.visit(&b);
         }
+        self.ic_macro_stack.pop();
         self.dm_leave_sclass();
         self.ta_barrier.pop();
         self.respond_to_missing_stack.pop();
@@ -6099,6 +6117,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         aa_registered_ranges: Vec::new(),
         ic_top_level_stmts_start: None,
         ic_parent_of_body: HashMap::new(),
+        ic_macro_stack: Vec::new(),
         ic_registered_ranges: Vec::new(),
         ic_kwbegin_plain_body: HashSet::new(),
         argalign_registered_ranges: Vec::new(),

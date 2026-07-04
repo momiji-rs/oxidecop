@@ -9499,9 +9499,15 @@ impl<'a> super::Cops<'a> {
     /// plain `if`/`begin` inside a class body) — no fixture example nests a
     /// modifier that way.
     fn ic_bare_access_modifier(&self, node: &ruby_prism::Node, in_macro_scope: bool) -> bool {
-        if !in_macro_scope {
+        // rubocop-ast macro?: the nearest HARD scope (class/module/block…)
+        // must not be a def — if/unless/begin wrappers are transparent, so
+        // the scope STACK (not the statements-list's direct container)
+        // decides (rails: bare `private` inside `if current_adapter?`).
+        let stack_macro = self.ic_macro_stack.last().copied().unwrap_or(true);
+        if !in_macro_scope && !stack_macro {
             return false;
         }
+        let _ = in_macro_scope;
         let Some(call) = node.as_call_node() else { return false };
         if call.receiver().is_some() || call.block().is_some() {
             return false;
