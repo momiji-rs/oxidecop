@@ -26995,6 +26995,11 @@ impl<'a> super::Cops<'a> {
         let Some(if_stmts) = gc_statements(node) else { return false };
         let Some(condition) = gc_predicate(node) else { return false };
         let mut ac = GcLvasgnCollector::default();
+        // `each_descendant` excludes the condition itself: a PLAIN write as
+        // the whole condition doesn't count (see the field doc).
+        if condition.as_local_variable_write_node().is_some() {
+            ac.skip_root_write = Some(condition.location().start_offset());
+        }
         ac.visit(&condition);
         if ac.names.is_empty() {
             return false;
@@ -27393,10 +27398,20 @@ fn gc_whole_lines(src: &[u8], start: usize, end: usize) -> (usize, usize) {
 #[derive(Default)]
 struct GcLvasgnCollector {
     names: Vec<Vec<u8>>,
+    /// Start offset of a PLAIN `x = y` write to EXCLUDE: upstream collects
+    /// via `node.condition.each_descendant(:lvasgn)`, which never yields the
+    /// condition node itself — so `if since = get_header(...)` (whitequark:
+    /// the lvasgn IS the condition) contributes nothing, while `if (x = y)`
+    /// (parens-wrapped, a descendant) and `x ||=`/`x +=` at the root
+    /// (whitequark or/op-asgn SHELLS whose inner lvasgn is a child) all
+    /// still count (rails corpus: 40+ GuardClause false negatives).
+    skip_root_write: Option<usize>,
 }
 impl<'pr> ruby_prism::Visit<'pr> for GcLvasgnCollector {
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
-        self.names.push(node.name().as_slice().to_vec());
+        if self.skip_root_write != Some(node.location().start_offset()) {
+            self.names.push(node.name().as_slice().to_vec());
+        }
         ruby_prism::visit_local_variable_write_node(self, node);
     }
     fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
