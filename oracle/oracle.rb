@@ -324,11 +324,14 @@ cur_ctx = ''
 # under Prism (`unsupported_on: :prism`) — not valid fidelity targets for us.
 cfg_stack = []
 it_skip = false
+it_cfg_mut = nil
+in_it_body = false
 while i < lines.length
   l = lines[i]
   indent = l[/\A */].length
   if l =~ /^\s*(RSpec\.describe|context|describe|shared_examples)\s/
     cur_ctx = l.strip
+    in_it_body = false
     cfg_stack.pop while cfg_stack.any? && cfg_stack.last[0] >= indent
     inh_cfg  = cfg_stack.any? ? cfg_stack.last[1] : 'default'
     inh_skip = cfg_stack.any? ? cfg_stack.last[2] : false
@@ -356,6 +359,8 @@ while i < lines.length
     # `unsupported_on: :prism` can also tag an individual example (rubocop's
     # own prism runs skip it) — mark every capture until the next `it`.
     it_skip = l.include?('unsupported_on: :prism')
+    it_cfg_mut = nil
+    in_it_body = true
   end
   # `before { (cur_)cop_config[...][...] = ... }` mutates a NESTED key of the
   # config hash — unrepresentable statically; skip the context.
@@ -379,6 +384,14 @@ while i < lines.length
       else
         base.sub(/\}\s*\z/, ", '#{key}' => #{val} }")
       end
+  end
+  # A bare `cop_config['Key'] = value` statement INSIDE an example body
+  # mutates the config for that one example only (rubocop's RSpec memoizes
+  # cop_config per example). Captured as a one-shot splice applied to the
+  # next expect_* in this `it`.
+  if in_it_body && cfg_stack.any? &&
+     l =~ /^\s+cop_config\[(['"])([^'"]+)\1\]\s*=\s*((?:\[[^\]]*\]|[^\[\]{}]+?))\s*$/
+    it_cfg_mut = [Regexp.last_match(2), Regexp.last_match(3).strip]
   end
   # A scalar `let(:name) { true/false/42/'str' }` — cop_config values often
   # reference these (`'SplitStrings' => split_strings`); record them per scope
@@ -491,6 +504,15 @@ while i < lines.length
     cfg_stack.last[4] = sections
   end
   cur_cfg = cfg_stack.any? ? cfg_stack.last[1] : 'default'
+  if it_cfg_mut
+    mk, mv = it_cfg_mut
+    cur_cfg =
+      if cur_cfg.nil? || cur_cfg == 'default'
+        "{ '#{mk}' => #{mv} }"
+      else
+        cur_cfg.sub(/\}\s*\z/, ", '#{mk}' => #{mv} }")
+      end
+  end
   cur_skip = (cfg_stack.any? ? cfg_stack.last[2] : false) || it_skip
   cur_as = cfg_stack.any? ? cfg_stack.last[3] : nil
   cur_sec = cfg_stack.any? ? cfg_stack.last[4] : nil
