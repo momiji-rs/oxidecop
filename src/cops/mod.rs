@@ -313,7 +313,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion",
 ];
 
 impl Engine {
@@ -1347,6 +1347,27 @@ pub(crate) struct Cops<'a> {
     // literal receiver/argument) or an interpolated regexp is checked —
     // `None` means "never offend" (upstream's `return if @valid_ref.nil?`).
     pub(crate) oorr_valid_ref: Option<u32>,
+    // Lint/RedundantSplatExpansion: per-splat container context, keyed by the
+    // splat node's own start offset and populated EAGERLY while visiting
+    // whichever node type can hold it directly (array literal element —
+    // including the bracket-less array prism synthesizes for a bare splat
+    // used as the WHOLE value of a simple/multiple assignment RHS — call
+    // argument, `when` condition, `rescue` exception) since prism gives us no
+    // parent pointers to look this up from the splat itself. Mirrors
+    // upstream's `node.parent` (`method_argument?`/`part_of_an_array?`/
+    // `redundant_brackets?`) and the `array_new_inside_array_literal?`
+    // sibling check (`array_len`).
+    pub(crate) rse_ctx: HashMap<usize, lint_cops::RseCtx>,
+    // Lint/RedundantSplatExpansion: start offsets of nodes that are the
+    // DIRECT `.value()` of a plain single-variable assignment (`lvasgn`/
+    // `ivasgn`/`cvasgn`/`gvasgn`/`casgn` in upstream's whitequark terms —
+    // deliberately NOT multiple assignment or any `+=`/`||=`/`&&=` compound
+    // form) — mirrors upstream's `ASSIGNMENT_TYPES` grandparent check that
+    // gates whether a splatted bare `Array.new(...)` call (with or without a
+    // block) is flagged: `redundant_splat_expansion`'s `grandparent =
+    // node.parent.parent` is exactly this node's parent whenever the splat's
+    // immediate container equals that value outright.
+    pub(crate) rse_assignment_value: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1809,6 +1830,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_constant_name(node.name().as_slice(), node.name_loc().start_offset(), Some(&v));
         self.check_self_assignment_const(node.location().start_offset(), node.name().as_slice(), &v);
         self.mto_note_child(&v, node.location().start_offset(), false);
+        // Lint/RedundantSplatExpansion's `ASSIGNMENT_TYPES` (`casgn` here) —
+        // see `rse_assignment_value`'s doc on `Cops`.
+        self.rse_assignment_value.insert(v.location().start_offset());
         assignment_write!(self, node);
         ruby_prism::visit_constant_write_node(self, node);
     }
@@ -1834,6 +1858,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         self.check_class_length_casgn(&node.value());
+        // Lint/RedundantSplatExpansion's `ASSIGNMENT_TYPES` (`casgn` here,
+        // namespaced form) — see `rse_assignment_value`'s doc on `Cops`.
+        self.rse_assignment_value.insert(node.value().location().start_offset());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_write_node(self, node);
@@ -2035,6 +2062,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_self_assignment_cvar(node);
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         self.check_or_assignment_write(&node.as_node(), node.name().as_slice(), &node.value());
+        // Lint/RedundantSplatExpansion's `ASSIGNMENT_TYPES` (`cvasgn` here) —
+        // see `rse_assignment_value`'s doc on `Cops`.
+        self.rse_assignment_value.insert(node.value().location().start_offset());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_class_variable_write_node(self, node);
@@ -2078,6 +2108,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_global_std_stream_gvasgn(node.name().as_slice(), &node.value());
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         self.check_or_assignment_write(&node.as_node(), node.name().as_slice(), &node.value());
+        // Lint/RedundantSplatExpansion's `ASSIGNMENT_TYPES` (`gvasgn` here) —
+        // see `rse_assignment_value`'s doc on `Cops`.
+        self.rse_assignment_value.insert(node.value().location().start_offset());
         assignment_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_global_variable_write_node(self, node);
@@ -2129,6 +2162,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_self_assignment_lvar(node);
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         self.check_or_assignment_write(&node.as_node(), node.name().as_slice(), &node.value());
+        // Lint/RedundantSplatExpansion's `ASSIGNMENT_TYPES` (`lvasgn` here) —
+        // see `rse_assignment_value`'s doc on `Cops`.
+        self.rse_assignment_value.insert(node.value().location().start_offset());
         assignment_write!(self, node);
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
@@ -2179,6 +2215,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_redundant_self_assignment_ivar(node);
         self.mto_note_child(&node.value(), node.location().start_offset(), false);
         self.check_or_assignment_write(&node.as_node(), node.name().as_slice(), &node.value());
+        // Lint/RedundantSplatExpansion's `ASSIGNMENT_TYPES` (`ivasgn` here) —
+        // see `rse_assignment_value`'s doc on `Cops`.
+        self.rse_assignment_value.insert(node.value().location().start_offset());
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         ruby_prism::visit_instance_variable_write_node(self, node);
@@ -2346,6 +2385,25 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // into the clause's conditions/body so nth-refs inside see the
         // updated state (mirrors upstream's node-enter callback timing).
         self.check_out_of_range_regexp_ref_when(node);
+        // Lint/RedundantSplatExpansion: a `when *expr` condition is never
+        // array-wrapped by prism (unlike an assignment RHS) — the splat's
+        // real parent is this `WhenNode` directly.
+        if self.on("Lint/RedundantSplatExpansion") {
+            let l = node.location();
+            for c in node.conditions().iter() {
+                if c.as_splat_node().is_some() {
+                    self.rse_ctx.insert(
+                        c.location().start_offset(),
+                        lint_cops::RseCtx {
+                            container: lint_cops::RseContainer::When,
+                            container_start: l.start_offset(),
+                            container_end: l.end_offset(),
+                            array_len: 0,
+                        },
+                    );
+                }
+            }
+        }
         ruby_prism::visit_when_node(self, node);
     }
     fn visit_in_node(&mut self, node: &ruby_prism::InNode<'pr>) {
@@ -2456,6 +2514,29 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.sak_check(kw.start_offset(), kw.end_offset(), b"rescue");
         }
         self.check_rescued_exceptions_variable_name(node);
+        // Lint/RedundantSplatExpansion: `rescue *expr` — upstream's
+        // whitequark/parser-gem translation wraps a multi-exception rescue
+        // list (splat included) in a synthetic bracket-less `array` node, so
+        // a splatted exception list's `grandparent` is the `resbody`
+        // (`RescueNode`) itself; prism's own `exceptions()` is already flat
+        // (no such wrapper), so the splat's real parent IS this `RescueNode`
+        // directly — one less level of indirection to replicate.
+        if self.on("Lint/RedundantSplatExpansion") {
+            let l = node.location();
+            for ex in &node.exceptions() {
+                if ex.as_splat_node().is_some() {
+                    self.rse_ctx.insert(
+                        ex.location().start_offset(),
+                        lint_cops::RseCtx {
+                            container: lint_cops::RseContainer::Rescue,
+                            container_start: l.start_offset(),
+                            container_end: l.end_offset(),
+                            array_len: 0,
+                        },
+                    );
+                }
+            }
+        }
         // Hand-rolled (rather than a plain `ruby_prism::visit_rescue_node`
         // call) ONLY so `renv_resbody_depth` can bracket exactly the
         // `.statements()` visit — traversal order/coverage is identical to
@@ -2953,6 +3034,33 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_array_alignment(node);
         let wa_matrix = self.wa_matrix_complex(node);
         self.wa_matrix_stack.push(wa_matrix);
+        // Lint/RedundantSplatExpansion: covers BOTH a real `[...]`/percent
+        // literal AND the bracket-less array prism synthesizes around a bare
+        // splat used as the WHOLE value of a simple/multiple-assignment RHS
+        // (`opening_loc` is `None` for that synthetic wrapper) — the same
+        // `ArrayNode` shape either way, distinguished only by `opening_loc`.
+        if self.on("Lint/RedundantSplatExpansion") {
+            let bracketed = node.opening_loc().is_some();
+            let l = node.location();
+            let len = node.elements().iter().count();
+            for e in node.elements().iter() {
+                if e.as_splat_node().is_some() {
+                    self.rse_ctx.insert(
+                        e.location().start_offset(),
+                        lint_cops::RseCtx {
+                            container: if bracketed {
+                                lint_cops::RseContainer::ArrayBracketed
+                            } else {
+                                lint_cops::RseContainer::ArrayImplicit
+                            },
+                            container_start: l.start_offset(),
+                            container_end: l.end_offset(),
+                            array_len: len,
+                        },
+                    );
+                }
+            }
+        }
         ruby_prism::visit_array_node(self, node);
         self.wa_matrix_stack.pop();
         self.ll_exit_collection();
@@ -3768,12 +3876,31 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 let first = spans.first().map(|(s, _)| *s).unwrap_or(0);
                 self.bare_arg_frames.push((first, spans));
             }
+            // Lint/RedundantSplatExpansion's `method_argument?`: a splat that
+            // is a direct positional argument — prism attaches no wrapper
+            // node here (same flat shape as upstream's translated tree), so
+            // the splat's real parent IS this `CallNode` (receiver chain and
+            // all — safe-navigation included, matching upstream's
+            // `call_type?` covering both `send` and `csend`).
+            let rse_track = self.on("Lint/RedundantSplatExpansion");
+            let rse_call_range = node.location();
             for arg in a.arguments().iter() {
                 if track_args {
                     self.assumed_arg_offsets.insert(arg.location().start_offset());
                 }
                 if ut_track {
                     self.ut_call_child.insert(arg.location().start_offset());
+                }
+                if rse_track && arg.as_splat_node().is_some() {
+                    self.rse_ctx.insert(
+                        arg.location().start_offset(),
+                        lint_cops::RseCtx {
+                            container: lint_cops::RseContainer::CallArg,
+                            container_start: rse_call_range.start_offset(),
+                            container_end: rse_call_range.end_offset(),
+                            array_len: 0,
+                        },
+                    );
                 }
                 if mlbl_track && !node.is_safe_navigation() {
                     self.mlbl_call_child.insert(arg.location().start_offset());
@@ -3883,6 +4010,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.call_stack.pop();
         self.ll_exit_collection();
+    }
+    fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
+        self.check_redundant_splat_expansion(node);
+        ruby_prism::visit_splat_node(self, node);
     }
     fn visit_yield_node(&mut self, node: &ruby_prism::YieldNode<'pr>) {
         let kw = node.keyword_loc();
@@ -4036,6 +4167,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         sgv_in_embedded_var: false,
         sgv_brace_eligible: false,
         sgv_climb: HashMap::new(),
+        rse_ctx: HashMap::new(),
+        rse_assignment_value: HashSet::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),

@@ -11202,3 +11202,304 @@ impl<'a> super::Cops<'a> {
         self.push(node.location().start_offset(), COP, false, msg);
     }
 }
+
+
+/// Lint/RedundantSplatExpansion: which kind of node directly holds a given
+/// splat — prism has no parent pointers, so `visit_array_node`/
+/// `visit_call_node`/`visit_when_node`/`visit_rescue_node` mark this eagerly
+/// (keyed by the splat's own start offset in `Cops::rse_ctx`) while they're
+/// visiting the actual container, for `check_redundant_splat_expansion` to
+/// read back once it reaches the splat itself.
+#[derive(Clone, Copy)]
+pub(crate) enum RseContainer {
+    /// A real `[...]` or percent (`%w`/`%W`/`%i`/`%I`) array literal —
+    /// upstream's `parent.array_type? && parent.loc.begin && parent.loc.end`
+    /// (`part_of_an_array?`)/`bracketed?`.
+    ArrayBracketed,
+    /// The bracket-less `array` node prism (like the legacy parser gem)
+    /// synthesizes around a bare splat used as the WHOLE value of a simple or
+    /// multiple assignment RHS (`a = *x`, `a, b = *x`) — same `ArrayNode`
+    /// shape as the real-literal case, just with no `opening_loc`.
+    ArrayImplicit,
+    /// A direct positional argument of a method call — upstream's
+    /// `parent.call_type?` (`method_argument?`), true for both a plain call
+    /// and a safe-navigation one.
+    CallArg,
+    /// A `when` clause condition — upstream's `parent.when_type?`.
+    When,
+    /// A `rescue` exception-class-list entry — upstream's
+    /// `grandparent&.resbody_type?` (see `visit_rescue_node`'s doc: prism's
+    /// flat `exceptions()` collapses that extra indirection away).
+    Rescue,
+}
+
+/// See `RseContainer`'s doc.
+#[derive(Clone, Copy)]
+pub(crate) struct RseCtx {
+    pub(crate) container: RseContainer,
+    /// The container's own start offset — for `ArrayBracketed`/`ArrayImplicit`
+    /// this is the array's `location()`; for the others, the container
+    /// node's own `location()`. Compared against `top_level_sole_stmt` and
+    /// looked up in `rse_assignment_value` to emulate upstream's `grandparent
+    /// = node.parent.parent` gate on a splatted `Array.new(...)` call.
+    pub(crate) container_start: usize,
+    pub(crate) container_end: usize,
+    /// Only meaningful when `container` is one of the two Array variants:
+    /// the array's own element count, for upstream's
+    /// `array_new_inside_array_literal?` sibling check.
+    pub(crate) array_len: usize,
+}
+
+/// Lint/RedundantSplatExpansion's `array_new?`/`Array.new`-detector: a bare
+/// (unqualified, `nil?`) or top-level-qualified (`::Array`, `cbase`)
+/// `Array.new(...)` call, with or without a block attached (both shapes are
+/// the SAME prism `CallNode`, unlike upstream's whitequark tree which wraps
+/// the block-attached form in a separate `:block` node around an identical
+/// `:send`).
+fn rse_is_array_new_call(call: &ruby_prism::CallNode) -> bool {
+    if call.name().as_slice() != b"new" {
+        return false;
+    }
+    let Some(recv) = call.receiver() else { return false };
+    recv.as_constant_read_node().is_some_and(|c| c.location().as_slice() == b"Array")
+        || recv
+            .as_constant_path_node()
+            .is_some_and(|cp| cp.parent().is_none() && cp.name_loc().as_slice() == b"Array")
+}
+
+/// Lint/RedundantSplatExpansion's `remove_brackets`: renders a splatted
+/// array literal's ELEMENTS as a bare comma-separated list, verbatim (byte
+/// range) for a plain `[...]` array, or re-quoted for a percent literal
+/// (`%w`/`%W`/`%i`/`%I`) whose elements carry no delimiter of their own.
+fn rse_remove_brackets(cops: &Cops, arr: &ruby_prism::ArrayNode) -> Vec<u8> {
+    let elements: Vec<&[u8]> = arr.elements().iter().map(|e| cops.node_src(&e)).collect();
+    let opening = arr.opening_loc().map(|l| l.as_slice()).unwrap_or(b"[");
+    let mut out = Vec::new();
+    if opening.starts_with(b"%w") {
+        out.push(b'\'');
+        for (i, el) in elements.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b"', '");
+            }
+            out.extend_from_slice(el);
+        }
+        out.push(b'\'');
+    } else if opening.starts_with(b"%W") {
+        out.push(b'"');
+        for (i, el) in elements.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b"\", \"");
+            }
+            out.extend_from_slice(el);
+        }
+        out.push(b'"');
+    } else if opening.starts_with(b"%i") {
+        out.push(b':');
+        for (i, el) in elements.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b", :");
+            }
+            out.extend_from_slice(el);
+        }
+    } else if opening.starts_with(b"%I") {
+        out.extend_from_slice(b":\"");
+        for (i, el) in elements.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b"\", :\"");
+            }
+            out.extend_from_slice(el);
+        }
+        out.push(b'"');
+    } else {
+        for (i, el) in elements.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b", ");
+            }
+            out.extend_from_slice(el);
+        }
+    }
+    out
+}
+
+impl<'a> Cops<'a> {
+    /// Lint/RedundantSplatExpansion's `replacement_range_and_content`: given
+    /// the splat and its (already-classified) expression, work out the
+    /// autocorrect `(start, end, replacement)`. `expr` is one of the three
+    /// shapes `check_redundant_splat_expansion` has already confirmed
+    /// `literal_expansion` matches: an `Array.new(...)` call, a (non-empty)
+    /// array literal, or a str/dstr/int/float scalar.
+    fn rse_replacement(
+        &self,
+        node: &ruby_prism::SplatNode,
+        expr: &ruby_prism::Node,
+        ctx: Option<RseCtx>,
+    ) -> (usize, usize, Vec<u8>) {
+        let splat_range = node.location();
+
+        if let Some(call) = expr.as_call_node().filter(rse_is_array_new_call) {
+            // `expression = node.parent.source_range if node.parent.array_type?`
+            // — widen the replace-range to swallow the enclosing array
+            // (real brackets or the implicit assignment-RHS wrapper) too.
+            let (start, end) = match ctx {
+                Some(c @ RseCtx { container: RseContainer::ArrayBracketed, .. })
+                | Some(c @ RseCtx { container: RseContainer::ArrayImplicit, .. }) => {
+                    (c.container_start, c.container_end)
+                }
+                _ => (splat_range.start_offset(), splat_range.end_offset()),
+            };
+            return (start, end, self.node_src(&call.as_node()).to_vec());
+        }
+
+        if let Some(arr) = expr.as_array_node() {
+            // `redundant_brackets?`: `parent.when_type? || method_argument? ||
+            // part_of_an_array? || grandparent&.resbody_type?`.
+            let redundant_brackets = matches!(
+                ctx.map(|c| c.container),
+                Some(RseContainer::When)
+                    | Some(RseContainer::CallArg)
+                    | Some(RseContainer::ArrayBracketed)
+                    | Some(RseContainer::Rescue)
+            );
+            if redundant_brackets {
+                let content = rse_remove_brackets(self, &arr);
+                return (splat_range.start_offset(), splat_range.end_offset(), content);
+            }
+            // `[node.loc.operator, '']` — just the bare `*`, leaving the
+            // array literal (or bracket-less implicit-assignment wrapper)
+            // itself intact.
+            let op = node.operator_loc();
+            return (op.start_offset(), op.end_offset(), Vec::new());
+        }
+
+        // Scalar literal (str/dstr/int/float): `replacement = variable.source;
+        // replacement = "[#{replacement}]" if wrap_in_brackets?(node)` —
+        // `wrap_in_brackets?` = `node.parent.array_type? &&
+        // !node.parent.bracketed?`, i.e. specifically the bracket-less
+        // implicit-assignment wrapper (a REAL bracketed array never reaches
+        // here un-wrapped, since it already has its own delimiters).
+        let mut replacement = self.node_src(expr).to_vec();
+        if matches!(ctx.map(|c| c.container), Some(RseContainer::ArrayImplicit)) {
+            let mut wrapped = Vec::with_capacity(replacement.len() + 2);
+            wrapped.push(b'[');
+            wrapped.append(&mut replacement);
+            wrapped.push(b']');
+            replacement = wrapped;
+        }
+        (splat_range.start_offset(), splat_range.end_offset(), replacement)
+    }
+
+    /// Lint/RedundantSplatExpansion: flags `*expr` where `expr` is a literal
+    /// whose splat is provably pointless — an array/percent-literal, a bare
+    /// scalar (str/dstr/int/float), or an `Array.new(...)` call/block sitting
+    /// somewhere upstream's `ASSIGNMENT_TYPES` grandparent check allows.
+    ///
+    /// Ported from `on_splat` + `redundant_splat_expansion` +
+    /// `replacement_range_and_content` — see `RseContainer`'s doc for how the
+    /// "parent"/"grandparent" AST-walk this cop relies on (impossible to do
+    /// directly over prism's parent-less tree) is reconstructed from the
+    /// eager `rse_ctx`/`rse_assignment_value` marks left by the container
+    /// node's own visitor.
+    pub(crate) fn check_redundant_splat_expansion(&mut self, node: &ruby_prism::SplatNode) {
+        const COP: &str = "Lint/RedundantSplatExpansion";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(expr) = node.expression() else { return };
+        let splat_start = node.location().start_offset();
+        let ctx = self.rse_ctx.get(&splat_start).copied();
+
+        let array_expr = expr.as_array_node();
+        let call_expr = expr.as_call_node().filter(|c| rse_is_array_new_call(c));
+        let is_scalar_literal = expr.as_string_node().is_some()
+            || expr.as_interpolated_string_node().is_some()
+            || expr.as_integer_node().is_some()
+            || expr.as_float_node().is_some();
+
+        // `literal_expansion` didn't match at all (a plain variable/call
+        // read, a range, a hash, ...) — nothing to say.
+        if !is_scalar_literal && array_expr.is_none() && call_expr.is_none() {
+            return;
+        }
+
+        // An empty array/percent literal (`*[]`, `*%w()`, ...) expands to
+        // nothing, so removing the splat would change semantics.
+        if let Some(arr) = &array_expr {
+            if arr.elements().iter().count() == 0 {
+                return;
+            }
+        }
+
+        // The `expanded_item.send_type?` branch — ONLY reachable for an
+        // `Array.new(...)` call/block, never for a plain literal.
+        if call_expr.is_some() {
+            // `array_new_inside_array_literal?`: `Array.new(...)` sitting
+            // alongside 2+ siblings inside an array literal (bracketed OR
+            // the implicit assignment/masgn-RHS wrapper) is accepted
+            // outright, no matter what encloses that array.
+            if let Some(c) = ctx {
+                if matches!(c.container, RseContainer::ArrayBracketed | RseContainer::ArrayImplicit)
+                    && c.array_len > 1
+                {
+                    return;
+                }
+            }
+            // `grandparent = node.parent.parent; return if grandparent &&
+            // !ASSIGNMENT_TYPES.include?(grandparent.type)` — fires only when
+            // the splat's container is EITHER the whole top-level program (no
+            // grandparent at all) or itself the direct value of a plain
+            // single-variable assignment (masgn excluded, matching upstream).
+            let grandparent_ok = match ctx {
+                Some(c) => {
+                    self.top_level_sole_stmt == Some(c.container_start)
+                        || self.rse_assignment_value.contains(&c.container_start)
+                }
+                // No tracked container at all (e.g. a `return`/`yield`
+                // argument list, which prism never array-wraps) — upstream's
+                // grandparent there is never `nil` (always at least the
+                // enclosing keyword node) and never an assignment type
+                // either, so this always skips; the sole miss is the
+                // vanishingly rare bare top-level `return *Array.new(...)`
+                // with nothing else in the file.
+                None => false,
+            };
+            if !grandparent_ok {
+                return;
+            }
+        }
+
+        let is_call_arg = matches!(ctx.map(|c| c.container), Some(RseContainer::CallArg));
+        let is_bracketed_array = matches!(ctx.map(|c| c.container), Some(RseContainer::ArrayBracketed));
+        // `array_splat?(node) = node.children.first.array_type?` — true only
+        // when the splatted expression is ITSELF an array (not an
+        // `Array.new` call, not a scalar).
+        let array_splat = array_expr.is_some();
+
+        if array_splat && (is_call_arg || is_bracketed_array) {
+            // `use_percent_literal_array_argument?`: `method_argument?(node)
+            // && (argument.percent_literal?(:string) ||
+            // argument.percent_literal?(:symbol))` — deliberately
+            // `method_argument?` only, NOT `part_of_an_array?`, so a percent
+            // literal splatted as a sibling inside a real array literal is
+            // never exempted by `AllowPercentLiteralArrayArgument`.
+            if is_call_arg && self.cfg.get(COP, "AllowPercentLiteralArrayArgument") != Some("false") {
+                if let Some(arr) = array_expr {
+                    let is_percent_str_or_sym = arr.opening_loc().is_some_and(|l| {
+                        let s = l.as_slice();
+                        s.starts_with(b"%w") || s.starts_with(b"%W") || s.starts_with(b"%i") || s.starts_with(b"%I")
+                    });
+                    if is_percent_str_or_sym {
+                        return;
+                    }
+                }
+            }
+            let (start, end, content) = self.rse_replacement(node, &expr, ctx);
+            self.push(splat_start, COP, true, "Pass array contents as separate arguments.");
+            self.fixes.push((start, end, content));
+            return;
+        }
+
+        let (start, end, content) = self.rse_replacement(node, &expr, ctx);
+        self.push(splat_start, COP, true, "Replace splat expansion with comma separated values.");
+        self.fixes.push((start, end, content));
+    }
+}
