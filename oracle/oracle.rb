@@ -383,6 +383,10 @@ while i < lines.length
     it_lets = {}
     in_it_body = true
   end
+  # `pending '...'` inside an `it` marks an expectation rubocop itself does
+  # NOT currently satisfy (the spec asserts aspirational behavior) — a
+  # faithful port must not satisfy it either, so skip the example.
+  it_skip = true if in_it_body && l =~ /^\s*pending\b/
   # RSpec stubbing (`allow(Dir).to receive(:pwd)`, buffer-name mocks) inside
   # a before block alters live-interpreter state the harness can't stage —
   # the whole context is unrepresentable. Bare `allow(` at line start (the
