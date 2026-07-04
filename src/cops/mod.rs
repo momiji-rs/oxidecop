@@ -370,7 +370,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
-    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void",
+    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax",
 ];
 
 impl Engine {
@@ -1621,6 +1621,45 @@ pub(crate) struct Cops<'a> {
     // (top-level program, `if`/`unless`/`when`/`in`/`rescue`/plain
     // `begin...end`) never responds to `void_context?` upstream either.
     pub(crate) void_pending_ctx: Option<bool>,
+    // Style/HashSyntax (EnforcedShorthandSyntax parenthesization): for a
+    // braceless keyword-hash argument's start offset, the call/super/yield
+    // node that directly owns it (`find_ancestor_method_dispatch_node`) —
+    // see `style::HsDispatch`'s doc.
+    pub(crate) hs_call_ctx: HashMap<usize, style::HsDispatch>,
+    // Style/HashSyntax: start offsets whose immediate parent is a
+    // call/if/super/until/while/yield node (`requires_parentheses_context?`
+    // — receiver/argument/predicate position, always forces added parens).
+    pub(crate) hs_call_like_ctx: HashSet<usize>,
+    // Style/HashSyntax: a node's start offset -> the start offset of the
+    // assignment node it's the VALUE of (`last_expression?`'s assignment
+    // climb, one hop per entry — chained assignments recurse through
+    // multiple entries).
+    pub(crate) hs_assign_parent: HashMap<usize, usize>,
+    // Style/HashSyntax: start offsets that have a following statement in
+    // their enclosing statements-list (`node.right_sibling`, restricted to
+    // the "plain statement" case this cop's fixtures actually exercise).
+    pub(crate) hs_stmt_next: HashSet<usize>,
+    // Style/HashSyntax: start offsets whose immediate parent (after
+    // transparently skipping a single-statement `StatementsNode` wrapper,
+    // like whitequark does) is a `(...)` grouping (`parentheses?`).
+    pub(crate) hs_paren_parent: HashSet<usize>,
+    // Style/HashSyntax: live nesting depth of "modifier-form if/while/until"
+    // ancestors at the current point of traversal
+    // (`use_modifier_form_without_parenthesized_method_call?`'s
+    // `ancestor.ancestors.any? { modifier_form? }` climb) — valid to read
+    // only while still nested inside those ancestors, which on_pair/on_hash
+    // always are (single-pass traversal, checked in pre-order).
+    pub(crate) hs_modifier_depth: u32,
+    // Style/HashSyntax: a pair's start offset -> the shared context of its
+    // containing hash-like node (bounds, braced?, last-pair key==value) —
+    // populated once per hash before its pairs are visited, so `on_pair`'s
+    // per-pair check (which prism gives no parent pointer for) can look it
+    // up. See `style::HsPairCtx`'s doc.
+    pub(crate) hs_pair_ctx: HashMap<usize, style::HsPairCtx>,
+    // Style/HashSyntax: braceless-keyword-hash start offsets already given
+    // a `return`-wrapping `{`/`}` fix — a hash with 2+ shorthand-eligible
+    // pairs would otherwise queue the identical wrap edit once per pair.
+    pub(crate) hs_wrapped_return: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2032,6 +2071,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_x_string_node(self, node);
     }
     fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
+        self.check_hash_syntax_hash(node);
         self.check_duplicate_hash_key(node);
         self.check_multiline_hash_brace_layout(node);
         self.check_trailing_comma_in_hash_literal(node);
@@ -2058,6 +2098,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_hash_node(self, node);
         self.dn_ancestors.pop();
         self.ll_exit_collection();
+    }
+    fn visit_keyword_hash_node(&mut self, node: &ruby_prism::KeywordHashNode<'pr>) {
+        self.check_hash_syntax_keyword_hash(node);
+        ruby_prism::visit_keyword_hash_node(self, node);
     }
     fn visit_optional_keyword_parameter_node(&mut self, node: &ruby_prism::OptionalKeywordParameterNode<'pr>) {
         if self.ll_active {
@@ -2306,7 +2350,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `:if`, which whitequark also uses for a ternary — this pushes for
         // those too, matching upstream making no such distinction).
         self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
+        // Style/HashSyntax: the predicate is a `requires_parentheses_context?`
+        // position; a genuine (non-ternary) modifier `if`/`unless` widens
+        // `hs_modifier_depth` for its whole subtree (predicate + body) — see
+        // the field docs.
+        self.hs_call_like_ctx.insert(node.predicate().location().start_offset());
+        let hs_modifier = node.if_keyword_loc().is_some() && node.end_keyword_loc().is_none();
+        if hs_modifier {
+            self.hs_modifier_depth += 1;
+        }
         ruby_prism::visit_if_node(self, node);
+        if hs_modifier {
+            self.hs_modifier_depth -= 1;
+        }
         self.dn_ancestors.pop();
         self.cond_depth -= 1;
         // post-order (after recursion): nested-modifier autocorrect needs the
@@ -2377,7 +2433,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.cond_depth += 1;
         self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
+        self.hs_call_like_ctx.insert(node.predicate().location().start_offset());
+        let hs_modifier = node.end_keyword_loc().is_none();
+        if hs_modifier {
+            self.hs_modifier_depth += 1;
+        }
         ruby_prism::visit_unless_node(self, node);
+        if hs_modifier {
+            self.hs_modifier_depth -= 1;
+        }
         self.dn_ancestors.pop();
         self.cond_depth -= 1;
         // post-order: see the if-visitor note.
@@ -2509,6 +2573,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.rs_lvar_write(node.name().as_slice(), &node.value());
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Style/HashSyntax: `last_expression?`'s assignment climb — the
+        // value is this write's "assignment_node" hop.
+        self.hs_assign_parent
+            .insert(node.value().location().start_offset(), node.location().start_offset());
         // Style/MethodCallWithoutArgsParentheses's `same_name_assignment?`:
         // this name is a live "ancestor assignment" for the whole `value`
         // subtree — see the `mcwap_assign_stack` field doc.
@@ -2975,6 +3043,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 self.check_void_begin_group(&list, void_pending.unwrap_or(false));
             }
         }
+        // Style/HashSyntax: `node.right_sibling` for any statement that
+        // isn't the last one in this list — see `hs_stmt_next`'s doc.
+        if self.on("Style/HashSyntax") {
+            let body: Vec<ruby_prism::Node> = node.body().iter().collect();
+            if let Some((_, rest)) = body.split_last() {
+                for s in rest {
+                    self.hs_stmt_next.insert(s.location().start_offset());
+                }
+            }
+        }
         self.check_semicolon_separators(node);
         self.ll_check_semicolons(node);
         self.check_constant_definition_in_block(node);
@@ -3277,7 +3355,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if dn_pushed {
             self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
         }
+        self.hs_call_like_ctx.insert(node.predicate().location().start_offset());
+        let hs_modifier = node.closing_loc().is_none();
+        if hs_modifier {
+            self.hs_modifier_depth += 1;
+        }
         ruby_prism::visit_while_node(self, node);
+        if hs_modifier {
+            self.hs_modifier_depth -= 1;
+        }
         if dn_pushed {
             self.dn_ancestors.pop();
         }
@@ -3345,7 +3431,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if dn_pushed {
             self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
         }
+        self.hs_call_like_ctx.insert(node.predicate().location().start_offset());
+        let hs_modifier = node.closing_loc().is_none();
+        if hs_modifier {
+            self.hs_modifier_depth += 1;
+        }
         ruby_prism::visit_until_node(self, node);
+        if hs_modifier {
+            self.hs_modifier_depth -= 1;
+        }
         if dn_pushed {
             self.dn_ancestors.pop();
         }
@@ -3469,6 +3563,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_parentheses_node(&mut self, node: &ruby_prism::ParenthesesNode<'pr>) {
         self.check_empty_expression(node);
         self.record_rescue_modifier_parens(node);
+        // Style/HashSyntax: `parentheses?(dispatch.parent)` — whitequark
+        // transparently unwraps a single-statement `StatementsNode` body, so
+        // a lone statement inside `(...)` has the parens node itself, not
+        // the statements wrapper, as its "parent".
+        if let Some(body) = node.body() {
+            if let Some(stmts) = body.as_statements_node() {
+                let items: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+                if items.len() == 1 {
+                    self.hs_paren_parent.insert(items[0].location().start_offset());
+                }
+            }
+        }
         ruby_prism::visit_parentheses_node(self, node);
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
@@ -3588,6 +3694,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ll_exit_collection();
     }
     fn visit_assoc_node(&mut self, node: &ruby_prism::AssocNode<'pr>) {
+        self.check_hash_syntax_pair(node);
         // both sides of a hash pair are "assumed arguments"
         if self.eng.debugger_on {
             self.assumed_arg_offsets.insert(node.key().location().start_offset());
@@ -3977,6 +4084,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let kw = node.keyword_loc();
             self.sak_check(kw.start_offset(), kw.end_offset(), b"super");
         }
+        self.hs_register_dispatch(
+            node.location().start_offset(),
+            Some(node.keyword_loc().end_offset()),
+            node.rparen_loc().is_some(),
+            false,
+            false,
+            None,
+            node.arguments().as_ref(),
+        );
         let framed = node.lparen_loc().is_none() && self.hot.empty_literal && node.arguments().is_some();
         if framed {
             let spans: Vec<(usize, usize)> = node
@@ -4144,6 +4260,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_or_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        self.hs_register_dispatch(
+            node.location().start_offset(),
+            node.message_loc().map(|l| l.end_offset()),
+            node.closing_loc().is_some_and(|l| l.as_slice() == b")"),
+            matches!(node.name().as_slice(), b"[]" | b"[]="),
+            {
+                let n = node.name().as_slice();
+                n.ends_with(b"=") && !matches!(n, b"==" | b"===" | b"!=" | b"<=" | b">=")
+            },
+            node.receiver().as_ref(),
+            node.arguments().as_ref(),
+        );
         // Style/RegexpLiteral: mark a receiver/argument regexp literal as a
         // direct child of THIS call (`node.parent&.call_type?`), before
         // descending — see `rl_call_child`'s doc.
@@ -4721,6 +4849,15 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_yield_node(&mut self, node: &ruby_prism::YieldNode<'pr>) {
         let kw = node.keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"yield");
+        self.hs_register_dispatch(
+            node.location().start_offset(),
+            Some(kw.end_offset()),
+            node.rparen_loc().is_some(),
+            false,
+            false,
+            None,
+            node.arguments().as_ref(),
+        );
         ruby_prism::visit_yield_node(self, node);
     }
     fn visit_defined_node(&mut self, node: &ruby_prism::DefinedNode<'pr>) {
@@ -4888,6 +5025,14 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         void_each_stack: Vec::new(),
         void_pending_block_name: None,
         void_pending_ctx: None,
+        hs_call_ctx: HashMap::new(),
+        hs_call_like_ctx: HashSet::new(),
+        hs_assign_parent: HashMap::new(),
+        hs_stmt_next: HashSet::new(),
+        hs_paren_parent: HashSet::new(),
+        hs_modifier_depth: 0,
+        hs_pair_ctx: HashMap::new(),
+        hs_wrapped_return: HashSet::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),

@@ -27435,3 +27435,729 @@ impl<'pr> ruby_prism::Visit<'pr> for GcLvarCollector {
         ruby_prism::visit_local_variable_read_node(self, node);
     }
 }
+
+
+// ===================== Style/HashSyntax =====================
+//
+// Ported from rubocop's `Style::HashSyntax` (`ConfigurableEnforcedStyle` +
+// `HashShorthandSyntax` + `RangeHelp`). Two independent concerns share one
+// cop: (1) hash-rocket vs Ruby-1.9 colon syntax (`EnforcedStyle`), checked
+// once per hash-like node (`on_hash`); (2) Ruby 3.1 value-omission shorthand
+// (`{foo:}` vs `{foo: foo}`, `EnforcedShorthandSyntax`), checked both once
+// per hash (`on_hash_for_mixed_shorthand`, styles `consistent`/
+// `either_consistent`) and once per pair (`on_pair`, styles `always`/
+// `never`; `either` never offends).
+//
+// Prism gives braced hash literals a distinct `HashNode` and braceless
+// keyword-argument hashes a distinct `KeywordHashNode` — whitequark's single
+// `:hash` type (`braces?`-distinguished) covers both, and upstream's
+// `on_hash` fires for either shape, so both node kinds are hooked (see
+// `check_hash_syntax_hash`/`check_hash_syntax_keyword_hash`).
+//
+// `EnforcedShorthandSyntax`'s parenthesization machinery
+// (`def_node_that_require_parentheses`, `last_expression?`,
+// `use_modifier_form_without_parenthesized_method_call?`) needs real
+// ancestor-chain facts prism doesn't provide (no parent pointers). Rather
+// than a full ancestor stack, each fact is captured with minimal, targeted
+// state exactly when the relevant node is visited (mirroring this file's
+// usual "populate ahead of time" idiom — see `Cops`'s `hs_*` fields):
+//   - `hs_call_ctx`: a hash-like node's start offset -> the call/super/yield
+//     that owns it as a direct argument (`find_ancestor_method_dispatch_node`
+//     is always exactly this 2-hop lookup — see `HsDispatch`'s doc).
+//   - `hs_call_like_ctx`/`hs_assign_parent`/`hs_stmt_next`/`hs_paren_parent`:
+//     one-hop "what kind of thing is my immediate parent" facts about a
+//     dispatch call itself, needed by `last_expression?`'s right-sibling
+//     and assignment-chain climb.
+//   - `hs_modifier_depth`: a live nesting counter (valid only while still
+//     inside the ancestor, which on_pair/on_hash always are, since this is
+//     a single-pass pre-order traversal) standing in for
+//     `ancestor.ancestors.any? { modifier_form? }`.
+//
+// A key simplification throughout: `node.parent.braces?` unconditionally
+// bails out of the whole parenthesization apparatus (see `register_offense`
+// in the ruby source), and a `KeywordHashNode` (braceless) can ONLY appear
+// as call/super/yield arguments (Ruby's grammar has no other braceless-hash
+// position) — so whenever a dispatch IS found for a braceless hash, that
+// hash is trivially the dispatch's own (non-empty) argument list, making
+// upstream's separate `last_argument.nil? || !last_argument.hash_type?` and
+// `def_node.arguments.empty?` guards always-false/always-true no-ops here.
+// The one place this matters is a hash used as a call's RECEIVER (never
+// braceless) — `hs_call_ctx` is only ever populated from a call's
+// `arguments()`, never its `receiver()`, so a receiver-position hash simply
+// has no dispatch entry, which happens to be behaviorally identical to
+// upstream's `use_element_of_hash_literal_as_receiver?` exclusion (verified
+// against real rubocop: `{foo: foo}.do_something[key]` autocorrects to
+// `{foo:}.do_something[key]`, no parens added).
+
+/// `find_ancestor_method_dispatch_node(node)` is always exactly
+/// `node.parent.parent` (the pair's hash's direct parent) — a braceless
+/// `KeywordHashNode` can only be a call/super/yield's argument, so whenever
+/// this is populated for a hash, upstream's separate `def_node =
+/// node.each_ancestor(:call, :super, :yield).first` climb is provably
+/// identical to it: the pair's nearest call/super/yield ancestor IS this
+/// dispatch, since nothing of that type can sit any closer than the hash's
+/// own direct parent.
+#[derive(Clone, Copy)]
+pub(crate) struct HsDispatch {
+    /// The dispatch node's own start offset (`Node#location.start_offset`).
+    pub start: usize,
+    /// `def_node.selector.end_pos` — a `Call`'s `message_loc` end, or a
+    /// `Super`/`Yield`'s `keyword_loc` end when there's no explicit message.
+    pub selector_end: Option<usize>,
+    /// `def_node.first_argument.source_range.begin_pos`.
+    pub first_arg_start: Option<usize>,
+    /// `parenthesized?` (`loc.end&.is?(')')`, i.e. an explicit `(...)`
+    /// argument list already exists).
+    pub parenthesized: bool,
+    /// `brackets?` (`method?(:[]) || method?(:[]=)`).
+    pub is_bracket_method: bool,
+    /// `assignment_method?` (`!comparison_method? &&
+    /// method_name.end_with?('=')`).
+    pub is_assignment_method: bool,
+}
+
+/// Style/HashSyntax: the shared context of a pair's containing hash-like
+/// node, computed once per hash (`hs_populate_pair_ctx`) and looked up by
+/// `on_pair`'s per-pair check (`check_hash_syntax_pair`), which — unlike
+/// `on_hash` — prism gives no parent pointer to rediscover this from.
+#[derive(Clone, Copy)]
+pub(crate) struct HsPairCtx {
+    pub hash_start: usize,
+    pub hash_end: usize,
+    /// `node.parent.braces?` — an explicit `{...}` `HashNode`, vs a
+    /// braceless `KeywordHashNode`.
+    pub braced: bool,
+    /// `last_pair.key.source == last_pair.value.source`, precomputed once
+    /// per hash (the SAME comparison, on the hash's OWN last pair, gates
+    /// every pair's `def_node_that_require_parentheses` call — see the
+    /// ruby source).
+    pub last_pair_key_eq_value: bool,
+    /// `node == last_argument.pairs.last` — is THIS pair the hash's own
+    /// last pair (only the last pair's fix ever inserts the closing paren).
+    pub is_last_pair: bool,
+}
+
+impl<'a> super::Cops<'a> {
+    /// Called from `visit_call_node`/`visit_super_node`/`visit_yield_node`
+    /// before descending: records (a) every argument and the receiver, if
+    /// any, as a `requires_parentheses_context?` position
+    /// (`hs_call_like_ctx`), and (b) for each Hash/KeywordHash-type
+    /// argument, the dispatch info later needed by
+    /// `find_ancestor_method_dispatch_node` (`hs_call_ctx`).
+    pub(crate) fn hs_register_dispatch(
+        &mut self,
+        start: usize,
+        selector_end: Option<usize>,
+        parenthesized: bool,
+        is_bracket_method: bool,
+        is_assignment_method: bool,
+        receiver: Option<&ruby_prism::Node>,
+        arguments: Option<&ruby_prism::ArgumentsNode>,
+    ) {
+        if !self.on("Style/HashSyntax") {
+            return;
+        }
+        if let Some(r) = receiver {
+            self.hs_call_like_ctx.insert(r.location().start_offset());
+        }
+        let Some(args) = arguments else { return };
+        let first_arg_start = args.arguments().iter().next().map(|n| n.location().start_offset());
+        for a in args.arguments().iter() {
+            self.hs_call_like_ctx.insert(a.location().start_offset());
+            if a.as_hash_node().is_some() || a.as_keyword_hash_node().is_some() {
+                self.hs_call_ctx.insert(
+                    a.location().start_offset(),
+                    HsDispatch {
+                        start,
+                        selector_end,
+                        first_arg_start,
+                        parenthesized,
+                        is_bracket_method,
+                        is_assignment_method,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn check_hash_syntax_hash(&mut self, node: &ruby_prism::HashNode) {
+        let pairs: Vec<ruby_prism::AssocNode> =
+            node.elements().iter().filter_map(|e| e.as_assoc_node()).collect();
+        let l = node.location();
+        self.hs_process_hash(&pairs, l.start_offset(), l.end_offset(), true);
+    }
+
+    pub(crate) fn check_hash_syntax_keyword_hash(&mut self, node: &ruby_prism::KeywordHashNode) {
+        let pairs: Vec<ruby_prism::AssocNode> =
+            node.elements().iter().filter_map(|e| e.as_assoc_node()).collect();
+        let l = node.location();
+        self.hs_process_hash(&pairs, l.start_offset(), l.end_offset(), false);
+    }
+
+    /// `on_hash`: `return if pairs.empty?`, then
+    /// `on_hash_for_mixed_shorthand`, then the `EnforcedStyle` dispatch
+    /// table.
+    fn hs_process_hash(
+        &mut self,
+        pairs: &[ruby_prism::AssocNode],
+        hash_start: usize,
+        hash_end: usize,
+        braced: bool,
+    ) {
+        const COP: &str = "Style/HashSyntax";
+        if !self.on(COP) {
+            return;
+        }
+        if pairs.is_empty() {
+            return;
+        }
+        self.hs_populate_pair_ctx(pairs, hash_start, hash_end, braced);
+        self.hs_mixed_shorthand_check(pairs, hash_start, braced);
+
+        let style = self.cfg.enforced_style(COP);
+        let use_hr_sym_values = self.cfg.get(COP, "UseHashRocketsWithSymbolValues") == Some("true");
+        let force_rockets =
+            use_hr_sym_values && pairs.iter().any(|p| p.value().as_symbol_node().is_some());
+
+        if style == "hash_rockets" || force_rockets {
+            self.hs_style_check(pairs, true, "Use hash rockets syntax.", style, force_rockets);
+        } else if style == "ruby19_no_mixed_keys" {
+            if self.hs_sym_indices(pairs) {
+                self.hs_style_check(
+                    pairs,
+                    false,
+                    "Use the new Ruby 1.9 hash syntax.",
+                    style,
+                    force_rockets,
+                );
+            } else {
+                self.hs_style_check(
+                    pairs,
+                    true,
+                    "Don't mix styles in the same hash.",
+                    style,
+                    force_rockets,
+                );
+            }
+        } else if style == "no_mixed_keys" {
+            if self.hs_sym_indices(pairs) {
+                // `pairs.first.inverse_delimiter`: a rocket-delimited first
+                // pair's inverse is colon (flag colon pairs as the mismatch);
+                // a colon-delimited first pair's inverse is rocket.
+                let flag_colon = pairs[0].operator_loc().is_some();
+                self.hs_style_check(
+                    pairs,
+                    flag_colon,
+                    "Don't mix styles in the same hash.",
+                    style,
+                    force_rockets,
+                );
+            } else {
+                self.hs_style_check(
+                    pairs,
+                    true,
+                    "Don't mix styles in the same hash.",
+                    style,
+                    force_rockets,
+                );
+            }
+        } else if self.hs_sym_indices(pairs) {
+            self.hs_style_check(pairs, false, "Use the new Ruby 1.9 hash syntax.", style, force_rockets);
+        }
+    }
+
+    /// `check(pairs, delim, msg)`: `flag_colon_pairs` selects which
+    /// delimiter is treated as the offending one (`delim == ':'` when
+    /// true, `delim == '=>'` when false).
+    fn hs_style_check(
+        &mut self,
+        pairs: &[ruby_prism::AssocNode],
+        flag_colon_pairs: bool,
+        msg: &'static str,
+        style: &str,
+        force_rockets: bool,
+    ) {
+        const COP: &str = "Style/HashSyntax";
+        for pair in pairs {
+            let is_colon = pair.operator_loc().is_none();
+            if is_colon != flag_colon_pairs {
+                continue;
+            }
+            self.push(pair.location().start_offset(), COP, true, msg);
+            if style == "hash_rockets" || force_rockets {
+                self.hs_autocorrect_hash_rockets(pair);
+            } else if matches!(style, "ruby19_no_mixed_keys" | "no_mixed_keys") {
+                self.hs_autocorrect_no_mixed_keys(pair);
+            } else {
+                self.hs_autocorrect_ruby19(pair);
+            }
+        }
+    }
+
+    /// `autocorrect_ruby19`: converts a hash-rocket pair (`:a => 0` /
+    /// `:a=>0`) to colon style (`a: 0`).
+    fn hs_autocorrect_ruby19(&mut self, pair: &ruby_prism::AssocNode) {
+        let Some(op) = pair.operator_loc() else { return };
+        let key_loc = pair.key().location();
+        let key_start = key_loc.start_offset();
+        let key_end = key_loc.end_offset();
+        if key_end <= key_start + 1 {
+            return;
+        }
+        // `range.source.sub(/^:(.*\S)\s*=>\s*$/, ...)`: capture group 1 is
+        // the key text minus its own leading `:` — any whitespace between
+        // the key and the operator is discarded regardless, same as the
+        // trailing `\s*=>\s*$` trim.
+        let key_text = &self.src[key_start + 1..key_end];
+        let range_end = self.hs_expand_right_space_nl(op.end_offset());
+
+        let pair_start = pair.location().start_offset();
+        let ctx = self.hs_pair_ctx.get(&pair_start).copied();
+        // `argument_without_space?(pair_node.parent)`: the containing hash
+        // is a braceless call argument glued directly to the selector with
+        // no space (`foo:bar => 1`).
+        let glued = ctx.is_some_and(|c| {
+            !c.braced
+                && self
+                    .hs_call_ctx
+                    .get(&c.hash_start)
+                    .is_some_and(|d| d.selector_end == Some(c.hash_start))
+        });
+
+        let mut repl = Vec::with_capacity(key_text.len() + 3);
+        if glued {
+            repl.push(b' ');
+        }
+        repl.extend_from_slice(key_text);
+        repl.extend_from_slice(b": ");
+        self.fixes.push((key_start, range_end, repl));
+
+        // `hash_node.parent&.return_type? && !hash_node.braces?`: a bare
+        // `return :key => value` needs `{`/`}` added so the converted
+        // `key: value` doesn't parse as a `return` with a bare keyword arg.
+        if let Some(c) = ctx {
+            if !c.braced
+                && self.dn_return_arg_offsets.contains(&c.hash_start)
+                && self.hs_wrapped_return.insert(c.hash_start)
+            {
+                self.fixes.push((c.hash_start, c.hash_start, b"{".to_vec()));
+                self.fixes.push((c.hash_end, c.hash_end, b"}".to_vec()));
+            }
+        }
+    }
+
+    /// `autocorrect_hash_rockets`: converts a colon pair (`a: 0`, or a
+    /// value-omission shorthand `a:`) to hash-rocket style (`:a => 0`).
+    fn hs_autocorrect_hash_rockets(&mut self, pair: &ruby_prism::AssocNode) {
+        let key_loc = pair.key().location();
+        let key_start = key_loc.start_offset();
+        let key_end = key_loc.end_offset();
+        if key_end == 0 || key_end <= key_start {
+            return;
+        }
+        let colon_start = key_end - 1;
+        let key_text = self.src[key_start..colon_start].to_vec();
+
+        let mut repl = Vec::with_capacity(key_text.len() * 2 + 6);
+        repl.push(b':');
+        repl.extend_from_slice(&key_text);
+        repl.extend_from_slice(b" => ");
+        if self.hs_value_omission(pair) {
+            repl.extend_from_slice(&key_text);
+        }
+        self.fixes.push((key_start, colon_start, repl));
+
+        let (rm_start, rm_end) = self.hs_expand_both_space_nl(colon_start, key_end);
+        self.fixes.push((rm_start, rm_end, Vec::new()));
+    }
+
+    /// `autocorrect_no_mixed_keys`: dispatches per-pair on its OWN current
+    /// delimiter (unlike the other two, which always convert the same way).
+    fn hs_autocorrect_no_mixed_keys(&mut self, pair: &ruby_prism::AssocNode) {
+        if pair.operator_loc().is_none() {
+            self.hs_autocorrect_hash_rockets(pair);
+        } else {
+            self.hs_autocorrect_ruby19(pair);
+        }
+    }
+
+    /// `range_with_surrounding_space(range, side: :right)` (defaults
+    /// `newlines: true, whitespace: false, continuations: false`): eat
+    /// trailing spaces/tabs, then a run of newlines.
+    fn hs_expand_right_space_nl(&self, mut pos: usize) -> usize {
+        while matches!(self.src.get(pos), Some(b' ' | b'\t')) {
+            pos += 1;
+        }
+        while self.src.get(pos) == Some(&b'\n') {
+            pos += 1;
+        }
+        pos
+    }
+
+    /// `range_with_surrounding_space(range)` (`side: :both` default): the
+    /// same expansion on both ends.
+    fn hs_expand_both_space_nl(&self, mut start: usize, mut end: usize) -> (usize, usize) {
+        while start > 0 && matches!(self.src[start - 1], b' ' | b'\t') {
+            start -= 1;
+        }
+        while start > 0 && self.src[start - 1] == b'\n' {
+            start -= 1;
+        }
+        while matches!(self.src.get(end), Some(b' ' | b'\t')) {
+            end += 1;
+        }
+        while self.src.get(end) == Some(&b'\n') {
+            end += 1;
+        }
+        (start, end)
+    }
+
+    /// `value_omission?`: `source.end_with?(':')` — equivalently (and more
+    /// directly, in prism), the value is the `ImplicitNode` prism
+    /// synthesizes for a `{foo:}` shorthand pair.
+    fn hs_value_omission(&self, pair: &ruby_prism::AssocNode) -> bool {
+        pair.value().as_implicit_node().is_some()
+    }
+
+    /// `key.source`: for a hash-rocket pair (`:a => 0`, `:"str" => 0`,
+    /// `:'&&' => 0`) this is the key's own full literal text, leading `:`
+    /// included. For a colon pair (`a: 0`, quoted `"str": 0`, or a
+    /// value-omission shorthand `a:`) prism's `SymbolNode#location` spans
+    /// through the pair's OWN trailing `:` too (confirmed empirically —
+    /// both the bare-label and quoted-label forms end their location on
+    /// that byte) — whitequark's key node excludes it (`pair_keyword_map`'s
+    /// `key_range.adjust(end_pos: -1)`), so it's trimmed here.
+    fn hs_key_source(&self, pair: &ruby_prism::AssocNode) -> Vec<u8> {
+        let loc = pair.key().location();
+        let (s, e) = (loc.start_offset(), loc.end_offset());
+        if pair.operator_loc().is_some() {
+            self.src[s..e].to_vec()
+        } else {
+            self.src[s..e.saturating_sub(1).max(s)].to_vec()
+        }
+    }
+
+    /// `sym_indices?`: every pair's key is a "word symbol" (see
+    /// `hs_word_symbol_pair`).
+    fn hs_sym_indices(&self, pairs: &[ruby_prism::AssocNode]) -> bool {
+        pairs.iter().all(|p| self.hs_word_symbol_pair(p))
+    }
+
+    /// `word_symbol_pair?`: `pair.key.any_sym_type?` (a plain OR
+    /// interpolated symbol) and `acceptable_19_syntax_symbol?(key.source)`.
+    fn hs_word_symbol_pair(&self, pair: &ruby_prism::AssocNode) -> bool {
+        let key = pair.key();
+        if key.as_symbol_node().is_none() && key.as_interpolated_symbol_node().is_none() {
+            return false;
+        }
+        let key_source = self.hs_key_source(pair);
+        self.hs_acceptable_19_syntax_symbol(&key_source)
+    }
+
+    /// `acceptable_19_syntax_symbol?`.
+    fn hs_acceptable_19_syntax_symbol(&self, sym_name: &[u8]) -> bool {
+        const COP: &str = "Style/HashSyntax";
+        let s = sym_name.strip_prefix(b":").unwrap_or(sym_name);
+        if self.cfg.get(COP, "PreferHashRocketsForNonAlnumEndingSymbols") == Some("true") {
+            let ok = std::str::from_utf8(s)
+                .ok()
+                .and_then(|t| t.chars().next_back())
+                .is_some_and(|c| c.is_alphanumeric() || c == '"' || c == '\'');
+            if !ok {
+                return false;
+            }
+        }
+        if hs_simple_ident(s) {
+            return true;
+        }
+        if self.cfg.target_ruby() <= 2.1 {
+            return false;
+        }
+        (s.len() >= 2 && s.starts_with(b"'") && s.ends_with(b"'"))
+            || (s.len() >= 2 && s.starts_with(b"\"") && s.ends_with(b"\""))
+    }
+
+    /// `last_pair.key.source == last_pair.value.source` — precomputed once
+    /// per hash (see `HsPairCtx::last_pair_key_eq_value`'s doc).
+    fn hs_last_pair_key_eq_value(&self, pair: &ruby_prism::AssocNode) -> bool {
+        let key_text = self.hs_key_source(pair);
+        if self.hs_value_omission(pair) {
+            return true; // value.source == key.source trivially for shorthand.
+        }
+        key_text == self.node_src(&pair.value())
+    }
+
+    fn hs_populate_pair_ctx(
+        &mut self,
+        pairs: &[ruby_prism::AssocNode],
+        hash_start: usize,
+        hash_end: usize,
+        braced: bool,
+    ) {
+        let Some(last) = pairs.last() else { return };
+        let last_pair_key_eq_value = self.hs_last_pair_key_eq_value(last);
+        let last_start = last.location().start_offset();
+        for p in pairs {
+            let ps = p.location().start_offset();
+            self.hs_pair_ctx.insert(
+                ps,
+                HsPairCtx { hash_start, hash_end, braced, last_pair_key_eq_value, is_last_pair: ps == last_start },
+            );
+        }
+    }
+
+    /// `require_hash_value_for_around_hash_literal?`: is this hash a
+    /// braceless call argument, directly (not via `.method` on it) glued
+    /// to an UNPARENTHESIZED call that's itself inside a modifier
+    /// if/while/until (`use_modifier_form_without_parenthesized_method_call?`,
+    /// approximated by the live `hs_modifier_depth` counter — see its doc).
+    fn hs_require_hash_value_around_literal(&self, hash_start: usize, braced: bool) -> bool {
+        if braced {
+            return false;
+        }
+        let Some(d) = self.hs_call_ctx.get(&hash_start) else { return false };
+        if d.is_bracket_method || d.parenthesized {
+            return false;
+        }
+        self.hs_modifier_depth > 0
+    }
+
+    /// `require_hash_value?`.
+    fn hs_require_hash_value(&self, pair: &ruby_prism::AssocNode, hash_start: usize, braced: bool) -> bool {
+        if pair.key().as_symbol_node().is_none() {
+            return true;
+        }
+        if self.hs_require_hash_value_around_literal(hash_start, braced) {
+            return true;
+        }
+        let value = pair.value();
+        let is_send_or_lvar = value.as_call_node().is_some() || value.as_local_variable_read_node().is_some();
+        if !is_send_or_lvar {
+            return true;
+        }
+        let value_source = self.node_src(&value);
+        let key_source = self.hs_key_source(pair);
+        key_source != value_source || key_source.ends_with(b"!") || key_source.ends_with(b"?")
+    }
+
+    /// `def_node_that_require_parentheses`.
+    fn hs_def_node_that_require_parentheses(&self, ctx: &HsPairCtx) -> Option<HsDispatch> {
+        if ctx.braced || !ctx.last_pair_key_eq_value {
+            return None;
+        }
+        let dispatch = *self.hs_call_ctx.get(&ctx.hash_start)?;
+        if dispatch.is_bracket_method || dispatch.is_assignment_method || dispatch.parenthesized {
+            return None;
+        }
+        if self.hs_paren_parent.contains(&dispatch.start) {
+            return None;
+        }
+        let last_expr = self.hs_last_expression(dispatch.start);
+        let requires_ctx = self.hs_call_like_ctx.contains(&dispatch.start);
+        if last_expr && !requires_ctx {
+            return None;
+        }
+        Some(dispatch)
+    }
+
+    /// `last_expression?`: no right sibling, and (transitively, through
+    /// any chained-assignment climb) no assignment ancestor with one
+    /// either.
+    fn hs_last_expression(&self, start: usize) -> bool {
+        if self.hs_stmt_next.contains(&start) {
+            return false;
+        }
+        match self.hs_assign_parent.get(&start) {
+            Some(&assign_start) => self.hs_last_expression(assign_start),
+            None => true,
+        }
+    }
+
+    /// `register_offense`: always applies the plain value-in-place edit,
+    /// then (only when `def_node_that_require_parentheses` finds a
+    /// dispatch) also turns the gap before its first argument into `(` and,
+    /// on the hash's own last pair only, appends the closing `)`.
+    fn hs_register_offense(
+        &mut self,
+        pair: &ruby_prism::AssocNode,
+        ctx: &HsPairCtx,
+        message: &'static str,
+        replacement: Vec<u8>,
+    ) {
+        const COP: &str = "Style/HashSyntax";
+        let anchor = if self.hs_value_omission(pair) {
+            pair.key().location().start_offset()
+        } else {
+            pair.value().location().start_offset()
+        };
+        self.push(anchor, COP, true, message);
+        let l = pair.location();
+        self.fixes.push((l.start_offset(), l.end_offset(), replacement));
+
+        let Some(dispatch) = self.hs_def_node_that_require_parentheses(ctx) else { return };
+        if let (Some(sel_end), Some(arg_start)) = (dispatch.selector_end, dispatch.first_arg_start) {
+            if sel_end < arg_start {
+                self.fixes.push((sel_end, arg_start, b"(".to_vec()));
+            }
+        }
+        if ctx.is_last_pair {
+            self.fixes.push((ctx.hash_end, ctx.hash_end, b")".to_vec()));
+        }
+    }
+
+    fn hs_register_offense_by_lookup(
+        &mut self,
+        pair: &ruby_prism::AssocNode,
+        message: &'static str,
+        replacement: Vec<u8>,
+    ) {
+        let Some(ctx) = self.hs_pair_ctx.get(&pair.location().start_offset()).copied() else { return };
+        self.hs_register_offense(pair, &ctx, message, replacement);
+    }
+
+    /// `on_pair`: `EnforcedShorthandSyntax` styles `always`/`never` only —
+    /// `either`/`consistent`/`either_consistent` are entirely handled by
+    /// `hs_mixed_shorthand_check` instead (`ignore_hash_shorthand_syntax?`).
+    /// A pair inside a `case/in` hash PATTERN also parses to prism's
+    /// `AssocNode` (unlike whitequark, which gives it a distinct
+    /// `match_hash_var`-family node, never `:pair`) — `hs_pair_ctx` is only
+    /// ever populated from a real `HashNode`/`KeywordHashNode`, so such a
+    /// pair simply has no entry here and is silently skipped, matching
+    /// upstream's `!pair_node.parent.hash_type?` exclusion.
+    pub(crate) fn check_hash_syntax_pair(&mut self, pair: &ruby_prism::AssocNode) {
+        const COP: &str = "Style/HashSyntax";
+        if !self.on(COP) {
+            return;
+        }
+        if self.cfg.target_ruby() <= 3.0 {
+            return;
+        }
+        let shorthand = self.cfg.get(COP, "EnforcedShorthandSyntax").unwrap_or("either");
+        if matches!(shorthand, "either" | "consistent" | "either_consistent") {
+            return;
+        }
+        let Some(ctx) = self.hs_pair_ctx.get(&pair.location().start_offset()).copied() else { return };
+        let value_omitted = self.hs_value_omission(pair);
+        if shorthand == "always" {
+            if value_omitted || self.hs_require_hash_value(pair, ctx.hash_start, ctx.braced) {
+                return;
+            }
+            let key_text = self.hs_key_source(pair);
+            let mut repl = key_text;
+            repl.push(b':');
+            self.hs_register_offense(pair, &ctx, "Omit the hash value.", repl);
+        } else {
+            if !value_omitted {
+                return;
+            }
+            let key_text = self.hs_key_source(pair);
+            let mut repl = key_text.clone();
+            repl.extend_from_slice(b": ");
+            repl.extend_from_slice(&key_text);
+            self.hs_register_offense(pair, &ctx, "Include the hash value.", repl);
+        }
+    }
+
+    /// `on_hash_for_mixed_shorthand`: styles `consistent`/`either_consistent`
+    /// only.
+    fn hs_mixed_shorthand_check(&mut self, pairs: &[ruby_prism::AssocNode], hash_start: usize, braced: bool) {
+        const COP: &str = "Style/HashSyntax";
+        if self.cfg.target_ruby() <= 3.0 {
+            return;
+        }
+        let shorthand = self.cfg.get(COP, "EnforcedShorthandSyntax").unwrap_or("either");
+        if !matches!(shorthand, "consistent" | "either_consistent") {
+            return;
+        }
+
+        #[derive(PartialEq, Clone, Copy)]
+        enum Cls {
+            Omitted,
+            Needed,
+            Omittable,
+        }
+        let classes: Vec<Cls> = pairs
+            .iter()
+            .map(|p| {
+                if self.hs_value_omission(p) {
+                    Cls::Omitted
+                } else if self.hs_require_hash_value(p, hash_start, braced) {
+                    Cls::Needed
+                } else {
+                    Cls::Omittable
+                }
+            })
+            .collect();
+        let has_omitted = classes.iter().any(|c| *c == Cls::Omitted);
+        let has_needed = classes.iter().any(|c| *c == Cls::Needed);
+        let has_omittable = classes.iter().any(|c| *c == Cls::Omittable);
+        let distinct = has_omitted as u8 + has_needed as u8 + has_omittable as u8;
+
+        if distinct > 1 {
+            if has_needed {
+                for (p, c) in pairs.iter().zip(&classes) {
+                    if *c != Cls::Omitted {
+                        continue;
+                    }
+                    let key_text = self.hs_key_source(p);
+                    let mut repl = key_text.clone();
+                    repl.extend_from_slice(b": ");
+                    repl.extend_from_slice(&key_text);
+                    self.hs_register_offense_by_lookup(
+                        p,
+                        "Do not mix explicit and implicit hash values. Include the hash value.",
+                        repl,
+                    );
+                }
+            } else {
+                for (p, c) in pairs.iter().zip(&classes) {
+                    if *c != Cls::Omittable {
+                        continue;
+                    }
+                    let key_text = self.hs_key_source(p);
+                    let mut repl = key_text.clone();
+                    repl.push(b':');
+                    self.hs_register_offense_by_lookup(
+                        p,
+                        "Do not mix explicit and implicit hash values. Omit the hash value.",
+                        repl,
+                    );
+                }
+            }
+        } else {
+            if has_needed {
+                return;
+            }
+            // `ignore_explicit_omissible_hash_shorthand_syntax?`: the ONLY
+            // bucket present is `:value_omittable` (no pair is already
+            // omitted), under `either_consistent`.
+            if has_omittable && shorthand == "either_consistent" {
+                return;
+            }
+            for (p, c) in pairs.iter().zip(&classes) {
+                if *c != Cls::Omittable {
+                    continue;
+                }
+                let key_text = self.hs_key_source(p);
+                let mut repl = key_text.clone();
+                repl.push(b':');
+                self.hs_register_offense_by_lookup(p, "Omit the hash value.", repl);
+            }
+        }
+    }
+}
+
+/// `acceptable_19_syntax_symbol?`'s `/\A[_a-z]\w*[?!]?\z/i` check: a bare
+/// identifier (letter/underscore then word chars), optionally ending in `?`
+/// or `!`.
+fn hs_simple_ident(s: &[u8]) -> bool {
+    let Some((&first, rest)) = s.split_first() else { return false };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    let mid = match rest.split_last() {
+        Some((&last, init)) if last == b'?' || last == b'!' => init,
+        _ => rest,
+    };
+    mid.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+}
