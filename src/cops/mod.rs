@@ -241,7 +241,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
-    "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems",
+    "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment", "Bundler/OrderedGems", "Layout/SpaceBeforeBlockBraces",
 ];
 
 impl Engine {
@@ -1978,6 +1978,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     // `ruby_prism::visit_block_node`) to flag "the body about to be visited
     // IS this block's own StatementsNode" right before descending into it.
     fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        self.check_space_before_block_braces(&node.opening_loc(), &node.closing_loc());
         self.check_block_end_newline(node);
         self.check_access_modifier_indentation_block(node);
         // Style/RedundantSelf: a block CONTINUES (shares) the enclosing
@@ -2479,6 +2480,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ll_exit_collection();
     }
     fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.check_space_before_block_braces(&node.opening_loc(), &node.closing_loc());
         self.check_block_end_newline_lambda(node);
         self.check_space_in_lambda_literal(node);
         self.check_empty_block_lambda(node);

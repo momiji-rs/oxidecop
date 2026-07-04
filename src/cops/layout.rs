@@ -5612,3 +5612,118 @@ impl<'a> super::Cops<'a> {
             .unwrap_or(2)
     }
 }
+
+
+impl<'a> Cops<'a> {
+    /// Layout/SpaceBeforeBlockBraces — verbatim port of `on_block`/`check_empty`/
+    /// `check_non_empty`. Shared by brace blocks (`ruby_prism::BlockNode`, which
+    /// covers `{}`, numbered-param, and `it`-param blocks alike — prism doesn't
+    /// split those into separate node kinds) AND stabby lambda literals
+    /// (`ruby_prism::LambdaNode`), since rubocop's own Prism translator rewrites
+    /// a `LambdaNode` into the very same "block whose send is `lambda`" `:block`
+    /// shape it uses for `lambda do...end` — `on_block` fires on both alike.
+    /// Both node kinds expose plain (non-`Option`) `opening_loc`/`closing_loc`.
+    pub(crate) fn check_space_before_block_braces<'x>(
+        &mut self,
+        opening: &ruby_prism::Location<'x>,
+        closing: &ruby_prism::Location<'x>,
+    ) {
+        const COP: &str = "Layout/SpaceBeforeBlockBraces";
+        if !self.on(COP) {
+            return;
+        }
+        // `node.keywords?`: `do`...`end` blocks never take this cop's brace-space
+        // rule — only the `{`-opened form does.
+        if opening.as_slice() != b"{" {
+            return;
+        }
+        const MISSING_MSG: &str = "Space missing to the left of {.";
+        const DETECTED_MSG: &str = "Space detected to the left of {.";
+
+        let left_brace = opening.start_offset();
+        let closing_start = closing.start_offset();
+        let no_space_style = self.cfg.get(COP, "EnforcedStyle") == Some("no_space");
+
+        // `conflict_with_block_delimiters?`: no_space + a multiline brace block
+        // would fight Style/BlockDelimiters' `line_count_based` autocorrection —
+        // rubocop silently skips the offense rather than register one that
+        // autocorrection would immediately re-break.
+        if no_space_style {
+            let block_delimiters_line_count_based =
+                self.cfg.get("Style/BlockDelimiters", "EnforcedStyle").unwrap_or("line_count_based")
+                    == "line_count_based";
+            if block_delimiters_line_count_based {
+                let open_line = self.idx.loc(left_brace).0;
+                let close_line = self.idx.loc(closing_start).0;
+                if open_line != close_line {
+                    return;
+                }
+            }
+        }
+
+        // `range_with_surrounding_space(left_brace)` (defaults: side: :both,
+        // newlines: true, whitespace: false, continuations: false) — only the
+        // LEFT expansion is ever read (`space_plus_brace.begin_pos`), so we only
+        // need to replicate that half: skip a run of spaces/tabs immediately
+        // before `{`, then (from wherever that stops) a run of newlines. Unlike
+        // a plain `\s*` scan, indentation on the line above a lone `\n{` is
+        // NOT re-consumed after the newline run (the generic-whitespace pass is
+        // disabled by default) — this loop mirrors that exact ordering.
+        let src = self.src;
+        let mut pos = left_brace;
+        while pos > 0 && matches!(src[pos - 1], b' ' | b'\t') {
+            pos -= 1;
+        }
+        while pos > 0 && src[pos - 1] == b'\n' {
+            pos -= 1;
+        }
+        let space_begin = pos;
+        let used_style_space = space_begin != left_brace;
+
+        // `empty_braces?`: `loc.begin.end_pos == loc.end.begin_pos` — nothing
+        // (not even a space) between `{` and `}`.
+        let empty_braces = opening.end_offset() == closing_start;
+
+        if empty_braces {
+            // `style_for_empty_braces`: explicit space/no_space, or (if the key
+            // is truly absent — only possible under `__replace_defaults__`)
+            // fall back to the main `style`.
+            let style_empty_space = match self.cfg.get(COP, "EnforcedStyleForEmptyBraces") {
+                Some("no_space") => false,
+                Some("space") => true,
+                _ => !no_space_style,
+            };
+            if style_empty_space == used_style_space {
+                return; // `handle_different_styles_for_empty_braces` — no offense either way
+            }
+            if style_empty_space {
+                // range = left_brace, msg = MISSING_MSG; autocorrect: source is
+                // "{" (not `\s`) -> `insert_before` a space.
+                self.push(left_brace, COP, true, MISSING_MSG);
+                self.fixes.push((left_brace, left_brace, b" ".to_vec()));
+            } else {
+                // range = [space_begin, left_brace), msg = DETECTED_MSG;
+                // autocorrect: source is whitespace -> remove it.
+                self.push(space_begin, COP, true, DETECTED_MSG);
+                self.fixes.push((space_begin, left_brace, Vec::new()));
+            }
+            return;
+        }
+
+        // `check_non_empty`/`case used_style; when style ... when :space ...
+        // else ...`.
+        let target_style_space = !no_space_style;
+        if used_style_space == target_style_space {
+            return; // `correct_style_detected` — no offense
+        }
+        if used_style_space {
+            // `space_detected`
+            self.push(space_begin, COP, true, DETECTED_MSG);
+            self.fixes.push((space_begin, left_brace, Vec::new()));
+        } else {
+            // `space_missing`
+            self.push(left_brace, COP, true, MISSING_MSG);
+            self.fixes.push((left_brace, left_brace, b" ".to_vec()));
+        }
+    }
+}
