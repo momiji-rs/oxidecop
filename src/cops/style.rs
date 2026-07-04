@@ -33910,3 +33910,744 @@ fn amd_select_grouped_def_nodes(body: &[ruby_prism::Node], i: usize) -> Vec<(usi
     }
     out
 }
+
+
+// ---------------------------------------------------------------------
+// Style/BlockDelimiters (mixins: ConfigurableEnforcedStyle, AllowedMethods,
+// AllowedPattern, RangeHelp).
+//
+// This is a whole-file scan (like `Gemspec/OrderedDependencies` /
+// `Bundler/OrderedGems`), NOT wired through the shared `Cops::visit_*`
+// dispatch: the cop needs its OWN notion of "my immediate parent" (is this
+// call+block combo an assignment's value / a call's receiver-or-argument /
+// a conditional predicate / an operator-keyword operand / an array or range
+// element / the last statement of a scope?), which the shared visitor has no
+// generic mechanism for. A dedicated top-down walk (`BdWalker`, implementing
+// `ruby_prism::Visit` on its own) carries that context explicitly.
+//
+// Two passes, mirroring upstream's TWO independent mechanisms that both feed
+// the SAME `@ignored_nodes` list:
+//   Pass A (`BdIgnoreScan`) replicates `on_send`'s `get_blocks` walk: for
+//   every unparenthesized call with (non-block-swallowing) arguments, find
+//   every literal block reachable through nested sends/keyword-hash pairs
+//   (braces/do-end bind differently there, so either style is accepted) and
+//   record its full range.
+//   Pass B (`BdWalker`) is the main context-aware walk. Whenever IT flags an
+//   offense, upstream's `add_offense` block also calls `ignore_node(node)` —
+//   `IgnoredNode#part_of_ignored_node?` is a byte-range CONTAINMENT check
+//   (not object identity), so this transitively suppresses every block
+//   nested inside an already-flagged one too. `BdWalker.ignored` (seeded
+//   from Pass A, extended live in Pass B) models both with one range list.
+//
+// Context propagation (`BdCtx{used, scope, chained}` — upstream's
+// `return_value_used?`/`return_value_of_scope?`/`chained?`): computed FRESH
+// at each recursion step from the child's structural slot (call receiver /
+// call argument / assignment value / conditional predicate / and-or operand
+// / array-or-range element / last-of-statements), EXCEPT parentheses, which
+// are transparent to `used` (upstream's `return_value_used?` recurses
+// through `begin_type?` parents) while unconditionally forcing `scope=true`
+// (a paren's lone child is trivially its own "last child" — the same reason
+// upstream's `return_value_of_scope?` `parent.children.last == node` check
+// fires for anything directly inside bare parens).
+//
+// `chain_end` threads `end_of_chain(node)` down TOP-DOWN instead of
+// upstream's bottom-up (`node.parent`) walk: prism has no parent pointers,
+// but since prism unifies whitequark's separate "send" and "block" nodes
+// into one `CallNode` (`with_block?`'s jump in `end_of_chain` is a no-op
+// there), `end_of_chain` reduces to "keep following `chained?` receivers
+// until one isn't chained; return ITS OWN full range" — computable while
+// descending, by propagating the effective chain-end downward through the
+// receiver spine.
+//
+// Known simplifications (none exercised by the fixture): the 24 compound
+// assignment node types (`+=`/`||=`/`&&=` on ivars/cvars/gvars/consts/
+// consts-path/index/attr) aren't tracked as `AssignValue` (only the 7 plain
+// `foo = x` forms are); a hash-literal PAIR's value isn't specially forced
+// to `scope=true` the way parens are (rare — needs a block used as a VALUE
+// of a real `{}`-braced hash literal, not a keyword-arg hash, which
+// `get_blocks` already exempts).
+struct BdIgnoreScan {
+    ignored: Vec<(usize, usize)>,
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for BdIgnoreScan {
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if bd_qualifies_for_ignore_scan(node) {
+            if let Some(args) = node.arguments() {
+                for a in args.arguments().iter() {
+                    bd_get_blocks(&a, &mut self.ignored);
+                }
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+}
+
+/// `on_send`'s guard: `node.arguments? && !node.parenthesized? &&
+/// !node.assignment_method? && !single_argument_operator_method?`.
+fn bd_qualifies_for_ignore_scan(node: &ruby_prism::CallNode) -> bool {
+    let Some(args) = node.arguments() else { return false };
+    if args.arguments().len() == 0 {
+        return false;
+    }
+    if node.opening_loc().is_some_and(|l| l.as_slice() == b"(") {
+        return false;
+    }
+    let name = node.name().as_slice();
+    // `assignment_method?`: ends with `=`, excluding the comparison operators
+    // that happen to (`==`, `===`, `!=`, `<=`, `>=`).
+    if name.ends_with(b"=") && !matches!(name, b"==" | b"===" | b"!=" | b"<=" | b">=") {
+        return false;
+    }
+    // `single_argument_operator_method?`: an operator method whose one
+    // argument is ITSELF a literal block (not merely containing one deeper
+    // in a receiver chain).
+    const OPERATOR_METHODS: &[&[u8]] = &[
+        b"|", b"^", b"&", b"<=>", b"==", b"===", b"=~", b">", b">=", b"<", b"<=", b"<<", b">>",
+        b"+", b"-", b"*", b"/", b"%", b"**", b"~", b"+@", b"-@", b"!@", b"~@", b"[]", b"[]=", b"!",
+        b"!=", b"!~", b"`",
+    ];
+    if OPERATOR_METHODS.contains(&name) && args.arguments().len() == 1 {
+        if let Some(first) = args.arguments().iter().next() {
+            if let Some(c) = first.as_call_node() {
+                if c.block().and_then(|b| b.as_block_node()).is_some() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// rubocop's `get_blocks`: recurses through send/csend receivers+arguments
+/// and bare-keyword-hash pairs (never through parens, real braced hashes, or
+/// INTO a found block's own body) marking every literal block/numblock/
+/// itblock found along the way "ignored" — braces/do-end bind differently
+/// there due to missing parens, so either delimiter style is accepted.
+fn bd_get_blocks(node: &ruby_prism::Node, ignored: &mut Vec<(usize, usize)>) {
+    if let Some(call) = node.as_call_node() {
+        if call.block().and_then(|b| b.as_block_node()).is_some() {
+            let l = call.location();
+            ignored.push((l.start_offset(), l.end_offset()));
+            return;
+        }
+        if let Some(r) = call.receiver() {
+            bd_get_blocks(&r, ignored);
+        }
+        if let Some(args) = call.arguments() {
+            for a in args.arguments().iter() {
+                bd_get_blocks(&a, ignored);
+            }
+        }
+        return;
+    }
+    if let Some(kw) = node.as_keyword_hash_node() {
+        for e in kw.elements().iter() {
+            bd_get_blocks(&e, ignored);
+        }
+        return;
+    }
+    if let Some(assoc) = node.as_assoc_node() {
+        bd_get_blocks(&assoc.key(), ignored);
+        bd_get_blocks(&assoc.value(), ignored);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BdStyle {
+    LineCountBased,
+    Semantic,
+    BracesForChaining,
+    AlwaysBraces,
+}
+
+/// A child's structural relationship to its immediate parent, reduced to
+/// exactly the three booleans upstream's `return_value_used?`/
+/// `return_value_of_scope?`/`chained?` ever consult. `chain_end` is only
+/// meaningful when `chained` is true — see the module doc comment.
+#[derive(Clone, Copy)]
+struct BdCtx {
+    used: bool,
+    scope: bool,
+    chained: bool,
+    chain_end: usize,
+}
+impl BdCtx {
+    const OTHER: Self = Self { used: false, scope: false, chained: false, chain_end: 0 };
+    const SCOPE_TRUE: Self = Self { used: false, scope: true, chained: false, chain_end: 0 };
+    const USED_ARG: Self = Self { used: true, scope: false, chained: false, chain_end: 0 };
+}
+
+const BD_DEFAULT_PROCEDURAL: &[&str] = &[
+    "benchmark", "bm", "bmbm", "create", "each_with_object", "measure", "new", "realtime", "tap",
+    "with_object",
+];
+const BD_DEFAULT_FUNCTIONAL: &[&str] = &["let", "let!", "subject", "watch"];
+
+fn bd_word_list(cfg: &crate::config::Config, cop: &str, key: &str, default: &[&str]) -> Vec<Vec<u8>> {
+    match cfg.param(cop, key).map(crate::config::parse_allowed_list) {
+        Some(v) => v.into_iter().map(String::into_bytes).collect(),
+        None => default.iter().map(|s| s.as_bytes().to_vec()).collect(),
+    }
+}
+
+fn bd_braces(blk: &ruby_prism::BlockNode) -> bool {
+    blk.closing_loc().as_slice() == b"}"
+}
+fn bd_multiline(idx: &super::LineIndex, blk: &ruby_prism::BlockNode) -> bool {
+    idx.loc(blk.opening_loc().start_offset()).0 != idx.loc(blk.closing_loc().start_offset()).0
+}
+
+/// `require_do_end?`: a single-line block whose body is a bare (no
+/// `begin`-keyword) attached `rescue`/`ensure` clause MUST stay `do...end`
+/// (`{ rescue ... }` / `{ ensure ... }` are syntax errors) UNLESS it's the
+/// simple modifier-rescue form (`expr rescue handler`, which prism gives its
+/// own `RescueModifierNode` — never a `BeginNode` — so it never reaches the
+/// `as_begin_node` branch below at all).
+fn bd_require_do_end(idx: &super::LineIndex, blk: &ruby_prism::BlockNode) -> bool {
+    if bd_braces(blk) || bd_multiline(idx, blk) {
+        return false;
+    }
+    let Some(body) = blk.body() else { return false };
+    let Some(begin) = body.as_begin_node() else { return false };
+    if begin.begin_keyword_loc().is_some() {
+        return false; // an explicit `begin...end` statement, not the block's own attached clause
+    }
+    if begin.ensure_clause().is_some() {
+        return true;
+    }
+    let Some(resc) = begin.rescue_clause() else { return false };
+    // `modifier_rescue?`'s guards, inverted. `rescue_node.body.nil?` (no
+    // protected statements before `rescue`) is `begin.statements()` — NOT
+    // `resc.statements()`, which is the HANDLER's body (prism's
+    // `RescueNode#statements` is whitequark's `resbody.body`, a DIFFERENT
+    // field from `rescue_node.body`).
+    if begin.statements().is_none() {
+        return true;
+    }
+    if begin.else_clause().is_some() {
+        return true;
+    }
+    if resc.subsequent().is_some() {
+        return true; // more than one `resbody`
+    }
+    if resc.exceptions().len() > 0 {
+        return true;
+    }
+    if resc.reference().is_some() {
+        return true; // `rescue => e`
+    }
+    false
+}
+
+/// `begin_required?`: converting `do...end` with an attached bare
+/// `rescue`/`ensure` to `{}` needs an explicit `begin...end` wrapper inside
+/// the braces (multiline only — a single line never reaches here since
+/// `require_do_end?` would have already forced `do...end`).
+fn bd_begin_required(idx: &super::LineIndex, blk: &ruby_prism::BlockNode) -> bool {
+    let Some(body) = blk.body() else { return false };
+    let bare = body
+        .as_begin_node()
+        .is_some_and(|b| b.begin_keyword_loc().is_none() && (b.rescue_clause().is_some() || b.ensure_clause().is_some()));
+    bare && bd_multiline(idx, blk)
+}
+
+struct BdWalker<'c, 'a> {
+    cops: &'c mut super::Cops<'a>,
+    style: BdStyle,
+    procedural: Vec<Vec<u8>>,
+    functional: Vec<Vec<u8>>,
+    braces_required: Vec<Vec<u8>>,
+    allow_oneliner: bool,
+    ignored: Vec<(usize, usize)>,
+    next_ctx: BdCtx,
+}
+
+impl<'c, 'a> BdWalker<'c, 'a> {
+    fn ws_before(&self, pos: usize) -> bool {
+        pos > 0 && self.cops.src.get(pos - 1).is_some_and(u8::is_ascii_whitespace)
+    }
+    fn ws_after(&self, pos: usize) -> bool {
+        self.cops.src.get(pos).is_some_and(u8::is_ascii_whitespace)
+    }
+
+    /// Every element of a statements list gets `Other` except the last,
+    /// which gets `SCOPE_TRUE` — UNLESS this is the whole file's top-level
+    /// list AND it holds exactly one statement, matching whitequark's
+    /// convention of never wrapping a solitary root statement (so it truly
+    /// has no parent at all, upstream's `return_value_of_scope?` bails via
+    /// `return false unless node.parent`). Every other single-or-multi
+    /// statement list (block/def/class/module/lambda/kwbegin bodies, and
+    /// if/while/case/when/rescue/else/ensure branch bodies alike) behaves as
+    /// `SCOPE_TRUE` for its last element regardless of which upstream
+    /// disjunct (`conditional?`/`children.last==node`) would technically
+    /// fire — both resolve to the same boolean, so one shared label suffices
+    /// (see the module doc comment).
+    fn handle_statements<'pr>(&mut self, node: &ruby_prism::StatementsNode<'pr>, is_root: bool) {
+        let items: Vec<_> = node.body().iter().collect();
+        let n = items.len();
+        for (i, child) in items.iter().enumerate() {
+            let ctx = if i + 1 < n {
+                BdCtx::OTHER
+            } else if is_root && n == 1 {
+                BdCtx::OTHER
+            } else {
+                BdCtx::SCOPE_TRUE
+            };
+            self.next_ctx = ctx;
+            self.visit(child);
+        }
+    }
+
+    /// `on_block`: `part_of_ignored_node?`, then `proper_block_style?`/
+    /// `message`/`add_offense`+autocorrect.
+    fn handle_combo<'pr>(&mut self, call: &ruby_prism::CallNode<'pr>, blk: &ruby_prism::BlockNode<'pr>, ctx: BdCtx, chain_end: usize) {
+        const COP: &str = "Style/BlockDelimiters";
+        let combo_loc = call.location();
+        let combo_start = combo_loc.start_offset();
+        let combo_end = combo_loc.end_offset();
+        if self.ignored.iter().any(|&(s, e)| s <= combo_start && combo_end <= e) {
+            return;
+        }
+        let name = call.name().as_slice();
+        let braces_required = self.braces_required.iter().any(|m| m.as_slice() == name);
+        let is_allowed = self.cops.allowed(COP, name);
+        let braces = bd_braces(blk);
+        let multiline = bd_multiline(self.cops.idx, blk);
+        let require_do_end = bd_require_do_end(self.cops.idx, blk);
+        let used = ctx.used;
+        let scope = ctx.scope;
+        let chained = ctx.chained;
+        let functional_block = used || scope;
+
+        let proper = if require_do_end {
+            true
+        } else if is_allowed {
+            true
+        } else if braces_required {
+            braces
+        } else {
+            match self.style {
+                BdStyle::LineCountBased => multiline ^ braces,
+                BdStyle::Semantic => {
+                    if braces {
+                        self.functional.iter().any(|m| m.as_slice() == name)
+                            || functional_block
+                            || (self.allow_oneliner && !multiline)
+                    } else {
+                        self.procedural.iter().any(|m| m.as_slice() == name) || !used
+                    }
+                }
+                BdStyle::BracesForChaining => {
+                    if multiline {
+                        if chained {
+                            braces
+                        } else {
+                            !braces
+                        }
+                    } else {
+                        braces
+                    }
+                }
+                BdStyle::AlwaysBraces => braces,
+            }
+        };
+        if proper {
+            return;
+        }
+        let msg = if braces_required {
+            format!("Brace delimiters `{{...}}` required for '{}' method.", String::from_utf8_lossy(name))
+        } else {
+            match self.style {
+                BdStyle::LineCountBased => {
+                    if multiline {
+                        "Avoid using `{...}` for multi-line blocks.".to_string()
+                    } else {
+                        "Prefer `{...}` over `do...end` for single-line blocks.".to_string()
+                    }
+                }
+                BdStyle::Semantic => {
+                    if braces {
+                        "Prefer `do...end` over `{...}` for procedural blocks.".to_string()
+                    } else {
+                        "Prefer `{...}` over `do...end` for functional blocks.".to_string()
+                    }
+                }
+                BdStyle::BracesForChaining => {
+                    if multiline {
+                        if chained {
+                            "Prefer `{...}` over `do...end` for multi-line chained blocks.".to_string()
+                        } else {
+                            "Prefer `do...end` for multi-line blocks without chaining.".to_string()
+                        }
+                    } else {
+                        "Prefer `{...}` over `do...end` for single-line blocks.".to_string()
+                    }
+                }
+                BdStyle::AlwaysBraces => "Prefer `{...}` over `do...end` for blocks.".to_string(),
+            }
+        };
+        let anchor = blk.opening_loc().start_offset();
+        self.cops.push(anchor, COP, true, msg);
+        self.ignored.push((combo_start, combo_end));
+        self.autocorrect(call, blk, chained, chain_end);
+    }
+
+    /// `autocorrect`: `correction_would_break_code?` only guards the
+    /// do-end -> braces direction.
+    fn autocorrect<'pr>(&mut self, call: &ruby_prism::CallNode<'pr>, blk: &ruby_prism::BlockNode<'pr>, chained: bool, chain_end: usize) {
+        if bd_braces(blk) {
+            self.replace_braces_with_do_end(call, blk, chained, chain_end);
+        } else {
+            let call_has_args = call.arguments().is_some_and(|a| a.arguments().len() > 0);
+            let call_parenthesized = call.opening_loc().is_some_and(|l| l.as_slice() == b"(");
+            if call_has_args && !call_parenthesized {
+                return;
+            }
+            self.replace_do_end_with_braces(blk);
+        }
+    }
+
+    fn replace_do_end_with_braces<'pr>(&mut self, blk: &ruby_prism::BlockNode<'pr>) {
+        let b = blk.opening_loc();
+        let e = blk.closing_loc();
+        let mut b_rep: Vec<u8> = b"{".to_vec();
+        if !self.ws_after(b.end_offset()) {
+            b_rep.push(b' ');
+        }
+        self.cops.fixes.push((b.start_offset(), b.end_offset(), b_rep));
+        self.cops.fixes.push((e.start_offset(), e.end_offset(), b"}".to_vec()));
+        if bd_begin_required(self.cops.idx, blk) {
+            // `body.location()` is NOT the protected content's range here — a
+            // bare (no `begin`-keyword) attached rescue/ensure `BeginNode`'s
+            // own location spans from the block's OWN `do` all the way
+            // through the block's OWN `end` (the same prism-vs-whitequark
+            // trap as a def-with-rescue body — see the module doc comment).
+            // The true start is the first protected statement (or the
+            // `rescue`/`ensure` keyword itself when there's no protected
+            // body); the true end is wherever real content stops, found by
+            // trimming back from the block's own closing keyword.
+            if let Some(begin) = blk.body().and_then(|b| b.as_begin_node()) {
+                let start = if let Some(st) = begin.statements() {
+                    st.location().start_offset()
+                } else if let Some(r) = begin.rescue_clause() {
+                    r.keyword_loc().start_offset()
+                } else if let Some(en) = begin.ensure_clause() {
+                    en.ensure_keyword_loc().start_offset()
+                } else {
+                    begin.location().start_offset()
+                };
+                let src = self.cops.src;
+                let mut end = e.start_offset();
+                while end > start && src[end - 1].is_ascii_whitespace() {
+                    end -= 1;
+                }
+                self.cops.fixes.push((start, start, b"begin\n".to_vec()));
+                self.cops.fixes.push((end, end, b"\nend".to_vec()));
+            }
+        }
+    }
+
+    fn replace_braces_with_do_end<'pr>(
+        &mut self,
+        call: &ruby_prism::CallNode<'pr>,
+        blk: &ruby_prism::BlockNode<'pr>,
+        chained: bool,
+        chain_end: usize,
+    ) {
+        let b = blk.opening_loc();
+        let e = blk.closing_loc();
+        let mut b_rep: Vec<u8> = Vec::new();
+        if !self.ws_before(b.start_offset()) {
+            b_rep.push(b' ');
+        }
+        b_rep.extend_from_slice(b"do");
+        if !self.ws_after(b.end_offset()) {
+            b_rep.push(b' ');
+        }
+        self.cops.fixes.push((b.start_offset(), b.end_offset(), b_rep));
+
+        let e_line = self.cops.idx.loc(e.start_offset()).0;
+        if let Some(&(_, cs, ce)) = self.cops.comments.iter().find(|&&(l, _, _)| l == e_line) {
+            let range_end = if chained { chain_end } else { e.end_offset() };
+            self.move_comment_before_block(call.location().start_offset(), range_end, cs, ce);
+        }
+
+        let mut e_rep: Vec<u8> = Vec::new();
+        if !self.ws_before(e.start_offset()) {
+            e_rep.push(b' ');
+        }
+        e_rep.extend_from_slice(b"end");
+        self.cops.fixes.push((e.start_offset(), e.end_offset(), e_rep));
+    }
+
+    /// `move_comment_before_block`: the three upstream edits (remove the
+    /// comment [+trailing space/newlines], remove the whitespace gap before
+    /// it if any, insert a fresh newline) collapse into ONE replace spanning
+    /// `[pcr_end, rm_end)` — same net text, and it sidesteps this project's
+    /// simple sort-by-start-descending fix applier, which would otherwise
+    /// silently drop one of two same-offset edits (see the doc comment on
+    /// `apply_fixes` in main.rs).
+    fn move_comment_before_block(&mut self, combo_start: usize, range_end: usize, c_start: usize, c_end: usize) {
+        let src = self.cops.src;
+        let mut pcr_end = c_start;
+        while pcr_end > range_end && src[pcr_end - 1].is_ascii_whitespace() {
+            pcr_end -= 1;
+        }
+        let mut rm_end = c_end;
+        while rm_end < src.len() && (src[rm_end] == b' ' || src[rm_end] == b'\t') {
+            rm_end += 1;
+        }
+        while rm_end < src.len() && src[rm_end] == b'\n' {
+            rm_end += 1;
+        }
+        self.cops.fixes.push((pcr_end, rm_end, b"\n".to_vec()));
+        let mut ins = src[c_start..c_end].to_vec();
+        ins.push(b'\n');
+        self.cops.fixes.push((combo_start, combo_start, ins));
+    }
+}
+
+impl<'pr, 'c, 'a> ruby_prism::Visit<'pr> for BdWalker<'c, 'a> {
+    fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
+        let stmts = node.statements();
+        self.handle_statements(&stmts, true);
+    }
+
+    fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        self.handle_statements(node, false);
+    }
+
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        let ctx = std::mem::replace(&mut self.next_ctx, BdCtx::OTHER);
+        let my_end = node.location().end_offset();
+        let effective_chain_end = if ctx.chained { ctx.chain_end } else { my_end };
+
+        if let Some(blk) = node.block().and_then(|b| b.as_block_node()) {
+            self.handle_combo(node, &blk, ctx, effective_chain_end);
+        }
+
+        if let Some(r) = node.receiver() {
+            self.next_ctx = BdCtx { used: true, scope: false, chained: true, chain_end: effective_chain_end };
+            self.visit(&r);
+        }
+        if let Some(args) = node.arguments() {
+            for a in args.arguments().iter() {
+                self.next_ctx = BdCtx::USED_ARG;
+                self.visit(&a);
+            }
+        }
+        if let Some(b) = node.block() {
+            if let Some(blk) = b.as_block_node() {
+                if let Some(params) = blk.parameters() {
+                    self.next_ctx = BdCtx::OTHER;
+                    self.visit(&params);
+                }
+                if let Some(body) = blk.body() {
+                    self.next_ctx = BdCtx::OTHER;
+                    self.visit(&body);
+                }
+            } else if let Some(ba) = b.as_block_argument_node() {
+                if let Some(expr) = ba.expression() {
+                    self.next_ctx = BdCtx::OTHER;
+                    self.visit(&expr);
+                }
+            }
+        }
+    }
+
+    fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        self.next_ctx = BdCtx::SCOPE_TRUE;
+        self.visit(&node.predicate());
+        if let Some(stmts) = node.statements() {
+            self.handle_statements(&stmts, false);
+        }
+        if let Some(sub) = node.subsequent() {
+            self.next_ctx = BdCtx::OTHER;
+            self.visit(&sub);
+        }
+    }
+
+    fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        self.next_ctx = BdCtx::SCOPE_TRUE;
+        self.visit(&node.predicate());
+        if let Some(stmts) = node.statements() {
+            self.handle_statements(&stmts, false);
+        }
+        if let Some(e) = node.else_clause() {
+            self.next_ctx = BdCtx::OTHER;
+            self.visit(&e.as_node());
+        }
+    }
+
+    fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        self.next_ctx = BdCtx::SCOPE_TRUE;
+        self.visit(&node.predicate());
+        if let Some(stmts) = node.statements() {
+            self.handle_statements(&stmts, false);
+        }
+    }
+
+    fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        self.next_ctx = BdCtx::SCOPE_TRUE;
+        self.visit(&node.predicate());
+        if let Some(stmts) = node.statements() {
+            self.handle_statements(&stmts, false);
+        }
+    }
+
+    fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
+        if let Some(pred) = node.predicate() {
+            self.next_ctx = BdCtx::SCOPE_TRUE;
+            self.visit(&pred);
+        }
+        for cond in node.conditions().iter() {
+            self.next_ctx = BdCtx::OTHER;
+            self.visit(&cond);
+        }
+        if let Some(e) = node.else_clause() {
+            self.next_ctx = BdCtx::OTHER;
+            self.visit(&e.as_node());
+        }
+    }
+
+    fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
+        if let Some(pred) = node.predicate() {
+            self.next_ctx = BdCtx::SCOPE_TRUE;
+            self.visit(&pred);
+        }
+        for cond in node.conditions().iter() {
+            self.next_ctx = BdCtx::OTHER;
+            self.visit(&cond);
+        }
+        if let Some(e) = node.else_clause() {
+            self.next_ctx = BdCtx::OTHER;
+            self.visit(&e.as_node());
+        }
+    }
+
+    fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
+        self.next_ctx = BdCtx::SCOPE_TRUE;
+        self.visit(&node.left());
+        self.next_ctx = BdCtx::SCOPE_TRUE;
+        self.visit(&node.right());
+    }
+
+    fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
+        self.next_ctx = BdCtx::SCOPE_TRUE;
+        self.visit(&node.left());
+        self.next_ctx = BdCtx::SCOPE_TRUE;
+        self.visit(&node.right());
+    }
+
+    fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+        for e in node.elements().iter() {
+            self.next_ctx = BdCtx::SCOPE_TRUE;
+            self.visit(&e);
+        }
+    }
+
+    fn visit_range_node(&mut self, node: &ruby_prism::RangeNode<'pr>) {
+        if let Some(l) = node.left() {
+            self.next_ctx = BdCtx::SCOPE_TRUE;
+            self.visit(&l);
+        }
+        if let Some(r) = node.right() {
+            self.next_ctx = BdCtx::SCOPE_TRUE;
+            self.visit(&r);
+        }
+    }
+
+    fn visit_parentheses_node(&mut self, node: &ruby_prism::ParenthesesNode<'pr>) {
+        let ctx = std::mem::replace(&mut self.next_ctx, BdCtx::OTHER);
+        let Some(body) = node.body() else { return };
+        if let Some(stmts) = body.as_statements_node() {
+            let items: Vec<_> = stmts.body().iter().collect();
+            if items.len() == 1 {
+                self.next_ctx = BdCtx { used: ctx.used, scope: true, chained: false, chain_end: 0 };
+                self.visit(&items[0]);
+            } else {
+                self.handle_statements(&stmts, false);
+            }
+        } else {
+            self.next_ctx = BdCtx { used: ctx.used, scope: true, chained: false, chain_end: 0 };
+            self.visit(&body);
+        }
+    }
+
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.next_ctx = BdCtx::USED_ARG;
+        self.visit(&node.value());
+    }
+    fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
+        self.next_ctx = BdCtx::USED_ARG;
+        self.visit(&node.value());
+    }
+    fn visit_class_variable_write_node(&mut self, node: &ruby_prism::ClassVariableWriteNode<'pr>) {
+        self.next_ctx = BdCtx::USED_ARG;
+        self.visit(&node.value());
+    }
+    fn visit_global_variable_write_node(&mut self, node: &ruby_prism::GlobalVariableWriteNode<'pr>) {
+        self.next_ctx = BdCtx::USED_ARG;
+        self.visit(&node.value());
+    }
+    fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+        self.next_ctx = BdCtx::USED_ARG;
+        self.visit(&node.value());
+    }
+    fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+        self.next_ctx = BdCtx::USED_ARG;
+        self.visit(&node.value());
+    }
+    fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        for l in node.lefts().iter() {
+            self.next_ctx = BdCtx::OTHER;
+            self.visit(&l);
+        }
+        if let Some(r) = node.rest() {
+            self.next_ctx = BdCtx::OTHER;
+            self.visit(&r);
+        }
+        for r in node.rights().iter() {
+            self.next_ctx = BdCtx::OTHER;
+            self.visit(&r);
+        }
+        self.next_ctx = BdCtx::USED_ARG;
+        self.visit(&node.value());
+    }
+}
+
+impl<'a> Cops<'a> {
+    pub(crate) fn check_block_delimiters<'pr>(&mut self, root: &ruby_prism::Node<'pr>) {
+        use ruby_prism::Visit as _;
+        const COP: &str = "Style/BlockDelimiters";
+        if !self.on(COP) {
+            return;
+        }
+        let style = match self.cfg.enforced_style(COP) {
+            "semantic" => BdStyle::Semantic,
+            "braces_for_chaining" => BdStyle::BracesForChaining,
+            "always_braces" => BdStyle::AlwaysBraces,
+            _ => BdStyle::LineCountBased,
+        };
+        let procedural = bd_word_list(self.cfg, COP, "ProceduralMethods", BD_DEFAULT_PROCEDURAL);
+        let functional = bd_word_list(self.cfg, COP, "FunctionalMethods", BD_DEFAULT_FUNCTIONAL);
+        let braces_required = bd_word_list(self.cfg, COP, "BracesRequiredMethods", &[]);
+        let allow_oneliner = self.cfg.get(COP, "AllowBracesOnProceduralOneLiners") == Some("true");
+
+        let mut scan = BdIgnoreScan { ignored: Vec::new() };
+        scan.visit(root);
+
+        let mut walker = BdWalker {
+            cops: self,
+            style,
+            procedural,
+            functional,
+            braces_required,
+            allow_oneliner,
+            ignored: scan.ignored,
+            next_ctx: BdCtx::OTHER,
+        };
+        walker.visit(root);
+    }
+}
