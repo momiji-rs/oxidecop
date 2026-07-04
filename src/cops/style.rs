@@ -19071,3 +19071,263 @@ fn tcihl_last_item_precedes_newline(src: &[u8], node: &ruby_prism::HashNode, ele
     }
     i < text.len() && text[i] == b'\n'
 }
+
+
+// Style/SpecialGlobalVars ---------------------------------------------------
+//
+// Ported from rubocop's `on_gvar`. Perl-style globals ($: $; $$ $0 $! $@ $,
+// $/ $\ $. $_ $> $< $? $~ $= $*, plus $" and their English-library aliases)
+// vs. three `EnforcedStyle`s:
+//   - use_english_names (default): perl form -> its English alias(es), and
+//     (when `RequireEnglish`, the default) inserts `require 'English'`
+//     unless the chosen alias is a genuine Ruby builtin needing no require.
+//   - use_perl_names: any English alias -> its perl form.
+//   - use_builtin_english_names: like use_perl_names, except the 3 aliases
+//     that ARE genuine builtins ($LOAD_PATH/$LOADED_FEATURES/$PROGRAM_NAME)
+//     are themselves preferred over their perl forms ($:/$"/$0) — a
+//     reversal that applies to exactly those 3 pairs.
+//
+// SGV_TABLE mirrors upstream's `ENGLISH_VARS` hash verbatim (pre-merge, i.e.
+// only the 18 perl-key entries — the self-mapping upstream adds for every
+// alias is encoded here as "not a perl key => already correct", see below).
+// FIRST alias in each list is `use_english_names`'s replacement.
+type SgvEntry = (&'static [u8], &'static [&'static str]);
+const SGV_TABLE: &[SgvEntry] = &[
+    (b"$:", &["$LOAD_PATH"]),
+    (b"$\"", &["$LOADED_FEATURES"]),
+    (b"$0", &["$PROGRAM_NAME"]),
+    (b"$!", &["$ERROR_INFO"]),
+    (b"$@", &["$ERROR_POSITION"]),
+    (b"$;", &["$FIELD_SEPARATOR", "$FS"]),
+    (b"$,", &["$OUTPUT_FIELD_SEPARATOR", "$OFS"]),
+    (b"$/", &["$INPUT_RECORD_SEPARATOR", "$RS"]),
+    (b"$\\", &["$OUTPUT_RECORD_SEPARATOR", "$ORS"]),
+    (b"$.", &["$INPUT_LINE_NUMBER", "$NR"]),
+    (b"$_", &["$LAST_READ_LINE"]),
+    (b"$>", &["$DEFAULT_OUTPUT"]),
+    (b"$<", &["$DEFAULT_INPUT"]),
+    (b"$$", &["$PROCESS_ID", "$PID"]),
+    (b"$?", &["$CHILD_STATUS"]),
+    (b"$~", &["$LAST_MATCH_INFO"]),
+    (b"$=", &["$IGNORECASE"]),
+    (b"$*", &["$ARGV", "ARGV"]),
+];
+
+/// upstream's `NON_ENGLISH_VARS`: aliases that are genuine Ruby builtins,
+/// not sourced from the 'English' library (no require needed; "regular" in
+/// `format_message`'s english/regular partition).
+const SGV_NON_ENGLISH: &[&str] = &["$LOAD_PATH", "$LOADED_FEATURES", "$PROGRAM_NAME", "ARGV"];
+
+/// The 3 perl keys whose SOLE alias is one of the `SGV_NON_ENGLISH`
+/// builtins — `use_builtin_english_names` flips the preferred direction for
+/// exactly these pairs (prefer the builtin alias over its perl form).
+const SGV_BUILTIN_PERL_KEYS: &[&[u8]] = &[b"$:", b"$\"", b"$0"];
+
+fn sgv_lookup(name: &[u8]) -> Option<&'static SgvEntry> {
+    SGV_TABLE.iter().find(|entry| entry.0 == name || entry.1.iter().any(|a| a.as_bytes() == name))
+}
+
+/// `format_list`: `items.join('` or `')`, embedded between the template's
+/// own surrounding backticks.
+fn sgv_format_list(items: &[&str]) -> String {
+    items.join("` or `")
+}
+
+/// `RangeHelp#range_by_whole_lines(range, include_final_newline: true)` —
+/// used only to remove a stray top-level `require 'English'` line that a
+/// new one is about to supersede at the top of the file.
+fn sgv_whole_lines(src: &[u8], start: usize, end: usize) -> (usize, usize) {
+    let mut s = start;
+    while s > 0 && src[s - 1] != b'\n' {
+        s -= 1;
+    }
+    let mut e = end;
+    while e < src.len() && src[e] != b'\n' {
+        e += 1;
+    }
+    if e < src.len() {
+        e += 1;
+    }
+    (s, e)
+}
+
+impl<'a> super::Cops<'a> {
+    /// Offense anchor: the gvar node's own start offset (rubocop's
+    /// `add_offense(node)` default range).
+    pub(crate) fn check_special_global_vars(&mut self, node: &ruby_prism::GlobalVariableReadNode) {
+        const COP: &str = "Style/SpecialGlobalVars";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name();
+        let name = name.as_slice();
+        let Some(&(perl_key, aliases)) = sgv_lookup(name) else { return };
+        let style = self.cfg.enforced_style(COP);
+        let is_perl_key = name == perl_key;
+        let global_text = String::from_utf8_lossy(name).into_owned();
+
+        // (message, preferred replacement text, "may need `require
+        // 'English'`" — only ever true for `use_english_names`, mirroring
+        // `should_require_english?`'s `style == :use_english_names` gate).
+        let (msg, preferred_first, may_require_english): (String, String, bool) = match style {
+            "use_english_names" => {
+                if !is_perl_key {
+                    return; // already one of its own aliases: correct style, no offense
+                }
+                let (regular, english): (Vec<&str>, Vec<&str>) =
+                    aliases.iter().copied().partition(|a| SGV_NON_ENGLISH.contains(a));
+                let msg = if regular.is_empty() {
+                    format!(
+                        "Prefer `{}` from the stdlib 'English' module (don't forget to require it) over `{}`.",
+                        sgv_format_list(&english),
+                        global_text
+                    )
+                } else if english.is_empty() {
+                    format!("Prefer `{}` over `{}`.", sgv_format_list(&regular), global_text)
+                } else {
+                    format!(
+                        "Prefer `{}` from the stdlib 'English' module (don't forget to require it) or `{}` over `{}`.",
+                        sgv_format_list(&english),
+                        sgv_format_list(&regular),
+                        global_text
+                    )
+                };
+                (msg, aliases[0].to_string(), true)
+            }
+            "use_perl_names" => {
+                if is_perl_key {
+                    return; // already the perl form: correct style, no offense
+                }
+                let preferred = String::from_utf8_lossy(perl_key).into_owned();
+                let msg = format!("Prefer `{}` over `{}`.", preferred, global_text);
+                (msg, preferred, false)
+            }
+            "use_builtin_english_names" => {
+                let is_special = SGV_BUILTIN_PERL_KEYS.contains(&perl_key);
+                if is_perl_key {
+                    if is_special {
+                        let preferred = aliases[0].to_string();
+                        let msg = format!("Prefer `{}` over `{}`.", preferred, global_text);
+                        (msg, preferred, false)
+                    } else {
+                        return; // e.g. `$$`, `$*`, ... : correct as-is under this style
+                    }
+                } else if is_special {
+                    return; // the builtin alias itself (`$LOAD_PATH` et al): correct
+                } else {
+                    let preferred = String::from_utf8_lossy(perl_key).into_owned();
+                    let msg = format!("Prefer `{}` over `{}`.", preferred, global_text);
+                    (msg, preferred, false)
+                }
+            }
+            _ => return,
+        };
+
+        let offset = node.location().start_offset();
+        self.push(offset, COP, true, &msg);
+
+        // `replacement`/`autocorrect`'s "climb through sole-child begin
+        // wrappers" ported as two shapes (the only ones prism/our visitor
+        // can materialize without parent pointers):
+        //   - braceless `"#$var"` (prism's `EmbeddedVariableNode`): node
+        //     stays the gvar itself (its own span excludes the pre-existing
+        //     `#`); `sgv_in_embedded_var` + `sgv_brace_eligible` says
+        //     whether the enclosing literal is dstr/xstr/regexp (not dsym).
+        //   - braced `"#{$var}"` where the gvar is the SOLE statement:
+        //     upstream climbs to the translated "begin" node, whose own
+        //     range (rubocop-ast's prism translation) spans the WHOLE
+        //     `#{...}` including delimiters — `sgv_climb` records that
+        //     range plus the outer literal's own eligibility.
+        let loc = node.location();
+        let (repl_start, repl_end, brace_eligible, climbed) =
+            if let Some(&(es, ee, elig)) = self.sgv_climb.get(&offset) {
+                (es, ee, elig, true)
+            } else if self.sgv_in_embedded_var {
+                (loc.start_offset(), loc.end_offset(), self.sgv_brace_eligible, false)
+            } else {
+                (loc.start_offset(), loc.end_offset(), false, false)
+            };
+        let replacement = if !brace_eligible {
+            preferred_first.clone()
+        } else if style == "use_english_names" {
+            if climbed {
+                format!("#{{{preferred_first}}}")
+            } else {
+                format!("{{{preferred_first}}}")
+            }
+        } else {
+            format!("#{preferred_first}")
+        };
+        self.fixes.push((repl_start, repl_end, replacement.into_bytes()));
+
+        if may_require_english
+            && self.cfg.get(COP, "RequireEnglish") == Some("true")
+            && !SGV_NON_ENGLISH.contains(&preferred_first.as_str())
+        {
+            self.sgv_ensure_english_required(offset);
+        }
+    }
+
+    /// Mirrors `RequireLibrary#ensure_required` + `RequireLibraryCorrector`:
+    /// inserts `require 'English'\n` before the file's first top-level
+    /// statement, unless a top-level `require 'English'` already precedes
+    /// (in source order) the top-level statement containing this offense —
+    /// then it's a no-op. A top-level `require 'English'` that instead
+    /// comes AFTER gets removed (whole line) since the new one always goes
+    /// at the very top. `@required_english`'s per-file "already handled"
+    /// latch is `self.sgv_required_english`.
+    fn sgv_ensure_english_required(&mut self, offense_offset: usize) {
+        if self.sgv_required_english {
+            return;
+        }
+        let stmts = self.sgv_top_stmts.clone();
+        let Some(stmt_idx) =
+            stmts.iter().position(|&(s, e, _)| s <= offense_offset && offense_offset < e)
+        else {
+            return;
+        };
+        self.sgv_required_english = true;
+        if stmts[..stmt_idx].iter().any(|&(_, _, is_req)| is_req) {
+            return;
+        }
+        for &(s, e, is_req) in &stmts[stmt_idx + 1..] {
+            if is_req {
+                let (rs, re) = sgv_whole_lines(self.src, s, e);
+                self.fixes.push((rs, re, Vec::new()));
+            }
+        }
+        let first_start = stmts[0].0;
+        self.fixes.push((first_start, first_start, b"require 'English'\n".to_vec()));
+    }
+
+    /// `RequireLibrary#require_any_library?`/`require_library_name?`:
+    /// `(send {(const {nil? cbase} :Kernel) nil?} :require (str "English"))`
+    /// — exactly a bare (or `Kernel.`/`::Kernel.`-qualified) `require` call
+    /// with a single plain string argument naming the library, no block.
+    /// Only ever consulted for Program's own direct top-level statements
+    /// (mirrors upstream's `on_send` early-`return if node.parent&.parent?`
+    /// restricting `@required_libs` bookkeeping to top-level requires).
+    pub(crate) fn sgv_is_require_english(&self, node: &ruby_prism::Node) -> bool {
+        let Some(call) = node.as_call_node() else { return false };
+        if call.name().as_slice() != b"require" || call.block().is_some() {
+            return false;
+        }
+        if let Some(recv) = call.receiver() {
+            let is_kernel = recv
+                .as_constant_read_node()
+                .is_some_and(|c| c.name().as_slice() == b"Kernel")
+                || recv
+                    .as_constant_path_node()
+                    .is_some_and(|c| c.parent().is_none() && c.name().is_some_and(|n| n.as_slice() == b"Kernel"));
+            if !is_kernel {
+                return false;
+            }
+        }
+        let Some(args) = call.arguments() else { return false };
+        let items: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        if items.len() != 1 {
+            return false;
+        }
+        items[0].as_string_node().is_some_and(|s| s.unescaped() == b"English")
+    }
+}

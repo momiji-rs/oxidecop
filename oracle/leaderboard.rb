@@ -285,6 +285,7 @@ COPS = {
   'Lint/RedundantCopEnableDirective' => 'lint/redundant_cop_enable_directive',
   'Style/TrailingCommaInHashLiteral' => 'style/trailing_comma_in_hash_literal',
   'Metrics/ModuleLength'             => 'metrics/module_length',
+  'Style/SpecialGlobalVars'          => 'style/special_global_vars',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

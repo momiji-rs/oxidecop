@@ -311,6 +311,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/MethodCallWithoutArgsParentheses", "Style/Alias", "Style/RaiseArgs", "Style/MethodDefParentheses",
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
+    "Style/SpecialGlobalVars",
 ];
 
 impl Engine {
@@ -1263,6 +1264,38 @@ pub(crate) struct Cops<'a> {
     // (`register_offense(expr, nil)` -> `AlignmentCorrector.correct` no-ops
     // on a nil node) so the two rewrites don't collide in one pass.
     pub(crate) aa_registered_ranges: Vec<(usize, usize)>,
+    // Style/SpecialGlobalVars: per-file `@required_english` flag — once a
+    // `require 'English'` has been inserted (or was already present at the
+    // relevant top-level position) for one offense, later offenses in the
+    // same file must not insert a second one.
+    pub(crate) sgv_required_english: bool,
+    // Style/SpecialGlobalVars: `(start_offset, end_offset, is_require_english)`
+    // for each of the Program's own top-level statements, computed once in
+    // `visit_program_node` — mirrors rubocop's `RequireLibrary#ensure_required`
+    // climbing every ancestor up to the root and consulting `@required_libs`/
+    // `right_siblings`, which prism's parent-less nodes can't do directly.
+    pub(crate) sgv_top_stmts: Vec<(usize, usize, bool)>,
+    // Style/SpecialGlobalVars: true while visiting the `variable` of an
+    // `EmbeddedVariableNode` (prism's dedicated node for the braceless
+    // `"#$gvar"`/`"#@ivar"` interpolation shorthand) — upstream's
+    // `node.parent&.type` being `:dstr`/`:xstr`/`:regexp` (only true for
+    // THIS braceless form, never for a braced `"#{$gvar}"`, whose gvar's
+    // parent is an intervening statements node) decides whether the
+    // autocorrect replacement needs its own `{}` added.
+    pub(crate) sgv_in_embedded_var: bool,
+    // Style/SpecialGlobalVars: whether the CURRENT innermost interpolated
+    // literal (set right before descending into its `parts()`) is one of
+    // upstream's brace-eligible parent types (`:dstr`/`:xstr`/`:regexp` —
+    // ordinary/x/regexp string literals) as opposed to `:dsym` (interpolated
+    // symbol, e.g. `:"#$:"`), which upstream's own `%i[dstr xstr
+    // regexp].include?` deliberately excludes: a braceless `#$var` inside a
+    // dsym is autocorrected WITHOUT adding braces (arguably a rubocop
+    // oddity, but this ports it verbatim).
+    pub(crate) sgv_brace_eligible: bool,
+    // Style/SpecialGlobalVars: gvar start offset -> (embedded-statements
+    // node's own start/end offsets, outer-literal brace eligibility) — see
+    // `visit_embedded_statements_node`'s doc.
+    pub(crate) sgv_climb: HashMap<usize, (usize, usize, bool)>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -1546,7 +1579,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.ll_dstr_delim.push(d);
         }
         self.interpolated_node_depth += 1;
+        let prev_brace_eligible = self.sgv_brace_eligible;
+        self.sgv_brace_eligible = true;
         ruby_prism::visit_interpolated_string_node(self, node);
+        self.sgv_brace_eligible = prev_brace_eligible;
         self.interpolated_node_depth -= 1;
         if delim.is_some() {
             self.ll_dstr_delim.pop();
@@ -1558,7 +1594,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_interpolated_symbol_node(&mut self, node: &ruby_prism::InterpolatedSymbolNode<'pr>) {
         self.check_lii_dsym(node);
+        let prev_brace_eligible = self.sgv_brace_eligible;
+        self.sgv_brace_eligible = false;
         ruby_prism::visit_interpolated_symbol_node(self, node);
+        self.sgv_brace_eligible = prev_brace_eligible;
     }
     fn visit_interpolated_regular_expression_node(
         &mut self,
@@ -1566,7 +1605,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     ) {
         self.check_lii_iregexp(node);
         self.interpolated_node_depth += 1;
+        let prev_brace_eligible = self.sgv_brace_eligible;
+        self.sgv_brace_eligible = true;
         ruby_prism::visit_interpolated_regular_expression_node(self, node);
+        self.sgv_brace_eligible = prev_brace_eligible;
         self.interpolated_node_depth -= 1;
     }
     fn visit_interpolated_x_string_node(&mut self, node: &ruby_prism::InterpolatedXStringNode<'pr>) {
@@ -1576,7 +1618,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_closing_heredoc_indentation(Some(node.opening_loc()), Some(node.closing_loc()));
         self.xstr_interp_base.push(self.interp_depth);
         self.interpolated_node_depth += 1;
+        let prev_brace_eligible = self.sgv_brace_eligible;
+        self.sgv_brace_eligible = true;
         ruby_prism::visit_interpolated_x_string_node(self, node);
+        self.sgv_brace_eligible = prev_brace_eligible;
         self.interpolated_node_depth -= 1;
         self.xstr_interp_base.pop();
     }
@@ -1920,6 +1965,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_global_variable_read_node(&mut self, node: &ruby_prism::GlobalVariableReadNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
         self.check_perl_backrefs_gvar(node);
+        self.check_special_global_vars(node);
     }
     fn visit_global_variable_write_node(&mut self, node: &ruby_prism::GlobalVariableWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
@@ -2799,12 +2845,35 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_embedded_variable_node(&mut self, node: &ruby_prism::EmbeddedVariableNode<'pr>) {
         self.check_variable_interpolation(node);
+        let prev = self.sgv_in_embedded_var;
+        self.sgv_in_embedded_var = true;
         ruby_prism::visit_embedded_variable_node(self, node);
+        self.sgv_in_embedded_var = prev;
     }
     fn visit_embedded_statements_node(&mut self, node: &ruby_prism::EmbeddedStatementsNode<'pr>) {
         self.check_space_inside_string_interpolation(node);
         self.check_redundant_string_coercion_in_interpolation(node);
         self.check_empty_interpolation(node);
+        // Style/SpecialGlobalVars: `"#{$var}"` with NOTHING but the gvar
+        // inside the braces is upstream's `node.parent&.begin_type? &&
+        // node.parent.children.one?` climb target — the translated
+        // "begin" node there is really THIS embedded-statements node
+        // itself, whose own `loc.expression` (rubocop-ast's prism
+        // translation) spans the WHOLE `#{...}` including its own `#{`/`}`
+        // delimiters. Recorded here (keyed by the sole gvar's own start
+        // offset) so the offense side doesn't need parent pointers.
+        if let Some(stmts) = node.statements() {
+            let body: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+            if body.len() == 1 {
+                if let Some(gvar) = body[0].as_global_variable_read_node() {
+                    let eloc = node.location();
+                    self.sgv_climb.insert(
+                        gvar.location().start_offset(),
+                        (eloc.start_offset(), eloc.end_offset(), self.sgv_brace_eligible),
+                    );
+                }
+            }
+        }
         self.interp_depth += 1;
         ruby_prism::visit_embedded_statements_node(self, node);
         self.interp_depth -= 1;
@@ -2816,6 +2885,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.class_children_stack.push(Self::direct_child_classes(&Some(node.statements().as_node())));
         self.exception_siblings_stack.push(Self::direct_child_defs(&Some(node.statements().as_node())));
         let top_body = node.statements().body();
+        self.sgv_top_stmts = top_body
+            .iter()
+            .map(|n| {
+                let loc = n.location();
+                (loc.start_offset(), loc.end_offset(), self.sgv_is_require_english(&n))
+            })
+            .collect();
         self.top_level_sole_stmt = if top_body.len() == 1 {
             top_body.first().map(|n| n.location().start_offset())
         } else {
@@ -3771,6 +3847,11 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         el_offended: HashSet::new(),
         else_layout_seen: HashSet::new(),
         top_level_sole_stmt: None,
+        sgv_required_english: false,
+        sgv_top_stmts: Vec::new(),
+        sgv_in_embedded_var: false,
+        sgv_brace_eligible: false,
+        sgv_climb: HashMap::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         rs_scope_stack: Vec::new(),
