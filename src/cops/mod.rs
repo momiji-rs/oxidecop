@@ -312,7 +312,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/SafeNavigationConsistency", "Style/HashTransformKeys", "Style/SymbolArray", "Style/HashTransformValues",
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
-    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator",
+    "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray",
 ];
 
 impl Engine {
@@ -614,6 +614,16 @@ pub(crate) struct Cops<'a> {
     pub(crate) percent_sym_spans: Vec<(usize, usize)>,
     // Spans of ANY percent-literal array — Lint/EmptyInterpolation skips those.
     pub(crate) percent_arr_spans: Vec<(usize, usize)>,
+    // Style/WordArray: one entry per currently-open `ArrayNode` (pushed on
+    // entry, popped on exit) — `true` when THAT array is a "matrix" (all of
+    // its own elements are arrays, and at least one sub-array has complex
+    // content per `WordRegex`), mirroring `matrix_of_complex_content?`. A
+    // child array's own check peeks at the top (its immediate parent) to
+    // answer `within_matrix_of_complex_content?` in O(1), no real parent
+    // pointers needed. (Approximation: this is the nearest ENCLOSING array
+    // node, not necessarily the strict AST parent if a non-array node sits
+    // between them — not exercised by the fixture.)
+    pub(crate) wa_matrix_stack: Vec<bool>,
     // Inner `File.dirname` calls claimed by an outer chain (NestedFileDirname).
     pub(crate) dirname_ignore: Vec<usize>,
     // Innermost statement-list span starts — Lint/DuplicateRequire scopes by it.
@@ -2786,6 +2796,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_percent_symbol_array(node);
         self.check_percent_string_array(node);
         self.check_symbol_array(node);
+        self.check_word_array(node);
         self.check_min_max_array(node);
         self.check_space_inside_percent_literal_delimiters_array(node);
         if self.ll_active {
@@ -2846,7 +2857,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         }
         self.check_array_alignment(node);
+        let wa_matrix = self.wa_matrix_complex(node);
+        self.wa_matrix_stack.push(wa_matrix);
         ruby_prism::visit_array_node(self, node);
+        self.wa_matrix_stack.pop();
         self.ll_exit_collection();
     }
     fn visit_assoc_node(&mut self, node: &ruby_prism::AssocNode<'pr>) {
@@ -3829,6 +3843,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         num_ignore: Vec::new(),
         percent_sym_spans: Vec::new(),
         percent_arr_spans: Vec::new(),
+        wa_matrix_stack: Vec::new(),
         dirname_ignore: Vec::new(),
         stmts_stack: Vec::new(),
         unless_else_spans: Vec::new(),

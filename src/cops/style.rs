@@ -19848,3 +19848,412 @@ fn tcial_last_item_precedes_newline(src: &[u8], node: &ruby_prism::ArrayNode, el
     }
     i < text.len() && text[i] == b'\n'
 }
+
+// ---------------------------------------------------------------------------
+// Style/WordArray
+//
+// Ported from rubocop's `Style::WordArray` + its `ArrayMinSize`/
+// `ArraySyntax`/`PercentArray` mixins + `PercentLiteralCorrector`. Structurally
+// a near-twin of `Style/SymbolArray` above (same two directions, same
+// MinSize/comment/style gating) — the `sa_*` helpers for generic string
+// literal rendering (`sa_to_string_literal`, `sa_inspect_body`,
+// `sa_escape_string`, `sa_needs_escaping`, `sa_single_quote_body`,
+// `sa_trim_interp_escape`, `sa_substitute_escaped_delimiters`,
+// `sa_preferred_delimiters`) are Ruby `Util`/`PreferredDelimiters` generics,
+// not symbol-specific, and are reused verbatim. Only genuinely word-specific
+// bits are new here: string (not symbol) element content, `WordRegex`
+// matching (`complex_content?` here checks the regex — or skips it entirely
+// for the percent-forced-brackets direction, `complex_regex: false` in
+// upstream — plus encoding validity and space), heredoc exclusion, and the
+// "matrix of complex content" 2D-array guard (`within_matrix_of_complex_content?`,
+// modeled via `wa_matrix_stack`/`wa_matrix_complex` — see mod.rs's
+// `visit_array_node`, which pushes/pops a `bool` per currently-open array
+// instead of needing real parent pointers).
+//
+// NOT modeled (see final report): `invalid_percent_array_context?` (bare
+// ambiguous-block-call guard) and the `array_style_detected`/
+// `config_to_allow_offenses`/`largest_brackets` `--auto-gen-config`
+// bookkeeping — neither is observable through the oracle's offense/
+// correction-only comparison (same precedent as `Style/SymbolArray`).
+// ---------------------------------------------------------------------------
+impl<'a> super::Cops<'a> {
+    /// `on_array`.
+    pub(crate) fn check_word_array<'x>(&mut self, node: &ruby_prism::ArrayNode<'x>) {
+        const COP: &str = "Style/WordArray";
+        if !self.on(COP) {
+            return;
+        }
+        let elements: Vec<ruby_prism::Node<'x>> = node.elements().iter().collect();
+        let opening = node.opening_loc();
+        let is_bracket = opening.as_ref().is_some_and(|o| o.as_slice().first() == Some(&b'['));
+        if is_bracket {
+            if elements.is_empty() || !elements.iter().all(|e| e.as_string_node().is_some()) {
+                return;
+            }
+            if elements.iter().any(|e| wa_is_heredoc(e)) {
+                return;
+            }
+            let word_regex = self.wa_word_regex();
+            if wa_complex_content(&elements, word_regex.as_ref()) {
+                return;
+            }
+            if self.wa_matrix_stack.last() == Some(&true) {
+                return;
+            }
+            self.check_word_array_bracketed(node, &elements, COP);
+        } else if opening.as_ref().is_some_and(|o| {
+            let s = o.as_slice();
+            s.starts_with(b"%w") || s.starts_with(b"%W")
+        }) {
+            self.check_word_array_percent(node, &elements, COP);
+        }
+    }
+
+    /// `matrix_of_complex_content?`, evaluated eagerly for every `ArrayNode`
+    /// as it's ENTERED (before recursing into its children) and pushed onto
+    /// `wa_matrix_stack`; a child peeks at the top of that stack (its
+    /// immediate enclosing array) to answer `within_matrix_of_complex_content?`
+    /// in O(1) — see the stack field's doc comment in `mod.rs`.
+    pub(crate) fn wa_matrix_complex(&self, node: &ruby_prism::ArrayNode) -> bool {
+        const COP: &str = "Style/WordArray";
+        if !self.on(COP) {
+            return false;
+        }
+        let elements: Vec<ruby_prism::Node> = node.elements().iter().collect();
+        if elements.is_empty() || !elements.iter().all(|e| e.as_array_node().is_some()) {
+            return false;
+        }
+        let word_regex = self.wa_word_regex();
+        elements.iter().any(|e| {
+            let sub = e.as_array_node().expect("checked above");
+            let sub_elements: Vec<ruby_prism::Node> = sub.elements().iter().collect();
+            wa_complex_content(&sub_elements, word_regex.as_ref())
+        })
+    }
+
+    /// `check_bracketed_array` (bracket -> percent direction).
+    fn check_word_array_bracketed<'x>(
+        &mut self,
+        node: &ruby_prism::ArrayNode<'x>,
+        elements: &[ruby_prism::Node<'x>],
+        cop: &'static str,
+    ) {
+        let l = node.location();
+        // `allowed_bracket_array?`: comments inside a multiline array, fewer
+        // elements than MinSize. (The third guard, `invalid_percent_array_context?`
+        // — a bare `foo ['a', 'b'] { }` ambiguous-block call — is not modeled;
+        // see final report.)
+        if self.block_has_inner_comment(l.start_offset(), l.end_offset()) {
+            return;
+        }
+        if elements.len() < self.cfg.int(cop, "MinSize") {
+            return;
+        }
+        if self.cfg.enforced_style(cop) != "percent" {
+            return;
+        }
+        self.push(l.start_offset(), cop, true, "Use `%w` or `%W` for an array of words.");
+
+        let escape = elements
+            .iter()
+            .any(|e| e.as_string_node().is_some_and(|s| wa_needs_escaping(s.unescaped())));
+        let delimiters = self.sa_preferred_delimiters();
+        let multiline = self.idx.loc(l.start_offset()).0
+            != self.idx.loc(l.end_offset().saturating_sub(1)).0;
+        let contents = if multiline {
+            self.wa_multiline_contents(node, elements, escape, delimiters)
+        } else {
+            let mut buf = Vec::new();
+            for (i, e) in elements.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b' ');
+                }
+                buf.extend(wa_fix_escaped_content(e, escape, delimiters));
+            }
+            buf
+        };
+        let mut repl = vec![b'%', if escape { b'W' } else { b'w' }, delimiters.0];
+        repl.extend(contents);
+        repl.push(delimiters.1);
+        self.fixes.push((l.start_offset(), l.end_offset(), repl));
+    }
+
+    /// `check_percent_array` (percent -> bracket direction).
+    fn check_word_array_percent<'x>(
+        &mut self,
+        node: &ruby_prism::ArrayNode<'x>,
+        elements: &[ruby_prism::Node<'x>],
+        cop: &'static str,
+    ) {
+        // `invalid_percent_array_contents?`: `complex_content?(values, complex_regex: false)`
+        // — encoding validity + space only, WordRegex not consulted.
+        let brackets_required = wa_complex_content(elements, None);
+        let style = self.cfg.enforced_style(cop);
+        if style != "brackets" && !brackets_required {
+            return;
+        }
+        let bracketed = wa_build_bracketed_array(node, elements, self.src);
+        let prefer = if bracketed.contains(&b'\n') {
+            "an array literal `[...]`".to_string()
+        } else {
+            format!("`{}`", String::from_utf8_lossy(&bracketed))
+        };
+        let l = node.location();
+        self.push(l.start_offset(), cop, true, format!("Use {prefer} for an array of words."));
+        self.fixes.push((l.start_offset(), l.end_offset(), bracketed));
+    }
+
+    /// `word_regex` — `Regexp.new(cop_config['WordRegex'])`. The default
+    /// value is a `Regexp` in rubocop's own `config/default.yml`
+    /// (`!ruby/regexp`), which `tools/gen_schema.rb` doesn't capture into the
+    /// generated string-keyed `SCHEMA` (see the brief's ARRAY-default note —
+    /// same idea, different YAML scalar kind); hardcode rubocop's own default
+    /// pattern as the `None` fallback. A configured value arrives from the
+    /// oracle either as a raw `/pattern/` literal (regex-literal cop_config
+    /// value) or bare pattern text (a plain-string cop_config value) — strip
+    /// a matching leading/trailing `/` pair when present. Onigmo's `\p{Word}`
+    /// (letters + marks + digits + connector-punctuation + join-control) is
+    /// exactly Rust regex's Unicode-mode `\w`, which Rust's `regex` crate
+    /// doesn't accept spelled as a `\p{}` property name — substitute textually.
+    fn wa_word_regex(&self) -> Option<regex::Regex> {
+        const COP: &str = "Style/WordArray";
+        const DEFAULT: &str = r"\A(?:\p{Word}|\p{Word}-\p{Word}|\n|\t)+\z";
+        let raw = self.cfg.get(COP, "WordRegex").unwrap_or(DEFAULT);
+        let raw = raw.trim();
+        let inner = if raw.len() >= 2 && raw.starts_with('/') && raw.ends_with('/') {
+            &raw[1..raw.len() - 1]
+        } else {
+            raw
+        };
+        let pattern = inner.replace("\\p{Word}", "\\w");
+        regex::Regex::new(&pattern).ok()
+    }
+
+    /// `PercentLiteralCorrector#autocorrect_multiline_words` +
+    /// `process_multiline_words`/`line_breaks`/`process_lines`/`end_content`
+    /// — see `sa_multiline_contents`'s doc comment (identical shape, string
+    /// content instead of symbol content).
+    fn wa_multiline_contents<'x>(
+        &self,
+        node: &ruby_prism::ArrayNode<'x>,
+        elements: &[ruby_prism::Node<'x>],
+        escape: bool,
+        delimiters: (u8, u8),
+    ) -> Vec<u8> {
+        let arr_loc = node.location();
+        let array_first_line = self.idx.loc(arr_loc.start_offset()).0;
+        let mut prev_last_line = array_first_line;
+        let mut out = Vec::new();
+        for (i, el) in elements.iter().enumerate() {
+            let el_loc = el.location();
+            let start = el_loc.start_offset();
+            let end = el_loc.end_offset();
+            let cur_first_line = self.idx.loc(start).0;
+            if cur_first_line == prev_last_line {
+                if !(i == 0 && cur_first_line == array_first_line) {
+                    out.push(b' ');
+                }
+            } else {
+                out.push(b'\n');
+                let from = self.idx.starts[prev_last_line];
+                out.extend_from_slice(&self.src[from..start]);
+            }
+            out.extend(wa_fix_escaped_content(el, escape, delimiters));
+            prev_last_line = self.idx.loc(end.saturating_sub(1).max(start)).0;
+        }
+        if let Some(close) = node.closing_loc() {
+            let close_start = close.start_offset();
+            let close_line = self.idx.loc(close_start).0;
+            let line_start = self.idx.starts[close_line - 1];
+            let prefix = &self.src[line_start..close_start];
+            if prefix.iter().all(|&b| b == b' ' || b == b'\t') {
+                out.push(b'\n');
+                out.extend_from_slice(prefix);
+            }
+        }
+        out
+    }
+}
+
+/// `StrNode#heredoc?` for a plain (non-interpolated) string element — a
+/// heredoc string's `opening` always starts with `<<`.
+fn wa_is_heredoc(node: &ruby_prism::Node) -> bool {
+    node.as_string_node()
+        .is_some_and(|s| s.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"<<")))
+}
+
+/// `PercentArray#complex_content?`: `str_content` only fires for a plain
+/// `str`-type node (Ruby's `def_node_matcher :str_content, '(str $_)'` —
+/// nil, i.e. skipped, for a `dstr`/interpolated element), so an interpolated
+/// word never contributes to (or blocks) the verdict either way. Otherwise,
+/// after forcing the content to UTF-8: invalid encoding, OR (when a
+/// `word_regex` is given — the percent-forced-brackets direction passes
+/// `None` to skip this clause entirely, matching `complex_regex: false`) the
+/// regex failing to match ANYWHERE in the content (`Regexp#match?` is an
+/// unanchored search — only the DEFAULT/most configs' own `\A`/`\z` anchors
+/// make this "must match the whole string"), OR a literal space, marks the
+/// whole array complex.
+fn wa_complex_content(elements: &[ruby_prism::Node], word_regex: Option<&regex::Regex>) -> bool {
+    for el in elements {
+        let Some(s) = el.as_string_node() else { continue };
+        let content = s.unescaped();
+        match std::str::from_utf8(content) {
+            Err(_) => return true,
+            Ok(text) => {
+                if let Some(re) = word_regex {
+                    if !re.is_match(text) {
+                        return true;
+                    }
+                }
+                if content.contains(&b' ') {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `PercentLiteralCorrector#fix_escaped_content`, string-element form (see
+/// `sa_fix_escaped_content` for the symbol-element original): the decoded
+/// string content, `escape_string`-escaped when ANY element in the array
+/// needed it (global, not per-element), then delimiter-escaped per
+/// `sa_substitute_escaped_delimiters`.
+fn wa_fix_escaped_content(el: &ruby_prism::Node, escape: bool, delimiters: (u8, u8)) -> Vec<u8> {
+    let content = el.as_string_node().map(|s| s.unescaped().to_vec()).unwrap_or_default();
+    let mut content = if escape { wa_escape_string(&content) } else { content };
+    sa_substitute_escaped_delimiters(&mut content, delimiters);
+    content
+}
+
+/// Ruby's `String#inspect`, minus the outer quotes — a word-array-local twin
+/// of `sa_inspect_body` (NOT shared with `Style/SymbolArray`, per the brief's
+/// "don't touch existing cop logic": `sa_inspect_body` renders C0/DEL bytes
+/// as `\xHH`, which is what real Ruby does for a BINARY-encoded or
+/// invalid-as-UTF-8 string — but every string that reaches this function has
+/// already passed `wa_complex_content`'s `str::from_utf8` check, so it is
+/// always valid UTF-8, and real Ruby's `.inspect` renders a valid-UTF-8
+/// string's C0/DEL bytes as `\u00XX` (4-digit uppercase hex) instead. Probed
+/// live: `"\x1f".dup.force_encoding("UTF-8").inspect` => `""` vs
+/// `String.new("\x1f", encoding: "ASCII-8BIT").inspect` => `"\x1F"`.)
+fn wa_inspect_body(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let b = s[i];
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'#' if matches!(s.get(i + 1), Some(b'{') | Some(b'@') | Some(b'$')) => {
+                out.extend_from_slice(b"\\#");
+            }
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            0x0b => out.extend_from_slice(b"\\v"),
+            0x07 => out.extend_from_slice(b"\\a"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x1b => out.extend_from_slice(b"\\e"),
+            0x00..=0x1f | 0x7f => out.extend_from_slice(format!("\\u{b:04X}").as_bytes()),
+            _ => out.push(b),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `Util#escape_string`: `inspect`'s body, with `\"` reverted to a bare `"`
+/// — the word-array-local twin of `sa_escape_string` (see `wa_inspect_body`).
+fn wa_escape_string(s: &[u8]) -> Vec<u8> {
+    let body = wa_inspect_body(s);
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] == b'\\' && body.get(i + 1) == Some(&b'"') {
+            out.push(b'"');
+            i += 2;
+        } else {
+            out.push(body[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `Util#needs_escaping?` — the word-array-local twin of `sa_needs_escaping`.
+fn wa_needs_escaping(s: &[u8]) -> bool {
+    double_quotes_required(&wa_escape_string(s))
+}
+
+/// `Util#to_string_literal` — the word-array-local twin of
+/// `sa_to_string_literal` (see `wa_inspect_body`).
+fn wa_to_string_literal(s: &[u8]) -> Vec<u8> {
+    if wa_needs_escaping(s) {
+        let mut out = vec![b'"'];
+        out.extend(wa_inspect_body(s));
+        out.push(b'"');
+        out
+    } else {
+        let mut out = vec![b'\''];
+        out.extend(sa_single_quote_body(s));
+        out.push(b'\'');
+        out
+    }
+}
+
+/// `WordArray#build_bracketed_array` +
+/// `PercentArray#build_bracketed_array_with_appropriate_whitespace`: each
+/// `%w`/`%W` word rendered as a bracket-form string literal (raw source +
+/// `to_string_literal`/interpolation-trim for a `%W` interpolated word,
+/// `to_string_literal` off the decoded value otherwise — see
+/// `sa_build_bracketed_array` for the symbol-element original this mirrors),
+/// joined with the ORIGINAL whitespace between the array's first two
+/// elements (reused for every gap) and wrapped in the array's own
+/// leading/trailing whitespace.
+fn wa_build_bracketed_array(
+    node: &ruby_prism::ArrayNode,
+    elements: &[ruby_prism::Node],
+    src: &[u8],
+) -> Vec<u8> {
+    if elements.is_empty() {
+        return b"[]".to_vec();
+    }
+    let words: Vec<Vec<u8>> = elements
+        .iter()
+        .map(|e| {
+            if let Some(d) = e.as_interpolated_string_node() {
+                let l = d.location();
+                let raw = &src[l.start_offset()..l.end_offset()];
+                let string_literal = wa_to_string_literal(raw);
+                sa_trim_interp_escape(&string_literal)
+            } else if let Some(s) = e.as_string_node() {
+                wa_to_string_literal(s.unescaped())
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    let open = node.opening_loc().expect("percent array has an opening delimiter");
+    let close = node.closing_loc().expect("percent array has a closing delimiter");
+    let leading = &src[open.end_offset()..elements[0].location().start_offset()];
+    let between: Vec<u8> = if elements.len() >= 2 {
+        src[elements[0].location().end_offset()..elements[1].location().start_offset()].to_vec()
+    } else {
+        b" ".to_vec()
+    };
+    let trailing = &src[elements[elements.len() - 1].location().end_offset()..close.start_offset()];
+    let mut out = vec![b'['];
+    out.extend_from_slice(leading);
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+            out.extend_from_slice(&between);
+        }
+        out.extend_from_slice(w);
+    }
+    out.extend_from_slice(trailing);
+    out.push(b']');
+    out
+}
+
