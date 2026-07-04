@@ -13507,6 +13507,9 @@ impl<'a> super::Cops<'a> {
     /// non-branch value never reaches here directly as a "parent" in that
     /// sense, so passing it straight through matches exactly).
     pub(crate) fn check_void_expr(&mut self, node: &ruby_prism::Node, no_autocorrect: bool) {
+        if !self.on(Self::COP) {
+            return;
+        }
         if let Some(if_node) = node.as_if_node() {
             // `check_if_expression`: ONLY the truthy/then branch — upstream
             // never looks at `else_branch` at all (a real asymmetry, kept
