@@ -31758,3 +31758,212 @@ fn ium_find_excessive_range(
     }
     Some((begin, end))
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/FormatString — enforces a single formatting utility per
+    /// `EnforcedStyle` (`format`, default; `sprintf`; `percent` for
+    /// `String#%`). Mirrors upstream's `formatter` node-matcher, which is a
+    /// 3-way union:
+    ///   - `(send nil? {:sprintf :format} _ _ ...)`: a receiverless
+    ///     `format`/`sprintf` call with >= 2 args.
+    ///   - `(send {str dstr} :% ...)`: `String#%` on a string/dstr literal,
+    ///     any arg count (in practice always 1, the RHS of `%`).
+    ///   - `(send !nil? :% {array hash})`: `RECEIVER % array-or-hash-literal`
+    ///     for any other non-nil receiver.
+    /// `include ConfigurableEnforcedStyle` just reads `cop_config['EnforcedStyle']`
+    /// (schema default `format`) — `self.cfg.enforced_style` is the same
+    /// lookup with the same out-of-range fallback.
+    pub(crate) fn check_format_string(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/FormatString";
+        if !self.on(COP) {
+            return;
+        }
+        let name = node.name();
+        let name = name.as_slice();
+        let detected: &'static str = match name {
+            b"format" | b"sprintf" => {
+                if node.receiver().is_some() {
+                    return;
+                }
+                let count = node.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0);
+                if count < 2 {
+                    return;
+                }
+                if name == b"format" { "format" } else { "sprintf" }
+            }
+            b"%" => {
+                let Some(recv) = node.receiver() else { return };
+                let recv_is_str = recv.as_string_node().is_some() || recv.as_interpolated_string_node().is_some();
+                if !recv_is_str {
+                    let args: Vec<ruby_prism::Node> =
+                        node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                    if args.len() != 1 {
+                        return;
+                    }
+                    if !(args[0].as_array_node().is_some() || ra_is_hash_like(&args[0])) {
+                        return;
+                    }
+                }
+                "percent"
+            }
+            _ => return,
+        };
+
+        let style = self.cfg.enforced_style(COP);
+        if detected == style {
+            return;
+        }
+
+        let Some(sel) = node.message_loc() else { return };
+        let display = |s: &str| if s == "percent" { "String#%".to_string() } else { s.to_string() };
+        let msg = format!("Favor `{}` over `{}`.", display(style), display(detected));
+        self.push(sel.start_offset(), COP, true, msg);
+        self.fs_autocorrect(node, style);
+    }
+
+    /// `autocorrect`: bails out entirely (no `self.fixes` entries) when
+    /// `variable_argument?` matches — `String#%` on a str/dstr literal with
+    /// exactly one argument that's either a bare local variable, or a method
+    /// call whose name ISN'T one of the known array-safe conversions
+    /// (`to_d`/`to_f`/`to_h`/`to_i`/`to_r`/`to_s`/`to_sym`). Otherwise
+    /// dispatches on the call's own method: `%` converts to the target
+    /// style's call form, `format`/`sprintf` either renames in place or (for
+    /// `EnforcedStyle: percent`) converts to `%` form.
+    fn fs_autocorrect(&mut self, node: &ruby_prism::CallNode, style: &str) {
+        let name = node.name();
+        let name = name.as_slice();
+        if name == b"%" {
+            let recv_is_str = node
+                .receiver()
+                .is_some_and(|r| r.as_string_node().is_some() || r.as_interpolated_string_node().is_some());
+            if recv_is_str {
+                let args: Vec<ruby_prism::Node> =
+                    node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                if args.len() == 1 && fs_variable_argument(&args[0]) {
+                    return;
+                }
+            }
+            self.fs_autocorrect_from_percent(node, style);
+        } else if name == b"format" || name == b"sprintf" {
+            if style == "percent" {
+                self.fs_autocorrect_to_percent(node);
+            } else if let Some(sel) = node.message_loc() {
+                self.fixes.push((sel.start_offset(), sel.end_offset(), style.as_bytes().to_vec()));
+            }
+        }
+    }
+
+    /// `autocorrect_from_percent`: `RECEIVER % rhs` -> `style(receiver,
+    /// args)`, where `args` is the RHS's own source for anything but an
+    /// array/hash literal RHS, which instead gets its ELEMENTS' sources
+    /// joined with `, ` (so the literal's own brackets/braces are dropped).
+    fn fs_autocorrect_from_percent(&mut self, node: &ruby_prism::CallNode, style: &str) {
+        let Some(recv) = node.receiver() else { return };
+        let Some(args) = node.arguments() else { return };
+        let arglist: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        let Some(first) = arglist.first() else { return };
+        let args_text: Vec<u8> = if let Some(arr) = first.as_array_node() {
+            fs_join_sources(self, arr.elements().iter().collect())
+        } else if ra_is_hash_like(first) {
+            fs_join_sources(self, hali_elements(first))
+        } else {
+            self.node_src(first).to_vec()
+        };
+
+        let mut corrected = Vec::new();
+        corrected.extend_from_slice(style.as_bytes());
+        corrected.push(b'(');
+        corrected.extend_from_slice(self.node_src(&recv));
+        corrected.extend_from_slice(b", ");
+        corrected.extend_from_slice(&args_text);
+        corrected.push(b')');
+        let loc = node.location();
+        self.fixes.push((loc.start_offset(), loc.end_offset(), corrected));
+    }
+
+    /// `autocorrect_to_percent`: `format(fmt, *params)` -> `fmt % args`,
+    /// where `args` is `[p1, p2, ...]` for 0-or-2+ params, or (for exactly
+    /// one param) that single param's source — braced (`{ ... }`) if it's a
+    /// hash, parenthesized if it's an unparenthesized operator-method call
+    /// (so the resulting `%` binds correctly), else bare.
+    fn fs_autocorrect_to_percent(&mut self, node: &ruby_prism::CallNode) {
+        let Some(args) = node.arguments() else { return };
+        let arglist: Vec<ruby_prism::Node> = args.arguments().iter().collect();
+        let Some((format_arg, param_args)) = arglist.split_first() else { return };
+        let args_text: Vec<u8> = if param_args.len() == 1 {
+            fs_format_single_parameter(self, &param_args[0])
+        } else {
+            let mut v = Vec::new();
+            v.push(b'[');
+            for (i, a) in param_args.iter().enumerate() {
+                if i > 0 {
+                    v.extend_from_slice(b", ");
+                }
+                v.extend_from_slice(self.node_src(a));
+            }
+            v.push(b']');
+            v
+        };
+
+        let mut corrected = Vec::new();
+        corrected.extend_from_slice(self.node_src(format_arg));
+        corrected.extend_from_slice(b" % ");
+        corrected.extend_from_slice(&args_text);
+        let loc = node.location();
+        self.fixes.push((loc.start_offset(), loc.end_offset(), corrected));
+    }
+}
+
+/// `variable_argument?`/`autocorrectable?`: true when the (single) RHS of a
+/// `String#%` call is a bare local variable, or a method call whose name is
+/// NOT one of the known-safe, non-array-returning conversions — i.e. when
+/// autocorrection would be unsafe and must be skipped.
+fn fs_variable_argument(node: &ruby_prism::Node) -> bool {
+    if node.as_local_variable_read_node().is_some() {
+        return true;
+    }
+    node.as_call_node().is_some_and(|c| !FS_AUTOCORRECTABLE_METHODS.contains(&c.name().as_slice()))
+}
+
+/// Upstream's `AUTOCORRECTABLE_METHODS` — known conversion methods whose
+/// return value is never an array.
+const FS_AUTOCORRECTABLE_METHODS: &[&[u8]] =
+    &[b"to_d", b"to_f", b"to_h", b"to_i", b"to_r", b"to_s", b"to_sym"];
+
+/// `format_single_parameter`: a hash argument gets space-padded braces; an
+/// unparenthesized operator-method call gets wrapped in parens (so it binds
+/// correctly as the RHS of the corrected `%`); anything else is left as-is.
+fn fs_format_single_parameter(cops: &Cops, arg: &ruby_prism::Node) -> Vec<u8> {
+    let source = cops.node_src(arg);
+    if ra_is_hash_like(arg) {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"{ ");
+        v.extend_from_slice(source);
+        v.extend_from_slice(b" }");
+        return v;
+    }
+    if let Some(call) = arg.as_call_node() {
+        if clamp_is_operator_method(call.name().as_slice()) && call.opening_loc().is_none() {
+            let mut v = Vec::new();
+            v.push(b'(');
+            v.extend_from_slice(source);
+            v.push(b')');
+            return v;
+        }
+    }
+    source.to_vec()
+}
+
+/// Joins each node's own source text with `, ` — used for an array/hash
+/// literal's ELEMENTS (dropping the literal's own brackets/braces).
+fn fs_join_sources(cops: &Cops, nodes: Vec<ruby_prism::Node>) -> Vec<u8> {
+    let mut v = Vec::new();
+    for (i, n) in nodes.iter().enumerate() {
+        if i > 0 {
+            v.extend_from_slice(b", ");
+        }
+        v.extend_from_slice(cops.node_src(n));
+    }
+    v
+}

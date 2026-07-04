@@ -341,6 +341,7 @@ COPS = {
   'Lint/DuplicateMethods'            => 'lint/duplicate_methods',
   'Lint/UselessAssignment'           => 'lint/useless_assignment',
   'Style/IfUnlessModifier'           => 'style/if_unless_modifier',
+  'Style/FormatString'               => 'style/format_string',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
