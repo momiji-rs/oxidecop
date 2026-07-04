@@ -217,7 +217,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/TrailingWhitespace", "Lint/BigDecimalNew", "Lint/BooleanSymbol", "Lint/Debugger",
     "Lint/EmptyEnsure", "Lint/EmptyExpression", "Lint/NestedMethodDefinition", "Lint/RandOne",
     "Lint/UriEscapeUnescape", "Lint/UriRegexp", "Naming/MethodName", "Style/ArrayJoin", "Style/Dir",
-    "Style/Documentation", "Style/EvenOdd", "Style/FrozenStringLiteralComment", "Style/LambdaCall",
+    "Style/Documentation", "Style/EvenOdd", "Style/FloatDivision", "Style/FrozenStringLiteralComment", "Style/LambdaCall",
     "Style/NegatedIf", "Style/NegatedUnless", "Style/NestedFileDirname", "Style/NilComparison",
     "Style/NumericLiterals", "Style/NumericPredicate", "Style/RandomWithOffset",
     "Style/RedundantReturn", "Style/StringChars", "Style/StringLiterals",
@@ -2451,6 +2451,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_even_odd(node);
         self.check_dir(node);
         self.check_string_chars(node);
+        self.check_float_division(node);
         self.check_nested_file_dirname(node);
         self.check_uri_regexp(node);
         self.check_uri_escape_unescape(node);

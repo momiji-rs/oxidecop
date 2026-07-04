@@ -12325,3 +12325,200 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+impl<'a> super::Cops<'a> {
+    /// Style/FloatDivision — checks for division with integers coerced to floats
+    pub(crate) fn check_float_division(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/FloatDivision";
+        if !self.on(COP) || node.name().as_slice() != b"/" {
+            return;
+        }
+
+        let Some(receiver) = node.receiver() else { return };
+        let Some(args) = node.arguments() else { return };
+        let args_vec: Vec<_> = args.arguments().iter().collect();
+        if args_vec.len() != 1 {
+            return;
+        }
+        let argument = &args_vec[0];
+
+        // Helper to check if a node is a .to_f method call
+        let is_to_f = |n: &ruby_prism::Node| {
+            n.as_call_node().is_some_and(|c| {
+                c.name().as_slice() == b"to_f" && c.receiver().is_some() && c.arguments().is_none()
+            })
+        };
+
+        // Pattern for matching Regexp.last_match
+        static REGEXP_MATCH_PAT: OnceLock<Pat> = OnceLock::new();
+        let regexp_match_pat = matcher(
+            &REGEXP_MATCH_PAT,
+            "(send (const {nil? cbase} :Regexp) :last_match int)",
+        );
+
+        // Check if a node is Regexp.last_match or $n
+        let is_regexp_match = |n: &ruby_prism::Node| {
+            // Check for Regexp.last_match(n)
+            if nodepattern::matches(regexp_match_pat, n, self.src).is_some() {
+                return true;
+            }
+            // Check for $n (NumberedReferenceReadNode)
+            if n.as_numbered_reference_read_node().is_some() {
+                return true;
+            }
+            false
+        };
+
+        // Don't fire if either operand is Regexp.last_match or $n
+        // For .to_f calls, check the receiver of the call
+        let receiver_is_regexp = if let Some(call) = receiver.as_call_node() {
+            if is_to_f(&receiver) {
+                if let Some(r) = call.receiver() {
+                    is_regexp_match(&r)
+                } else {
+                    false
+                }
+            } else {
+                is_regexp_match(&receiver)
+            }
+        } else {
+            is_regexp_match(&receiver)
+        };
+
+        let argument_is_regexp = if let Some(call) = argument.as_call_node() {
+            if is_to_f(argument) {
+                if let Some(a) = call.receiver() {
+                    is_regexp_match(&a)
+                } else {
+                    false
+                }
+            } else {
+                is_regexp_match(argument)
+            }
+        } else {
+            is_regexp_match(argument)
+        };
+
+        if receiver_is_regexp || argument_is_regexp {
+            return;
+        }
+
+        let receiver_has_to_f = is_to_f(&receiver);
+        let argument_has_to_f = is_to_f(argument);
+
+        let style = self.cfg.enforced_style(COP);
+        let style_str = &style[..];
+
+        // Determine if this is an offense based on style
+        let should_fire = match style_str {
+            "left_coerce" => argument_has_to_f, // fire if right has to_f
+            "right_coerce" => receiver_has_to_f, // fire if left has to_f
+            "single_coerce" => receiver_has_to_f && argument_has_to_f, // fire if both have to_f
+            "fdiv" => receiver_has_to_f || argument_has_to_f, // fire if either has to_f
+            _ => false,
+        };
+
+        if !should_fire {
+            return;
+        }
+
+        let message = match style_str {
+            "left_coerce" => "Prefer using `.to_f` on the left side.",
+            "right_coerce" => "Prefer using `.to_f` on the right side.",
+            "single_coerce" => "Prefer using `.to_f` on one side only.",
+            "fdiv" => "Prefer using `fdiv` for float divisions.",
+            _ => return,
+        };
+
+        let l = node.location();
+        self.push(l.start_offset(), COP, true, message);
+
+        // Create the fix based on style
+        match style_str {
+            "left_coerce" | "single_coerce" => {
+                // left_coerce: add .to_f to receiver if needed, remove from argument
+                // single_coerce: always keep on left, remove from right
+                if !receiver_has_to_f {
+                    // Add .to_f to receiver
+                    let receiver_end = receiver.location().end_offset();
+                    self.fixes.push((receiver_end, receiver_end, b".to_f".to_vec()));
+                }
+                if argument_has_to_f {
+                    // Remove .to_f from argument
+                    if let Some(call) = argument.as_call_node() {
+                        if let Some(dot) = call.call_operator_loc() {
+                            let msg_loc = call.message_loc().unwrap();
+                            self.fixes.push((dot.start_offset(), msg_loc.end_offset(), Vec::new()));
+                        }
+                    }
+                }
+            }
+            "right_coerce" => {
+                // Remove .to_f from receiver, add .to_f to argument if needed
+                if receiver_has_to_f {
+                    // Remove .to_f from receiver
+                    if let Some(call) = receiver.as_call_node() {
+                        if let Some(dot) = call.call_operator_loc() {
+                            let msg_loc = call.message_loc().unwrap();
+                            self.fixes.push((dot.start_offset(), msg_loc.end_offset(), Vec::new()));
+                        }
+                    }
+                }
+                if !argument_has_to_f {
+                    // Add .to_f to argument
+                    let arg_end = argument.location().end_offset();
+                    self.fixes.push((arg_end, arg_end, b".to_f".to_vec()));
+                }
+            }
+            "fdiv" => {
+                // Replace the entire division with fdiv
+                let receiver_src = if receiver_has_to_f {
+                    if let Some(call) = receiver.as_call_node() {
+                        if let Some(recv) = call.receiver() {
+                            self.node_src(&recv).to_vec()
+                        } else {
+                            self.node_src(&receiver).to_vec()
+                        }
+                    } else {
+                        self.node_src(&receiver).to_vec()
+                    }
+                } else {
+                    self.node_src(&receiver).to_vec()
+                };
+
+                let argument_src = if argument_has_to_f {
+                    if let Some(call) = argument.as_call_node() {
+                        if let Some(recv) = call.receiver() {
+                            self.node_src(&recv).to_vec()
+                        } else {
+                            self.node_src(&argument).to_vec()
+                        }
+                    } else {
+                        self.node_src(&argument).to_vec()
+                    }
+                } else {
+                    self.node_src(&argument).to_vec()
+                };
+
+                // Check if argument needs parentheses
+                let arg_src_str = String::from_utf8_lossy(&argument_src);
+                let arg_needs_parens = !arg_src_str.starts_with('(') || !arg_src_str.ends_with(')');
+
+                let mut replacement = format!(
+                    "{}.fdiv",
+                    String::from_utf8_lossy(&receiver_src)
+                );
+                if arg_needs_parens {
+                    replacement.push('(');
+                    replacement.push_str(&arg_src_str);
+                    replacement.push(')');
+                } else {
+                    replacement.push_str(&arg_src_str);
+                }
+
+                self.fixes.push((l.start_offset(), l.end_offset(), replacement.into_bytes()));
+            }
+            _ => {}
+        }
+    }
+}

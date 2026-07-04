@@ -230,6 +230,7 @@ COPS = {
   'Style/CommentedKeyword'           => 'style/commented_keyword',
   'Style/For'                        => 'style/for',
   'Style/RedundantSort'              => 'style/redundant_sort',
+  'Style/FloatDivision'              => 'style/float_division',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
