@@ -28529,3 +28529,526 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// ---- Style/MutableConstant ----
+//
+// Ports `MutableConstant` (its private `ShareableConstantValue` mixin, the
+// shared `FrozenStringLiteral` mixin, and `ConfigurableEnforcedStyle`)
+// verbatim. Two `EnforcedStyle`s: `literals` (default) only flags known
+// mutable LITERAL node shapes (array/hash/string/regexp/range, the last two
+// only pre-Ruby-3.0); `strict` flags anything that isn't PROVABLY immutable
+// or provably an operation that produces an immutable object (so arbitrary
+// calls like `Something.new` are flagged too).
+//
+// `Recursive: true` does NOT change what gets flagged at a value's own
+// level — `mutable_nodes` only descends into a literal's children (array
+// elements / hash key+value pairs) when that value is ALREADY wrapped in an
+// explicit `.freeze` call. In that case each outermost still-unfrozen
+// literal found underneath becomes its OWN offense (own `add_offense` call,
+// own autocorrect), recursing through further pre-existing `.freeze` layers
+// as needed (`descends through multiple already-frozen layers` spec). A
+// non-recursive-eligible (not yet frozen) top-level mutable value always
+// produces exactly one offense at its own outermost range, same as
+// `Recursive: false` — the *autocorrect* for THAT offense then cascades
+// `.freeze` onto every nested mutable literal below it when `Recursive` is
+// on (`freeze_nested_literals`), independent of the detection-time
+// recursion above.
+//
+// Prism-specific notes:
+// - Both `CONST = x` and `Foo::CONST = x` are whitequark's unified `casgn`
+//   node type (on_casgn fires for either); prism splits them into
+//   `ConstantWriteNode`/`ConstantPathWriteNode`, so both are hooked.
+//   `on_casgn`'s `node.expression.nil?` branch (only true for `CONST +=`/
+//   `CONST ||=`/`CONST &&=`, whose whitequark `casgn` child has no RHS of
+//   its own) only re-dispatches for an `or_asgn` PARENT — `CONST ||= x` —
+//   never `+=`/`&&=`; prism's equivalent split-out node types
+//   (`ConstantOrWriteNode` vs `ConstantOperatorWriteNode`/
+//   `ConstantAndWriteNode`) mean only the "Or" hooks call in here.
+// - A heredoc's prism node (`StringNode`/`InterpolatedStringNode`) reports
+//   its OWN `location()` as just the opening declaration (`<<~HERE`), never
+//   spanning the body/closing lines — verified empirically against
+//   `Prism.parse`. That's exactly rubocop's own heredoc anchor/`.freeze`
+//   placement (`FOO = <<-HERE.freeze` — appended right after the opening
+//   tag, not after the closing delimiter), so the generic
+//   `node.location().start_offset()`/`end_offset()` autocorrect logic below
+//   needs no heredoc special-casing at all.
+// - Whitequark's `casgn`/`dstr` heredoc children make `uninterpolated_
+//   heredoc?` a needed EXTRA check beside `uninterpolated_string?` in the
+//   original mixin; under prism a non-interpolated heredoc is already a
+//   plain `StringNode` (see above), so `mc_uninterpolated_string` alone
+//   covers both the heredoc and non-heredoc cases without a separate path.
+impl<'a> super::Cops<'a> {
+    /// Entry point — called with the RHS `value` node of a `CONST = value`
+    /// or `CONST ||= value` (bare or namespaced). Mirrors `on_casgn` +
+    /// `on_assignment`.
+    pub(crate) fn check_mutable_constant<'pr>(&mut self, value: ruby_prism::Node<'pr>) {
+        const COP: &str = "Style/MutableConstant";
+        if !self.on(COP) {
+            return;
+        }
+        let strict = self.cfg.enforced_style(COP) == "strict";
+        let recursive = self.cfg.get(COP, "Recursive") == Some("true");
+
+        let mut nodes: Vec<ruby_prism::Node<'pr>> = Vec::new();
+        self.mc_collect_offending(value, strict, recursive, &mut nodes);
+
+        for node in nodes {
+            self.push(
+                node.location().start_offset(),
+                COP,
+                true,
+                "Freeze mutable objects assigned to constants.",
+            );
+            self.mc_autocorrect(&node, recursive);
+        }
+    }
+
+    /// `mutable_nodes`: collects every node that should itself receive an
+    /// offense + autocorrect. Descends through `literal_children` ONLY when
+    /// `Recursive` is on AND `value` is already explicitly `.freeze`d (see
+    /// this section's doc comment) — otherwise applies the style's
+    /// offending-check directly to `value` and stops.
+    fn mc_collect_offending<'pr>(
+        &self,
+        value: ruby_prism::Node<'pr>,
+        strict: bool,
+        recursive: bool,
+        out: &mut Vec<ruby_prism::Node<'pr>>,
+    ) {
+        if recursive && self.mc_explicitly_frozen_literal(&value) {
+            // `explicitly_frozen_literal?` already confirmed this shape.
+            let call = value.as_call_node().expect("checked by mc_explicitly_frozen_literal");
+            let receiver = call.receiver().expect("checked by mc_explicitly_frozen_literal");
+            for child in mc_literal_children(&receiver) {
+                self.mc_collect_offending(child, strict, recursive, out);
+            }
+            return;
+        }
+        let offending = if strict { self.mc_strict_check(&value) } else { self.mc_literal_check(&value) };
+        if offending {
+            out.push(value);
+        }
+    }
+
+    /// `literal_check`: only a known mutable-literal shape (or, pre-3.0, a
+    /// parenthesized range) is even a candidate; frozen strings and an
+    /// active `shareable_constant_value` pragma both suppress it.
+    fn mc_literal_check(&self, value: &ruby_prism::Node) -> bool {
+        if !self.mc_mutable_or_unfrozen_range(value) {
+            return false;
+        }
+        if self.mc_frozen_string_literal(value) {
+            return false;
+        }
+        if self.mc_shareable_constant_value(value) {
+            return false;
+        }
+        true
+    }
+
+    /// `strict_check`: everything is a candidate EXCEPT what's provably
+    /// immutable or provably produced by an immutable-producing operation.
+    fn mc_strict_check(&self, value: &ruby_prism::Node) -> bool {
+        if self.mc_immutable_literal(value) {
+            return false;
+        }
+        if mc_operation_produces_immutable(value) {
+            return false;
+        }
+        if self.mc_frozen_string_literal(value) {
+            return false;
+        }
+        if self.mc_shareable_constant_value(value) {
+            return false;
+        }
+        true
+    }
+
+    /// `mutable_or_unfrozen_range?`.
+    fn mc_mutable_or_unfrozen_range(&self, value: &ruby_prism::Node) -> bool {
+        self.mc_mutable_literal(value) || (self.cfg.target_ruby() <= 2.7 && mc_range_enclosed_in_parens(value))
+    }
+
+    /// `mutable_literal?` — `Node#mutable_literal?` MINUS regexp/range once
+    /// those are frozen (Ruby 3.0+).
+    fn mc_mutable_literal(&self, node: &ruby_prism::Node) -> bool {
+        if self.mc_frozen_regexp_or_range(node) {
+            return false;
+        }
+        mc_is_mutable_literal_type(node)
+    }
+
+    /// `immutable_literal?` — `Node#immutable_literal?` PLUS regexp/range
+    /// once those are frozen (Ruby 3.0+).
+    fn mc_immutable_literal(&self, node: &ruby_prism::Node) -> bool {
+        self.mc_frozen_regexp_or_range(node) || mc_is_immutable_literal_type(node)
+    }
+
+    /// `frozen_regexp_or_range_literals?`.
+    fn mc_frozen_regexp_or_range(&self, node: &ruby_prism::Node) -> bool {
+        self.cfg.target_ruby() >= 3.0 && mc_is_regexp_or_range(node)
+    }
+
+    /// `frozen_string_literal?` (the `FrozenStringLiteral` mixin's private
+    /// method, NOT the cop-config-driven `Style/FrozenStringLiteral`).
+    fn mc_frozen_string_literal(&self, value: &ruby_prism::Node) -> bool {
+        let frozen_string = if self.cfg.target_ruby() >= 3.0 {
+            mc_uninterpolated_string(value)
+        } else {
+            // `FROZEN_STRING_LITERAL_TYPES_RUBY27`: ANY str/dstr counts,
+            // interpolated or not.
+            value.as_string_node().is_some() || value.as_interpolated_string_node().is_some()
+        };
+        frozen_string && self.frozen_string_literal_enabled()
+    }
+
+    /// `shareable_constant_value?`: a no-op before Ruby 3.0; otherwise the
+    /// nearest preceding whole-line `shareable_constant_value` magic
+    /// comment (scanning backward from `value`'s own line) must specify one
+    /// of the three "enabled" values.
+    fn mc_shareable_constant_value(&self, value: &ruby_prism::Node) -> bool {
+        if self.cfg.target_ruby() < 3.0 {
+            return false;
+        }
+        let loc = value.location();
+        let last_byte = loc.end_offset().saturating_sub(1).max(loc.start_offset());
+        let last_line = self.idx.loc(last_byte).0;
+        match self.mc_recent_shareable_value(last_line) {
+            Some(v) => matches!(v.as_str(), "literal" | "experimental_everything" | "experimental_copy"),
+            None => false,
+        }
+    }
+
+    /// `ShareableConstantValue#magic_comment_in_scope`: scans PHYSICAL
+    /// source lines backward from `last_line` (inclusive) down to line 1 —
+    /// not just leading comments — for the nearest whole-line
+    /// `shareable_constant_value` magic comment of ANY validity (`none`
+    /// included), returning its raw (case-preserved) value.
+    fn mc_recent_shareable_value(&self, last_line: usize) -> Option<String> {
+        for line_no in (1..=last_line).rev() {
+            let start = self.idx.starts[line_no - 1];
+            let end = self.line_end(line_no);
+            let text = String::from_utf8_lossy(&self.src[start..end]);
+            if let Some(v) = scv_value(&text) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// `explicitly_frozen_literal?`.
+    fn mc_explicitly_frozen_literal(&self, node: &ruby_prism::Node) -> bool {
+        let Some(call) = node.as_call_node() else { return false };
+        if call.name().as_slice() != b"freeze" {
+            return false;
+        }
+        let Some(recv) = call.receiver() else { return false };
+        self.mc_mutable_literal(&recv)
+    }
+
+    /// `freezable_nested_literal?`.
+    fn mc_freezable_nested_literal(&self, node: &ruby_prism::Node) -> bool {
+        if self.mc_frozen_string_literal(node) {
+            return false;
+        }
+        if self.mc_shareable_constant_value(node) {
+            return false;
+        }
+        self.mc_mutable_literal(node)
+    }
+
+    /// `autocorrect`: splat-expansion is a special, mutually-exclusive
+    /// shape (`FOO = *1..10`); otherwise wrap bracket-less arrays/
+    /// parenthesize-requiring expressions, then append `.freeze`, then
+    /// (when `Recursive`) cascade into `freeze_nested_literals`.
+    fn mc_autocorrect(&mut self, node: &ruby_prism::Node, recursive: bool) {
+        let start = node.location().start_offset();
+        let end = node.location().end_offset();
+
+        if let Some(splat_value) = mc_splat_value(node) {
+            self.mc_correct_splat_expansion(start, end, &splat_value);
+            self.fixes.push((end, end, b".freeze".to_vec()));
+            return;
+        }
+
+        // The closing wrap character (if any) and `.freeze` both insert at
+        // the same zero-width `end` position — combined into ONE fix here
+        // rather than two separate pushes, since two inserts at an
+        // identical offset would otherwise apply in an unspecified
+        // relative order (observed: `.freeze` landing BEFORE the closing
+        // bracket/paren instead of after it).
+        let mut suffix: Vec<u8> = Vec::new();
+        let mut wrapped = false;
+        if let Some(arr) = node.as_array_node() {
+            if arr.opening_loc().is_none() {
+                self.fixes.push((start, start, b"[".to_vec()));
+                suffix.push(b']');
+                wrapped = true;
+            }
+        }
+        if !wrapped && mc_requires_parentheses(node) {
+            self.fixes.push((start, start, b"(".to_vec()));
+            suffix.push(b')');
+        }
+        suffix.extend_from_slice(b".freeze");
+        self.fixes.push((end, end, suffix));
+
+        if recursive {
+            self.mc_freeze_nested_literals(node);
+        }
+    }
+
+    /// `freeze_nested_literals`: cascades `.freeze` onto every nested
+    /// mutable literal underneath an already-being-corrected `node`,
+    /// descending THROUGH (without re-freezing) any child that already
+    /// carries its own explicit `.freeze`.
+    fn mc_freeze_nested_literals(&mut self, node: &ruby_prism::Node) {
+        for child in mc_literal_children(node) {
+            if self.mc_explicitly_frozen_literal(&child) {
+                if let Some(recv) = child.as_call_node().and_then(|c| c.receiver()) {
+                    self.mc_freeze_nested_literals(&recv);
+                }
+            } else if self.mc_freezable_nested_literal(&child) {
+                self.mc_autocorrect(&child, true);
+            }
+        }
+    }
+
+    /// `correct_splat_expansion`: replaces the WHOLE splat-array value with
+    /// `(range).to_a` (reusing an already-present pair of parens verbatim
+    /// rather than doubling them up).
+    fn mc_correct_splat_expansion(&mut self, start: usize, end: usize, splat_value: &ruby_prism::Node) {
+        let src = self.node_src(splat_value);
+        let mut replacement = Vec::with_capacity(src.len() + 8);
+        if mc_range_enclosed_in_parens(splat_value) {
+            replacement.extend_from_slice(src);
+        } else {
+            replacement.push(b'(');
+            replacement.extend_from_slice(src);
+            replacement.push(b')');
+        }
+        replacement.extend_from_slice(b".to_a");
+        self.fixes.push((start, end, replacement));
+    }
+}
+
+/// `Node#mutable_literal?`'s type set (str/dstr/xstr/array/hash/regexp/
+/// range), minus the Ruby-3.0+-frozen regexp/range carve-out which the
+/// caller (`Cops::mc_mutable_literal`) applies separately.
+fn mc_is_mutable_literal_type(node: &ruby_prism::Node) -> bool {
+    node.as_string_node().is_some()
+        || node.as_interpolated_string_node().is_some()
+        || node.as_x_string_node().is_some()
+        || node.as_interpolated_x_string_node().is_some()
+        || node.as_array_node().is_some()
+        || node.as_hash_node().is_some()
+        || mc_is_regexp_or_range(node)
+}
+
+/// `Node#immutable_literal?`'s type set (int/float/sym/dsym/true/false/nil/
+/// complex/rational).
+fn mc_is_immutable_literal_type(node: &ruby_prism::Node) -> bool {
+    node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_interpolated_symbol_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+        || node.as_nil_node().is_some()
+        || node.as_rational_node().is_some()
+        || node.as_imaginary_node().is_some()
+}
+
+/// `node.type?(:regexp, :range)` — whitequark unifies both `irange`/
+/// `erange` under `:range` and both interpolated/non-interpolated regexps
+/// under `:regexp`; prism splits each into two node types.
+fn mc_is_regexp_or_range(node: &ruby_prism::Node) -> bool {
+    node.as_regular_expression_node().is_some()
+        || node.as_interpolated_regular_expression_node().is_some()
+        || node.as_range_node().is_some()
+}
+
+/// `uninterpolated_string?` MINUS the `str_type?` short-circuit (a plain
+/// `StringNode` already covers that, heredoc or not — see this section's
+/// top doc comment) — true when every part is a literal string fragment,
+/// i.e. no embedded statement/variable interpolation anywhere.
+fn mc_uninterpolated_string(node: &ruby_prism::Node) -> bool {
+    if node.as_string_node().is_some() {
+        return true;
+    }
+    if let Some(i) = node.as_interpolated_string_node() {
+        return i.parts().iter().all(|p| p.as_string_node().is_some());
+    }
+    false
+}
+
+/// `range_enclosed_in_parentheses?`: `(begin (range _ _))` — a RANGE that is
+/// ITSELF the sole statement of a parenthesized group, e.g. `(1..99)`
+/// assigned directly (not a bare `1..99`, whose node IS the range already).
+fn mc_range_enclosed_in_parens(node: &ruby_prism::Node) -> bool {
+    let Some(p) = node.as_parentheses_node() else { return false };
+    let Some(body) = p.body() else { return false };
+    if let Some(stmts) = body.as_statements_node() {
+        let items: Vec<_> = stmts.body().iter().collect();
+        return items.len() == 1 && items[0].as_range_node().is_some();
+    }
+    body.as_range_node().is_some()
+}
+
+/// `requires_parentheses?`: `node.range_type? || (node.send_type? &&
+/// node.loc.dot.nil?)` — a bare range, or a send with NO explicit `.`
+/// (operator calls like `FOO + BAR`, and any other dot-less call shape).
+fn mc_requires_parentheses(node: &ruby_prism::Node) -> bool {
+    node.as_range_node().is_some() || node.as_call_node().is_some_and(|c| c.call_operator_loc().is_none())
+}
+
+/// `splat_value` node matcher: `(array (splat $_))` — prism represents a
+/// bare `*x` used as a whole assignment RHS as an (opening-less) `ArrayNode`
+/// wrapping a single `SplatNode`, the same shape as a real one-element
+/// array literal containing a splat.
+fn mc_splat_value<'pr>(node: &ruby_prism::Node<'pr>) -> Option<ruby_prism::Node<'pr>> {
+    let arr = node.as_array_node()?;
+    let elements: Vec<_> = arr.elements().iter().collect();
+    if elements.len() != 1 {
+        return None;
+    }
+    elements[0].as_splat_node()?.expression()
+}
+
+/// `node.percent_literal?` — a `%w`/`%W`/`%i`/`%I` array has no per-element
+/// delimiters, so `.freeze` can't be spliced onto any single element.
+fn mc_is_percent_array(arr: &ruby_prism::ArrayNode) -> bool {
+    arr.opening_loc().is_some_and(|o| o.as_slice().starts_with(b"%"))
+}
+
+/// `literal_children`: an array literal's own elements (`[]` for a percent
+/// literal), or a hash literal's key+value pairs (an `**splat` entry
+/// contributes nothing, matching upstream's `child.pair_type?` filter).
+fn mc_literal_children<'pr>(node: &ruby_prism::Node<'pr>) -> Vec<ruby_prism::Node<'pr>> {
+    if let Some(arr) = node.as_array_node() {
+        if mc_is_percent_array(&arr) {
+            return Vec::new();
+        }
+        return arr.elements().iter().collect();
+    }
+    if let Some(h) = node.as_hash_node() {
+        let mut out = Vec::new();
+        for el in h.elements().iter() {
+            if let Some(pair) = el.as_assoc_node() {
+                out.push(pair.key());
+                out.push(pair.value());
+            }
+        }
+        return out;
+    }
+    Vec::new()
+}
+
+/// `operation_produces_immutable_object?` (the `MutableConstant`-OWN node
+/// pattern — deliberately different from `Style/RedundantFreeze`'s sibling
+/// pattern, e.g. no `str`/`array`-receiver exclusion on the reverse
+/// arithmetic branch). Each `{send ...}` / `(block (send ...) ...)`
+/// alternative collapses to a single check here: prism represents a call
+/// with or without a trailing block as the SAME `CallNode` (the block just
+/// rides along in `call.block()`), unlike whitequark's separate wrapping
+/// `:block` node the upstream pattern exists to also match.
+fn mc_operation_produces_immutable(node: &ruby_prism::Node) -> bool {
+    // (const _ _)
+    if node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some() {
+        return true;
+    }
+    if let Some(call) = node.as_call_node() {
+        return mc_call_produces_immutable(&call);
+    }
+    // (or (send (const {nil? cbase} :ENV) :[] _) _)
+    if let Some(or_node) = node.as_or_node() {
+        if let Some(l) = or_node.left().as_call_node() {
+            return mc_is_env_bracket(&l);
+        }
+    }
+    false
+}
+
+fn mc_call_produces_immutable(call: &ruby_prism::CallNode) -> bool {
+    let name = call.name().as_slice();
+
+    // (send (const {nil? cbase} :Struct) :new ...)
+    if name == b"new" && call.receiver().is_some_and(|r| mc_is_bare_or_top_const(&r, b"Struct")) {
+        return true;
+    }
+    // (send _ :freeze)
+    if name == b"freeze" {
+        return true;
+    }
+    // (send {float int} {:+ :- :* :** :/ :% :<<} _)
+    if let Some(recv) = call.receiver() {
+        if (recv.as_float_node().is_some() || recv.as_integer_node().is_some())
+            && matches!(name, b"+" | b"-" | b"*" | b"**" | b"/" | b"%" | b"<<")
+        {
+            return true;
+        }
+    }
+    // (send _ {:+ :- :* :** :/ :%} {float int})
+    if matches!(name, b"+" | b"-" | b"*" | b"**" | b"/" | b"%") {
+        if let Some(args) = call.arguments() {
+            let a: Vec<_> = args.arguments().iter().collect();
+            if a.len() == 1 && (a[0].as_float_node().is_some() || a[0].as_integer_node().is_some()) {
+                return true;
+            }
+        }
+    }
+    // (send _ {:== :=== :!= :<= :>= :< :>} _)
+    if matches!(name, b"==" | b"===" | b"!=" | b"<=" | b">=" | b"<" | b">") {
+        return true;
+    }
+    // (send (const {nil? cbase} :ENV) :[] _)
+    if mc_is_env_bracket(call) {
+        return true;
+    }
+    // (send _ {:count :length :size} ...)
+    matches!(name, b"count" | b"length" | b"size")
+}
+
+fn mc_is_env_bracket(call: &ruby_prism::CallNode) -> bool {
+    call.name().as_slice() == b"[]" && call.receiver().is_some_and(|r| mc_is_bare_or_top_const(&r, b"ENV"))
+}
+
+/// `{nil? cbase}` receiver guard: a bare `Name` or top-level `::Name`
+/// constant reference.
+fn mc_is_bare_or_top_const(node: &ruby_prism::Node, name: &[u8]) -> bool {
+    if let Some(c) = node.as_constant_read_node() {
+        return c.name().as_slice() == name;
+    }
+    if let Some(cp) = node.as_constant_path_node() {
+        return cp.parent().is_none() && cp.name().is_some_and(|n| n.as_slice() == name);
+    }
+    false
+}
+
+/// The `shareable_constant_value` value a magic-comment line specifies,
+/// case PRESERVED (unlike `fsl_value`'s downcase — rubocop's
+/// `shareable_constant_value_enabled?`/`valid_shareable_constant_value?`
+/// compare the raw extracted token against lowercase literals directly, so
+/// e.g. `# shareable_constant_value: LITERAL` is a validly-parsed but
+/// NON-enabling value, not an enabling one). Mirrors `MagicComment.parse
+/// (line).shareable_constant_value`: the emacs `-*- k: v; ... -*-` form,
+/// vim comments (which cannot specify it — `VimComment#shareable_constant_
+/// value` is a no-op override), then the simple form, which only counts
+/// when it is the WHOLE comment line.
+fn scv_value(line: &str) -> Option<String> {
+    static EMACS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static EMACS_TOK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static VIM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SIMPLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if let Some(c) = re(&EMACS, r"-\*-(.+)-\*-").captures(line) {
+        let tok = re(&EMACS_TOK, r"(?i)^shareable[_-]constant[_-]value\s*:\s*([[:alnum:]_-]+)$");
+        c[1].split(';').find_map(|t| tok.captures(t.trim()).map(|c| c[1].to_string()))
+    } else if re(&VIM, r"#\s*vim:\s*\S").is_match(line) {
+        None
+    } else {
+        re(&SIMPLE, r"(?i)^\s*#\s*shareable[_-]constant[_-]value:\s*([[:alnum:]_-]+)\s*$")
+            .captures(line)
+            .map(|c| c[1].to_string())
+    }
+}

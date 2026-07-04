@@ -370,7 +370,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
-    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods",
+    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant",
 ];
 
 impl Engine {
@@ -2167,6 +2167,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Lint/RedundantSplatExpansion's `ASSIGNMENT_TYPES` (`casgn` here) —
         // see `rse_assignment_value`'s doc on `Cops`.
         self.rse_assignment_value.insert(v.location().start_offset());
+        self.check_mutable_constant(node.value());
         assignment_write!(self, node);
         ruby_prism::visit_constant_write_node(self, node);
     }
@@ -2176,6 +2177,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_self_assignment_const(node.location().start_offset(), node.name().as_slice(), &v);
         self.check_multiline_memoization(node.location().start_offset(), &v);
         self.check_class_length_casgn(&v);
+        self.check_mutable_constant(node.value());
         assignment_write!(self, node);
         ruby_prism::visit_constant_or_write_node(self, node);
     }
@@ -2195,6 +2197,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Lint/RedundantSplatExpansion's `ASSIGNMENT_TYPES` (`casgn` here,
         // namespaced form) — see `rse_assignment_value`'s doc on `Cops`.
         self.rse_assignment_value.insert(node.value().location().start_offset());
+        self.check_mutable_constant(node.value());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_write_node(self, node);
@@ -2219,6 +2222,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_constant_path_or_write_node(&mut self, node: &ruby_prism::ConstantPathOrWriteNode<'pr>) {
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
         self.check_class_length_casgn(&node.value());
+        self.check_mutable_constant(node.value());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
         ruby_prism::visit_constant_path_or_write_node(self, node);
