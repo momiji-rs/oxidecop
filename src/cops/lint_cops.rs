@@ -16757,3 +16757,1877 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+// =====================================================================
+// Lint/UselessAssignment
+//
+// A from-scratch, narrowed port of `RuboCop::Cop::VariableForce` (the
+// ~450-line `variable_force.rb` plus its `Scope`/`Variable`/`Assignment`/
+// `Reference`/`Branch`/`Branchable` support classes) specialized to exactly
+// what `Lint::UselessAssignment` consumes. This is the heaviest VariableForce
+// consumer in the cop set: unlike `ShadowedArgument`/`Unused*Argument`
+// (which only need a used/unused boolean per parameter), this cop needs
+// real per-assignment liveness — which of several sequential/branching
+// assignments to the same name are "live" (could still be observed by a
+// later read) versus "dead" (unconditionally overwritten before any read).
+//
+// Architecture, mapped onto prism:
+//
+// 1. SCOPES (`UaKind`/`UaFrame`): one frame per `def`/`defs`, `class`,
+//    `module`, `sclass`, and every `block`/`lambda` literal, plus one for
+//    the top level — exactly upstream's `SCOPE_TYPES`. Variable
+//    declaration/resolution is delegated to prism's own `depth` field on
+//    every `LocalVariable{Read,Write,Target,OperatorWrite,OrWrite,
+//    AndWrite}Node` (see the `ShadowedArgument`/`SaCollector` doc comment
+//    above for why this is exact): `frames[frames.len()-1-depth]` is the
+//    variable's home frame. A block's frame is "soft" — `depth` can walk
+//    outward through it — so `captured_by_block` is just `depth > 0`
+//    evaluated while the CURRENT frame is a block (mirrors
+//    `VariableTable#mark_variable_as_captured_by_block_if_so`).
+//
+// 2. BRANCHES (`UaBranch` = `Option<Rc<UaBranchNode>>`, a persistent/shared
+//    linked list): upstream's `Branch.of`/`Branchable` compute a node's
+//    "nearest branching ancestor" lazily via real parent pointers, which
+//    prism doesn't give us. Since branches never cross a scope boundary
+//    (`Branch.of` stops once `!scope.include?(node)`), and since we already
+//    do a real recursive-descent traversal (not the generic auto-visit used
+//    by simpler cops), we thread the "current branch" downward exactly like
+//    a reader parameter: entering a branched CHILD position (an `if`/
+//    `unless` truthy/falsey body, a `case`/`case/in` `when`/`in`/`else`
+//    clause, a `rescue`/`rescue-clause`/`else` region of a "protected"
+//    `begin`, the right-hand side of `&&`/`||`/`op_asgn`/`or_asgn`/
+//    `and_asgn`) pushes a new `Rc<UaBranchNode>` (parent = the branch active
+//    just before entering); an ALWAYS-RUN position (an `if`'s condition, a
+//    `case`'s target, a loop's condition, a `for`'s element/collection, the
+//    left side of `&&`/`||`/op-assign, an `ensure` body) is transparent
+//    (inherits the surrounding branch unchanged — matches `always_run?`
+//    causing `Branch.of` to skip that ancestor entirely). Entering any new
+//    SCOPE resets the current branch to `None` (matches branches never
+//    escaping their scope). `UaBranchNode.may_jump` is upstream's
+//    `ExceptionHandler#may_jump_to_other_branch?`/`#may_run_incompletely?`
+//    (always equal for our two users, `Rescue`/`Ensure`'s `main_body?`
+//    slot): true only for the PROTECTED body of a `begin` that has a
+//    `rescue` and/or `ensure` clause, since an exception can transfer
+//    control out of it at any statement boundary.
+//
+// 3. REFERENCE CASCADE (`ua_reference_cascade`): a direct port of
+//    `Variable#reference!`'s reverse walk over a variable's assignments,
+//    marking every assignment "referenced" unless it's proven to have
+//    already been unconditionally overwritten by a later one (a `None`
+//    branch, or a branch identical to the read's own). `ua_exclusive_with`
+//    ports `Branch#exclusive_with?`; `in_modifier_conditional` ports the
+//    `foo = 1 unless foo`-shaped special case verbatim.
+//
+// 4. LOOP-COMPLETION MARKING (`ua_mark_loop_completions`): a direct port of
+//    `mark_assignments_as_referenced_in_loop`/`find_variables_in_loop` — a
+//    purely SYNTACTIC (scope-unaware, exactly like upstream's
+//    `each_descendant`) post-scan of a loop's (or a `retry`-containing
+//    `begin/rescue`'s) full subtree once its normal traversal finishes,
+//    marking assignments to any variable also READ somewhere in that same
+//    subtree: unconditionally for the last such assignment, and for every
+//    other one that also sits under an `if`/`unless`/`case`/`case/in`/
+//    `begin-with-rescue` region (`in_branch_node`, upstream's
+//    `each_ancestor(*BRANCH_NODES)` — deliberately NOT the same predicate as
+//    `may_jump`/branch-push above: loops/`&&`/`||`/op-assigns/`ensure`
+//    don't count here).
+//
+// 5. `variable_in_loop_condition?` (`UaAssignment.in_loop_condition`): a
+//    narrower, ADDITIONAL suppression computed at record time from
+//    `loop_stack` (innermost currently-open `while`/`until`/`for`), guarded
+//    by `no_loop_condition_check` (any enclosing `def` — upstream's
+//    `each_ancestor(:any_def).any?` — since `each_ancestor` is a raw,
+//    scope-unaware walk that must not let an OUTER loop's condition
+//    suppress a same-named but semantically distinct variable declared
+//    inside a nested `def`).
+//
+// 6. IGNORE-CASCADE (`chained_assignment?`/`ignore_node`): `foo = bar = x`
+//    is two independent `Variable`s (`foo`, `bar`) whose assignment nodes
+//    NEST (bar's node is foo's `.value()`). Once `foo`'s assignment is
+//    reported useless, upstream `ignore_node`s it, which transparently
+//    suppresses any OTHER assignment (any variable) physically nested
+//    inside it — otherwise `bar` would ALSO get an independent (and, after
+//    autocorrecting away "foo = ", spatially conflicting) offense. Modeled
+//    here as a per-scope list of "ignored" byte ranges accumulated in the
+//    same order upstream processes variables (declaration order per scope,
+//    each variable's assignments newest-first) — see `ua_finish_scope`.
+//
+// Not modeled / simplified (none exercised by the fixture — see the task's
+// final report for the exhaustive list): `rest_assignment?`'s message-text
+// fork for a masgn splat with NO sibling targets (`*a = 1, 2, 3` — always
+// treated as the far-more-common `multiple_assignment?` message/autocorrect
+// here); `chained_assignment?`/sequential-assignment detection is only
+// evaluated for a plain (`LocalVariableWriteNode`) assignment's OWN value,
+// never for a regexp named-capture's right-hand side; `collect_variable_like_names`
+// (the "Did you mean" candidate pool) treats every nested scope as fully
+// opaque rather than also harvesting its "twisted" (receiver/superclass/
+// block-invocation) outer-scope-owned pieces.
+// =====================================================================
+use std::rc::Rc;
+
+#[derive(Clone)]
+struct UaBranchNode {
+    parent: Option<Rc<UaBranchNode>>,
+    control_id: usize,
+    child_id: usize,
+    may_jump: bool,
+}
+type UaBranch = Option<Rc<UaBranchNode>>;
+
+fn ua_new_branch(parent: &UaBranch, control_id: usize, child_id: usize, may_jump: bool) -> UaBranch {
+    Some(Rc::new(UaBranchNode { parent: parent.clone(), control_id, child_id, may_jump }))
+}
+
+fn ua_branches_eq(a: &UaBranch, b: &UaBranch) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x.control_id == y.control_id && x.child_id == y.child_id,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// `Branch#exclusive_with?`.
+fn ua_exclusive_with(a: &Rc<UaBranchNode>, b: &UaBranch) -> bool {
+    if a.may_jump {
+        return false;
+    }
+    let Some(mut cur) = b.clone() else { return false };
+    loop {
+        if cur.control_id == a.control_id {
+            return cur.child_id != a.child_id;
+        }
+        match cur.parent.clone() {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    match &a.parent {
+        Some(p) => ua_exclusive_with(p, b),
+        None => false,
+    }
+}
+
+/// `Assignment#run_exclusively_with?` / `Branchable#run_exclusively_with?`.
+fn ua_run_exclusively_with(a: &UaBranch, b: &UaBranch) -> bool {
+    match a {
+        Some(ab) => ua_exclusive_with(ab, b),
+        None => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum UaKind {
+    Def,
+    Block,
+    Other,
+}
+
+struct UaFrame {
+    kind: UaKind,
+    names: HashMap<Vec<u8>, usize>,
+    decl_order: Vec<usize>,
+    /// `return_value_node_of_scope`'s range for THIS scope, precomputed at
+    /// push time from its (about-to-be-visited) body.
+    return_range: Option<(usize, usize)>,
+}
+
+/// `Assignment#meta_assignment_node`'s effective classification, narrowed to
+/// what affects our message text and autocorrect strategy.
+#[derive(Clone, Copy, PartialEq)]
+enum UaMeta {
+    /// Plain `x = value` (`assignment.node` IS the whole thing).
+    Plain,
+    /// A masgn target, or a masgn splat target with sibling targets
+    /// (`multiple_assignment?`).
+    MultipleAssign,
+    /// A standalone masgn splat target with NO sibling targets
+    /// (`rest_assignment?` — message falls back to `similar_name_message`,
+    /// but autocorrect still renames to `_`).
+    RestAssign,
+    /// A `for x in ...` loop variable (`for_assignment?`).
+    ForAssign,
+    /// `x += value` / `x -= value` / etc (autocorrectable: `remove_trailing_character_from_operator`).
+    OperatorAssign,
+    /// `x ||= value` (message shows "Use `||`..."; never autocorrected).
+    OrAssign,
+    /// `x &&= value` (message shows "Use `&&`..."; never autocorrected).
+    AndAssign,
+    /// `/(?<name>...)/ =~ str` named capture.
+    RegexpNamedCapture,
+    /// `rescue Foo => name` / `rescue => name`.
+    ExceptionVar,
+}
+
+struct UaAssignment {
+    meta: UaMeta,
+    node_start: usize,
+    node_end: usize,
+    /// Offense anchor: `assignment.node.loc.name` (or, for a regexp named
+    /// capture, the regexp literal's own start).
+    anchor: usize,
+    branch: UaBranch,
+    referenced: bool,
+    reassigned: bool,
+    in_branch_node: bool,
+    no_loop_condition_check: bool,
+    in_loop_condition: bool,
+    /// Start offset of `.value()`, for the plain-assignment autocorrect
+    /// (`node.loc.name.begin.join(node.expression.source_range.begin)`).
+    value_start: Option<usize>,
+    /// `chained_assignment?`'s two conditions, evaluated ONLY for `Plain`.
+    value_is_send: bool,
+    value_is_lvasgn: bool,
+    /// For `OperatorAssign`: the bare operator text (`"+"`, `"-"`, ...,
+    /// straight from prism's own `binary_operator`) — used for the message
+    /// ("Use `+` instead of `+=`.").
+    op_text: Vec<u8>,
+    /// For `OperatorAssign`: end offset of `binary_operator_loc` (which
+    /// spans the FULL combined token, e.g. `"+="`) — the
+    /// `remove_trailing_character_from_operator` autocorrect drops just
+    /// the trailing `=` (`[operator_end-1, operator_end)`).
+    operator_end: usize,
+    /// For `Or`/`AndAssign`: whether this assignment is the scope's own
+    /// final statement (`operator_assignment_message`'s
+    /// `return_value_node_of_scope` check) — only then does the message
+    /// show "Use `||`/`&&` instead of...".
+    is_scope_return_value: bool,
+    /// `in_modifier_conditional?`: this assignment's own node is (modulo
+    /// one layer of parenthesization) a direct child of a modifier-form
+    /// `if`/`unless`/`while`/`until`.
+    is_modifier_child: bool,
+    /// `sequential_assignment?`: `x = 1, y = 2` (parsed as `x = [1, y = 2]`)
+    /// — disables autocorrect for every assignment in the chain.
+    sequential: bool,
+}
+
+struct UaVar {
+    name: Vec<u8>,
+    captured_by_block: bool,
+    assignments: Vec<UaAssignment>,
+    /// `method_argument?`: declared as a `def`/`defs` parameter — the only
+    /// kind zero-arity `super` implicitly references.
+    is_arg: bool,
+}
+
+/// `Variable#reference!`: walk `assignments` newest-first, marking each
+/// referenced unless proven unconditionally overwritten by a later one,
+/// exactly matching upstream's `consumed_branches`/`in_modifier_conditional?`
+/// bookkeeping. `modifier: &[bool]` is parallel to `assignments`: whether
+/// that assignment's own node sits directly under a modifier-form
+/// `if`/`unless`/`while`/`until` (see `in_modifier_conditional?`).
+fn ua_reference_cascade(assignments: &mut [UaAssignment], modifier: &[bool], ref_branch: &UaBranch) {
+    let mut consumed: HashSet<(usize, usize)> = HashSet::new();
+    for i in (0..assignments.len()).rev() {
+        if let Some(b) = &assignments[i].branch {
+            if consumed.contains(&(b.control_id, b.child_id)) {
+                continue;
+            }
+        }
+        if !ua_run_exclusively_with(&assignments[i].branch, ref_branch) {
+            assignments[i].referenced = true;
+        }
+        if modifier[i] {
+            continue;
+        }
+        let branch_none = assignments[i].branch.is_none();
+        let branch_eq = ua_branches_eq(&assignments[i].branch, ref_branch);
+        if branch_none || branch_eq {
+            break;
+        }
+        // `may_run_incompletely?` == `may_jump` for our two users.
+        let may_run_incompletely = assignments[i].branch.as_ref().is_some_and(|b| b.may_jump);
+        if !may_run_incompletely {
+            if let Some(b) = &assignments[i].branch {
+                consumed.insert((b.control_id, b.child_id));
+            }
+        }
+    }
+}
+
+struct UaOffense {
+    anchor: usize,
+    correctable: bool,
+    message: String,
+}
+
+/// The scope-tracking, branch-tracking recursive-descent visitor described
+/// in the module doc comment above.
+struct UaCollector<'s> {
+    src: &'s [u8],
+    frames: Vec<UaFrame>,
+    vars: Vec<UaVar>,
+    current_branch: UaBranch,
+    /// `each_ancestor(*BRANCH_NODES).any?` — raw, scope-unaware nesting
+    /// count of `if`/`unless`/`case`/`case/in`/protected-`begin` regions.
+    branch_node_depth: u32,
+    /// Innermost currently-open `while`/`until` (its condition's referenced
+    /// local-variable names) or `for` (`None`, meaning "has no usable
+    /// condition, don't look further out either" — matches
+    /// `each_ancestor.find` stopping at the nearest loop-type ancestor).
+    loop_stack: Vec<Option<HashSet<Vec<u8>>>>,
+    /// `in_modifier_conditional?`: set true just before visiting the ONE
+    /// direct child (predicate, or sole body statement) of a modifier-form
+    /// `if`/`unless`/`while`/`until`; consumed (read then cleared) by the
+    /// very next assignment-recording visitor entered.
+    modifier_ctx: bool,
+    /// `sequential_assignment?`: true while traversing the VALUE subtree of
+    /// a plain assignment whose own value is an array literal containing
+    /// an assignment descendant (`x = 1, y = 2`) — every assignment
+    /// recorded anywhere within (at any nesting depth, e.g. `x = 1, (y = 2,
+    /// z = 3)`) inherits it, matching upstream's ancestor-climbing check.
+    force_sequential: bool,
+    offenses: Vec<UaOffense>,
+    fixes: Vec<(usize, usize, Vec<u8>)>,
+}
+
+impl<'s> UaCollector<'s> {
+    fn new(src: &'s [u8]) -> Self {
+        UaCollector {
+            src,
+            frames: Vec::new(),
+            vars: Vec::new(),
+            current_branch: None,
+            branch_node_depth: 0,
+            loop_stack: Vec::new(),
+            modifier_ctx: false,
+            force_sequential: false,
+            offenses: Vec::new(),
+            fixes: Vec::new(),
+        }
+    }
+
+    fn take_modifier_ctx(&mut self) -> bool {
+        std::mem::take(&mut self.modifier_ctx)
+    }
+
+    /// Visits the ONE direct child of a modifier-form conditional
+    /// (predicate, or sole body statement), propagating `modifier_ctx`
+    /// through at most one layer of `(...)` parenthesization — matches
+    /// `in_modifier_conditional?`'s `parent = parent.parent if
+    /// parent&.begin_type?`.
+    fn visit_modifier_child<'pr>(&mut self, node: &ruby_prism::Node<'pr>)
+    where
+        Self: ruby_prism::Visit<'pr>,
+    {
+        use ruby_prism::Visit;
+        self.modifier_ctx = true;
+        if let Some(p) = node.as_parentheses_node() {
+            if let Some(body) = p.body() {
+                if let Some(st) = body.as_statements_node() {
+                    if let Some(first) = st.body().iter().next() {
+                        self.visit(&first);
+                        self.modifier_ctx = false;
+                        return;
+                    }
+                }
+                self.visit(&body);
+                self.modifier_ctx = false;
+                return;
+            }
+        }
+        self.visit(node);
+        self.modifier_ctx = false;
+    }
+
+    fn resolve(&self, name: &[u8], depth: u32) -> Option<usize> {
+        let top = self.frames.len().checked_sub(1)?;
+        let f = top.checked_sub(depth as usize)?;
+        self.frames[f].names.get(name).copied()
+    }
+
+    /// `process_variable_declaration` / the `declare_variable unless
+    /// variable_exist?` half of `process_variable_assignment`.
+    fn ensure_declared(&mut self, name: &[u8], depth: u32) -> usize {
+        if let Some(idx) = self.resolve(name, depth) {
+            return idx;
+        }
+        let top = self.frames.len() - 1;
+        let f = top.saturating_sub(depth as usize);
+        let idx = self.vars.len();
+        self.vars.push(UaVar { name: name.to_vec(), captured_by_block: false, assignments: Vec::new(), is_arg: false });
+        self.frames[f].names.insert(name.to_vec(), idx);
+        self.frames[f].decl_order.push(idx);
+        idx
+    }
+
+    /// A parameter declaration (`def`/`defs` OR block/lambda) — always at
+    /// depth 0 (a parameter belongs to its own scope). `is_arg`
+    /// (`method_argument?`, the only kind zero-arity `super` implicitly
+    /// references) is true only when the CURRENT (innermost) frame is a
+    /// `def`'s own — a block's own parameters are `block_argument?`, not
+    /// `method_argument?`.
+    fn declare_arg(&mut self, name: &[u8]) {
+        if self.resolve(name, 0).is_some() {
+            return;
+        }
+        let top = self.frames.len() - 1;
+        let is_arg = self.frames[top].kind == UaKind::Def;
+        let idx = self.vars.len();
+        self.vars.push(UaVar { name: name.to_vec(), captured_by_block: false, assignments: Vec::new(), is_arg });
+        self.frames[top].names.insert(name.to_vec(), idx);
+        self.frames[top].decl_order.push(idx);
+    }
+
+    /// `VariableTable#push_scope` + resetting the branch (branches never
+    /// cross a scope boundary — see the module doc comment). Returns the
+    /// saved outer branch, to be restored by the caller after finishing
+    /// this scope (see `pop_scope_and_finish`).
+    fn push_scope<'n>(&mut self, kind: UaKind, body: &Option<ruby_prism::Node<'n>>) -> UaBranch {
+        self.frames.push(UaFrame {
+            kind,
+            names: HashMap::new(),
+            decl_order: Vec::new(),
+            return_range: ua_scope_return_range(body),
+        });
+        std::mem::take(&mut self.current_branch)
+    }
+
+    fn pop_scope_and_finish<'n>(&mut self, saved_branch: UaBranch, body: &Option<ruby_prism::Node<'n>>) {
+        self.finish_scope(body);
+        self.current_branch = saved_branch;
+    }
+
+    /// `process_pattern_match_variable`: declare (searching outward through
+    /// block scopes like a real reference would, but never assign) — see
+    /// the `visit_match_predicate_node`/`visit_match_required_node`/
+    /// `visit_case_match_node` call sites.
+    fn declare_pattern_var(&mut self, name: &[u8]) {
+        if self.find_by_name(name).is_some() {
+            return;
+        }
+        let idx = self.vars.len();
+        self.vars.push(UaVar { name: name.to_vec(), captured_by_block: false, assignments: Vec::new(), is_arg: false });
+        let top = self.frames.len() - 1;
+        self.frames[top].names.insert(name.to_vec(), idx);
+        self.frames[top].decl_order.push(idx);
+    }
+
+    /// `Assignment#meta_assignment_node`'s `multiple_assignment_node`/
+    /// `rest_assignment_node`, recursively: a masgn target is either a
+    /// splat (unwrap once, remembering `is_rest`), a nested `(a, b)`
+    /// sub-mlhs (flatten into its own lefts/rest/rights — sibling count is
+    /// recomputed fresh at THIS nesting level), a local-variable target
+    /// (record the write), or anything else (index/attr/ivar targets —
+    /// just visit normally so nested reads are still picked up).
+    fn process_masgn_target_list<'pr>(&mut self, targets: &[ruby_prism::Node<'pr>])
+    where
+        Self: ruby_prism::Visit<'pr>,
+    {
+        let has_siblings = targets.len() > 1;
+        for t in targets {
+            self.process_masgn_target(t, false, has_siblings);
+        }
+    }
+
+    fn process_masgn_target<'pr>(&mut self, t: &ruby_prism::Node<'pr>, is_rest: bool, has_siblings: bool)
+    where
+        Self: ruby_prism::Visit<'pr>,
+    {
+        use ruby_prism::Visit;
+        if let Some(splat) = t.as_splat_node() {
+            if let Some(expr) = splat.expression() {
+                self.process_masgn_target(&expr, true, has_siblings);
+            }
+            return;
+        }
+        if let Some(mt) = t.as_multi_target_node() {
+            let mut inner: Vec<ruby_prism::Node<'pr>> = mt.lefts().iter().collect();
+            if let Some(r) = mt.rest() {
+                inner.push(r);
+            }
+            inner.extend(mt.rights().iter());
+            self.process_masgn_target_list(&inner);
+            return;
+        }
+        if let Some(lvt) = t.as_local_variable_target_node() {
+            let is_mod = self.take_modifier_ctx();
+            let name = lvt.name();
+            let name = name.as_slice();
+            let depth = lvt.depth();
+            let loc = lvt.location();
+            let meta = if is_rest && !has_siblings { UaMeta::RestAssign } else { UaMeta::MultipleAssign };
+            let mut a = self.base_assignment(meta, loc.start_offset(), loc.end_offset(), loc.start_offset(), name);
+            a.is_modifier_child = is_mod;
+            self.record_assignment(name, depth, a);
+            return;
+        }
+        self.visit(t);
+    }
+
+    /// `for_assignment_node`: EVERY element of a `for` loop's index — plain,
+    /// splat, or nested — is `for_assignment?` uniformly (never
+    /// `multiple_assignment?`, since a `for`'s mlhs-wrapped index is never a
+    /// masgn's grandparent).
+    fn process_for_target<'pr>(&mut self, t: &ruby_prism::Node<'pr>)
+    where
+        Self: ruby_prism::Visit<'pr>,
+    {
+        use ruby_prism::Visit;
+        if let Some(splat) = t.as_splat_node() {
+            if let Some(expr) = splat.expression() {
+                self.process_for_target(&expr);
+            }
+            return;
+        }
+        if let Some(mt) = t.as_multi_target_node() {
+            let mut inner: Vec<ruby_prism::Node<'pr>> = mt.lefts().iter().collect();
+            if let Some(r) = mt.rest() {
+                inner.push(r);
+            }
+            inner.extend(mt.rights().iter());
+            for it in &inner {
+                self.process_for_target(it);
+            }
+            return;
+        }
+        if let Some(lvt) = t.as_local_variable_target_node() {
+            let is_mod = self.take_modifier_ctx();
+            let name = lvt.name();
+            let name = name.as_slice();
+            let depth = lvt.depth();
+            let loc = lvt.location();
+            let mut a = self.base_assignment(UaMeta::ForAssign, loc.start_offset(), loc.end_offset(), loc.start_offset(), name);
+            a.is_modifier_child = is_mod;
+            self.record_assignment(name, depth, a);
+            return;
+        }
+        self.visit(t);
+    }
+
+    /// `exception_assignment?`'s target: `rescue Foo => name` / `rescue =>
+    /// name`. `exceptions_first_end`/`keyword_end` are
+    /// `remove_exception_assignment_part`'s `range` start candidates
+    /// (the exception-type list's own end, else the `rescue` keyword's end).
+    fn record_rescue_reference<'pr>(
+        &mut self,
+        reference: &ruby_prism::Node<'pr>,
+        exceptions_first_end: Option<usize>,
+        keyword_end: usize,
+    ) where
+        Self: ruby_prism::Visit<'pr>,
+    {
+        if let Some(lvt) = reference.as_local_variable_target_node() {
+            let is_mod = self.take_modifier_ctx();
+            let name = lvt.name();
+            let name = name.as_slice();
+            let depth = lvt.depth();
+            let loc = lvt.location();
+            let start = exceptions_first_end.unwrap_or(keyword_end);
+            let mut a = self.base_assignment(UaMeta::ExceptionVar, loc.start_offset(), loc.end_offset(), loc.start_offset(), name);
+            a.is_modifier_child = is_mod;
+            a.value_start = Some(start);
+            self.record_assignment(name, depth, a);
+        } else {
+            use ruby_prism::Visit;
+            self.visit(reference);
+        }
+    }
+
+    /// `VariableTable#mark_variable_as_captured_by_block_if_so`.
+    fn mark_captured(&mut self, idx: usize, depth: u32) {
+        if depth > 0 && self.frames.last().is_some_and(|f| f.kind == UaKind::Block) {
+            self.vars[idx].captured_by_block = true;
+        }
+    }
+
+    fn in_loop_condition_now(&self, name: &[u8]) -> bool {
+        match self.loop_stack.last() {
+            Some(Some(names)) => names.contains(name),
+            _ => false,
+        }
+    }
+
+    fn has_def_ancestor(&self) -> bool {
+        self.frames.iter().any(|f| f.kind == UaKind::Def)
+    }
+
+    /// Record an assignment to `name` (already-resolved `depth`). Returns
+    /// the assignment's index within its variable for later mutation
+    /// (op/or/and-assign need to record the pre-value reference first, then
+    /// come back and finish the assignment fields after visiting `.value()`).
+    fn record_assignment(&mut self, name: &[u8], depth: u32, spec: UaAssignment) {
+        let idx = self.ensure_declared(name, depth);
+        self.mark_captured(idx, depth);
+        let reassigned = {
+            let last = self.vars[idx].assignments.last();
+            match last {
+                Some(prev) if !self.vars[idx].captured_by_block && ua_branches_eq(&prev.branch, &spec.branch) => true,
+                _ => false,
+            }
+        };
+        if reassigned {
+            if let Some(prev) = self.vars[idx].assignments.last_mut() {
+                if !prev.referenced {
+                    prev.reassigned = true;
+                }
+            }
+        }
+        self.vars[idx].assignments.push(spec);
+    }
+
+    /// `VariableTable#reference_variable` + `Variable#reference!`.
+    fn reference(&mut self, name: &[u8], depth: u32) {
+        let Some(idx) = self.resolve(name, depth) else { return };
+        self.mark_captured(idx, depth);
+        let branch = self.current_branch.clone();
+        let modifier: Vec<bool> = self.vars[idx].assignments.iter().map(|a| a.is_modifier_child).collect();
+        ua_reference_cascade(&mut self.vars[idx].assignments, &modifier, &branch);
+    }
+
+    /// Zero-arity `super`: reference every `method_argument?` variable
+    /// reachable by walking outward from the current scope through
+    /// consecutive block frames (stopping at, and including, the first
+    /// non-block frame) — see the `SaCollector::mark_zsuper` doc comment
+    /// for why this exactly matches `VariableTable#accessible_variables`
+    /// filtered to `method_argument?` for this cop's purposes.
+    fn mark_zsuper(&mut self) {
+        let branch = self.current_branch.clone();
+        for i in (0..self.frames.len()).rev() {
+            let kind = self.frames[i].kind;
+            if kind == UaKind::Def {
+                let idxs: Vec<usize> = self.frames[i].names.values().copied().collect();
+                for idx in idxs {
+                    if !self.vars[idx].is_arg {
+                        continue;
+                    }
+                    let modifier: Vec<bool> = self.vars[idx].assignments.iter().map(|a| a.is_modifier_child).collect();
+                    ua_reference_cascade(&mut self.vars[idx].assignments, &modifier, &branch);
+                }
+                break;
+            } else if kind == UaKind::Block {
+                continue;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Bare `binding`: `VariableTable#accessible_variables` — reference the
+    /// current scope's own vars, and keep going (and referencing) outward
+    /// through block frames, stopping right after including the first
+    /// non-block frame.
+    fn mark_binding(&mut self) {
+        let branch = self.current_branch.clone();
+        let mut i = self.frames.len();
+        while i > 0 {
+            i -= 1;
+            let is_block = self.frames[i].kind == UaKind::Block;
+            let idxs: Vec<usize> = self.frames[i].names.values().copied().collect();
+            for idx in idxs {
+                let modifier: Vec<bool> = self.vars[idx].assignments.iter().map(|a| a.is_modifier_child).collect();
+                ua_reference_cascade(&mut self.vars[idx].assignments, &modifier, &branch);
+            }
+            if !is_block {
+                break;
+            }
+        }
+    }
+}
+
+// --- UaAssignment / UaCollector: construction, scope-finish, messages ---
+
+impl UaAssignment {
+    fn new(meta: UaMeta, node_start: usize, node_end: usize, anchor: usize, branch: UaBranch) -> Self {
+        UaAssignment {
+            meta,
+            node_start,
+            node_end,
+            anchor,
+            branch,
+            referenced: false,
+            reassigned: false,
+            in_branch_node: false,
+            no_loop_condition_check: false,
+            in_loop_condition: false,
+            value_start: None,
+            value_is_send: false,
+            value_is_lvasgn: false,
+            op_text: Vec::new(),
+            operator_end: 0,
+            is_scope_return_value: false,
+            is_modifier_child: false,
+            sequential: false,
+        }
+    }
+}
+
+impl<'s> UaCollector<'s> {
+    /// Fills in the fields that come uniformly from collector state
+    /// (branch, `in_branch_node`, the loop-condition/def-ancestor guard).
+    /// `is_modifier_child` is NOT set here — callers must capture
+    /// `take_modifier_ctx()` as the very first thing they do (before
+    /// recursing into any child, e.g. an operator-assignment's `.value()`)
+    /// and set it on the returned assignment afterwards.
+    fn base_assignment(&self, meta: UaMeta, node_start: usize, node_end: usize, anchor: usize, name: &[u8]) -> UaAssignment {
+        let mut a = UaAssignment::new(meta, node_start, node_end, anchor, self.current_branch.clone());
+        a.in_branch_node = self.branch_node_depth > 0;
+        a.no_loop_condition_check = self.has_def_ancestor();
+        a.in_loop_condition = !a.no_loop_condition_check && self.in_loop_condition_now(name);
+        a.sequential = self.force_sequential;
+        a
+    }
+
+    /// `VariableTable#find_variable` (name-only, no explicit depth) — used
+    /// only by the loop-completion pass, matching upstream's own
+    /// name-resolved-via-VariableTable lookup for
+    /// `mark_assignments_as_referenced_in_loop`.
+    fn find_by_name(&self, name: &[u8]) -> Option<usize> {
+        let mut i = self.frames.len();
+        while i > 0 {
+            i -= 1;
+            if let Some(&idx) = self.frames[i].names.get(name) {
+                return Some(idx);
+            }
+            if self.frames[i].kind != UaKind::Block {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// `mark_assignments_as_referenced_in_loop`.
+    fn mark_loop_completions(&mut self, scan: &UaLoopScan) {
+        for name in &scan.read_names {
+            let Some(idx) = self.find_by_name(name) else { continue };
+            let in_loop: Vec<usize> = self.vars[idx]
+                .assignments
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| scan.assign_positions.contains(&a.node_start))
+                .map(|(i, _)| i)
+                .collect();
+            if in_loop.is_empty() {
+                continue;
+            }
+            for &ai in &in_loop {
+                if self.vars[idx].assignments[ai].in_branch_node {
+                    self.vars[idx].assignments[ai].referenced = true;
+                }
+            }
+            if let Some(&last) = in_loop.last() {
+                self.vars[idx].assignments[last].referenced = true;
+            }
+        }
+    }
+
+    /// `after_leaving_scope` → `check_for_unused_assignments` for every
+    /// variable declared directly in this (just-finished) scope, in
+    /// declaration order (needed for the ignore-cascade — see the module
+    /// doc comment). `scope_body` is the scope's own body node, reused for
+    /// the similar-name candidate scan.
+    fn finish_scope<'n>(&mut self, scope_body: &Option<ruby_prism::Node<'n>>) {
+        let frame = self.frames.pop().expect("frame stack underflow");
+        if frame.decl_order.iter().all(|&i| self.vars[i].name.starts_with(b"_")) {
+            return;
+        }
+        let send_names = ua_collect_variable_like_sends(scope_body);
+        let mut ignored: Vec<(usize, usize)> = Vec::new();
+        for &vidx in &frame.decl_order {
+            if self.vars[vidx].name.starts_with(b"_") {
+                continue;
+            }
+            let n = self.vars[vidx].assignments.len();
+            for i in (0..n).rev() {
+                let (used, skip_ignored, skip_loop_cond, node_start, node_end) = {
+                    let a = &self.vars[vidx].assignments[i];
+                    let captured = self.vars[vidx].captured_by_block;
+                    let used = (!a.reassigned && captured) || a.referenced;
+                    let skip_ignored = ignored.iter().any(|&(s, e)| a.node_start >= s && a.node_start < e);
+                    (used, skip_ignored, a.in_loop_condition, a.node_start, a.node_end)
+                };
+                if used || skip_ignored || skip_loop_cond {
+                    continue;
+                }
+                let (correctable, message, fix) = self.ua_offense_for(vidx, i, &frame, &send_names);
+                let anchor = self.vars[vidx].assignments[i].anchor;
+                self.offenses.push(UaOffense { anchor, correctable, message });
+                if let Some(f) = fix {
+                    self.fixes.push(f);
+                }
+                if self.vars[vidx].assignments[i].meta == UaMeta::Plain
+                    && (self.vars[vidx].assignments[i].value_is_send || self.vars[vidx].assignments[i].value_is_lvasgn)
+                {
+                    ignored.push((node_start, node_end));
+                }
+            }
+        }
+    }
+
+    /// `message_for_useless_assignment` + `autocorrect`. Returns
+    /// (correctable, full message, optional fix).
+    fn ua_offense_for(
+        &self,
+        vidx: usize,
+        aidx: usize,
+        frame: &UaFrame,
+        send_names: &HashSet<Vec<u8>>,
+    ) -> (bool, String, Option<(usize, usize, Vec<u8>)>) {
+        let name = self.vars[vidx].name.clone();
+        let name_str = String::from_utf8_lossy(&name).into_owned();
+        let a_meta = self.vars[vidx].assignments[aidx].meta;
+        let base = format!("Useless assignment to variable - `{name_str}`.");
+        let suffix = match a_meta {
+            UaMeta::MultipleAssign => {
+                format!(" Use `_` or `_{name_str}` as a variable name to indicate that it won't be used.")
+            }
+            UaMeta::OperatorAssign | UaMeta::OrAssign | UaMeta::AndAssign => {
+                let a = &self.vars[vidx].assignments[aidx];
+                if a.is_scope_return_value {
+                    let (short, full) = match a_meta {
+                        UaMeta::OrAssign => ("||".to_string(), "||=".to_string()),
+                        UaMeta::AndAssign => ("&&".to_string(), "&&=".to_string()),
+                        _ => {
+                            let op = String::from_utf8_lossy(&a.op_text).into_owned();
+                            (op.clone(), format!("{op}="))
+                        }
+                    };
+                    format!(" Use `{short}` instead of `{full}`.")
+                } else {
+                    String::new()
+                }
+            }
+            _ => {
+                let mut candidates: HashSet<Vec<u8>> = send_names.clone();
+                for &vi in &frame.decl_order {
+                    candidates.insert(self.vars[vi].name.clone());
+                }
+                ua_similar_name_suffix(&name, candidates)
+            }
+        };
+        let message = format!("{base}{suffix}");
+
+        let a = &self.vars[vidx].assignments[aidx];
+        let uncorrectable = a.sequential || a_meta == UaMeta::OrAssign || a_meta == UaMeta::AndAssign;
+        let correctable = !uncorrectable;
+        let fix = if uncorrectable { None } else { self.ua_autocorrect_for(vidx, aidx) };
+        (correctable, message, fix)
+    }
+
+    fn ua_autocorrect_for(&self, vidx: usize, aidx: usize) -> Option<(usize, usize, Vec<u8>)> {
+        let a = &self.vars[vidx].assignments[aidx];
+        match a.meta {
+            UaMeta::MultipleAssign | UaMeta::RestAssign | UaMeta::ForAssign => {
+                Some((a.node_start, a.node_end, b"_".to_vec()))
+            }
+            UaMeta::OperatorAssign => Some((a.operator_end - 1, a.operator_end, Vec::new())),
+            UaMeta::OrAssign | UaMeta::AndAssign => None,
+            UaMeta::ExceptionVar => {
+                let start = a.value_start?;
+                Some((start, a.node_end, Vec::new()))
+            }
+            UaMeta::RegexpNamedCapture => {
+                // `replace_named_capture_group_with_non_capturing_group`:
+                // `node.children.first.source.sub(/\(\?<#{name}>/, '(?:')`
+                // — `node_start..node_end` is the regexp literal's own
+                // range (see `visit_match_write_node`).
+                let name = &self.vars[vidx].name;
+                let regex_src = &self.src[a.node_start..a.node_end];
+                let pattern = format!("(?<{}>", String::from_utf8_lossy(name));
+                let pos = ua_find_bytes(regex_src, pattern.as_bytes())?;
+                let abs_start = a.node_start + pos;
+                let abs_end = abs_start + pattern.len();
+                Some((abs_start, abs_end, b"(?:".to_vec()))
+            }
+            UaMeta::Plain => {
+                let value_start = a.value_start?;
+                Some((a.anchor, value_start, Vec::new()))
+            }
+        }
+    }
+}
+
+fn ua_find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
+/// Result of the purely-syntactic (scope-unaware) descendant scan over a
+/// loop's (or a `retry`-containing `begin/rescue`'s) full subtree —
+/// `find_variables_in_loop`.
+struct UaLoopScan {
+    read_names: HashSet<Vec<u8>>,
+    assign_positions: HashSet<usize>,
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for UaLoopScan {
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.read_names.insert(node.name().as_slice().to_vec());
+    }
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        self.assign_positions.insert(node.location().start_offset());
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        self.assign_positions.insert(node.location().start_offset());
+    }
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        self.read_names.insert(node.name().as_slice().to_vec());
+        self.assign_positions.insert(node.location().start_offset());
+        ruby_prism::visit_local_variable_operator_write_node(self, node);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        self.read_names.insert(node.name().as_slice().to_vec());
+        self.assign_positions.insert(node.location().start_offset());
+        ruby_prism::visit_local_variable_or_write_node(self, node);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        self.read_names.insert(node.name().as_slice().to_vec());
+        self.assign_positions.insert(node.location().start_offset());
+        ruby_prism::visit_local_variable_and_write_node(self, node);
+    }
+}
+
+fn ua_scan_loop(node: &ruby_prism::Node) -> UaLoopScan {
+    let mut s = UaLoopScan { read_names: HashSet::new(), assign_positions: HashSet::new() };
+    use ruby_prism::Visit;
+    s.visit(node);
+    s
+}
+
+/// `sequential_assignment?`'s base case: does `node`'s subtree contain any
+/// assignment-shaped node at all (purely syntactic, matching upstream's
+/// naive `each_descendant.any?(&:assignment?)`)?
+fn ua_contains_any_assignment(node: &ruby_prism::Node) -> bool {
+    struct S {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for S {
+        fn visit_local_variable_write_node(&mut self, _n: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_local_variable_target_node(&mut self, _n: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_local_variable_operator_write_node(&mut self, _n: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_local_variable_or_write_node(&mut self, _n: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_local_variable_and_write_node(&mut self, _n: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_multi_write_node(&mut self, _n: &ruby_prism::MultiWriteNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_instance_variable_write_node(&mut self, _n: &ruby_prism::InstanceVariableWriteNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_global_variable_write_node(&mut self, _n: &ruby_prism::GlobalVariableWriteNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_class_variable_write_node(&mut self, _n: &ruby_prism::ClassVariableWriteNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_constant_write_node(&mut self, _n: &ruby_prism::ConstantWriteNode<'pr>) {
+            self.found = true;
+        }
+    }
+    let mut s = S { found: false };
+    use ruby_prism::Visit;
+    s.visit(node);
+    s.found
+}
+
+/// `collect_variable_like_names`'s method-invocation half:
+/// receiverless, argument-less sends, scanned with every nested
+/// `def`/`class`/`module`/`sclass`/`block`/`lambda` treated as fully
+/// opaque (a simplification of upstream's `Scope#each_node`, which also
+/// harvests a nested scope's own "twisted" outer-owned pieces — see the
+/// module doc comment's residual-risk note).
+struct UaSendNames {
+    names: HashSet<Vec<u8>>,
+}
+impl<'pr> ruby_prism::Visit<'pr> for UaSendNames {
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        let has_args = node.arguments().is_some_and(|a| a.arguments().iter().next().is_some());
+        if node.receiver().is_none() && !has_args {
+            self.names.insert(node.name().as_slice().to_vec());
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+    fn visit_def_node(&mut self, _n: &ruby_prism::DefNode<'pr>) {}
+    fn visit_class_node(&mut self, _n: &ruby_prism::ClassNode<'pr>) {}
+    fn visit_module_node(&mut self, _n: &ruby_prism::ModuleNode<'pr>) {}
+    fn visit_singleton_class_node(&mut self, _n: &ruby_prism::SingletonClassNode<'pr>) {}
+    fn visit_block_node(&mut self, _n: &ruby_prism::BlockNode<'pr>) {}
+    fn visit_lambda_node(&mut self, _n: &ruby_prism::LambdaNode<'pr>) {}
+}
+
+fn ua_collect_variable_like_sends(scope_body: &Option<ruby_prism::Node>) -> HashSet<Vec<u8>> {
+    let mut s = UaSendNames { names: HashSet::new() };
+    if let Some(b) = scope_body {
+        use ruby_prism::Visit;
+        s.visit(b);
+    }
+    s.names
+}
+
+/// `process_pattern_match_variable`: pattern-match capture names (`in`/`=>`
+/// destructuring, and `case/in`) are declared but NEVER get an `Assignment`
+/// record at all — so this collector only needs their NAMES (to declare
+/// them, making later reads resolve) and never touches `record_assignment`.
+struct UaPatternVars {
+    names: Vec<Vec<u8>>,
+}
+impl<'pr> ruby_prism::Visit<'pr> for UaPatternVars {
+    fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+        self.names.push(node.name().as_slice().to_vec());
+    }
+}
+fn ua_collect_pattern_vars(node: &ruby_prism::Node) -> Vec<Vec<u8>> {
+    let mut s = UaPatternVars { names: Vec::new() };
+    use ruby_prism::Visit;
+    s.visit(node);
+    s.names
+}
+
+/// `return_value_node_of_scope`: the scope's own final directly-executed
+/// statement's byte range (or the whole body's range, for a non-`begin`
+/// single-expression body) — used only to decide whether an operator
+/// assignment's message gets the "Use `||`/`&&`/... instead" suffix.
+fn ua_scope_return_range(body: &Option<ruby_prism::Node>) -> Option<(usize, usize)> {
+    let body = body.as_ref()?;
+    if let Some(st) = body.as_statements_node() {
+        let last = st.body().iter().last()?;
+        let l = last.location();
+        Some((l.start_offset(), l.end_offset()))
+    } else {
+        let l = body.location();
+        Some((l.start_offset(), l.end_offset()))
+    }
+}
+
+// --- DidYouMean::SpellChecker port (Jaro/Jaro-Winkler/Levenshtein) ---
+
+fn ua_normalize(s: &[u8]) -> Vec<char> {
+    String::from_utf8_lossy(s).chars().filter(|&c| c != '@').flat_map(|c| c.to_lowercase()).collect()
+}
+fn ua_chars(s: &[u8]) -> Vec<char> {
+    String::from_utf8_lossy(s).chars().collect()
+}
+
+fn ua_jaro(a: &[char], b: &[char]) -> f64 {
+    let (s1, s2) = if a.len() > b.len() { (b, a) } else { (a, b) };
+    let len1 = s1.len();
+    let len2 = s2.len();
+    if len1 == 0 {
+        return if len2 == 0 { 0.0 } else { 0.0 };
+    }
+    let range = if len2 > 3 { len2 / 2 - 1 } else { 0 };
+    let mut flags1 = vec![false; len1];
+    let mut flags2 = vec![false; len2];
+    let mut m: i64 = 0;
+    for i in 0..len1 {
+        let last = i + range;
+        let start = if i >= range { i - range } else { 0 };
+        let mut j = start;
+        while j <= last && j < len2 {
+            if !flags2[j] && s1[i] == s2[j] {
+                flags2[j] = true;
+                flags1[i] = true;
+                m += 1;
+                break;
+            }
+            j += 1;
+        }
+    }
+    if m == 0 {
+        return 0.0;
+    }
+    let mut k = 0usize;
+    let mut t: i64 = 0;
+    for i in 0..len1 {
+        if !flags1[i] {
+            continue;
+        }
+        let mut index = k;
+        let mut j = k;
+        while j < len2 {
+            index = j;
+            if flags2[j] {
+                j += 1;
+                break;
+            }
+            j += 1;
+        }
+        k = j;
+        if s1[i] != s2[index] {
+            t += 1;
+        }
+    }
+    let t = (t as f64 / 2.0).floor();
+    let mf = m as f64;
+    let l1 = len1 as f64;
+    let l2 = len2 as f64;
+    (mf / l1 + mf / l2 + (mf - t) / mf) / 3.0
+}
+
+fn ua_jaro_winkler(word: &[char], input: &[char]) -> f64 {
+    let jaro = ua_jaro(word, input);
+    if jaro > 0.7 {
+        let mut prefix = 0usize;
+        for (i, &c1) in word.iter().enumerate() {
+            if i >= 4 {
+                break;
+            }
+            if input.get(i) == Some(&c1) {
+                prefix += 1;
+            } else {
+                break;
+            }
+        }
+        jaro + (prefix as f64) * 0.1 * (1.0 - jaro)
+    } else {
+        jaro
+    }
+}
+
+fn ua_levenshtein(a: &[char], b: &[char]) -> i64 {
+    let n = a.len();
+    let m = b.len();
+    if n == 0 {
+        return m as i64;
+    }
+    if m == 0 {
+        return n as i64;
+    }
+    let mut d: Vec<i64> = (0..=m as i64).collect();
+    for i in 1..=n {
+        let mut prev_diag = d[0];
+        d[0] = i as i64;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            let tmp = d[j];
+            d[j] = (d[j] + 1).min(d[j - 1] + 1).min(prev_diag + cost);
+            prev_diag = tmp;
+        }
+    }
+    d[m]
+}
+
+/// `DidYouMean::SpellChecker#correct`.
+fn ua_spellcheck_correct(input: &[u8], dictionary: &HashSet<Vec<u8>>) -> Option<Vec<u8>> {
+    let norm_input = ua_normalize(input);
+    let threshold = if norm_input.len() > 3 { 0.834 } else { 0.77 };
+    let mut words: Vec<Vec<u8>> = dictionary
+        .iter()
+        .filter(|w| w.as_slice() != input)
+        .filter(|w| ua_jaro_winkler(&ua_normalize(w), &norm_input) >= threshold)
+        .cloned()
+        .collect();
+    words.sort_by(|a, b| {
+        let da = ua_jaro_winkler(&ua_chars(a), &norm_input);
+        let db = ua_jaro_winkler(&ua_chars(b), &norm_input);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    words.reverse();
+    let lev_threshold = (norm_input.len() as f64 * 0.25).ceil() as i64;
+    let mut corrections: Vec<Vec<u8>> =
+        words.iter().filter(|w| ua_levenshtein(&ua_normalize(w), &norm_input) <= lev_threshold).cloned().collect();
+    if corrections.is_empty() {
+        corrections = words
+            .iter()
+            .filter(|w| {
+                let wn = ua_normalize(w);
+                let len = norm_input.len().min(wn.len());
+                ua_levenshtein(&wn, &norm_input) < len as i64
+            })
+            .take(1)
+            .cloned()
+            .collect();
+    }
+    corrections.into_iter().next()
+}
+
+fn ua_similar_name_suffix(target: &[u8], mut candidates: HashSet<Vec<u8>>) -> String {
+    candidates.remove(target);
+    match ua_spellcheck_correct(target, &candidates) {
+        Some(name) => format!(" Did you mean `{}`?", String::from_utf8_lossy(&name)),
+        None => String::new(),
+    }
+}
+
+fn ua_scan_names(node: &ruby_prism::Node) -> HashSet<Vec<u8>> {
+    struct S {
+        names: HashSet<Vec<u8>>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for S {
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            self.names.insert(node.name().as_slice().to_vec());
+        }
+    }
+    let mut s = S { names: HashSet::new() };
+    use ruby_prism::Visit;
+    s.visit(node);
+    s.names
+}
+
+fn ua_contains_retry(first_rescue: &ruby_prism::RescueNode) -> bool {
+    struct S {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for S {
+        fn visit_retry_node(&mut self, _n: &ruby_prism::RetryNode<'pr>) {
+            self.found = true;
+        }
+    }
+    let mut s = S { found: false };
+    use ruby_prism::Visit;
+    s.visit(&first_rescue.as_node());
+    s.found
+}
+
+/// `find_variables_in_loop` scoped to a `begin/rescue`'s protected region
+/// (main body + every chained rescue clause + `else`) — deliberately
+/// EXCLUDING `ensure` (upstream's `:rescue` node never includes it either).
+fn ua_scan_loop_begin_no_ensure(node: &ruby_prism::BeginNode) -> UaLoopScan {
+    let mut s = UaLoopScan { read_names: HashSet::new(), assign_positions: HashSet::new() };
+    use ruby_prism::Visit;
+    if let Some(st) = node.statements() {
+        s.visit(&st.as_node());
+    }
+    let mut rc = node.rescue_clause();
+    while let Some(r) = rc {
+        for exc in r.exceptions().iter() {
+            s.visit(&exc);
+        }
+        if let Some(reference) = r.reference() {
+            s.visit(&reference);
+        }
+        if let Some(st) = r.statements() {
+            s.visit(&st.as_node());
+        }
+        rc = r.subsequent();
+    }
+    if let Some(e) = node.else_clause() {
+        if let Some(st) = e.statements() {
+            s.visit(&st.as_node());
+        }
+    }
+    s
+}
+
+// --- The traversal itself ---
+
+impl<'pr, 's> ruby_prism::Visit<'pr> for UaCollector<'s> {
+    // -- Scopes --
+
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        if let Some(recv) = node.receiver() {
+            self.visit(&recv);
+        }
+        let body = node.body();
+        let saved = self.push_scope(UaKind::Def, &body);
+        if let Some(params) = node.parameters() {
+            self.visit_parameters_node(&params);
+        }
+        if let Some(b) = &body {
+            self.visit(b);
+        }
+        self.pop_scope_and_finish(saved, &body);
+    }
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        self.visit(&node.constant_path());
+        if let Some(sup) = node.superclass() {
+            self.visit(&sup);
+        }
+        let body = node.body();
+        let saved = self.push_scope(UaKind::Other, &body);
+        if let Some(b) = &body {
+            self.visit(b);
+        }
+        self.pop_scope_and_finish(saved, &body);
+    }
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        self.visit(&node.constant_path());
+        let body = node.body();
+        let saved = self.push_scope(UaKind::Other, &body);
+        if let Some(b) = &body {
+            self.visit(b);
+        }
+        self.pop_scope_and_finish(saved, &body);
+    }
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        self.visit(&node.expression());
+        let body = node.body();
+        let saved = self.push_scope(UaKind::Other, &body);
+        if let Some(b) = &body {
+            self.visit(b);
+        }
+        self.pop_scope_and_finish(saved, &body);
+    }
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        let body = node.body();
+        let saved = self.push_scope(UaKind::Block, &body);
+        if let Some(params) = node.parameters() {
+            self.visit(&params);
+        }
+        if let Some(b) = &body {
+            self.visit(b);
+        }
+        self.pop_scope_and_finish(saved, &body);
+    }
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        let body = node.body();
+        let saved = self.push_scope(UaKind::Block, &body);
+        if let Some(params) = node.parameters() {
+            self.visit(&params);
+        }
+        if let Some(b) = &body {
+            self.visit(b);
+        }
+        self.pop_scope_and_finish(saved, &body);
+    }
+
+    // -- Parameter declarations (declare-only, never assigned) --
+
+    fn visit_required_parameter_node(&mut self, node: &ruby_prism::RequiredParameterNode<'pr>) {
+        self.declare_arg(node.name().as_slice());
+    }
+    fn visit_optional_parameter_node(&mut self, node: &ruby_prism::OptionalParameterNode<'pr>) {
+        self.declare_arg(node.name().as_slice());
+        self.visit(&node.value());
+    }
+    fn visit_rest_parameter_node(&mut self, node: &ruby_prism::RestParameterNode<'pr>) {
+        if let Some(name) = node.name() {
+            self.declare_arg(name.as_slice());
+        }
+    }
+    fn visit_required_keyword_parameter_node(&mut self, node: &ruby_prism::RequiredKeywordParameterNode<'pr>) {
+        self.declare_arg(node.name().as_slice());
+    }
+    fn visit_optional_keyword_parameter_node(&mut self, node: &ruby_prism::OptionalKeywordParameterNode<'pr>) {
+        self.declare_arg(node.name().as_slice());
+        self.visit(&node.value());
+    }
+    fn visit_keyword_rest_parameter_node(&mut self, node: &ruby_prism::KeywordRestParameterNode<'pr>) {
+        if let Some(name) = node.name() {
+            self.declare_arg(name.as_slice());
+        }
+    }
+    fn visit_block_parameter_node(&mut self, node: &ruby_prism::BlockParameterNode<'pr>) {
+        if let Some(name) = node.name() {
+            self.declare_arg(name.as_slice());
+        }
+    }
+    fn visit_block_local_variable_node(&mut self, node: &ruby_prism::BlockLocalVariableNode<'pr>) {
+        self.ensure_declared(node.name().as_slice(), 0);
+    }
+
+    // -- Plain / multiple / rest / for / operator / regexp assignments --
+
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        let is_mod = self.take_modifier_ctx();
+        let inherited_sequential = self.force_sequential;
+        let name = node.name();
+        let name = name.as_slice();
+        let depth = node.depth();
+        self.ensure_declared(name, depth);
+        let value = node.value();
+        let is_sequential_array = value.as_array_node().is_some_and(|arr| ua_contains_any_assignment(&arr.as_node()));
+        if is_sequential_array {
+            self.force_sequential = true;
+        }
+        self.visit(&value);
+        self.force_sequential = inherited_sequential;
+        let loc = node.location();
+        let value_loc = value.location();
+        let mut a = self.base_assignment(UaMeta::Plain, loc.start_offset(), loc.end_offset(), node.name_loc().start_offset(), name);
+        a.is_modifier_child = is_mod;
+        a.value_start = Some(value_loc.start_offset());
+        a.value_is_send = value.as_call_node().is_some();
+        a.value_is_lvasgn = value.as_local_variable_write_node().is_some();
+        a.sequential = inherited_sequential || is_sequential_array;
+        self.record_assignment(name, depth, a);
+    }
+
+    fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+        let is_mod = self.take_modifier_ctx();
+        let name = node.name();
+        let name = name.as_slice();
+        let depth = node.depth();
+        self.ensure_declared(name, depth);
+        self.reference(name, depth);
+        let op_loc = node.binary_operator_loc();
+        let control_id = node.location().start_offset();
+        let saved = self.current_branch.clone();
+        self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+        self.visit(&node.value());
+        self.current_branch = saved;
+        let loc = node.location();
+        let mut a = self.base_assignment(UaMeta::OperatorAssign, loc.start_offset(), loc.end_offset(), loc.start_offset(), name);
+        a.is_modifier_child = is_mod;
+        a.op_text = node.binary_operator().as_slice().to_vec();
+        a.operator_end = op_loc.end_offset();
+        a.is_scope_return_value = self.frames.last().and_then(|f| f.return_range) == Some((loc.start_offset(), loc.end_offset()));
+        self.record_assignment(name, depth, a);
+    }
+    fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+        let is_mod = self.take_modifier_ctx();
+        let name = node.name();
+        let name = name.as_slice();
+        let depth = node.depth();
+        self.ensure_declared(name, depth);
+        self.reference(name, depth);
+        let control_id = node.location().start_offset();
+        let saved = self.current_branch.clone();
+        self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+        self.visit(&node.value());
+        self.current_branch = saved;
+        let loc = node.location();
+        let mut a = self.base_assignment(UaMeta::OrAssign, loc.start_offset(), loc.end_offset(), loc.start_offset(), name);
+        a.is_modifier_child = is_mod;
+        a.is_scope_return_value = self.frames.last().and_then(|f| f.return_range) == Some((loc.start_offset(), loc.end_offset()));
+        self.record_assignment(name, depth, a);
+    }
+    fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+        let is_mod = self.take_modifier_ctx();
+        let name = node.name();
+        let name = name.as_slice();
+        let depth = node.depth();
+        self.ensure_declared(name, depth);
+        self.reference(name, depth);
+        let control_id = node.location().start_offset();
+        let saved = self.current_branch.clone();
+        self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+        self.visit(&node.value());
+        self.current_branch = saved;
+        let loc = node.location();
+        let mut a = self.base_assignment(UaMeta::AndAssign, loc.start_offset(), loc.end_offset(), loc.start_offset(), name);
+        a.is_modifier_child = is_mod;
+        a.is_scope_return_value = self.frames.last().and_then(|f| f.return_range) == Some((loc.start_offset(), loc.end_offset()));
+        self.record_assignment(name, depth, a);
+    }
+
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.take_modifier_ctx();
+        let name = node.name();
+        self.reference(name.as_slice(), node.depth());
+    }
+
+    fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        self.take_modifier_ctx();
+        self.visit(&node.value());
+        let mut targets: Vec<ruby_prism::Node> = node.lefts().iter().collect();
+        if let Some(r) = node.rest() {
+            targets.push(r);
+        }
+        targets.extend(node.rights().iter());
+        self.process_masgn_target_list(&targets);
+    }
+
+    fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
+        self.take_modifier_ctx();
+        self.visit(&node.collection());
+        let idx = node.index();
+        self.process_for_target(&idx);
+        let control_id = node.location().start_offset();
+        self.loop_stack.push(None);
+        let saved = self.current_branch.clone();
+        self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+        if let Some(st) = node.statements() {
+            self.visit(&st.as_node());
+        }
+        self.current_branch = saved;
+        self.loop_stack.pop();
+        let scan = ua_scan_loop(&node.as_node());
+        self.mark_loop_completions(&scan);
+    }
+
+    fn visit_match_write_node(&mut self, node: &ruby_prism::MatchWriteNode<'pr>) {
+        let is_mod = self.take_modifier_ctx();
+        let call = node.call();
+        let regex_opt = call.receiver();
+        let targets: Vec<ruby_prism::LocalVariableTargetNode> =
+            node.targets().iter().filter_map(|t| t.as_local_variable_target_node()).collect();
+        for t in &targets {
+            self.ensure_declared(t.name().as_slice(), t.depth());
+        }
+        if let Some(args) = call.arguments() {
+            for a in args.arguments().iter() {
+                self.visit(&a);
+            }
+        }
+        if let Some(regex) = &regex_opt {
+            self.visit(regex);
+        }
+        let regex_range = regex_opt.as_ref().map(|r| r.location()).unwrap_or_else(|| node.location());
+        let anchor = regex_range.start_offset();
+        for t in &targets {
+            let name = t.name();
+            let name = name.as_slice();
+            let mut a = self.base_assignment(
+                UaMeta::RegexpNamedCapture,
+                regex_range.start_offset(),
+                regex_range.end_offset(),
+                anchor,
+                name,
+            );
+            a.is_modifier_child = is_mod;
+            self.record_assignment(name, t.depth(), a);
+        }
+    }
+
+    // -- Pattern matching (`in`/`=>`): declare-only captures --
+
+    fn visit_match_predicate_node(&mut self, node: &ruby_prism::MatchPredicateNode<'pr>) {
+        self.take_modifier_ctx();
+        self.visit(&node.value());
+        for name in ua_collect_pattern_vars(&node.pattern()) {
+            self.declare_pattern_var(&name);
+        }
+    }
+    fn visit_match_required_node(&mut self, node: &ruby_prism::MatchRequiredNode<'pr>) {
+        self.take_modifier_ctx();
+        self.visit(&node.value());
+        for name in ua_collect_pattern_vars(&node.pattern()) {
+            self.declare_pattern_var(&name);
+        }
+    }
+
+    // -- Conditionals / branches --
+
+    fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        self.branch_node_depth += 1;
+        let is_modifier = node.if_keyword_loc().is_some() && node.end_keyword_loc().is_none();
+        if is_modifier {
+            self.visit_modifier_child(&node.predicate());
+        } else {
+            self.visit(&node.predicate());
+        }
+        let control_id = node.location().start_offset();
+        if let Some(st) = node.statements() {
+            let saved = self.current_branch.clone();
+            self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+            if is_modifier {
+                if let Some(first) = st.body().iter().next() {
+                    self.visit_modifier_child(&first);
+                }
+            } else {
+                self.visit(&st.as_node());
+            }
+            self.current_branch = saved;
+        }
+        if let Some(sub) = node.subsequent() {
+            let saved = self.current_branch.clone();
+            self.current_branch = ua_new_branch(&saved, control_id, 2, false);
+            self.visit(&sub);
+            self.current_branch = saved;
+        }
+        self.branch_node_depth -= 1;
+    }
+    fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        self.branch_node_depth += 1;
+        let is_modifier = node.end_keyword_loc().is_none();
+        if is_modifier {
+            self.visit_modifier_child(&node.predicate());
+        } else {
+            self.visit(&node.predicate());
+        }
+        let control_id = node.location().start_offset();
+        if let Some(st) = node.statements() {
+            let saved = self.current_branch.clone();
+            self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+            if is_modifier {
+                if let Some(first) = st.body().iter().next() {
+                    self.visit_modifier_child(&first);
+                }
+            } else {
+                self.visit(&st.as_node());
+            }
+            self.current_branch = saved;
+        }
+        if let Some(e) = node.else_clause() {
+            let saved = self.current_branch.clone();
+            self.current_branch = ua_new_branch(&saved, control_id, 2, false);
+            if let Some(st) = e.statements() {
+                self.visit(&st.as_node());
+            }
+            self.current_branch = saved;
+        }
+        self.branch_node_depth -= 1;
+    }
+    fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
+        self.branch_node_depth += 1;
+        if let Some(p) = node.predicate() {
+            self.visit(&p);
+        }
+        let control_id = node.location().start_offset();
+        for cond in node.conditions().iter() {
+            if let Some(w) = cond.as_when_node() {
+                let child_id = w.location().start_offset();
+                let saved = self.current_branch.clone();
+                self.current_branch = ua_new_branch(&saved, control_id, child_id, false);
+                for c in w.conditions().iter() {
+                    self.visit(&c);
+                }
+                if let Some(st) = w.statements() {
+                    self.visit(&st.as_node());
+                }
+                self.current_branch = saved;
+            }
+        }
+        if let Some(e) = node.else_clause() {
+            let child_id = e.location().start_offset();
+            let saved = self.current_branch.clone();
+            self.current_branch = ua_new_branch(&saved, control_id, child_id, false);
+            if let Some(st) = e.statements() {
+                self.visit(&st.as_node());
+            }
+            self.current_branch = saved;
+        }
+        self.branch_node_depth -= 1;
+    }
+    fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
+        self.branch_node_depth += 1;
+        if let Some(p) = node.predicate() {
+            self.visit(&p);
+        }
+        let control_id = node.location().start_offset();
+        for cond in node.conditions().iter() {
+            if let Some(inn) = cond.as_in_node() {
+                let child_id = inn.location().start_offset();
+                let saved = self.current_branch.clone();
+                self.current_branch = ua_new_branch(&saved, control_id, child_id, false);
+                for name in ua_collect_pattern_vars(&inn.pattern()) {
+                    self.declare_pattern_var(&name);
+                }
+                if let Some(st) = inn.statements() {
+                    self.visit(&st.as_node());
+                }
+                self.current_branch = saved;
+            }
+        }
+        if let Some(e) = node.else_clause() {
+            let child_id = e.location().start_offset();
+            let saved = self.current_branch.clone();
+            self.current_branch = ua_new_branch(&saved, control_id, child_id, false);
+            if let Some(st) = e.statements() {
+                self.visit(&st.as_node());
+            }
+            self.current_branch = saved;
+        }
+        self.branch_node_depth -= 1;
+    }
+
+    fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        let predicate = node.predicate();
+        let cond_names = ua_scan_names(&predicate);
+        let control_id = node.location().start_offset();
+        // `modifier_form?` (`loc.end.nil?`) — but a post-condition loop
+        // (`begin...end while cond`) is a DIFFERENT whitequark type
+        // (`:while_post`, not in `BASIC_CONDITIONALS`), so it never counts
+        // as a modifier conditional for `in_modifier_conditional?` even
+        // though it ALSO lacks its own closing keyword.
+        let is_modifier = !node.is_begin_modifier() && node.closing_loc().is_none();
+        if node.is_begin_modifier() {
+            self.loop_stack.push(Some(cond_names));
+            let saved = self.current_branch.clone();
+            self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+            if let Some(st) = node.statements() {
+                self.visit(&st.as_node());
+            }
+            self.current_branch = saved;
+            self.loop_stack.pop();
+            self.visit(&predicate);
+        } else {
+            if is_modifier {
+                self.visit_modifier_child(&predicate);
+            } else {
+                self.visit(&predicate);
+            }
+            self.loop_stack.push(Some(cond_names));
+            let saved = self.current_branch.clone();
+            self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+            if let Some(st) = node.statements() {
+                if is_modifier {
+                    if let Some(first) = st.body().iter().next() {
+                        self.visit_modifier_child(&first);
+                    }
+                } else {
+                    self.visit(&st.as_node());
+                }
+            }
+            self.current_branch = saved;
+            self.loop_stack.pop();
+        }
+        let scan = ua_scan_loop(&node.as_node());
+        self.mark_loop_completions(&scan);
+    }
+    fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        let predicate = node.predicate();
+        let cond_names = ua_scan_names(&predicate);
+        let control_id = node.location().start_offset();
+        let is_modifier = !node.is_begin_modifier() && node.closing_loc().is_none();
+        if node.is_begin_modifier() {
+            self.loop_stack.push(Some(cond_names));
+            let saved = self.current_branch.clone();
+            self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+            if let Some(st) = node.statements() {
+                self.visit(&st.as_node());
+            }
+            self.current_branch = saved;
+            self.loop_stack.pop();
+            self.visit(&predicate);
+        } else {
+            if is_modifier {
+                self.visit_modifier_child(&predicate);
+            } else {
+                self.visit(&predicate);
+            }
+            self.loop_stack.push(Some(cond_names));
+            let saved = self.current_branch.clone();
+            self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+            if let Some(st) = node.statements() {
+                if is_modifier {
+                    if let Some(first) = st.body().iter().next() {
+                        self.visit_modifier_child(&first);
+                    }
+                } else {
+                    self.visit(&st.as_node());
+                }
+            }
+            self.current_branch = saved;
+            self.loop_stack.pop();
+        }
+        let scan = ua_scan_loop(&node.as_node());
+        self.mark_loop_completions(&scan);
+    }
+
+    fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
+        self.take_modifier_ctx();
+        self.visit(&node.left());
+        let control_id = node.location().start_offset();
+        let saved = self.current_branch.clone();
+        self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+        self.visit(&node.right());
+        self.current_branch = saved;
+    }
+    fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
+        self.take_modifier_ctx();
+        self.visit(&node.left());
+        let control_id = node.location().start_offset();
+        let saved = self.current_branch.clone();
+        self.current_branch = ua_new_branch(&saved, control_id, 1, false);
+        self.visit(&node.right());
+        self.current_branch = saved;
+    }
+
+    fn visit_rescue_modifier_node(&mut self, node: &ruby_prism::RescueModifierNode<'pr>) {
+        self.take_modifier_ctx();
+        self.branch_node_depth += 1;
+        let control_id = node.location().start_offset();
+        let saved = self.current_branch.clone();
+        self.current_branch = ua_new_branch(&saved, control_id, 1, true);
+        self.visit(&node.expression());
+        self.current_branch = ua_new_branch(&saved, control_id, 2, false);
+        self.visit(&node.rescue_expression());
+        self.current_branch = saved;
+        self.branch_node_depth -= 1;
+    }
+
+    fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
+        self.take_modifier_ctx();
+        let control_id = node.location().start_offset();
+        let has_rescue = node.rescue_clause().is_some();
+        let has_ensure = node.ensure_clause().is_some();
+        let may_jump = has_rescue || has_ensure;
+        if has_rescue {
+            self.branch_node_depth += 1;
+        }
+        let saved = self.current_branch.clone();
+        if may_jump {
+            self.current_branch = ua_new_branch(&saved, control_id, 1, true);
+        }
+        if let Some(st) = node.statements() {
+            self.visit(&st.as_node());
+        }
+        self.current_branch = saved.clone();
+
+        let mut rc = node.rescue_clause();
+        while let Some(r) = rc {
+            let child_id = r.location().start_offset();
+            self.current_branch = ua_new_branch(&saved, control_id, child_id, false);
+            for exc in r.exceptions().iter() {
+                self.visit(&exc);
+            }
+            if let Some(reference) = r.reference() {
+                let exceptions_first_end = r.exceptions().iter().next().map(|e| e.location().end_offset());
+                let keyword_end = r.keyword_loc().end_offset();
+                self.record_rescue_reference(&reference, exceptions_first_end, keyword_end);
+            }
+            if let Some(st) = r.statements() {
+                self.visit(&st.as_node());
+            }
+            self.current_branch = saved.clone();
+            rc = r.subsequent();
+        }
+        if let Some(e) = node.else_clause() {
+            let child_id = e.location().start_offset();
+            self.current_branch = ua_new_branch(&saved, control_id, child_id, false);
+            if let Some(st) = e.statements() {
+                self.visit(&st.as_node());
+            }
+            self.current_branch = saved.clone();
+        }
+        if has_rescue {
+            self.branch_node_depth -= 1;
+        }
+
+        if let Some(first_rescue) = node.rescue_clause() {
+            if ua_contains_retry(&first_rescue) {
+                let scan = ua_scan_loop_begin_no_ensure(node);
+                self.mark_loop_completions(&scan);
+            }
+        }
+
+        if let Some(en) = node.ensure_clause() {
+            if let Some(st) = en.statements() {
+                self.visit(&st.as_node());
+            }
+        }
+    }
+
+    // -- Implicit references --
+
+    fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+        self.take_modifier_ctx();
+        self.mark_zsuper();
+        if let Some(block) = node.block() {
+            self.visit_block_node(&block);
+        }
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if node.name().as_slice() == b"binding" {
+            let empty_args = node.arguments().map(|a| a.arguments().iter().next().is_none()).unwrap_or(true);
+            if empty_args {
+                self.mark_binding();
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+}
+
+impl<'a> Cops<'a> {
+    pub(crate) fn check_useless_assignment(&mut self, node: &ruby_prism::ProgramNode) {
+        const COP: &str = "Lint/UselessAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        let mut c = UaCollector::new(self.src);
+        let body = Some(node.statements().as_node());
+        let saved = c.push_scope(UaKind::Other, &body);
+        use ruby_prism::Visit;
+        c.visit(&node.statements().as_node());
+        c.pop_scope_and_finish(saved, &body);
+        for off in c.offenses {
+            self.push(off.anchor, COP, off.correctable, off.message);
+        }
+        for f in c.fixes {
+            self.fixes.push(f);
+        }
+    }
+}
