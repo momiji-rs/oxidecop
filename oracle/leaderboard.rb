@@ -327,6 +327,7 @@ COPS = {
   'Style/GuardClause'                => 'style/guard_clause',
   'Lint/LiteralAsCondition'          => 'lint/literal_as_condition',
   'Lint/ShadowedArgument'            => 'lint/shadowed_argument',
+  'Lint/Void'                        => 'lint/void',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

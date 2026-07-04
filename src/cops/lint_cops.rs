@@ -13360,3 +13360,482 @@ impl<'pr> ruby_prism::Visit<'pr> for SaCollector {
         }
     }
 }
+
+
+// ---------------------------------------------------------------------
+// Lint/Void
+//
+// Architecture note: upstream's `on_begin`/`on_kwbegin` fires for EVERY
+// whitequark `:begin`/`:kwbegin` node found ANYWHERE in the tree (rubocop's
+// generic per-node-type dispatch, independent of `check_begin`'s own
+// internal recursion). A whitequark `:begin` node is exactly one of:
+//   - an implicit 2+-statement sequence (def/block/for/ensure/if/case/
+//     when/in/rescue/top-level bodies) — prism: a `StatementsNode` with
+//     `body().len() >= 2` (a single statement is NEVER wrapped upstream,
+//     matching this codebase's established `StatementsNode` convention —
+//     see `DnFrame::BeginGroup`'s doc in mod.rs).
+//   - an explicit parenthesized grouping `(...)` — prism: `ParenthesesNode`
+//     — which whitequark represents as `:begin` regardless of how many
+//     statements it holds (0, 1, or many).
+// An explicit `begin...end`/`:kwbegin` is a DIFFERENT whitequark type and
+// is only reached via `EnsureNode`'s clause / `EnsureNode`'s statements
+// via the generic `StatementsNode` path above; `check_void_op`'s own
+// `node.children.first while node&.begin_type?` unwrap loop ONLY unwraps
+// `:begin` (i.e. `ParenthesesNode` here), never `:kwbegin`.
+//
+// `void_context?` (whether the LAST child of a 2+-statement group is ALSO
+// checked, not just popped) is `true` upstream only for: `EnsureNode`
+// (always), `ForNode` (always), `DefNode`/`DefNode` w/ receiver (only
+// `initialize` or an assignment-method `foo=`), and `BlockNode` (only
+// `each`/`tap`). EVERY other container (top-level program, `if`/`unless`/
+// `when`/`in`/`case`-`else` branches, a plain `begin...end`, a `rescue`/
+// `resbody`'s own main body) never responds to `void_context?` at all, so
+// it defaults to `false`. This is threaded top-down via `void_pending_ctx`
+// (see its field doc in mod.rs), which the FOUR special containers set
+// right before descending into a body that is DIRECTLY a `StatementsNode`
+// (never set for an implicit rescue/else/ensure-wrapping `BeginNode`
+// instead — matching upstream's main-body-under-rescue/ensure never being
+// the LAST child of its real `:rescue`/`:ensure` parent, hence never void,
+// exactly the same as the "unset" default) — see `visit_statements_node`,
+// `visit_def_node`, `visit_block_node`, `visit_for_node`,
+// `visit_ensure_node` in mod.rs.
+//
+// `inside_each_block` (`each_ancestor(:any_block).first&.method?(:each)`)
+// is tracked as a genuine ancestor stack (`void_each_stack`, pushed/popped
+// by `visit_block_node`/`visit_lambda_node` for EVERY block/`->` literal —
+// prism's translator rewrites `->(){}` into the same "block whose send is
+// `lambda`" shape) so a nested `.each` block correctly shadows/un-shadows
+// through arbitrarily deep if/case/def nesting, matching `each_ancestor`
+// finding only the NEAREST block ancestor.
+impl<'a> super::Cops<'a> {
+    const COP: &'static str = "Lint/Void";
+
+    /// `check_begin`: the whitequark `:begin`/`:kwbegin` handler, applied
+    /// to any 2+-statement group (see the module doc above for how prism
+    /// nodes map onto this). `void_ctx` is this group's own
+    /// `void_context?` verdict (always `false` unless the caller threaded
+    /// one in via `void_pending_ctx`).
+    pub(crate) fn check_void_begin_group(&mut self, items: &[ruby_prism::Node], void_ctx: bool) {
+        if !self.on(Self::COP) {
+            return;
+        }
+        let inside_each = self.void_each_stack.last().copied().unwrap_or(false);
+        let n = items.len();
+        // `expressions.pop if !in_void_context?(node) || inside_each_block`
+        let take_n = if !void_ctx || inside_each { n.saturating_sub(1) } else { n };
+        for expr in &items[..take_n] {
+            // `check_void_op(expr) { inside_each_block }` — a block is
+            // ALWAYS given here, so `return if block && yield(node)`
+            // reduces to `return if inside_each_block`.
+            self.check_void_op(expr, inside_each);
+            self.check_void_expr(expr, false);
+        }
+    }
+
+    /// `check_void_op`: unwraps parenthesized grouping(s), then flags a
+    /// `BINARY_OPERATORS`/`UNARY_OPERATORS` call whose return value is
+    /// discarded. `suppress` is upstream's `block && yield(node)` — `true`
+    /// only when called from `check_begin`'s per-statement loop while
+    /// `inside_each_block`; the `on_block`/`on_ensure` single-statement
+    /// callers below never suppress (upstream never passes a block there).
+    pub(crate) fn check_void_op(&mut self, node: &ruby_prism::Node, suppress: bool) {
+        if !self.on(Self::COP) {
+            return;
+        }
+        // `node = node.children.first while node&.begin_type?` — ONLY a
+        // parenthesized grouping maps to whitequark's `:begin` here (an
+        // explicit `begin...end`/`:kwbegin` is a distinct type, never
+        // unwrapped by this loop upstream either).
+        if let Some(p) = node.as_parentheses_node() {
+            let Some(inner) = p.body() else { return };
+            if let Some(s) = inner.as_statements_node() {
+                let Some(first) = s.body().iter().next() else { return };
+                self.check_void_op(&first, suppress);
+                return;
+            }
+            self.check_void_op(&inner, suppress);
+            return;
+        }
+        let Some(call) = node.as_call_node() else { return };
+        let name_id = call.name();
+        let name = name_id.as_slice();
+        const UNARY: &[&[u8]] = &[b"+@", b"-@", b"~", b"!"];
+        const BINARY: &[&[u8]] = &[b"*", b"/", b"%", b"+", b"-", b"==", b"===", b"!=", b"<", b">", b"<=", b">=", b"<=>"];
+        let is_unary = UNARY.contains(&name);
+        if !is_unary && !BINARY.contains(&name) {
+            return;
+        }
+        // `if !UNARY_OPERATORS.include?(...) && node.loc.dot && node.arguments.none?; return; end`
+        if !is_unary && call.call_operator_loc().is_some() && void_call_args_empty(&call) {
+            return;
+        }
+        if suppress {
+            return;
+        }
+        let Some(sel) = call.message_loc() else { return };
+        let msg = format!("Operator `{}` used in void context.", String::from_utf8_lossy(name));
+        self.push(sel.start_offset(), Self::COP, true, msg);
+        self.autocorrect_void_op(&call);
+    }
+
+    fn autocorrect_void_op(&mut self, call: &ruby_prism::CallNode) {
+        if void_call_args_empty(call) {
+            // `corrector.replace(node, node.receiver.source)` — always
+            // present: every operator call reaching here (unary, or a
+            // dot-call with zero args already excluded above) has a receiver.
+            let Some(recv) = call.receiver() else { return };
+            let recv_src = self.node_src(&recv).to_vec();
+            let loc = call.location();
+            self.fixes.push((loc.start_offset(), loc.end_offset(), recv_src));
+        } else {
+            if let Some(dot) = call.call_operator_loc() {
+                self.fixes.push((dot.start_offset(), dot.end_offset(), Vec::new()));
+            }
+            let Some(sel) = call.message_loc() else { return };
+            // `range_with_surrounding_space(range: node.loc.selector, side: :both, newlines: false)`
+            let (s, e) = void_expand_both_horizontal_ws(self.src, sel.start_offset(), sel.end_offset());
+            self.fixes.push((s, e, b"\n".to_vec()));
+        }
+    }
+
+    /// `check_expression`: dispatches to the `if`/`case`/`case...in`
+    /// single-branch-value checkers, else falls through to
+    /// `check_void_expression_nodes`. `no_autocorrect` mirrors upstream's
+    /// `node.parent.type?(:if, :case, :when, :case_match, :in_pattern)`
+    /// guard in `autocorrect_void_expression` — always `true` once we've
+    /// entered ANY branch-value recursion below (an `if`/`case` node's own
+    /// non-branch value never reaches here directly as a "parent" in that
+    /// sense, so passing it straight through matches exactly).
+    pub(crate) fn check_void_expr(&mut self, node: &ruby_prism::Node, no_autocorrect: bool) {
+        if let Some(if_node) = node.as_if_node() {
+            // `check_if_expression`: ONLY the truthy/then branch — upstream
+            // never looks at `else_branch` at all (a real asymmetry, kept
+            // byte-for-byte).
+            self.check_void_branch_value(if_node.statements());
+            return;
+        }
+        if let Some(u) = node.as_unless_node() {
+            self.check_void_branch_value(u.statements());
+            return;
+        }
+        if let Some(c) = node.as_case_node() {
+            for cond in c.conditions().iter() {
+                if let Some(w) = cond.as_when_node() {
+                    self.check_void_branch_value(w.statements());
+                }
+            }
+            if let Some(e) = c.else_clause() {
+                self.check_void_branch_value(e.statements());
+            }
+            return;
+        }
+        if let Some(c) = node.as_case_match_node() {
+            for cond in c.conditions().iter() {
+                if let Some(inp) = cond.as_in_node() {
+                    self.check_void_branch_value(inp.statements());
+                }
+            }
+            if let Some(e) = c.else_clause() {
+                self.check_void_branch_value(e.statements());
+            }
+            return;
+        }
+        self.check_void_expression_nodes(node, no_autocorrect);
+    }
+
+    /// A `when`/`in`/`else` branch's body is only a checkable "value" when
+    /// it's EXACTLY one statement — 0 statements means no body (upstream's
+    /// `if when_node.body`/`if in_pattern_node.body` guard); 2+ statements
+    /// is instead separately flagged (non-last members only, `void_ctx:
+    /// false`) via the generic `StatementsNode` handling in
+    /// `visit_statements_node`, matching upstream's independent `on_begin`
+    /// dispatch for that nested `:begin` node.
+    fn check_void_branch_value(&mut self, stmts: Option<ruby_prism::StatementsNode>) {
+        let Some(stmts) = stmts else { return };
+        let list = stmts.body();
+        if list.iter().count() != 1 {
+            return;
+        }
+        if let Some(only) = list.iter().next() {
+            self.check_void_expr(&only, true);
+        }
+    }
+
+    /// `check_void_expression_nodes`: literal / variable-or-constant /
+    /// `self` / `defined?`-or-lambda-or-proc, then (only when
+    /// `CheckForMethodsWithNoSideEffects`) a nonmutating method call.
+    fn check_void_expression_nodes(&mut self, node: &ruby_prism::Node, no_autocorrect: bool) {
+        self.check_void_literal(node, no_autocorrect);
+        self.check_void_var(node, no_autocorrect);
+        self.check_void_self(node, no_autocorrect);
+        self.check_defined_or_lambda(node, no_autocorrect);
+        if self.cfg.get(Self::COP, "CheckForMethodsWithNoSideEffects") == Some("true") {
+            self.check_void_nonmutating(node);
+        }
+    }
+
+    fn check_void_literal(&mut self, node: &ruby_prism::Node, no_autocorrect: bool) {
+        if !void_entirely_literal(node) {
+            return;
+        }
+        // `|| node.xstr_type? || node.range_type? || node.nil_type?`
+        if node.as_x_string_node().is_some() || node.as_interpolated_x_string_node().is_some() {
+            return;
+        }
+        if node.as_range_node().is_some() {
+            return;
+        }
+        if node.as_nil_node().is_some() {
+            return;
+        }
+        let src = self.node_src(node);
+        let msg = format!("Literal `{}` used in void context.", String::from_utf8_lossy(src));
+        self.push(node.location().start_offset(), Self::COP, true, msg);
+        self.autocorrect_void_expression(node, no_autocorrect);
+    }
+
+    fn check_void_var(&mut self, node: &ruby_prism::Node, no_autocorrect: bool) {
+        // `__ENCODING__`: a nested-constant-path shape upstream
+        // (`Encoding::UTF_8`) whose `.source` reads literally
+        // `"__ENCODING__"`, matching `SPECIAL_KEYWORDS` — always VAR_MSG
+        // over the full node. Prism gives a dedicated `SourceEncodingNode`
+        // instead of a real constant path, so it's special-cased directly;
+        // `__FILE__`/`__LINE__` are plain literal types upstream (`str`/
+        // `int`), handled by `check_void_literal` via `SourceFileNode`/
+        // `SourceLineNode` in `void_is_literal_leaf`, never here.
+        if node.as_source_encoding_node().is_some() {
+            let src = self.node_src(node);
+            let msg = format!("Variable `{}` used in void context.", String::from_utf8_lossy(src));
+            self.push(node.location().start_offset(), Self::COP, true, msg);
+            self.autocorrect_void_expression(node, no_autocorrect);
+            return;
+        }
+        let is_var = node.as_local_variable_read_node().is_some()
+            || node.as_instance_variable_read_node().is_some()
+            || node.as_class_variable_read_node().is_some()
+            || node.as_global_variable_read_node().is_some();
+        if is_var {
+            // `offense_range = node.loc.name; message = ... node.loc.name.source`
+            // — for every variable-read type, `loc.name` spans the exact
+            // same range as the whole node (no separate sigil-less name
+            // sub-location), so the full node source/range serve directly.
+            let src = self.node_src(node);
+            let msg = format!("Variable `{}` used in void context.", String::from_utf8_lossy(src));
+            self.push(node.location().start_offset(), Self::COP, true, msg);
+            self.autocorrect_void_expression(node, no_autocorrect);
+            return;
+        }
+        if node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some() {
+            let src = self.node_src(node);
+            let msg = format!("Constant `{}` used in void context.", String::from_utf8_lossy(src));
+            self.push(node.location().start_offset(), Self::COP, true, msg);
+            self.autocorrect_void_expression(node, no_autocorrect);
+        }
+    }
+
+    fn check_void_self(&mut self, node: &ruby_prism::Node, no_autocorrect: bool) {
+        if node.as_self_node().is_none() {
+            return;
+        }
+        self.push(node.location().start_offset(), Self::COP, true, "`self` used in void context.");
+        self.autocorrect_void_expression(node, no_autocorrect);
+    }
+
+    fn check_defined_or_lambda(&mut self, node: &ruby_prism::Node, no_autocorrect: bool) {
+        if node.as_defined_node().is_none() && !void_lambda_or_proc(node) {
+            return;
+        }
+        let src = self.node_src(node);
+        let msg = format!("`{}` used in void context.", String::from_utf8_lossy(src));
+        self.push(node.location().start_offset(), Self::COP, true, msg);
+        self.autocorrect_void_expression(node, no_autocorrect);
+    }
+
+    fn check_void_nonmutating(&mut self, node: &ruby_prism::Node) {
+        // Both `node.type?(:send, :any_block)` alternatives collapse to a
+        // plain `CallNode` in prism — a block, if any, is a FIELD of the
+        // call, never a separate wrapping node (`autocorrect_nonmutating_
+        // send`'s `node.send_type? ? node : node.send_node` is therefore
+        // always just `node` itself here too).
+        let Some(call) = node.as_call_node() else { return };
+        const WITH_BANG: &[&[u8]] = &[
+            b"capitalize", b"chomp", b"chop", b"compact", b"delete_prefix", b"delete_suffix",
+            b"downcase", b"encode", b"flatten", b"gsub", b"lstrip", b"merge", b"next", b"reject",
+            b"reverse", b"rotate", b"rstrip", b"scrub", b"select", b"shuffle", b"slice", b"sort",
+            b"sort_by", b"squeeze", b"strip", b"sub", b"succ", b"swapcase", b"tr", b"tr_s",
+            b"transform_values", b"unicode_normalize", b"uniq", b"upcase",
+        ];
+        const REPLACEABLE_BY_EACH: &[&[u8]] = &[b"collect", b"map"];
+        let name_id = call.name();
+        let name = name_id.as_slice();
+        let suggestion: Vec<u8> = if REPLACEABLE_BY_EACH.contains(&name) {
+            b"each".to_vec()
+        } else if WITH_BANG.contains(&name) {
+            let mut s = name.to_vec();
+            s.push(b'!');
+            s
+        } else {
+            return;
+        };
+        let msg = format!(
+            "Method `#{}` used in void context. Did you mean `#{}`?",
+            String::from_utf8_lossy(name),
+            String::from_utf8_lossy(&suggestion)
+        );
+        self.push(node.location().start_offset(), Self::COP, true, msg);
+        // `autocorrect_nonmutating_send`: unconditional (no parent-type or
+        // assignment-method exclusion, unlike `autocorrect_void_expression`).
+        if let Some(sel) = call.message_loc() {
+            self.fixes.push((sel.start_offset(), sel.end_offset(), suggestion));
+        }
+    }
+
+    /// `autocorrect_void_expression`: skipped entirely when reached via an
+    /// `if`/`case`/`case...in` branch-value (`no_autocorrect`) or when the
+    /// nearest enclosing `def`/`defs` (any depth, through blocks/ifs — see
+    /// `def_name_stack`) is an assignment method (`foo=`); otherwise
+    /// removes the node plus its leading horizontal whitespace and ONE
+    /// run of newlines.
+    fn autocorrect_void_expression(&mut self, node: &ruby_prism::Node, no_autocorrect: bool) {
+        if no_autocorrect {
+            return;
+        }
+        if self.def_name_stack.last().is_some_and(|n| void_is_assignment_method_name(n)) {
+            return;
+        }
+        let loc = node.location();
+        let start = void_expand_left_ws_and_newlines(self.src, loc.start_offset());
+        self.fixes.push((start, loc.end_offset(), Vec::new()));
+    }
+}
+
+/// `each_value`/`each_key`-recursive `entirely_literal?`. `AssocSplatNode`
+/// (`**kwsplat`) is silently ignored (contributes nothing, matching
+/// upstream's `each_key`/`each_value` skipping kwsplats outright — an
+/// empty-after-filtering hash's `.all?` is vacuously `true`).
+fn void_entirely_literal(node: &ruby_prism::Node) -> bool {
+    if let Some(arr) = node.as_array_node() {
+        return arr.elements().iter().all(|e| void_entirely_literal(&e));
+    }
+    if let Some(h) = node.as_hash_node() {
+        return h.elements().iter().all(|e| match e.as_assoc_node() {
+            Some(pair) => void_entirely_literal(&pair.key()) && void_entirely_literal(&pair.value()),
+            None => true,
+        });
+    }
+    if let Some(call) = node.as_call_node() {
+        return call.name().as_slice() == b"freeze" && call.receiver().is_some_and(|r| void_entirely_literal(&r));
+    }
+    void_is_literal_leaf(node)
+}
+
+/// `node.literal?` (`LITERALS` minus the composite array/hash types
+/// already handled above) — `xstr`/`range`/`nil` are included here (they
+/// ARE `literal?` upstream) but excluded one level up by `check_void_
+/// literal`'s explicit `xstr_type?`/`range_type?`/`nil_type?` guards, not
+/// here, matching upstream's own `entirely_literal?` vs `check_literal`
+/// split exactly. `__FILE__`/`__LINE__` are plain `str`/`int` literals
+/// upstream (whitequark folds them at parse time); prism instead gives
+/// dedicated `SourceFileNode`/`SourceLineNode` types, included here as
+/// their literal equivalents.
+fn void_is_literal_leaf(node: &ruby_prism::Node) -> bool {
+    node.as_string_node().is_some()
+        || node.as_interpolated_string_node().is_some()
+        || node.as_x_string_node().is_some()
+        || node.as_interpolated_x_string_node().is_some()
+        || node.as_integer_node().is_some()
+        || node.as_float_node().is_some()
+        || node.as_symbol_node().is_some()
+        || node.as_interpolated_symbol_node().is_some()
+        || node.as_regular_expression_node().is_some()
+        || node.as_interpolated_regular_expression_node().is_some()
+        || node.as_true_node().is_some()
+        || node.as_false_node().is_some()
+        || node.as_nil_node().is_some()
+        || node.as_range_node().is_some()
+        || node.as_rational_node().is_some()
+        || node.as_imaginary_node().is_some()
+        || node.as_source_file_node().is_some()
+        || node.as_source_line_node().is_some()
+}
+
+/// `node.arguments.empty?` / `.none?` (both spellings used upstream) —
+/// `None` (no parens/args at all) or an empty argument list either count.
+fn void_call_args_empty(call: &ruby_prism::CallNode) -> bool {
+    call.arguments().is_none_or(|a| a.arguments().iter().count() == 0)
+}
+
+/// `Node#lambda_or_proc?`: `{lambda? proc?}`.
+/// - `lambda?`: `(any_block (send nil? :lambda) ...)` — a stabby `->(){}`
+///   (prism: dedicated `LambdaNode`, always a match) OR a real `lambda {
+///   }`/`lambda do end` call (prism: `CallNode` named `lambda`, no
+///   receiver, WITH a literal block).
+/// - `proc?`: `(block (send nil? :proc) ...)` (a `proc { }` call, same
+///   shape) OR `(block (send #global_const?(:Proc) :new) ...)` (`Proc.new
+///   { }`) OR the blockless `(send #global_const?(:Proc) :new)` (a bare
+///   `Proc.new` with no block or args at all).
+fn void_lambda_or_proc(node: &ruby_prism::Node) -> bool {
+    if node.as_lambda_node().is_some() {
+        return true;
+    }
+    let Some(call) = node.as_call_node() else { return false };
+    let name_id = call.name();
+    let name = name_id.as_slice();
+    let has_literal_block = call.block().is_some_and(|b| b.as_block_node().is_some());
+    if has_literal_block {
+        if call.receiver().is_none() && (name == b"lambda" || name == b"proc") {
+            return true;
+        }
+        return name == b"new" && call.receiver().is_some_and(|r| void_is_proc_const(&r));
+    }
+    name == b"new"
+        && call.receiver().is_some_and(|r| void_is_proc_const(&r))
+        && call.arguments().is_none_or(|a| a.arguments().iter().count() == 0)
+}
+
+/// `global_const?(:Proc)`: a bare top-level `Proc` (`ConstantReadNode`) or
+/// `::Proc` (`ConstantPathNode` with no parent, i.e. the `::` root).
+fn void_is_proc_const(node: &ruby_prism::Node) -> bool {
+    if let Some(c) = node.as_constant_read_node() {
+        return c.name().as_slice() == b"Proc";
+    }
+    if let Some(c) = node.as_constant_path_node() {
+        return c.parent().is_none() && c.name().is_some_and(|n| n.as_slice() == b"Proc");
+    }
+    false
+}
+
+/// `DefNode#assignment_method?`: `!comparison_method? && method_name.to_s.
+/// end_with?('=')`.
+pub(crate) fn void_is_assignment_method_name(name: &[u8]) -> bool {
+    const COMPARISON: &[&[u8]] = &[b"==", b"===", b"!=", b"<=", b">=", b">", b"<"];
+    !COMPARISON.contains(&name) && name.ends_with(b"=")
+}
+
+/// `RangeHelp#range_with_surrounding_space(range: node.loc.selector, side:
+/// :both, newlines: false)` — horizontal whitespace only, both sides,
+/// never crossing a newline.
+fn void_expand_both_horizontal_ws(src: &[u8], mut start: usize, mut end: usize) -> (usize, usize) {
+    while start > 0 && matches!(src[start - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    while end < src.len() && matches!(src[end], b' ' | b'\t') {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// `RangeHelp#range_with_surrounding_space(range: node.source_range, side:
+/// :left)` (`newlines: true` by default) — horizontal whitespace THEN one
+/// run of newlines, left side only (matches `RangeHelp#final_pos` exactly:
+/// it never loops back to re-consume spaces/tabs after crossing a
+/// newline, so an earlier line's own indentation is left untouched).
+fn void_expand_left_ws_and_newlines(src: &[u8], mut start: usize) -> usize {
+    while start > 0 && matches!(src[start - 1], b' ' | b'\t') {
+        start -= 1;
+    }
+    while start > 0 && src[start - 1] == b'\n' {
+        start -= 1;
+    }
+    start
+}

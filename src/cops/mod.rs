@@ -370,7 +370,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
-    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument",
+    "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void",
 ];
 
 impl Engine {
@@ -1591,6 +1591,36 @@ pub(crate) struct Cops<'a> {
     // why a nested `elsif` node's own end here is NOT its raw prism
     // `location().end_offset()`.
     pub(crate) lac_ignored: Vec<(usize, usize)>,
+    // Lint/Void: `each_ancestor(:any_block).first&.method?(:each)` — a
+    // stack of "is this open block/`->` lambda ancestor a `.each` call",
+    // pushed/popped by `visit_block_node`/`visit_lambda_node` for EVERY
+    // block (prism's Prism-translator rewrites `->(){}` into the same
+    // "block whose send is `lambda`" shape, so it's `false` there). Reading
+    // `.last()` gives the NEAREST enclosing block regardless of how many
+    // non-block nodes (if/case/def/...) sit in between — matches
+    // `each_ancestor` walking straight up the parent chain.
+    pub(crate) void_each_stack: Vec<bool>,
+    // Lint/Void: the owning call's method name for the block about to be
+    // visited, stashed by `visit_call_node` right before descending into a
+    // LITERAL block (never for a `&:sym`/`&blk` block-PASS argument, which
+    // never triggers `visit_block_node` at all) — consumed by
+    // `visit_block_node` to compute `void_each_stack`'s top and
+    // `BlockNode#void_context?` (`VOID_CONTEXT_METHODS = [:each, :tap]`).
+    pub(crate) void_pending_block_name: Option<Vec<u8>>,
+    // Lint/Void's `in_void_context?`: the void-context verdict for the
+    // StatementsNode about to be visited, stashed by whichever caller
+    // KNOWS it (`visit_def_node`/`visit_block_node`/`visit_for_node`/
+    // `visit_ensure_node`, right before descending into a body that is
+    // DIRECTLY a `StatementsNode` — never set when it's an implicit
+    // rescue/ensure-wrapping `BeginNode` instead, matching upstream's
+    // `parent.respond_to?(:void_context?)` being false for a `:rescue`/
+    // `:ensure`-nested main body that isn't the LAST child). Consumed
+    // (taken) unconditionally at the top of `visit_statements_node`, so it
+    // can never leak into an unrelated, later-visited `StatementsNode`.
+    // Absent (`None`) defaults to `false` — every other container type
+    // (top-level program, `if`/`unless`/`when`/`in`/`rescue`/plain
+    // `begin...end`) never responds to `void_context?` upstream either.
+    pub(crate) void_pending_ctx: Option<bool>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2933,6 +2963,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_range_node(self, node);
     }
     fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        // Lint/Void's `on_begin`/`on_kwbegin`: fires for EVERY implicit
+        // whitequark `:begin` node, which is exactly a `StatementsNode` with
+        // 2+ statements (a single statement is transparently unwrapped —
+        // no `:begin` node exists at all upstream — see `void_each_stack`'s
+        // doc for how the void-context verdict is threaded down here).
+        let void_pending = self.void_pending_ctx.take();
+        if self.on("Lint/Void") {
+            let list: Vec<ruby_prism::Node> = node.body().iter().collect();
+            if list.len() >= 2 {
+                self.check_void_begin_group(&list, void_pending.unwrap_or(false));
+            }
+        }
         self.check_semicolon_separators(node);
         self.ll_check_semicolons(node);
         self.check_constant_definition_in_block(node);
@@ -2994,6 +3036,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     // `ruby_prism::visit_block_node`) to flag "the body about to be visited
     // IS this block's own StatementsNode" right before descending into it.
     fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        // Lint/Void: consume the owning call's method name (see
+        // `void_pending_block_name`'s doc); `None` only if somehow reached
+        // without that stash (never happens in practice — every `BlockNode`
+        // has an owning call), treated as neither `each` nor `tap`.
+        let void_method_name = self.void_pending_block_name.take();
+        let void_is_each = void_method_name.as_deref() == Some(&b"each"[..]);
+        let void_is_tap = void_method_name.as_deref() == Some(&b"tap"[..]);
+        self.void_each_stack.push(void_is_each);
         self.check_space_before_block_braces(&node.opening_loc(), &node.closing_loc());
         self.check_block_end_newline(node);
         self.check_access_modifier_indentation_block(node);
@@ -3114,9 +3164,31 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if body.as_statements_node().is_some() {
                 self.block_owns_next_stmts = true;
                 self.el_am_block_owns_next_stmts = true;
+                // Lint/Void's `on_block`/`on_numblock`/`on_itblock`: a
+                // SINGLE-statement, non-`begin` body is checked directly
+                // (`check_void_op`/`check_expression`, no group/pop logic)
+                // when `in_void_context?` (this block's own `void_context?`
+                // — `each`/`tap`) — but `each` is excluded right after, so
+                // only a bare `tap { single_stmt }` ever reaches this. A
+                // 2+-statement body instead goes through
+                // `visit_statements_node`'s generic group handling below via
+                // `void_pending_ctx`.
+                let stmts = body.as_statements_node().unwrap();
+                let count = stmts.body().iter().count();
+                if count == 1 {
+                    if void_is_tap {
+                        if let Some(only) = stmts.body().iter().next() {
+                            self.check_void_op(&only, false);
+                            self.check_void_expr(&only, false);
+                        }
+                    }
+                } else if count >= 2 {
+                    self.void_pending_ctx = Some(void_is_each || void_is_tap);
+                }
             }
             self.visit(&body);
         }
+        self.void_each_stack.pop();
         if dn_define_method.is_some() {
             self.dn_ancestors.pop();
         }
@@ -3287,7 +3359,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.sak_check(do_kw.start_offset(), do_kw.end_offset(), b"do");
             self.sak_check_end(node.end_keyword_loc().start_offset(), b"end");
         }
-        ruby_prism::visit_for_node(self, node);
+        // Manual (rather than the default `ruby_prism::visit_for_node`) so
+        // `void_pending_ctx` is set immediately before (and only before) the
+        // STATEMENTS child specifically — `ForNode#void_context?` is always
+        // `true` upstream (see `void_pending_ctx`'s field doc).
+        self.visit(&node.index());
+        self.visit(&node.collection());
+        if let Some(stmts) = node.statements() {
+            self.void_pending_ctx = Some(true);
+            self.visit_statements_node(&stmts);
+        }
     }
     fn visit_pre_execution_node(&mut self, node: &ruby_prism::PreExecutionNode<'pr>) {
         if self.on("Style/BeginBlock") {
@@ -3364,7 +3445,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_ensure_return(node);
         let kw = node.ensure_keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"ensure");
-        ruby_prism::visit_ensure_node(self, node);
+        // Lint/Void's `on_ensure`/`check_ensure`: `EnsureNode#void_context?`
+        // is unconditionally `true` upstream. A single-statement clause body
+        // (`node.branch` not `begin_type?`) is checked DIRECTLY — never
+        // gated on `in_void_context?` at all — matching `check_ensure`'s
+        // early bypass; a 2+-statement body instead goes through
+        // `visit_statements_node`'s generic group handling via
+        // `void_pending_ctx` (an empty clause, `node.statements() ==
+        // None`, mirrors `check_ensure`'s `return unless (body = node.
+        // branch)` guard: nothing to check).
+        if let Some(stmts) = node.statements() {
+            let count = stmts.body().iter().count();
+            if count == 1 {
+                if let Some(only) = stmts.body().iter().next() {
+                    self.check_void_expr(&only, false);
+                }
+            } else if count >= 2 {
+                self.void_pending_ctx = Some(true);
+            }
+            self.visit_statements_node(&stmts);
+        }
     }
     fn visit_parentheses_node(&mut self, node: &ruby_prism::ParenthesesNode<'pr>) {
         self.check_empty_expression(node);
@@ -3797,6 +3897,19 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // stop, with `find_last_child(def_node.body)` precomputed eagerly —
         // it only depends on this def's own static shape.
         self.dn_ancestors.push(DnFrame::Def(self.dn_compute_def_last_child(node)));
+        // Lint/Void's `DefNode#void_context?`: `(def_type? && method?
+        // (:initialize)) || assignment_method?` — `def_type?` is false for
+        // a `defs` (`def self.foo`, prism: `receiver().is_some()`), so only
+        // `assignment_method?` can apply there. Only set when the body is
+        // DIRECTLY a `StatementsNode` (no rescue/else/ensure wrapping it in
+        // an implicit `BeginNode` — see `void_pending_ctx`'s doc).
+        if node.body().is_some_and(|b| b.as_statements_node().is_some()) {
+            let is_defs = node.receiver().is_some();
+            let name = node.name();
+            let void_ctx = (!is_defs && name.as_slice() == b"initialize")
+                || lint_cops::void_is_assignment_method_name(name.as_slice());
+            self.void_pending_ctx = Some(void_ctx);
+        }
         ruby_prism::visit_def_node(self, node);
         self.dn_ancestors.pop();
         if alias_plain_def {
@@ -3848,7 +3961,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // Style/Alias's `scope_type`: same rewrite as above — a stabby lambda
         // is a `:block` whose method is `lambda`, never `instance_eval`.
         self.alias_scope_stack.push(1);
+        // Lint/Void: a stabby `->(){}` is an `each_ancestor(:any_block)`
+        // stop too (same rewrite noted above), but never `each`/`tap` —
+        // see `void_each_stack`'s doc.
+        self.void_each_stack.push(false);
         ruby_prism::visit_lambda_node(self, node);
+        self.void_each_stack.pop();
         self.alias_scope_stack.pop();
         self.ms_block_stack.pop();
         self.nle_stack.pop();
@@ -4521,6 +4639,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             // doc. Left `None` for `&:sym` block-pass args, which never
             // trigger `visit_block_node`.
             if b.as_block_node().is_some() {
+                // Lint/Void: see `void_pending_block_name`'s field doc.
+                self.void_pending_block_name = Some(node.name().as_slice().to_vec());
                 let is_lambda_call = node.name().as_slice() == b"lambda";
                 let is_define_method =
                     matches!(node.name().as_slice(), b"define_method" | b"define_singleton_method")
@@ -4765,6 +4885,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         nx_reindented: HashMap::new(),
         mc_nested_or: HashSet::new(),
         lac_ignored: Vec::new(),
+        void_each_stack: Vec::new(),
+        void_pending_block_name: None,
+        void_pending_ctx: None,
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),
