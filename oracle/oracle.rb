@@ -417,7 +417,7 @@ while i < lines.length
   # An `it`-body local string assignment (`message = "..." \` + continuation
   # lines) — RSpec fixtures interpolate these into annotation messages just
   # like lets, so capture them into a per-example lets overlay.
-  if in_it_body && l =~ /^\s+(\w+)\s*=\s*['"]/
+  if (in_it_body || cfg_stack.any?) && l =~ /^\s+(\w+)\s*=\s*['"]/
     name = l[/^\s+(\w+)/, 1]
     buf = l.sub(/^\s+\w+\s*=\s*/, '').rstrip
     while buf.end_with?('\\')
@@ -432,14 +432,17 @@ while i < lines.length
       pieces = buf.scan(/"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'/)
       if pieces.any?
         val = pieces.map { |d, sq| d ? unescape_dq(d) : sq }.join
-        it_lets[name] = "\"#{val}\"" unless val.include?('"')
+        # inside an `it` the local dies with the example; at context level
+        # it's closure-visible to every nested example (frame lets inherit).
+        target = in_it_body ? it_lets : cfg_stack.last[7]
+        target[name] = "\"#{val}\"" unless val.include?('"')
       end
     end
   end
   # `(a_message, b_message) = %w[x y].map do |arg| "template #\{arg}" end` —
   # statically expand the map: one string per name, template's `#\{arg}`
   # replaced by the matching %w value.
-  if in_it_body && l =~ /^\s+\(?(\w+(?:,\s*\w+)+)\)?\s*=\s*%w\[([^\]]+)\]\.map do \|(\w+)\|\s*$/
+  if (in_it_body || cfg_stack.any?) && l =~ /^\s+\(?(\w+(?:,\s*\w+)+)\)?\s*=\s*%w\[([^\]]+)\]\.map do \|(\w+)\|\s*$/
     names_raw, vals_raw, param = Regexp.last_match(1), Regexp.last_match(2), Regexp.last_match(3)
     names = names_raw.split(/,\s*/)
     vals = vals_raw.split
@@ -453,9 +456,10 @@ while i < lines.length
     lit = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/
     if pieces.any? && names.size == vals.size && buf.gsub(lit, '').strip.empty?
       tmpl = pieces.map { |d, sq| d ? d : sq }.join
+      target = in_it_body ? it_lets : cfg_stack.last[7]
       names.zip(vals).each do |n, v|
         resolved = unescape_dq(tmpl.gsub(/\#\{#{Regexp.escape(param)}\}/, v))
-        it_lets[n] = "\"#{resolved}\"" unless resolved.include?('"')
+        target[n] = "\"#{resolved}\"" unless resolved.include?('"')
       end
     end
   end
