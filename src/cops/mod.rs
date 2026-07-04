@@ -238,7 +238,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
-    "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource",
+    "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem",
 ];
 
 impl Engine {
@@ -2265,6 +2265,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.interp_depth -= 1;
     }
     fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
+        self.check_duplicated_gem(node);
         self.check_mixin_usage(&node.statements().as_node());
         self.class_children_stack.push(Self::direct_child_classes(&Some(node.statements().as_node())));
         self.exception_siblings_stack.push(Self::direct_child_defs(&Some(node.statements().as_node())));

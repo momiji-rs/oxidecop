@@ -1,5 +1,6 @@
 //! Bundler department.
 use super::Cops;
+use std::collections::HashMap;
 
 impl<'a> Cops<'a> {
     /// Bundler/InsecureProtocolSource — `source :gemcutter`/`:rubygems`/
@@ -72,5 +73,232 @@ impl<'a> Cops<'a> {
         };
         self.push(l.start_offset(), COP, true, message);
         self.fixes.push((l.start_offset(), l.end_offset(), b"'https://rubygems.org'".to_vec()));
+    }
+}
+
+
+impl<'a> Cops<'a> {
+    /// Bundler/DuplicatedGem — a `gem 'name'` declaration repeated in the
+    /// same Gemfile, unless every occurrence lives in a mutually exclusive
+    /// branch of the SAME `if`/`elsif`/`else`/`unless`/`case`-`when` chain.
+    ///
+    /// rubocop's `on_new_investigation` runs a `def_node_search` for
+    /// `(send nil? :gem str ...)` over the WHOLE file (inside defs/blocks/
+    /// classes too), groups the matches by their (structurally-equal)
+    /// first-argument string node, and for any group with more than one
+    /// member, checks `conditional_declaration?`:
+    ///
+    ///   parent = nodes[0].each_ancestor.find { |a| !a.begin_type? }
+    ///   return false unless parent&.type?(:if, :when)
+    ///   root = parent.if_type? ? parent : parent.parent
+    ///   nodes.all? { |n| root.branches.compact.any? { |b| b == n || b.child_nodes.include?(n) } }
+    ///
+    /// Prism has no parent pointers, so this walks a real ancestor stack
+    /// built via `visit_branch_node_enter`/`_leave` (pushed/popped around
+    /// EVERY branch node in the tree by prism's own dispatcher, not just the
+    /// ones we care about — the cheapest way to get an `each_ancestor`
+    /// equivalent here). Two prism-only wrapper shapes get skipped like
+    /// rubocop's `begin_type?` skips whitequark's implicit multi-statement
+    /// `:begin`: `StatementsNode` (prism wraps EVERY body, even a single
+    /// statement, unlike whitequark, which only wraps 2+ statements) and
+    /// `ElseNode` (whitequark has no wrapper for `else` at all — its body is
+    /// a direct child slot of the `:if`/`:case` node, so `each_ancestor`
+    /// never sees it).
+    pub(crate) fn check_duplicated_gem(&mut self, node: &ruby_prism::ProgramNode) {
+        const COP: &str = "Bundler/DuplicatedGem";
+        if !self.on(COP) {
+            return;
+        }
+        if !dg_is_gemfile(self.rel_path) {
+            return;
+        }
+        let mut finder = DgFinder { stack: Vec::new(), matches: Vec::new() };
+        use ruby_prism::Visit;
+        finder.visit(&node.as_node());
+        if finder.matches.len() < 2 {
+            return;
+        }
+        // Group by the (unescaped) string content of the first argument —
+        // `group_by(&:first_argument)` upstream, where Node#== is
+        // structural. Insertion order is irrelevant for the final output
+        // (offenses are sorted by line/col downstream) but kept stable
+        // anyway.
+        let mut order: Vec<Vec<u8>> = Vec::new();
+        let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for (i, m) in finder.matches.iter().enumerate() {
+            groups
+                .entry(m.gem_name.clone())
+                .or_insert_with(|| {
+                    order.push(m.gem_name.clone());
+                    Vec::new()
+                })
+                .push(i);
+        }
+        for key in &order {
+            let idxs = &groups[key];
+            if idxs.len() < 2 {
+                continue;
+            }
+            let first = &finder.matches[idxs[0]];
+            if dg_conditional_declaration(&finder.matches, idxs, first) {
+                continue;
+            }
+            let (first_line, _) = self.idx.loc(first.call_start);
+            let gem_name = String::from_utf8_lossy(key);
+            for &i in &idxs[1..] {
+                let start = finder.matches[i].call_start;
+                let message = format!(
+                    "Gem `{gem_name}` requirements already given on line {first_line} of the Gemfile."
+                );
+                self.push(start, COP, false, message);
+            }
+        }
+    }
+}
+
+/// Only Gemfile-shaped files: rubocop's default `Include` for this cop
+/// (`**/*.gemfile`, `**/Gemfile`, `**/gems.rb`) approximated on the
+/// basename, since the harness has no generic per-cop `Include` gate.
+fn dg_is_gemfile(rel_path: &str) -> bool {
+    let name = std::path::Path::new(rel_path).file_name().and_then(|f| f.to_str()).unwrap_or("");
+    name == "Gemfile" || name == "gems.rb" || name.ends_with(".gemfile")
+}
+
+struct DgMatch<'pr> {
+    call_start: usize,
+    gem_name: Vec<u8>,
+    // The flattened branch bodies of the nearest enclosing if/unless/case
+    // conditional that DIRECTLY contains this call (skipping only
+    // StatementsNode/ElseNode/BeginNode wrappers) — None when no such
+    // ancestor exists (unconditional, or nested under something else first,
+    // e.g. a `def`/block/class).
+    branches: Option<Vec<Option<ruby_prism::Node<'pr>>>>,
+}
+
+struct DgFinder<'pr> {
+    stack: Vec<ruby_prism::Node<'pr>>,
+    matches: Vec<DgMatch<'pr>>,
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for DgFinder<'pr> {
+    fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+        self.stack.push(node);
+    }
+    fn visit_branch_node_leave(&mut self) {
+        self.stack.pop();
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if node.receiver().is_none() && node.name().as_slice() == b"gem" {
+            if let Some(first) = node.arguments().and_then(|a| a.arguments().iter().next()) {
+                if let Some(s) = first.as_string_node() {
+                    // self.stack.last() is this very call node (pushed by
+                    // visit_branch_node_enter right before we were
+                    // dispatched to) — ancestors start one below it.
+                    let branches = dg_ancestor_branches(&self.stack);
+                    self.matches.push(DgMatch {
+                        call_start: node.location().start_offset(),
+                        gem_name: s.unescaped().to_vec(),
+                        branches,
+                    });
+                }
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+}
+
+/// `nodes[0].each_ancestor.find { |a| !a.begin_type? }` then its
+/// `.branches` (flattened through the whole if/elsif/else or
+/// case/when/else) — or `None` when the nearest real ancestor isn't
+/// `if`/`unless`/`when`.
+fn dg_ancestor_branches<'pr>(
+    stack: &[ruby_prism::Node<'pr>],
+) -> Option<Vec<Option<ruby_prism::Node<'pr>>>> {
+    if stack.len() < 2 {
+        return None;
+    }
+    let mut idx = stack.len() - 2;
+    loop {
+        let anc = &stack[idx];
+        if anc.as_statements_node().is_some() || anc.as_begin_node().is_some() || anc.as_else_node().is_some() {
+            if idx == 0 {
+                return None;
+            }
+            idx -= 1;
+            continue;
+        }
+        if let Some(iff) = anc.as_if_node() {
+            return Some(dg_if_chain_branches(&iff));
+        }
+        if let Some(unl) = anc.as_unless_node() {
+            return Some(vec![
+                unl.statements().map(|s| s.as_node()),
+                unl.else_clause().and_then(|e| e.statements()).map(|s| s.as_node()),
+            ]);
+        }
+        if anc.as_when_node().is_some() {
+            if idx == 0 {
+                return None;
+            }
+            return stack[idx - 1].as_case_node().map(dg_case_branches);
+        }
+        return None;
+    }
+}
+
+/// Flattens an `if`/`elsif`/`else` chain into its branch bodies, in source
+/// order — rubocop-ast's `IfNode#branches` recursing through `elsif`s.
+fn dg_if_chain_branches<'pr>(node: &ruby_prism::IfNode<'pr>) -> Vec<Option<ruby_prism::Node<'pr>>> {
+    let mut out = vec![node.statements().map(|s| s.as_node())];
+    let mut cur = node.subsequent();
+    while let Some(n) = cur {
+        if let Some(elsif) = n.as_if_node() {
+            out.push(elsif.statements().map(|s| s.as_node()));
+            cur = elsif.subsequent();
+        } else if let Some(els) = n.as_else_node() {
+            out.push(els.statements().map(|s| s.as_node()));
+            cur = None;
+        } else {
+            cur = None;
+        }
+    }
+    out
+}
+
+/// `CaseNode#branches`: every `when`'s body plus the `else` body, in order.
+fn dg_case_branches<'pr>(node: ruby_prism::CaseNode<'pr>) -> Vec<Option<ruby_prism::Node<'pr>>> {
+    let mut out: Vec<Option<ruby_prism::Node<'pr>>> = node
+        .conditions()
+        .iter()
+        .filter_map(|c| c.as_when_node())
+        .map(|w| w.statements().map(|s| s.as_node()))
+        .collect();
+    if let Some(els) = node.else_clause() {
+        out.push(els.statements().map(|s| s.as_node()));
+    }
+    out
+}
+
+/// `conditional_declaration?`: true iff EVERY node in the group lives inside
+/// one of `first`'s conditional branches (rubocop's `within_conditional?`:
+/// `branch == node || branch.child_nodes.include?(node)` — collapsed here to
+/// one check since prism always wraps bodies in a `StatementsNode`, so "is
+/// `node` a direct child of `branch`'s statement list" and "is `branch`
+/// itself the (unwrapped) node" are the same test against `branch`'s two
+/// possible shapes).
+fn dg_conditional_declaration(matches: &[DgMatch], idxs: &[usize], first: &DgMatch) -> bool {
+    let Some(branches) = &first.branches else { return false };
+    idxs.iter().all(|&i| {
+        let start = matches[i].call_start;
+        branches.iter().any(|b| dg_branch_contains(b, start))
+    })
+}
+
+fn dg_branch_contains(branch: &Option<ruby_prism::Node>, target: usize) -> bool {
+    let Some(b) = branch else { return false };
+    if let Some(st) = b.as_statements_node() {
+        st.body().iter().any(|n| n.location().start_offset() == target)
+    } else {
+        b.location().start_offset() == target
     }
 }
