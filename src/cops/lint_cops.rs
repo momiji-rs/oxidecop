@@ -12764,6 +12764,7 @@ impl<'a> Cops<'a> {
             frames: vec![SaFrame { kind: SaKind::Other, names: HashMap::new() }],
             counters: vec![0],
             vars: Vec::new(),
+            masgn_value_clamp: None,
         };
         use ruby_prism::Visit;
         c.visit(&node.as_node());
@@ -12859,6 +12860,13 @@ struct SaFrame {
 /// `check_shadowed_argument`.
 struct SaCollector {
     frames: Vec<SaFrame>,
+    /// While traversing a masgn's VALUE: the masgn's own start offset.
+    /// Ruby evaluates the RHS before any target is assigned, so an implicit
+    /// (`super`/`binding`) reference arising there must count as happening
+    /// AT the assignment, not after it (`index, algorithm, arg = super` —
+    /// rails mysql adapter false positive); position-clamping the recorded
+    /// reference to the masgn start reproduces VariableForce's event order.
+    masgn_value_clamp: Option<usize>,
     /// Parallel to `frames`: `counters[i]` counts how many currently-open
     /// `if`/`while`/`until`/`case`/`case_match`/block/lambda/rescue-region
     /// constructs sit between the CURRENT traversal position and
@@ -12932,6 +12940,7 @@ impl SaCollector {
     /// out upstream too) but doesn't stop the walk; any other (hard,
     /// non-`Def`) frame stops the walk without marking anything.
     fn mark_zsuper(&mut self, pos: usize) {
+        let pos = self.masgn_value_clamp.map_or(pos, |c| c.min(pos));
         for i in (0..self.frames.len()).rev() {
             match self.frames[i].kind {
                 SaKind::Def => {
@@ -12952,6 +12961,7 @@ impl SaCollector {
     /// through `Block` frames, stopping right after including the first
     /// non-`Block` frame.
     fn mark_binding(&mut self, pos: usize) {
+        let pos = self.masgn_value_clamp.map_or(pos, |c| c.min(pos));
         let mut i = self.frames.len();
         while i > 0 {
             i -= 1;
@@ -13228,7 +13238,10 @@ impl<'pr> ruby_prism::Visit<'pr> for SaCollector {
         for t in &targets {
             self.process_masgn_target(t, &whole);
         }
+        let saved = self.masgn_value_clamp;
+        self.masgn_value_clamp = Some(whole.location().start_offset());
         self.visit(&node.value());
+        self.masgn_value_clamp = saved;
     }
     fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
         self.visit(&node.collection());
