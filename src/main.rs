@@ -492,15 +492,22 @@ fn main() {
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_nanos() as u64)
                         .unwrap_or(0);
-                    (mt, m.len())
+                    #[cfg(unix)]
+                    let exec = {
+                        use std::os::unix::fs::PermissionsExt;
+                        m.permissions().mode() & 0o111 != 0
+                    };
+                    #[cfg(not(unix))]
+                    let exec = true;
+                    (mt, m.len(), exec)
                 })
             } else {
                 None
             };
             // warm path: an unchanged (mtime, len) stat reuses the cached
             // result without reading the file
-            if let (Some(c), Some((mt, ln))) = (&cache, meta) {
-                if let Some(hit) = c.get_by_meta(&rel, mt, ln) {
+            if let (Some(c), Some((mt, ln, ex))) = (&cache, meta) {
+                if let Some(hit) = c.get_by_meta(&rel, mt, ln, ex) {
                     return (display, hit);
                 }
             }
@@ -512,9 +519,10 @@ fn main() {
                     // identical bytes under the same basename in different
                     // dirs must not share an entry. rubocop's ResultCache is
                     // path-keyed the same way.
+                    let file_exec = meta.map(|(_, _, e)| e).unwrap_or(true);
                     if nested.is_none() {
                         if let Some(c) = &cache {
-                            if let Some(hit) = c.get(&src, &rel) {
+                            if let Some(hit) = c.get(&src, &rel, file_exec) {
                                 return (display, hit);
                             }
                         }
@@ -522,7 +530,7 @@ fn main() {
                     let offenses = cops::lint(&src, the_cfg, the_eng, &rel).offenses;
                     if nested.is_none() {
                         if let Some(c) = &cache {
-                            c.put(&src, &rel, &offenses, meta.map(|(mt, ln)| (rel.as_str(), mt, ln)));
+                            c.put(&src, &rel, file_exec, &offenses, meta.map(|(mt, ln, _)| (rel.as_str(), mt, ln)));
                         }
                     }
                     (display, offenses)
