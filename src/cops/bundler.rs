@@ -302,3 +302,58 @@ fn dg_branch_contains(branch: &Option<ruby_prism::Node>, target: usize) -> bool 
         b.location().start_offset() == target
     }
 }
+
+
+impl<'a> Cops<'a> {
+    /// Bundler/GemFilename — rubocop's `on_new_investigation` runs this once
+    /// per file, independent of its contents. With EnforcedStyle: Gemfile
+    /// (default) a `gems.rb`/`gems.locked` basename is flagged; with
+    /// `gems.rb`, a `Gemfile`/`Gemfile.lock` basename is flagged. No
+    /// autocorrector. `add_global_offense` anchors at file start (byte 0 ->
+    /// 1:1, same as Lint/EmptyFile's global offense).
+    pub(crate) fn check_gem_filename(&mut self) {
+        const COP: &str = "Bundler/GemFilename";
+        if !self.on(COP) {
+            return;
+        }
+        // rubocop's `processed_source.file_path` is the EXPANDED (absolute)
+        // path — `File.expand_path` against the working directory (live
+        // probe: `rubocop gems.rb` reports `file path: /private/tmp/.../gems.rb`).
+        let file_path = if self.rel_path.starts_with('/') {
+            self.rel_path.to_string()
+        } else {
+            std::env::current_dir()
+                .map(|d| d.join(self.rel_path).to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| self.rel_path.to_string())
+        };
+        let file_path = file_path.as_str();
+        let basename = file_path.rsplit('/').next().unwrap_or(file_path);
+        let gemfile_required = self.cfg.enforced_style(COP) != "gems.rb";
+
+        let message = if gemfile_required {
+            match basename {
+                "gems.rb" => Some(format!(
+                    "`gems.rb` file was found but `Gemfile` is required (file path: {file_path})."
+                )),
+                "gems.locked" => Some(format!(
+                    "Expected a `Gemfile.lock` with `Gemfile` but found `gems.locked` file (file path: {file_path})."
+                )),
+                _ => None,
+            }
+        } else {
+            match basename {
+                "Gemfile" => Some(format!(
+                    "`Gemfile` was found but `gems.rb` file is required (file path: {file_path})."
+                )),
+                "Gemfile.lock" => Some(format!(
+                    "Expected a `gems.locked` file with `gems.rb` but found `Gemfile.lock` (file path: {file_path})."
+                )),
+                _ => None,
+            }
+        };
+
+        if let Some(message) = message {
+            self.push(0, COP, false, message);
+        }
+    }
+}

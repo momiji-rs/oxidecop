@@ -246,6 +246,7 @@ COPS = {
   'Naming/PredicatePrefix'           => 'naming/predicate_prefix',
   'Bundler/InsecureProtocolSource'   => 'bundler/insecure_protocol_source',
   'Bundler/DuplicatedGem'            => 'bundler/duplicated_gem',
+  'Bundler/GemFilename'              => 'bundler/gem_filename',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

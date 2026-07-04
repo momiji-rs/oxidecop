@@ -500,10 +500,15 @@ fn main() {
             }
             match std::fs::read(f) {
                 Ok(src) => {
-                    let base = rel.rsplit('/').next().unwrap_or(&rel);
+                    // Key the content cache on the full relative path, not
+                    // just the basename: some offense MESSAGES embed the file
+                    // path (Bundler/GemFilename's `file path: ...`), so
+                    // identical bytes under the same basename in different
+                    // dirs must not share an entry. rubocop's ResultCache is
+                    // path-keyed the same way.
                     if nested.is_none() {
                         if let Some(c) = &cache {
-                            if let Some(hit) = c.get(&src, base) {
+                            if let Some(hit) = c.get(&src, &rel) {
                                 return (display, hit);
                             }
                         }
@@ -511,7 +516,7 @@ fn main() {
                     let offenses = cops::lint(&src, the_cfg, the_eng, &rel).offenses;
                     if nested.is_none() {
                         if let Some(c) = &cache {
-                            c.put(&src, base, &offenses, meta.map(|(mt, ln)| (rel.as_str(), mt, ln)));
+                            c.put(&src, &rel, &offenses, meta.map(|(mt, ln)| (rel.as_str(), mt, ln)));
                         }
                     }
                     (display, offenses)

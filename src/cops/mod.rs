@@ -238,7 +238,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
-    "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem",
+    "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
 ];
 
 impl Engine {
@@ -3111,6 +3111,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         .node()
         .as_program_node()
         .and_then(|p| p.statements().body().iter().next().map(|n| n.location().start_offset()));
+    cops.check_gem_filename();
     cops.check_frozen_string_literal(first_code_line);
     cops.check_empty_line_after_magic_comment(first_code_line);
     cops.check_duplicate_magic_comment(first_code_line);
