@@ -604,6 +604,14 @@ def parse_val(v)
   # hash-form grouped values (`{ 'Pry' => %w[...], 'X' => nil }`) act like
   # rubocop's `config.values.flatten`: the arrays inside, flattened.
   if v.start_with?('{')
+    # A flat string-valued hash with a 'default' key (PercentLiteralDelimiters'
+    # PreferredDelimiters shape) resolves to its default value — the engine's
+    # flat config carries no nested hashes and the cops read the default pair.
+    # Guarded to hashes with NO unquoted array values so grouped-array configs
+    # (`{ 'Pry' => %w[...] }`) keep the values.flatten behavior below.
+    if (dm = v.match(/['"]default['"]\s*=>\s*(['"])([^'"]*)\1/)) && v !~ /=>\s*%?[wi]{0,2}\[/
+      return dm[2]
+    end
     return v.scan(/%[wi]\[([^\]]*)\]/).flat_map { |m| m[0].split(/\s+/) } +
            v.scan(/\[([^\]]*)\]/).flat_map { |m| split_top(m[0]).map { |x| normalize_pattern(x) } }
   end
