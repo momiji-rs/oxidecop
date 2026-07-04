@@ -235,6 +235,7 @@ COPS = {
   'Style/CaseLikeIf'                 => 'style/case_like_if',
   'Naming/VariableName'              => 'naming/variable_name',
   'Naming/RescuedExceptionsVariableName' => 'naming/rescued_exceptions_variable_name',
+  'Lint/UnreachableLoop'             => 'lint/unreachable_loop',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

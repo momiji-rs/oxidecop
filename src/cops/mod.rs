@@ -232,6 +232,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/TrailingUnderscoreVariable", "Lint/NonLocalExitFromIterator", "Layout/EmptyComment",
     "Style/EmptyCaseCondition", "Style/OneLineConditional", "Style/IfWithSemicolon",
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
+    "Lint/UnreachableLoop",
 ];
 
 impl Engine {
@@ -1984,6 +1985,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
         self.check_loop_while(node);
+        self.check_unreachable_loop_while(node);
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_assignment_in_condition(&node.predicate());
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), false);
@@ -2015,6 +2017,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
         self.check_loop_until(node);
+        self.check_unreachable_loop_until(node);
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_assignment_in_condition(&node.predicate());
         self.check_negated_while(node.predicate(), node.location().start_offset(), node.keyword_loc(), true);
@@ -2043,6 +2046,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
         self.check_for(node);
+        self.check_unreachable_loop_for(node);
         ruby_prism::visit_for_node(self, node);
     }
     fn visit_pre_execution_node(&mut self, node: &ruby_prism::PreExecutionNode<'pr>) {
@@ -2597,6 +2601,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_useless_times(node);
         self.check_attr(node);
         self.check_lambda_call(node);
+        self.check_unreachable_loop_call(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
         let n = node.as_node();

@@ -8414,3 +8414,493 @@ impl<'a> super::Cops<'a> {
     }
 }
 
+
+/// Lint/UnreachableLoop — a loop (`while`/`until`/`for`, or a block attached
+/// to an `Enumerable`/enumerator method or `Kernel#loop`) whose body ALWAYS
+/// breaks out on the very first iteration: every control-flow path through
+/// it ends in `break`/`return`/`raise`/etc, so the loop can run at most once.
+///
+/// Ports upstream's `statements`/`break_statement?`/`check_if`/`check_case`/
+/// `preceded_by_continue_statement?`/`conditional_continue_keyword?` verbatim
+/// (see rubocop's `lib/rubocop/cop/lint/unreachable_loop.rb`), adapted to
+/// prism's node shapes:
+///
+/// * Upstream's dual "a bare single statement OR a `:begin`/`:kwbegin`-
+///   wrapped list" representation collapses in prism, which ALWAYS wraps a
+///   body in a `StatementsNode` regardless of statement count. Since
+///   `preceded_by_continue_statement?`'s "left siblings" reduce to an empty
+///   slice for a one-element list anyway (no earlier statements to scan), a
+///   single find-plus-preceding-scan over the flattened list reproduces
+///   upstream's behavior for every case this cop's fixture exercises — the
+///   one place this simplification could theoretically diverge is a
+///   single-statement loop body whose TRUE upstream left-siblings would come
+///   from OUTSIDE the body (e.g. the `while`'s own condition, or a block's
+///   call/args), which is not something any real check here would find
+///   containing `next`/`redo` in practice (see final-report residual risks).
+/// * A bare `begin...end` grouping (no `rescue`/`else`/`ensure`) is treated
+///   the same way — flattened one level — mirroring upstream's shared
+///   `:begin`/`:kwbegin` case; one WITH exception-handling clauses attached
+///   is opaque (upstream's `case node.type` has no `:rescue` branch either).
+/// * Prism has no back-pointer from a block to its owning call (unlike
+///   whitequark, where the block node OWNS its `send_node` child) — so
+///   `loop_method?`/`on_block` is implemented from `visit_call_node` instead
+///   of `visit_block_node`, where the owning `CallNode` is directly at hand.
+///   Empirically (verified against real `rubocop`), a `CallNode`'s own
+///   `location()` already spans from the start of its full receiver chain
+///   through its trailing block's closing delimiter, matching upstream's
+///   block-node offense anchor exactly with no extra adjustment needed.
+/// * `unless` is folded into the same `if`-branch handling as upstream (the
+///   `parser` gem normalizes `unless` into a swapped-branch `:if` node,
+///   which is why `break_statement?`'s `:if` case silently also covers it).
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_unreachable_loop_while(&mut self, node: &ruby_prism::WhileNode) {
+        if !self.on(UL_COP) {
+            return;
+        }
+        self.ul_check(node.location().start_offset(), node.statements().map(|s| s.as_node()));
+    }
+
+    pub(crate) fn check_unreachable_loop_until(&mut self, node: &ruby_prism::UntilNode) {
+        if !self.on(UL_COP) {
+            return;
+        }
+        self.ul_check(node.location().start_offset(), node.statements().map(|s| s.as_node()));
+    }
+
+    pub(crate) fn check_unreachable_loop_for(&mut self, node: &ruby_prism::ForNode) {
+        if !self.on(UL_COP) {
+            return;
+        }
+        self.ul_check(node.location().start_offset(), node.statements().map(|s| s.as_node()));
+    }
+
+    /// `on_block` — reached from `visit_call_node`, since prism gives us the
+    /// call a block is attached to directly (unlike whitequark's block node,
+    /// which owns a `send_node` child pointing the other way).
+    pub(crate) fn check_unreachable_loop_call<'pr>(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if !self.on(UL_COP) {
+            return;
+        }
+        let Some(block) = node.block() else { return };
+        // `&:sym`/bare `&blk` block-passes are `BlockArgumentNode`s, never a
+        // real block — `any_block_type?` upstream.
+        let Some(block) = block.as_block_node() else { return };
+        if !ul_loopable_call(node) {
+            return;
+        }
+        let src = call_source_excluding_block(node, self.src);
+        if self.ul_matches_allowed_pattern(src) {
+            return;
+        }
+        self.ul_check(node.location().start_offset(), block.body());
+    }
+
+    /// Shared `check(node)` body: find the first top-level statement that
+    /// always breaks, then gate on `preceded_by_continue_statement?` (did an
+    /// earlier statement in the SAME list run `next`/`redo`?) and
+    /// `conditional_continue_keyword?` (does the found statement itself end
+    /// in `... || next`/`... || redo`?).
+    fn ul_check(&mut self, anchor: usize, body: Option<ruby_prism::Node>) {
+        const MSG: &str = "This loop will have at most one iteration.";
+        let list = ul_flatten_group(body);
+        let Some(idx) = list.iter().position(|n| self.ul_break_statement(n)) else { return };
+        if self.ul_preceded_by_continue(&list[..idx]) {
+            return;
+        }
+        if ul_conditional_continue_keyword(&list[idx]) {
+            return;
+        }
+        self.push(anchor, UL_COP, false, MSG);
+    }
+
+    /// `loop_method?` — is `node` itself a call+block pair over an
+    /// `Enumerable`/enumerator method or `Kernel#loop`, not exempted by
+    /// `AllowedPatterns`? Used both to gate the top-level `on_block` entry
+    /// AND (per upstream) to exclude a nested loop from
+    /// `preceded_by_continue_statement?`'s scan — a `next`/`redo` belonging
+    /// to an INNER loop doesn't "continue" the outer one.
+    fn ul_loop_method(&self, node: &ruby_prism::Node) -> bool {
+        let Some(call) = node.as_call_node() else { return false };
+        let Some(block) = call.block() else { return false };
+        if block.as_block_node().is_none() {
+            return false;
+        }
+        if !ul_loopable_call(&call) {
+            return false;
+        }
+        let src = call_source_excluding_block(&call, self.src);
+        !self.ul_matches_allowed_pattern(src)
+    }
+
+    /// `matches_allowed_pattern?` with upstream's schema-default
+    /// `AllowedPatterns: ['(exactly|at_least|at_most)\(\d+\)\.times']`
+    /// hard-coded as the fallback for when the (array-typed, so
+    /// schema-absent) config key isn't user-overridden — `cfg.param` only
+    /// ever surfaces USER config, never schema defaults, for array params.
+    fn ul_matches_allowed_pattern(&self, text: &[u8]) -> bool {
+        match self.eng.allowed_patterns.get(UL_COP) {
+            Some(pats) => {
+                let s = String::from_utf8_lossy(text);
+                pats.iter().any(|re| re.is_match(&s))
+            }
+            None => {
+                static DEFAULT: OnceLock<regex::Regex> = OnceLock::new();
+                let re = DEFAULT
+                    .get_or_init(|| regex::Regex::new(r"(exactly|at_least|at_most)\(\d+\)\.times").unwrap());
+                re.is_match(&String::from_utf8_lossy(text))
+            }
+        }
+    }
+
+    /// The shared "find the first statement that always breaks, then check
+    /// no EARLIER one in the same list ran `next`/`redo`" scan — used both
+    /// for a genuinely grouped `:begin`/`:kwbegin`, and for any
+    /// `StatementsNode` (which, per `ul_break_statement`'s comment, always
+    /// gets this treatment regardless of its element count).
+    fn ul_group_break(&self, list: &[ruby_prism::Node]) -> bool {
+        match list.iter().position(|n| self.ul_break_statement(n)) {
+            None => false,
+            Some(idx) => !self.ul_preceded_by_continue(&list[..idx]),
+        }
+    }
+
+    /// `break_statement?` applied to a single node.
+    fn ul_break_statement(&self, node: &ruby_prism::Node) -> bool {
+        if ul_break_command(node) {
+            return true;
+        }
+        // Prism always wraps a branch's body in a `StatementsNode`, even for
+        // a single statement — unlike whitequark, which hands `break_statement?`
+        // either a lone node OR a `:begin`-wrapped list depending on count.
+        // Since a one-element grouped scan trivially reduces to just
+        // `ul_break_statement` on that lone element (its "preceding slice"
+        // is empty either way), treating EVERY `StatementsNode` as a group
+        // reproduces upstream's dual representation exactly.
+        if let Some(stmts) = node.as_statements_node() {
+            return self.ul_group_break(&stmts.body().iter().collect::<Vec<_>>());
+        }
+        // `case node.type when :begin, :kwbegin` — a bare `begin...end`
+        // grouping (no exception-handling clauses) used as a single
+        // statement; flatten one level and recurse the same find-plus-
+        // preceding-scan used for any other grouped list.
+        if let Some(begin) = node.as_begin_node() {
+            if begin.rescue_clause().is_some() || begin.else_clause().is_some() || begin.ensure_clause().is_some() {
+                return false;
+            }
+            let list = ul_flatten_group(begin.statements().map(|s| s.as_node()));
+            return self.ul_group_break(&list);
+        }
+        if let Some(iff) = node.as_if_node() {
+            return self.ul_check_if(&iff);
+        }
+        if let Some(unl) = node.as_unless_node() {
+            return self.ul_check_unless(&unl);
+        }
+        if let Some(c) = node.as_case_node() {
+            return self.ul_check_case(&c);
+        }
+        if let Some(c) = node.as_case_match_node() {
+            return self.ul_check_case_match(&c);
+        }
+        false
+    }
+
+    /// `branch.body && break_statement?(branch.body)` for a branch resolved
+    /// via prism's `.statements()` (`None` when the branch is absent or has
+    /// an empty body).
+    fn ul_branch_break(&self, branch: Option<ruby_prism::StatementsNode>) -> bool {
+        match branch {
+            None => false,
+            Some(s) => self.ul_break_statement(&s.as_node()),
+        }
+    }
+
+    /// `check_if` — `if_branch && else_branch && break_statement?(if_branch)
+    /// && break_statement?(else_branch)`. An `elsif` is a nested `IfNode`
+    /// reachable via `.subsequent()`, exactly like upstream's `else_branch`
+    /// holding the nested `(if ...)` node for a chain — recursing through
+    /// `ul_break_statement` (which dispatches back into `ul_check_if`)
+    /// reproduces upstream's own recursive `check_if` calls.
+    fn ul_check_if(&self, node: &ruby_prism::IfNode) -> bool {
+        if !self.ul_branch_break(node.statements()) {
+            return false;
+        }
+        match node.subsequent() {
+            None => false,
+            Some(sub) => match sub.as_else_node() {
+                Some(els) => self.ul_branch_break(els.statements()),
+                None => self.ul_break_statement(&sub),
+            },
+        }
+    }
+
+    /// `check_if` on an `unless` — the `parser` gem normalizes `unless` into
+    /// a swapped-branch `:if` node (`node_parts` swaps true/false), which is
+    /// why upstream's `:if` case transparently also covers it; prism keeps a
+    /// distinct `UnlessNode`, so replicate the swap explicitly: `.statements
+    /// ()` is the negated ("else"-position) body, `.else_clause()` the
+    /// ("if"-position) body. `&&` is symmetric, so the swap direction is
+    /// otherwise inconsequential.
+    fn ul_check_unless(&self, node: &ruby_prism::UnlessNode) -> bool {
+        let Some(else_clause) = node.else_clause() else { return false };
+        self.ul_branch_break(else_clause.statements()) && self.ul_branch_break(node.statements())
+    }
+
+    /// `check_case` for `case`/`when` — an `else` that always breaks, AND
+    /// every `when` branch does too.
+    fn ul_check_case(&self, node: &ruby_prism::CaseNode) -> bool {
+        let Some(else_clause) = node.else_clause() else { return false };
+        if !self.ul_branch_break(else_clause.statements()) {
+            return false;
+        }
+        node.conditions().iter().all(|w| match w.as_when_node() {
+            Some(w) => self.ul_branch_break(w.statements()),
+            None => false,
+        })
+    }
+
+    /// `check_case` for `case`/`in` (pattern matching) — same shape as
+    /// `ul_check_case`, over `in` branches instead of `when` branches.
+    fn ul_check_case_match(&self, node: &ruby_prism::CaseMatchNode) -> bool {
+        let Some(else_clause) = node.else_clause() else { return false };
+        if !self.ul_branch_break(else_clause.statements()) {
+            return false;
+        }
+        node.conditions().iter().all(|i| match i.as_in_node() {
+            Some(i) => self.ul_branch_break(i.statements()),
+            None => false,
+        })
+    }
+
+    /// `preceded_by_continue_statement?` — did an EARLIER statement in the
+    /// same list run `next`/`redo` anywhere in its subtree? A sibling that's
+    /// itself a loop (a `while`/`until`/`for` keyword, or another
+    /// `loop_method?` call+block) is skipped: a `next`/`redo` belonging to
+    /// that INNER loop doesn't continue the outer one being checked here.
+    fn ul_preceded_by_continue(&self, siblings: &[ruby_prism::Node]) -> bool {
+        siblings.iter().any(|sib| {
+            if ul_loop_keyword(sib) || self.ul_loop_method(sib) {
+                return false;
+            }
+            ul_contains_next_or_redo(sib)
+        })
+    }
+}
+
+const UL_COP: &str = "Lint/UnreachableLoop";
+
+/// `statements(node)` — the flattened list of top-level statements making up
+/// `n`: empty when there's no body, the un-wrapped children of a
+/// `StatementsNode` or a bare (no `rescue`/`else`/`ensure`) grouping
+/// `BeginNode`, or a one-element list holding `n` itself otherwise.
+fn ul_flatten_group<'pr>(n: Option<ruby_prism::Node<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+    let Some(n) = n else { return Vec::new() };
+    if let Some(s) = n.as_statements_node() {
+        return s.body().iter().collect();
+    }
+    if let Some(b) = n.as_begin_node() {
+        if b.rescue_clause().is_some() || b.else_clause().is_some() || b.ensure_clause().is_some() {
+            return Vec::new();
+        }
+        return match b.statements() {
+            Some(s) => s.body().iter().collect(),
+            None => Vec::new(),
+        };
+    }
+    vec![n]
+}
+
+/// `break_command?` — a bare `return`/`break` (regardless of arguments), or
+/// a call to one of `raise`/`fail`/`throw`/`exit`/`exit!`/`abort` with a nil
+/// or `(::)Kernel` receiver, over a plain (non-safe-navigation) `send`.
+fn ul_break_command(node: &ruby_prism::Node) -> bool {
+    if node.as_return_node().is_some() || node.as_break_node().is_some() {
+        return true;
+    }
+    let Some(call) = node.as_call_node() else { return false };
+    if call.is_safe_navigation() {
+        return false;
+    }
+    if !matches!(call.name().as_slice(), b"raise" | b"fail" | b"throw" | b"exit" | b"exit!" | b"abort") {
+        return false;
+    }
+    match call.receiver() {
+        None => true,
+        Some(recv) => ul_is_kernel_const(&recv),
+    }
+}
+
+/// `(const {nil? cbase} :Kernel)` — bare `Kernel` or top-level `::Kernel`
+/// (NOT `Foo::Kernel`, which would have a non-nil, non-cbase first child).
+fn ul_is_kernel_const(node: &ruby_prism::Node) -> bool {
+    if let Some(c) = node.as_constant_read_node() {
+        return c.name().as_slice() == b"Kernel";
+    }
+    if let Some(c) = node.as_constant_path_node() {
+        return c.parent().is_none() && c.name().is_some_and(|n| n.as_slice() == b"Kernel");
+    }
+    false
+}
+
+/// `node.loop_keyword?` — a `while`/`until`/`for`, pre- or post-condition
+/// alike (the post-condition distinction doesn't matter for this cop, which
+/// only ever inspects the node's TYPE here, never whether it's a modifier).
+fn ul_loop_keyword(node: &ruby_prism::Node) -> bool {
+    node.as_while_node().is_some() || node.as_until_node().is_some() || node.as_for_node().is_some()
+}
+
+/// `send_node.enumerable_method? || send_node.enumerator_method? ||
+/// send_node.method?(:loop)` for the CALL a block is attached to — prism
+/// gives us this directly as the `CallNode` itself (its `.block()` is the
+/// block), unlike whitequark where the block node owns a `send_node` child.
+fn ul_loopable_call(call: &ruby_prism::CallNode) -> bool {
+    let name = call.name().as_slice();
+    name == b"loop" || ul_is_enumerator_method(name) || ul_is_enumerable_method(name)
+}
+
+/// `MethodIdentifierPredicates::ENUMERATOR_METHODS` plus the `each_*` prefix
+/// rule.
+fn ul_is_enumerator_method(name: &[u8]) -> bool {
+    if name.starts_with(b"each_") {
+        return true;
+    }
+    matches!(
+        name,
+        b"collect"
+            | b"collect_concat"
+            | b"detect"
+            | b"downto"
+            | b"each"
+            | b"find"
+            | b"find_all"
+            | b"find_index"
+            | b"inject"
+            | b"loop"
+            | b"map!"
+            | b"map"
+            | b"reduce"
+            | b"reject"
+            | b"reject!"
+            | b"reverse_each"
+            | b"select"
+            | b"select!"
+            | b"times"
+            | b"upto"
+    )
+}
+
+/// `MethodIdentifierPredicates::ENUMERABLE_METHODS` — `Enumerable.
+/// instance_methods + [:each]` (Ruby 3.4.1's `Enumerable`, matching the
+/// rubocop-ast version this cop is pinned to).
+fn ul_is_enumerable_method(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"all?"
+            | b"any?"
+            | b"chain"
+            | b"chunk"
+            | b"chunk_while"
+            | b"collect"
+            | b"collect_concat"
+            | b"compact"
+            | b"count"
+            | b"cycle"
+            | b"detect"
+            | b"drop"
+            | b"drop_while"
+            | b"each"
+            | b"each_cons"
+            | b"each_entry"
+            | b"each_slice"
+            | b"each_with_index"
+            | b"each_with_object"
+            | b"entries"
+            | b"filter"
+            | b"filter_map"
+            | b"find"
+            | b"find_all"
+            | b"find_index"
+            | b"first"
+            | b"flat_map"
+            | b"grep"
+            | b"grep_v"
+            | b"group_by"
+            | b"include?"
+            | b"inject"
+            | b"lazy"
+            | b"map"
+            | b"max"
+            | b"max_by"
+            | b"member?"
+            | b"min"
+            | b"min_by"
+            | b"minmax"
+            | b"minmax_by"
+            | b"none?"
+            | b"one?"
+            | b"partition"
+            | b"reduce"
+            | b"reject"
+            | b"reverse_each"
+            | b"select"
+            | b"slice_after"
+            | b"slice_before"
+            | b"slice_when"
+            | b"sort"
+            | b"sort_by"
+            | b"sum"
+            | b"take"
+            | b"take_while"
+            | b"tally"
+            | b"to_a"
+            | b"to_h"
+            | b"to_set"
+            | b"uniq"
+            | b"zip"
+    )
+}
+
+/// `each_descendant(*CONTINUE_KEYWORDS).any?` — does `node`'s subtree
+/// contain a `next` or `redo` ANYWHERE, with no scope boundary (this walks
+/// into nested blocks/defs too, exactly like upstream's raw AST descent).
+fn ul_contains_next_or_redo(node: &ruby_prism::Node) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
+            self.found = true;
+            ruby_prism::visit_next_node(self, node);
+        }
+        fn visit_redo_node(&mut self, node: &ruby_prism::RedoNode<'pr>) {
+            self.found = true;
+            ruby_prism::visit_redo_node(self, node);
+        }
+    }
+    let mut f = Finder { found: false };
+    use ruby_prism::Visit;
+    f.visit(node);
+    f.found
+}
+
+/// `conditional_continue_keyword?` — does the LAST (in depth-first, pre-
+/// order traversal — matching `each_descendant`) `or`-node anywhere in
+/// `node`'s subtree have a `next`/`redo` right-hand side, e.g. `return
+/// do_something(value) || next`?
+fn ul_conditional_continue_keyword(node: &ruby_prism::Node) -> bool {
+    struct Finder {
+        last_matches: Option<bool>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+        fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
+            let rhs = node.right();
+            self.last_matches = Some(rhs.as_next_node().is_some() || rhs.as_redo_node().is_some());
+            ruby_prism::visit_or_node(self, node);
+        }
+    }
+    let mut f = Finder { last_matches: None };
+    use ruby_prism::Visit;
+    f.visit(node);
+    f.last_matches.unwrap_or(false)
+}
+
