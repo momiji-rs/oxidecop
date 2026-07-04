@@ -241,7 +241,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
-    "Layout/IndentationStyle", "Layout/ParameterAlignment",
+    "Layout/IndentationStyle", "Layout/ParameterAlignment", "Style/RedundantAssignment",
 ];
 
 impl Engine {
@@ -2426,6 +2426,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_binary_operator_parameter(node);
         self.check_nested_method_definition(node);
         self.check_redundant_return(node);
+        self.check_redundant_assignment(node);
         self.check_return_in_void_context(node);
         self.check_optional_arguments(node);
         self.check_method_parameter_name(node);

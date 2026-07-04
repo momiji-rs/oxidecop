@@ -14229,3 +14229,154 @@ fn hali_elements<'pr>(node: &ruby_prism::Node<'pr>) -> Vec<ruby_prism::Node<'pr>
         Vec::new()
     }
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Style/RedundantAssignment — a def body (or one of its tail branches)
+    /// whose last two statements are `x = expr` immediately followed by a
+    /// bare read of `x`: the assignment is dead, since the method's return
+    /// value would be `expr` either way. Ported from rubocop's
+    /// `check_branch`, which recurses into begin/if-else/case/rescue/ensure
+    /// tails of the def body — the last statement of any of those container
+    /// types is itself a further tail position to check.
+    pub(crate) fn check_redundant_assignment(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Style/RedundantAssignment";
+        if !self.on(COP) {
+            return;
+        }
+        if let Some(b) = node.body() {
+            self.ra_branch(&b);
+        }
+    }
+
+    /// Mirrors rubocop's `check_branch`/`check_*_node` family. Each of these
+    /// node types is a "tail position container": whatever ends up last in
+    /// one of its branches is, transitively, the def's own tail position.
+    fn ra_branch(&mut self, node: &ruby_prism::Node) {
+        if let Some(stmts) = node.as_statements_node() {
+            self.ra_check_statements(&stmts);
+        } else if let Some(c) = node.as_case_node() {
+            for w in c.conditions().iter() {
+                if let Some(w) = w.as_when_node() {
+                    if let Some(s) = w.statements() {
+                        self.ra_branch(&s.as_node());
+                    }
+                }
+            }
+            if let Some(s) = c.else_clause().and_then(|e| e.statements()) {
+                self.ra_branch(&s.as_node());
+            }
+        } else if let Some(c) = node.as_case_match_node() {
+            for i in c.conditions().iter() {
+                if let Some(i) = i.as_in_node() {
+                    if let Some(s) = i.statements() {
+                        self.ra_branch(&s.as_node());
+                    }
+                }
+            }
+            if let Some(s) = c.else_clause().and_then(|e| e.statements()) {
+                self.ra_branch(&s.as_node());
+            }
+        } else if let Some(i) = node.as_if_node() {
+            // Skip ternaries (no `if` keyword) and modifier-form `if`/`elsif`
+            // (no `end` keyword) — rubocop's `node.modifier_form? ||
+            // node.ternary?`.
+            if i.if_keyword_loc().is_none() || i.end_keyword_loc().is_none() {
+                return;
+            }
+            if let Some(s) = i.statements() {
+                self.ra_branch(&s.as_node());
+            }
+            if let Some(sub) = i.subsequent() {
+                self.ra_branch(&sub); // ElseNode, or the elsif's IfNode
+            }
+        } else if let Some(u) = node.as_unless_node() {
+            if u.end_keyword_loc().is_none() {
+                return; // modifier-form `unless`
+            }
+            if let Some(s) = u.statements() {
+                self.ra_branch(&s.as_node());
+            }
+            if let Some(s) = u.else_clause().and_then(|e| e.statements()) {
+                self.ra_branch(&s.as_node());
+            }
+        } else if let Some(e) = node.as_else_node() {
+            // Reached via an `if`/`unless`'s `subsequent()` — that's just a
+            // bare `Node`, not routed through the case/case_match/if/unless
+            // `else_clause()` accessors above.
+            if let Some(s) = e.statements() {
+                self.ra_branch(&s.as_node());
+            }
+        } else if let Some(b) = node.as_begin_node() {
+            if let Some(ens) = b.ensure_clause() {
+                // rubocop's `check_ensure_node` only descends into the
+                // `ensure` branch itself — the protected body and any
+                // rescue clauses are never visited when `ensure` is
+                // present (verified live: `x = 2; x; ensure; 3; end`
+                // reports no offense for the protected body).
+                if let Some(s) = ens.statements() {
+                    self.ra_branch(&s.as_node());
+                }
+            } else if let Some(r) = b.rescue_clause() {
+                // rubocop's `check_rescue_node` walks ALL child nodes of
+                // the `rescue` node unconditionally — the protected body,
+                // every rescue clause, and an `else` clause if present —
+                // even though the body isn't really a tail position when
+                // there's a rescue-`else` (verified live).
+                if let Some(s) = b.statements() {
+                    self.ra_branch(&s.as_node());
+                }
+                let mut cur = Some(r);
+                while let Some(rn) = cur {
+                    if let Some(s) = rn.statements() {
+                        self.ra_branch(&s.as_node());
+                    }
+                    cur = rn.subsequent();
+                }
+                if let Some(s) = b.else_clause().and_then(|e| e.statements()) {
+                    self.ra_branch(&s.as_node());
+                }
+            } else if let Some(s) = b.statements() {
+                // Bare `begin...end` grouping (rubocop's `:kwbegin`).
+                self.ra_branch(&s.as_node());
+            }
+        }
+    }
+
+    /// The actual pattern check (rubocop's `check_begin_node`): if the last
+    /// two statements are `lvasgn` then a same-named `lvar`, that's the
+    /// offense; otherwise recurse into just the last statement, since only
+    /// the tail position matters transitively.
+    fn ra_check_statements(&mut self, stmts: &ruby_prism::StatementsNode) {
+        const COP: &str = "Style/RedundantAssignment";
+        let body: Vec<ruby_prism::Node> = stmts.body().iter().collect();
+        if body.len() >= 2 {
+            if let (Some(asgn), Some(read)) = (
+                body[body.len() - 2].as_local_variable_write_node(),
+                body[body.len() - 1].as_local_variable_read_node(),
+            ) {
+                if asgn.name().as_slice() == read.name().as_slice() {
+                    let al = asgn.location();
+                    self.push(
+                        al.start_offset(),
+                        COP,
+                        true,
+                        "Redundant assignment before returning detected.",
+                    );
+                    let expr = asgn.value();
+                    self.fixes.push((
+                        al.start_offset(),
+                        al.end_offset(),
+                        self.node_src(&expr).to_vec(),
+                    ));
+                    let rl = read.location();
+                    self.fixes.push((rl.start_offset(), rl.end_offset(), Vec::new()));
+                    return;
+                }
+            }
+        }
+        if let Some(last) = body.last() {
+            self.ra_branch(last);
+        }
+    }
+}

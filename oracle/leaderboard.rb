@@ -253,6 +253,7 @@ COPS = {
   'Gemspec/OrderedDependencies'      => 'gemspec/ordered_dependencies',
   'Layout/IndentationStyle'          => 'layout/indentation_style',
   'Layout/ParameterAlignment'        => 'layout/parameter_alignment',
+  'Style/RedundantAssignment'        => 'style/redundant_assignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
