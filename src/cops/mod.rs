@@ -308,7 +308,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
     "Style/ExplicitBlockArgument",
     "Style/RescueModifier", "Layout/FirstParameterIndentation", "Bundler/DuplicatedGroup", "Layout/EmptyLinesAroundArguments", "Style/EvalWithLocation",
-    "Style/MethodCallWithoutArgsParentheses", "Style/Alias",
+    "Style/MethodCallWithoutArgsParentheses", "Style/Alias", "Style/RaiseArgs",
 ];
 
 impl Engine {
@@ -1095,6 +1095,19 @@ pub(crate) struct Cops<'a> {
     // "populate ahead of time, keyed by the child's own start offset" idiom
     // (see `ut_call_child` etc. above).
     pub(crate) redundant_sort_logical_left: HashMap<usize, (usize, usize)>,
+    // Style/RaiseArgs: start offsets of a call node that is the immediate
+    // LEFT/RIGHT operand of an `and`/`or` node, or the immediate then/else
+    // branch of a ternary `IfNode` — matching upstream's `requires_parens?`
+    // (`node.parent.operator_keyword? || (node.parent.if_type? &&
+    // node.parent.ternary?)`), needed only when the parent turns out to BE
+    // the `raise`/`fail` call this cop corrects. `operator_keyword?` is true
+    // for AndNode/OrNode regardless of `&&`/`and` spelling, so both operands
+    // of every logical node are registered unconditionally; populated
+    // eagerly in `visit_and_node`/`visit_or_node`/`visit_if_node` before
+    // descending, mirroring `redundant_sort_logical_left`'s "populate ahead
+    // of time, keyed by the child's own start offset" idiom (prism gives no
+    // parent pointers).
+    pub(crate) ra_needs_parens: HashSet<usize>,
     // Naming/VariableName: depth of enclosing pattern-match PATTERN subtrees
     // (an `InNode`/`MatchRequiredNode`/`MatchPredicateNode`'s `.pattern()`,
     // not its `.statements()`/guard) — prism represents a plain pattern bind
@@ -1679,6 +1692,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if let Some(stmts) = node.statements() {
                 if let Some(only) = stmts.body().iter().next() {
                     self.mto_note_child(&only, node.location().start_offset(), false);
+                    self.ra_needs_parens.insert(only.location().start_offset());
                 }
             }
             if let Some(else_stmts) =
@@ -1686,6 +1700,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             {
                 if let Some(only) = else_stmts.body().iter().next() {
                     self.mto_note_child(&only, node.location().start_offset(), false);
+                    self.ra_needs_parens.insert(only.location().start_offset());
                 }
             }
         }
@@ -3115,6 +3130,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_and_with_identical_operands(node);
         let op = node.operator_loc();
         self.redundant_sort_logical_left.insert(node.left().location().start_offset(), (op.start_offset(), op.end_offset()));
+        self.ra_needs_parens.insert(node.left().location().start_offset());
+        self.ra_needs_parens.insert(node.right().location().start_offset());
         if op.as_slice() == b"and" {
             self.sak_check(op.start_offset(), op.end_offset(), b"and");
         }
@@ -3124,6 +3141,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_or_with_identical_operands(node);
         let op = node.operator_loc();
         self.redundant_sort_logical_left.insert(node.left().location().start_offset(), (op.start_offset(), op.end_offset()));
+        self.ra_needs_parens.insert(node.left().location().start_offset());
+        self.ra_needs_parens.insert(node.right().location().start_offset());
         if op.as_slice() == b"or" {
             self.sak_check(op.start_offset(), op.end_offset(), b"or");
         }
@@ -3258,6 +3277,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_case_equality(node);
         self.check_redundant_exception(node);
         self.check_raise_exception(node);
+        self.check_raise_args(node);
         self.check_self_assignment_send(node);
         self.check_useless_times(node);
         self.check_attr(node);
@@ -3736,6 +3756,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         mmcbl_heredoc_chain: HashMap::new(),
         se_ancestor_end_lines: Vec::new(),
         redundant_sort_logical_left: HashMap::new(),
+        ra_needs_parens: HashSet::new(),
         pattern_depth: 0,
         renv_resbody_depth: 0,
         renv_pending_kwbegin_stack: Vec::new(),

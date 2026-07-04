@@ -16951,3 +16951,251 @@ impl<'a> super::Cops<'a> {
         }
     }
 }
+
+
+/// `Node#hash_type?`, spanning prism's two hash-shaped node kinds: an
+/// explicit `{...}` `HashNode` and a braceless trailing-keyword-arguments
+/// `KeywordHashNode` (both `hash_type?` in whitequark, which has no braced/
+/// braceless distinction).
+fn ra_is_hash_like(node: &ruby_prism::Node) -> bool {
+    node.as_hash_node().is_some() || node.as_keyword_hash_node().is_some()
+}
+
+/// `Node#const_name`: the full dotted name of a constant expression
+/// (`ConstantReadNode`/plain `ConstantPathNode`), with a leading `::`
+/// (cbase) anchor stripped — `None` for anything else (a local variable
+/// read, a method call, ...).
+fn ra_const_name(node: &ruby_prism::Node) -> Option<String> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some(String::from_utf8_lossy(c.name().as_slice()).into_owned());
+    }
+    if let Some(p) = node.as_constant_path_node() {
+        let name = String::from_utf8_lossy(p.name()?.as_slice()).into_owned();
+        return match p.parent() {
+            None => Some(name),
+            Some(parent) => Some(format!("{}::{name}", ra_const_name(&parent)?)),
+        };
+    }
+    None
+}
+
+/// `RaiseArgs#acceptable_exploded_args?`: whether a `.new(...)` call's own
+/// argument list is one exploded-style ALREADY wants to leave alone.
+/// `args.size > 1` (a real multi-arg constructor, e.g. `Ex.new(a, b)`) is
+/// always acceptable; zero args is never acceptable (that's the "no
+/// arguments" offense case — `raise Ex.new` -> `raise Ex`); exactly one arg
+/// is acceptable only for the whitequark types `ACCEPTABLE_ARG_TYPES`
+/// covers — `hash` (an explicit `{...}` OR a braceless trailing-keyword
+/// hash, prism's `HashNode`/`KeywordHashNode` — this ALSO covers
+/// `forwarded_kwrestarg`, since prism represents a lone anonymous `**`
+/// forward as a `KeywordHashNode` wrapping one valueless `AssocSplatNode`,
+/// not a separate node kind), `splat`/`forwarded_restarg` (prism's
+/// `SplatNode`, with or without an `expression` — a lone anonymous `*`
+/// forward is the same node type, just with `expression: None`), and
+/// `forwarded_args` (prism's dedicated `ForwardingArgumentsNode`, for a lone
+/// `...` forward).
+fn ra_acceptable_exploded_args(args: &[ruby_prism::Node]) -> bool {
+    if args.len() > 1 {
+        return true;
+    }
+    let Some(arg) = args.first() else { return false };
+    ra_is_hash_like(arg) || arg.as_splat_node().is_some() || arg.as_forwarding_arguments_node().is_some()
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/RaiseArgs — enforces `raise`/`fail` argument shape per
+    /// `EnforcedStyle`: `exploded` (default, `raise E.new(msg)` -> `raise E,
+    /// msg`) or `compact` (`raise E, msg` -> `raise E.new(msg)`). Dispatches
+    /// on `on_send`'s `node.command?(:raise) || node.command?(:fail)` —
+    /// `command?` requires BOTH no receiver AND a matching name, so
+    /// `obj.raise(...)` is never touched.
+    ///
+    /// Both directions' correction consult `node.parent &&
+    /// requires_parens?(node.parent)` — true when the immediate parent is
+    /// an `and`/`or` node (`operator_keyword?`, true for that TYPE
+    /// regardless of `&&`/`and` spelling — prism's `AndNode`/`OrNode` cover
+    /// both) or a ternary `IfNode` (`if_type? && ternary?`). Since prism
+    /// carries no parent pointers, `Cops::ra_needs_parens` is populated
+    /// eagerly by `visit_and_node`/`visit_or_node` (both operands,
+    /// unconditionally) and `visit_if_node`'s existing ternary-branch block
+    /// (then/else, when the branch holds exactly one statement) BEFORE
+    /// descending — see its declaration for the full rationale. Every OTHER
+    /// parent shape (a plain statement, a normal `if`/`unless`'s branch, a
+    /// method argument, ...) never requires parens, matching upstream
+    /// exactly (those cases just fall through `ra_needs_parens.contains`
+    /// returning `false`).
+    pub(crate) fn check_raise_args(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/RaiseArgs";
+        if !self.on(COP) {
+            return;
+        }
+        if node.receiver().is_some() {
+            return;
+        }
+        if !matches!(node.name().as_slice(), b"raise" | b"fail") {
+            return;
+        }
+
+        if self.cfg.enforced_style(COP) == "compact" {
+            self.ra_check_compact(node);
+        } else {
+            self.ra_check_exploded(node);
+        }
+    }
+
+    /// `RaiseArgs#check_compact`: flags an "exploded" `raise klass, msg[,
+    /// ...]` call (2+ arguments) — UNLESS the first argument is itself a
+    /// method call whose own first argument is hash-shaped (upstream's
+    /// `exception.send_type? && exception.first_argument&.hash_type?`,
+    /// e.g. `raise MyKwArgError.new(a: 1, b: 2), message` — already
+    /// constructor-shaped enough that compacting further is ambiguous).
+    fn ra_check_compact(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/RaiseArgs";
+        let args: Vec<ruby_prism::Node> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.len() <= 1 {
+            return; // `correct_style_detected` — already compact (or bare), no offense
+        }
+        let exception = &args[0];
+        if let Some(call) = exception.as_call_node() {
+            if let Some(first) = call.arguments().and_then(|a| a.arguments().iter().next()) {
+                if ra_is_hash_like(&first) {
+                    return;
+                }
+            }
+        }
+
+        let method = node.name().as_slice().to_vec();
+        self.push(
+            node.location().start_offset(),
+            COP,
+            true,
+            format!(
+                "Provide an exception object as an argument to `{}`.",
+                String::from_utf8_lossy(&method)
+            ),
+        );
+
+        // `correction_exploded_to_compact`: bails (offense stands, but no
+        // fix is produced) when there's more than one trailing message arg
+        // (`raise RuntimeError, msg, caller`) — genuinely ambiguous how to
+        // fold >1 extra argument into a single `.new(...)` call.
+        let message_nodes = &args[1..];
+        if message_nodes.len() > 1 {
+            return;
+        }
+        let message_node = &message_nodes[0];
+
+        // `exception_class = exception_node.receiver&.source ||
+        // exception_node.source` — the RECEIVER of a call-shaped exception
+        // expression (e.g. `FooError.new` -> `FooError`, dropping `.new`),
+        // else the expression's own full source verbatim (a bare constant,
+        // local variable, or receiver-less call).
+        let exception_class: &[u8] = match exception.as_call_node().and_then(|c| c.receiver()) {
+            Some(recv) => self.node_src(&recv),
+            None => self.node_src(exception),
+        };
+        let argument = self.node_src(message_node);
+
+        let mut inner = exception_class.to_vec();
+        inner.extend_from_slice(b".new(");
+        inner.extend_from_slice(argument);
+        inner.push(b')');
+
+        let needs_parens = self.ra_needs_parens.contains(&node.location().start_offset());
+        let mut replacement = method;
+        if needs_parens {
+            replacement.push(b'(');
+            replacement.extend_from_slice(&inner);
+            replacement.push(b')');
+        } else {
+            replacement.push(b' ');
+            replacement.extend_from_slice(&inner);
+        }
+        let l = node.location();
+        self.fixes.push((l.start_offset(), l.end_offset(), replacement));
+    }
+
+    /// `RaiseArgs#check_exploded`: flags a "compact" `raise Klass.new(...)`
+    /// single-argument call — a `.new` send with a receiver
+    /// (`use_new_method?`) whose OWN argument list isn't already one
+    /// exploded style leaves alone (`acceptable_exploded_args?`, see
+    /// `ra_acceptable_exploded_args`), and whose receiver's constant name
+    /// (if it names a constant at all) isn't in `AllowedCompactTypes`
+    /// (`allowed_non_exploded_type?`).
+    fn ra_check_exploded(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Style/RaiseArgs";
+        // `node.arguments.one?` — including the "no arguments at all" case,
+        // where `node.arguments()` is `None` and `.one?` on `[]` is false.
+        let Some(args_node) = node.arguments() else { return };
+        let args: Vec<ruby_prism::Node> = args_node.arguments().iter().collect();
+        if args.len() != 1 {
+            return; // `correct_style_detected`
+        }
+        let first_arg = &args[0];
+
+        // `use_new_method?`: `send_type? && receiver && method?(:new)`.
+        let Some(call) = first_arg.as_call_node() else { return };
+        let Some(receiver) = call.receiver() else { return };
+        if call.name().as_slice() != b"new" {
+            return;
+        }
+
+        let ctor_args: Vec<ruby_prism::Node> =
+            call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if ra_acceptable_exploded_args(&ctor_args) {
+            return;
+        }
+
+        // `allowed_non_exploded_type?`: `Array(cop_config['AllowedCompactTypes'])
+        // .include?(arg.receiver.const_name)` — a non-constant receiver's
+        // `const_name` is `nil`, which can never appear in the (string)
+        // list, so this only ever exempts a CONSTANT receiver.
+        if let Some(name) = ra_const_name(&receiver) {
+            let allowed: Vec<String> = self
+                .cfg
+                .get(COP, "AllowedCompactTypes")
+                .map(crate::config::parse_allowed_list)
+                .unwrap_or_default();
+            if allowed.iter().any(|t| t == &name) {
+                return;
+            }
+        }
+
+        let method = node.name().as_slice().to_vec();
+        self.push(
+            node.location().start_offset(),
+            COP,
+            true,
+            format!(
+                "Provide an exception class and message as arguments to `{}`.",
+                String::from_utf8_lossy(&method)
+            ),
+        );
+
+        // `correction_compact_to_exploded`: `[exception_node, message_node]
+        // .compact.map(&:source).join(', ')` — `exception_node` is the
+        // `.new` receiver (verbatim source, so `Foo::Bar` stays qualified);
+        // `message_node` is the (at most one, per `ra_acceptable_exploded_args`
+        // already having bailed on >1) sole constructor argument, omitted
+        // entirely when the `.new` call took none (`raise Ex.new` -> `raise Ex`).
+        let mut args_str = self.node_src(&receiver).to_vec();
+        if let Some(msg) = ctor_args.first() {
+            args_str.extend_from_slice(b", ");
+            args_str.extend_from_slice(self.node_src(msg));
+        }
+
+        let needs_parens = self.ra_needs_parens.contains(&node.location().start_offset());
+        let mut replacement = method;
+        if needs_parens {
+            replacement.push(b'(');
+            replacement.extend_from_slice(&args_str);
+            replacement.push(b')');
+        } else {
+            replacement.push(b' ');
+            replacement.extend_from_slice(&args_str);
+        }
+        let l = node.location();
+        self.fixes.push((l.start_offset(), l.end_offset(), replacement));
+    }
+}
