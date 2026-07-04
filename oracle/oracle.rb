@@ -323,6 +323,7 @@ cur_ctx = ''
 # frame = [indent, cfg, skip]. `skip` marks contexts rubocop itself doesn't run
 # under Prism (`unsupported_on: :prism`) — not valid fidelity targets for us.
 cfg_stack = []
+it_skip = false
 while i < lines.length
   l = lines[i]
   indent = l[/\A */].length
@@ -352,6 +353,9 @@ while i < lines.length
     # closed — without this, a trailing top-level example would inherit the
     # previous sibling context's cop_config.
     cfg_stack.pop while cfg_stack.any? && cfg_stack.last[0] >= indent
+    # `unsupported_on: :prism` can also tag an individual example (rubocop's
+    # own prism runs skip it) — mark every capture until the next `it`.
+    it_skip = l.include?('unsupported_on: :prism')
   end
   # `before { (cur_)cop_config[...][...] = ... }` mutates a NESTED key of the
   # config hash — unrepresentable statically; skip the context.
@@ -487,7 +491,7 @@ while i < lines.length
     cfg_stack.last[4] = sections
   end
   cur_cfg = cfg_stack.any? ? cfg_stack.last[1] : 'default'
-  cur_skip = cfg_stack.any? ? cfg_stack.last[2] : false
+  cur_skip = (cfg_stack.any? ? cfg_stack.last[2] : false) || it_skip
   cur_as = cfg_stack.any? ? cfg_stack.last[3] : nil
   cur_sec = cfg_stack.any? ? cfg_stack.last[4] : nil
   cur_ovr = cfg_stack.any? ? cfg_stack.last[5] : nil
