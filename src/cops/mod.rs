@@ -368,7 +368,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/ArrayAlignment", "Lint/RedundantCopEnableDirective", "Style/TrailingCommaInHashLiteral", "Metrics/ModuleLength",
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
-    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse",
+    "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr",
 ];
 
 impl Engine {
@@ -780,6 +780,12 @@ pub(crate) struct Cops<'a> {
     // (a real ancestor walk, not just "am I the predicate") ported as a
     // counter maintained around each conditional's visit.
     pub(crate) cond_depth: usize,
+    // Style/AndOr (EnforcedStyle: always): start offsets of `or`/`||` nodes
+    // whose DIRECT AST parent is an `and`/`&&` node — rubocop-ast's
+    // `node.parent&.and_type?` in `keep_operator_precedence`. Populated in
+    // `check_and_or_and` (visited pre-order, so a parent AndNode is always
+    // seen before its child) and consulted in `check_and_or_or`.
+    pub(crate) andor_or_parent_and: std::collections::HashSet<usize>,
     // Start offsets of MatchLastLineNode/InterpolatedMatchLastLineNode
     // literals already offended-on as the receiver of an enclosing `!`/`not`
     // call — the later direct visit of the literal skips these so it isn't
@@ -1999,6 +2005,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
+        self.check_and_or_conditional(&node.predicate());
         self.check_nested_ternary_operator(node);
         // pre-order, before recursion: register THIS ternary's branches as
         // having it for a parent (a nested ternary in the else-branch, e.g.
@@ -2938,6 +2945,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.is_begin_modifier(),
         );
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
+        self.check_and_or_conditional(&node.predicate());
         self.check_assignment_in_condition(&node.predicate());
         // `on_while` is never invoked upstream for the `begin...end while`
         // post-condition-loop shape (a distinct whitequark node type), so
@@ -3006,6 +3014,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.is_begin_modifier(),
         );
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
+        self.check_and_or_conditional(&node.predicate());
         self.check_assignment_in_condition(&node.predicate());
         // `on_until` (aliased to `on_while` upstream) is never invoked for
         // the `begin...end until` post-condition-loop shape either.
@@ -3697,6 +3706,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_alias_method_node(self, node);
     }
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
+        self.check_and_or_and(node);
         self.check_and_with_identical_operands(node);
         self.check_safe_navigation_consistency(node.left(), node.right(), true);
         let op = node.operator_loc();
@@ -3709,6 +3719,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_and_node(self, node);
     }
     fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
+        self.check_and_or_or(node);
         self.check_or_with_identical_operands(node);
         self.check_safe_navigation_consistency(node.left(), node.right(), false);
         let op = node.operator_loc();
@@ -4356,6 +4367,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         mod_stack: Vec::new(),
         nodoc_all_stack: Vec::new(),
         cond_depth: 0,
+        andor_or_parent_and: HashSet::new(),
         regexp_bang_ignore: Vec::new(),
         multiline_if_mod_seen: HashSet::new(),
         nested_ternary_reported: HashSet::new(),

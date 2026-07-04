@@ -309,6 +309,7 @@ COPS = {
   'Style/CommandLiteral'             => 'style/command_literal',
   'Style/AccessorGrouping'           => 'style/accessor_grouping',
   'Style/IfInsideElse'               => 'style/if_inside_else',
+  'Style/AndOr'                      => 'style/and_or',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

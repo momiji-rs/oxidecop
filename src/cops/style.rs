@@ -21905,3 +21905,422 @@ fn iie_multiline_if(
     }
     out
 }
+
+
+/// Style/AndOr — `and`/`or` (as opposed to `&&`/`||`, which prism folds into
+/// the very same `AndNode`/`OrNode` shapes, distinguished only by
+/// `operator_loc`'s text) should be replaced by `&&`/`||`.
+///
+/// `EnforcedStyle: conditionals` (default) flags `and`/`or` only inside the
+/// PREDICATE of an `if`/`while`/`until` — including ternaries, since prism
+/// gives `cond ? a : b` the very same `IfNode` shape as a keyword `if`, and
+/// upstream's `on_if` (aliased to `on_while`/`on_until`, but NOT `unless`,
+/// which is likewise just an `IfNode` upstream) does not distinguish. This is
+/// driven by `check_and_or_conditional`, called with each of those node
+/// kinds' `predicate()` from `visit_if_node`/`visit_while_node`/
+/// `visit_until_node` (a single `WhileNode`/`UntilNode` shape covers both the
+/// keyword and post-condition-loop forms, so no extra hook is needed for the
+/// latter). It uses a throwaway `AndOrCollector` (implementing `Visit`
+/// itself, not `self`) to find every `AndNode`/`OrNode` anywhere in the
+/// predicate subtree — mirroring upstream's `node.condition.each_node(:and,
+/// :or)`, a full pre-order descendant scan that does NOT stop at a matched
+/// node (nested `and`/`or` inside one already found are visited too) —
+/// without re-triggering unrelated hooks that `self`'s own `Visit` impl would
+/// fire a second time when the normal traversal reaches this predicate.
+///
+/// `EnforcedStyle: always` flags every `and`/`or` in the file, which falls
+/// out for free from `check_and_or_and`/`check_and_or_or` firing on every
+/// `visit_and_node`/`visit_or_node` occurrence (nested ones included) during
+/// the ordinary traversal.
+///
+/// Autocorrection (`correct_send`/`correct_setter`/`correct_other`/
+/// `keep_operator_precedence` upstream) needs a node's immediate AST PARENT
+/// to decide `keep_operator_precedence`'s case 1 (wrap an `or` node whose
+/// direct parent is an `and` node) — the only way that arises from bare
+/// `and`/`or` keywords (equal, left-associative precedence) is a chain like
+/// `a or b and c`, parsed as `AndNode(OrNode(a, b), c)`, i.e. the `or`
+/// ends up as a direct child (left OR right) of the `and`. Rather than thread
+/// parent pointers through, both code paths record, in a set keyed by the
+/// CHILD's unique start offset, "this start offset's node has an `and`
+/// parent" — populated by the parent the moment it's visited (pre-order, so
+/// always before the child is processed) and consulted by the child. For
+/// `always` style this lives on `self.andor_or_parent_and` (populated in
+/// `check_and_or_and`, spanning the whole file); for `conditionals` style
+/// each `AndOrCollector` carries its own local instance, scoped to that one
+/// predicate scan.
+impl<'a> super::Cops<'a> {
+    pub(crate) fn check_and_or_and(&mut self, node: &ruby_prism::AndNode) {
+        const COP: &str = "Style/AndOr";
+        if !self.on(COP) || self.cfg.get(COP, "EnforcedStyle") != Some("always") {
+            return;
+        }
+        let left = node.left();
+        let right = node.right();
+        // Pre-order: record before descending, so the child's own visit sees it.
+        if left.as_or_node().is_some() {
+            self.andor_or_parent_and.insert(left.location().start_offset());
+        }
+        if right.as_or_node().is_some() {
+            self.andor_or_parent_and.insert(right.location().start_offset());
+        }
+        let loc = node.location();
+        let op = node.operator_loc();
+        self.andor_process(
+            true,
+            loc.start_offset(),
+            loc.end_offset(),
+            op.start_offset(),
+            op.end_offset(),
+            &left,
+            &right,
+            false,
+        );
+    }
+
+    pub(crate) fn check_and_or_or(&mut self, node: &ruby_prism::OrNode) {
+        const COP: &str = "Style/AndOr";
+        if !self.on(COP) || self.cfg.get(COP, "EnforcedStyle") != Some("always") {
+            return;
+        }
+        let left = node.left();
+        let right = node.right();
+        let loc = node.location();
+        let op = node.operator_loc();
+        let parent_is_and = self.andor_or_parent_and.contains(&loc.start_offset());
+        self.andor_process(
+            false,
+            loc.start_offset(),
+            loc.end_offset(),
+            op.start_offset(),
+            op.end_offset(),
+            &left,
+            &right,
+            parent_is_and,
+        );
+    }
+
+    /// `on_conditionals`/`on_if` (style: conditionals): scan `predicate` for
+    /// every `and`/`or` node anywhere within it (not just a top-level one)
+    /// and process each.
+    pub(crate) fn check_and_or_conditional(&mut self, predicate: &ruby_prism::Node) {
+        const COP: &str = "Style/AndOr";
+        if !self.on(COP) || self.cfg.get(COP, "EnforcedStyle") != Some("conditionals") {
+            return;
+        }
+        let mut collector = AndOrCollector { items: Vec::new(), or_parent_and: std::collections::HashSet::new() };
+        collector.visit(predicate);
+        let AndOrCollector { items, or_parent_and } = collector;
+        for item in items {
+            let parent_is_and = or_parent_and.contains(&item.start);
+            self.andor_process(
+                item.is_and,
+                item.start,
+                item.end,
+                item.op_start,
+                item.op_end,
+                &item.left,
+                &item.right,
+                parent_is_and,
+            );
+        }
+    }
+
+    /// `process_logical_operator`: shared by both `EnforcedStyle`s once the
+    /// node to process (and its immediate `and`-parent status, for
+    /// `keep_operator_precedence`) has been identified. `node_start`/
+    /// `node_end` is the WHOLE `and`/`or` node's own range (used for
+    /// wrapping); `op_start`/`op_end` is just its `operator_loc` (the offense
+    /// anchor, and the range replaced with `&&`/`||`).
+    fn andor_process(
+        &mut self,
+        is_and: bool,
+        node_start: usize,
+        node_end: usize,
+        op_start: usize,
+        op_end: usize,
+        left: &ruby_prism::Node,
+        right: &ruby_prism::Node,
+        parent_is_and: bool,
+    ) {
+        const COP: &str = "Style/AndOr";
+        // `return if node.logical_operator?` — `&&`/`||` share the very same
+        // `AndNode`/`OrNode` shape upstream and are never processed.
+        let op_bytes = &self.src[op_start..op_end];
+        if op_bytes != b"and" && op_bytes != b"or" {
+            return;
+        }
+        let msg = if is_and { "Use `&&` instead of `and`." } else { "Use `||` instead of `or`." };
+        self.push(op_start, COP, true, msg);
+
+        self.andor_correct_child(left, false);
+        self.andor_correct_child(right, true);
+
+        let prefer: &[u8] = if is_and { b"&&" } else { b"||" };
+        self.fixes.push((op_start, op_end, prefer.to_vec()));
+
+        // `keep_operator_precedence`.
+        if !is_and && parent_is_and {
+            self.fixes.push((node_start, node_start, b"(".to_vec()));
+            self.fixes.push((node_end, node_end, b")".to_vec()));
+        } else if is_and {
+            if right.as_or_node().is_some() {
+                let rl = right.location();
+                self.fixes.push((rl.start_offset(), rl.start_offset(), b"(".to_vec()));
+                self.fixes.push((rl.end_offset(), rl.end_offset(), b")".to_vec()));
+            }
+        }
+    }
+
+    /// Dispatches one operand of the `and`/`or` node: `expr.each_child_node`
+    /// upstream's `if expr.send_type? ... elsif expr.type?(...) ||
+    /// expr.assignment? ...`. `is_rhs` is whether `expr` is the RIGHT operand
+    /// (upstream: `expr.equal?(node.parent.children.last)`), needed by
+    /// `andor_correct_other`'s bare-keyword guard.
+    fn andor_correct_child(&mut self, expr: &ruby_prism::Node, is_rhs: bool) {
+        if let Some(call) = expr.as_call_node() {
+            self.andor_correct_send(&call);
+        } else if andor_is_other_kind(expr) {
+            self.andor_correct_other(expr, is_rhs);
+        }
+    }
+
+    /// `correct_send`.
+    fn andor_correct_send(&mut self, node: &ruby_prism::CallNode) {
+        let name = node.name();
+        let name_b = name.as_slice();
+        if name_b == b"!" {
+            self.andor_correct_not(node);
+            return;
+        }
+        // `setter_method?` — `loc?(:operator)`, i.e. this call carries its
+        // own `=` (attribute writer OR simple index writer, e.g. `obj.attr =
+        // val` / `obj[i] = val` — prism's `equal_loc`).
+        if node.equal_loc().is_some() {
+            self.andor_correct_setter(node);
+            return;
+        }
+        // `comparison_method?`.
+        if matches!(name_b, b"==" | b"===" | b"!=" | b"<=" | b">=" | b">" | b"<") {
+            self.andor_correct_other(&node.as_node(), false);
+            return;
+        }
+        // `correctable_send?`: `!node.parenthesized? && node.arguments? &&
+        // !node.method?(:[])`.
+        if node.closing_loc().is_some() || name_b == b"[]" {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let arg_list: Vec<_> = args.arguments().iter().collect();
+        if arg_list.is_empty() {
+            return;
+        }
+        let Some(sel) = node.message_loc() else { return };
+        // `whitespace_before_arg`: normally the space between the selector
+        // and its first (unparenthesized) argument becomes `(`; but if the
+        // selector is a predicate method glued directly to its argument
+        // (`is_a?Integer`, no space at all — `node.source` matches `/\?\S/`),
+        // there's no space to consume and `(` is simply inserted.
+        let node_loc = node.location();
+        let node_src = &self.src[node_loc.start_offset()..node_loc.end_offset()];
+        let glued_predicate = andor_question_glued(node_src);
+        let begin_paren = sel.end_offset();
+        let end_paren = if glued_predicate { begin_paren } else { begin_paren + 1 };
+        self.fixes.push((begin_paren, end_paren, b"(".to_vec()));
+        let last = arg_list.last().expect("checked non-empty above");
+        let le = last.location().end_offset();
+        self.fixes.push((le, le, b")".to_vec()));
+    }
+
+    /// `correct_setter`: wrap from the receiver through the last argument
+    /// (the assigned value) in parens.
+    fn andor_correct_setter(&mut self, node: &ruby_prism::CallNode) {
+        let Some(receiver) = node.receiver() else { return };
+        let Some(args) = node.arguments() else { return };
+        let Some(last) = args.arguments().iter().last() else { return };
+        let rs = receiver.location().start_offset();
+        let le = last.location().end_offset();
+        self.fixes.push((rs, rs, b"(".to_vec()));
+        self.fixes.push((le, le, b")".to_vec()));
+    }
+
+    /// `correct_not`: `!`/`not` is a `CallNode` named `:!`, distinguished by
+    /// `message_loc`'s text.
+    fn andor_correct_not(&mut self, node: &ruby_prism::CallNode) {
+        let Some(sel) = node.message_loc() else { return };
+        let Some(receiver) = node.receiver() else { return };
+        if sel.as_slice() == b"!" {
+            // Recurse a level down and add parens to the receiver call, e.g.
+            // `!obj.method arg` -> `!obj.method(arg)`.
+            if let Some(rc) = receiver.as_call_node() {
+                self.andor_correct_send(&rc);
+            }
+        } else if sel.as_slice() == b"not" {
+            self.andor_correct_other(&node.as_node(), false);
+        }
+    }
+
+    /// `correct_other`: wraps `expr` in parens, unless it's already its own
+    /// parenthesized call (`yield(1)`'s own `lparen_loc`, or `not(arg)`'s
+    /// `CallNode` `opening_loc` — NOTE `return(x)`/`next(1)`/`break(2)` do
+    /// NOT count: prism, like whitequark, parses their `(...)` as a
+    /// parenthesized-expression ARGUMENT, not part of the keyword node's own
+    /// location, so they always get wrapped), or it's a bare (argument-less)
+    /// `return`/`next`/`break`/`yield` used as the right-hand operand (upstream:
+    /// `node.children.empty? && node.equal?(node.parent.children.last)`).
+    fn andor_correct_other(&mut self, expr: &ruby_prism::Node, is_rhs: bool) {
+        if let Some(call) = expr.as_call_node() {
+            if call.opening_loc().is_some() {
+                return;
+            }
+        } else if let Some(y) = expr.as_yield_node() {
+            if y.lparen_loc().is_some() {
+                return;
+            }
+        }
+        if is_rhs {
+            let bare = if let Some(r) = expr.as_return_node() {
+                r.arguments().is_none()
+            } else if let Some(n) = expr.as_next_node() {
+                n.arguments().is_none()
+            } else if let Some(b) = expr.as_break_node() {
+                b.arguments().is_none()
+            } else if let Some(y) = expr.as_yield_node() {
+                y.arguments().is_none()
+            } else {
+                false
+            };
+            if bare {
+                return;
+            }
+        }
+        let l = expr.location();
+        self.fixes.push((l.start_offset(), l.start_offset(), b"(".to_vec()));
+        self.fixes.push((l.end_offset(), l.end_offset(), b")".to_vec()));
+    }
+}
+
+/// Style/AndOr: does `expr` fall into upstream's `expr.type?(:return, :next,
+/// :break, :yield) || expr.assignment?` bucket (as opposed to `send_type?`,
+/// handled separately, or neither, left untouched)? `assignment?` upstream
+/// covers whitequark's `lvasgn ivasgn cvasgn gvasgn casgn masgn` (equals
+/// assignments) and `op_asgn or_asgn and_asgn` (shorthand `+=`/`||=`/`&&=`) —
+/// prism keeps each of those as its own dedicated write-node kind (4 variants
+/// per target flavor: plain, `+=`-style operator, `||=`, `&&=`, across local/
+/// instance/class/global variables, plus constant, constant-path, call
+/// (attr-shorthand, e.g. `obj.attr += 1`), and index (`obj[i] += 1`)
+/// shorthand forms, plus plain `MultiWriteNode` for `masgn`).
+fn andor_is_other_kind(expr: &ruby_prism::Node) -> bool {
+    expr.as_return_node().is_some()
+        || expr.as_next_node().is_some()
+        || expr.as_break_node().is_some()
+        || expr.as_yield_node().is_some()
+        || expr.as_local_variable_write_node().is_some()
+        || expr.as_local_variable_operator_write_node().is_some()
+        || expr.as_local_variable_and_write_node().is_some()
+        || expr.as_local_variable_or_write_node().is_some()
+        || expr.as_instance_variable_write_node().is_some()
+        || expr.as_instance_variable_operator_write_node().is_some()
+        || expr.as_instance_variable_and_write_node().is_some()
+        || expr.as_instance_variable_or_write_node().is_some()
+        || expr.as_class_variable_write_node().is_some()
+        || expr.as_class_variable_operator_write_node().is_some()
+        || expr.as_class_variable_and_write_node().is_some()
+        || expr.as_class_variable_or_write_node().is_some()
+        || expr.as_global_variable_write_node().is_some()
+        || expr.as_global_variable_operator_write_node().is_some()
+        || expr.as_global_variable_and_write_node().is_some()
+        || expr.as_global_variable_or_write_node().is_some()
+        || expr.as_constant_write_node().is_some()
+        || expr.as_constant_operator_write_node().is_some()
+        || expr.as_constant_and_write_node().is_some()
+        || expr.as_constant_or_write_node().is_some()
+        || expr.as_constant_path_write_node().is_some()
+        || expr.as_constant_path_operator_write_node().is_some()
+        || expr.as_constant_path_and_write_node().is_some()
+        || expr.as_constant_path_or_write_node().is_some()
+        || expr.as_call_operator_write_node().is_some()
+        || expr.as_call_and_write_node().is_some()
+        || expr.as_call_or_write_node().is_some()
+        || expr.as_index_operator_write_node().is_some()
+        || expr.as_index_and_write_node().is_some()
+        || expr.as_index_or_write_node().is_some()
+        || expr.as_multi_write_node().is_some()
+}
+
+/// `whitespace_before_arg`'s `/\?\S/.match?(node.source)`: a literal `?`
+/// followed immediately by a non-whitespace byte, anywhere in `src` (Ruby's
+/// `\S` — not space/tab/newline/CR/FF/VT).
+fn andor_question_glued(src: &[u8]) -> bool {
+    for i in 0..src.len().saturating_sub(1) {
+        if src[i] == b'?' && !matches!(src[i + 1], b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Style/AndOr (`conditionals` style): collects every `AndNode`/`OrNode`
+/// found anywhere within a scanned subtree (pre-order, matching upstream's
+/// `each_node` — descends into an already-matched node's children too, so
+/// `a and b and c`'s two nested `AndNode`s are both collected), plus which of
+/// them are an `or`-node whose immediate parent is an `and`-node (see the
+/// module doc above `check_and_or_and` for why only that direction needs
+/// tracking). A dedicated `Visit` impl (rather than reusing `self`) so this
+/// read-only scan doesn't re-fire unrelated per-node hooks that `self`'s own
+/// `Visit` impl carries, which the ordinary traversal will fire once already
+/// when it reaches this same subtree.
+struct AndOrItem<'pr> {
+    is_and: bool,
+    start: usize,
+    end: usize,
+    op_start: usize,
+    op_end: usize,
+    left: ruby_prism::Node<'pr>,
+    right: ruby_prism::Node<'pr>,
+}
+
+struct AndOrCollector<'pr> {
+    items: Vec<AndOrItem<'pr>>,
+    or_parent_and: std::collections::HashSet<usize>,
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for AndOrCollector<'pr> {
+    fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
+        let left = node.left();
+        let right = node.right();
+        if left.as_or_node().is_some() {
+            self.or_parent_and.insert(left.location().start_offset());
+        }
+        if right.as_or_node().is_some() {
+            self.or_parent_and.insert(right.location().start_offset());
+        }
+        let loc = node.location();
+        let op = node.operator_loc();
+        self.items.push(AndOrItem {
+            is_and: true,
+            start: loc.start_offset(),
+            end: loc.end_offset(),
+            op_start: op.start_offset(),
+            op_end: op.end_offset(),
+            left,
+            right,
+        });
+        ruby_prism::visit_and_node(self, node);
+    }
+    fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
+        let left = node.left();
+        let right = node.right();
+        let loc = node.location();
+        let op = node.operator_loc();
+        self.items.push(AndOrItem {
+            is_and: false,
+            start: loc.start_offset(),
+            end: loc.end_offset(),
+            op_start: op.start_offset(),
+            op_end: op.end_offset(),
+            left,
+            right,
+        });
+        ruby_prism::visit_or_node(self, node);
+    }
+}
