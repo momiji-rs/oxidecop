@@ -2,6 +2,7 @@
 //! a THIN `Visit` impl that dispatches into per-department modules
 //! (`style`/`naming`/`lint`/`layout`), and the `lint()` entry point.
 mod breakable;
+mod bundler;
 mod layout;
 mod lint_cops;
 mod metrics;
@@ -237,7 +238,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/MultilineTernaryOperator", "Style/CommentedKeyword", "Style/For", "Style/RedundantSort", "Style/EachWithObject", "Style/CaseLikeIf", "Naming/VariableName", "Naming/RescuedExceptionsVariableName",
     "Lint/UnreachableLoop", "Style/InfiniteLoop", "Style/OrAssignment", "Style/EmptyMethod",
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
-    "Naming/PredicatePrefix",
+    "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource",
 ];
 
 impl Engine {
@@ -2681,6 +2682,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_attr(node);
         self.check_lambda_call(node);
         self.check_unreachable_loop_call(node);
+        self.check_insecure_protocol_source(node);
         // Run every ACTIVE declarative pattern against this call (enablement
         // and style gates were resolved when the Engine was built).
         let n = node.as_node();

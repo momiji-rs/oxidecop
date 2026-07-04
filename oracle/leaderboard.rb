@@ -244,6 +244,7 @@ COPS = {
   'Style/HashAsLastArrayItem'        => 'style/hash_as_last_array_item',
   'Lint/ParenthesesAsGroupedExpression' => 'lint/parentheses_as_grouped_expression',
   'Naming/PredicatePrefix'           => 'naming/predicate_prefix',
+  'Bundler/InsecureProtocolSource'   => 'bundler/insecure_protocol_source',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
