@@ -15799,3 +15799,384 @@ fn pac_is_safe_assignment(node: &ruby_prism::Node) -> bool {
         || node.as_multi_write_node().is_some()
         || node.as_call_node().is_some_and(|c| c.equal_loc().is_some())
 }
+
+
+// ---------------------------------------------------------------------------
+// Style/ExplicitBlockArgument
+// ---------------------------------------------------------------------------
+//
+// A block whose ENTIRE body is a single `yield` forwarding exactly the
+// block's own parameters (same names, same order, same count) just relays to
+// an implicit block; suggest an explicit `&block` parameter instead. Ported
+// from `RuboCop::Cop::Style::ExplicitBlockArgument`.
+//
+// Upstream's `yielding_block?` node-pattern `(block $_ (args $...) (yield
+// $...))` only matches when the block's body IS the `yield` (whitequark
+// never wraps a lone statement in `:begin`); prism always wraps a block body
+// in a `StatementsNode` even for one statement, so the equivalent check here
+// is "exactly one statement, and it's a `YieldNode`" — see
+// `check_explicit_block_argument`.
+//
+// `yielding_arguments?`'s `fill`+`zip` dance collapses to something simpler
+// once traced through: `Array#fill` only ever EXTENDS (a negative length is a
+// no-op), and `Array#zip`'s pairing is driven by its RECEIVER's (the
+// yield-args') length — so any length mismatch always produces at least one
+// `nil` pairing, which always fails the `next false unless yield_arg &&
+// block_arg` guard. Net effect: the offense fires iff the two arg lists have
+// the SAME length and match pairwise by name — see `eba_yield_arg_names` /
+// `check_explicit_block_argument`'s comparison.
+
+use super::EbaDefInfo;
+use super::EbaKind;
+use super::EbaOwner;
+
+/// `arg.optarg_type? ? arg.node_parts[0] : arg.source`, applied to every
+/// parameter of `p` in Ruby's fixed grammar order (required, optional, rest,
+/// post, keyword, keyword-rest, block) — `build_new_arguments_for_zsuper`'s
+/// per-argument text, precomputed once per `def` (cheap either way: this only
+/// ever runs a handful of times per file).
+fn eba_build_zsuper_args(src: &[u8], p: &ruby_prism::ParametersNode) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let push_src = |out: &mut Vec<Vec<u8>>, l: ruby_prism::Location| {
+        out.push(src[l.start_offset()..l.end_offset()].to_vec());
+    };
+    for n in p.requireds().iter() {
+        push_src(&mut out, n.location());
+    }
+    for n in p.optionals().iter() {
+        if let Some(o) = n.as_optional_parameter_node() {
+            out.push(o.name().as_slice().to_vec());
+        } else {
+            push_src(&mut out, n.location());
+        }
+    }
+    if let Some(r) = p.rest() {
+        push_src(&mut out, r.location());
+    }
+    for n in p.posts().iter() {
+        push_src(&mut out, n.location());
+    }
+    for n in p.keywords().iter() {
+        push_src(&mut out, n.location());
+    }
+    if let Some(kr) = p.keyword_rest() {
+        push_src(&mut out, kr.location());
+    }
+    if let Some(b) = p.block() {
+        push_src(&mut out, b.location());
+    }
+    out
+}
+
+/// Precomputes everything `check_explicit_block_argument` needs about `node`
+/// (this `def`/`defs`): the block name to use everywhere inside it, whether
+/// (and how) its own signature needs a `(&block)`-shaped edit, and its
+/// parameters' zsuper-forwarding text. Called once on `visit_def_node` entry
+/// — see `Cops::eba_def_stack`'s doc.
+pub(crate) fn eba_build_def_info(src: &[u8], node: &ruby_prism::DefNode) -> EbaDefInfo {
+    let start_offset = node.location().start_offset();
+    match node.parameters() {
+        // `def m` / `def m()` — no parameter of any kind (prism omits the
+        // `ParametersNode` entirely rather than giving an empty one).
+        None => {
+            let (s, e) = if let (Some(lp), Some(rp)) = (node.lparen_loc(), node.rparen_loc()) {
+                (lp.start_offset(), rp.end_offset())
+            } else {
+                let ne = node.name_loc().end_offset();
+                (ne, ne)
+            };
+            EbaDefInfo {
+                start_offset,
+                block_name: b"block".to_vec(),
+                needs_sig_edit: true,
+                sig_edit: (s, e, b"(&block)".to_vec()),
+                zsuper_arg_texts: Vec::new(),
+            }
+        }
+        Some(p) => {
+            if let Some(bp) = p.block() {
+                // Already has an explicit `&name` — `extract_block_name`:
+                // reuse its name (empty for an anonymous bare `&`, which
+                // `"&#{nil}"` would likewise render as just `&`).
+                let name = bp.name().map(|n| n.as_slice().to_vec()).unwrap_or_default();
+                EbaDefInfo {
+                    start_offset,
+                    block_name: name,
+                    needs_sig_edit: false,
+                    sig_edit: (0, 0, Vec::new()),
+                    zsuper_arg_texts: eba_build_zsuper_args(src, &p),
+                }
+            } else {
+                // `insert_argument`: find the last-declared parameter (fixed
+                // grammar order: required, optional, rest, post, keyword,
+                // keyword-rest — block is absent in this branch) and extend
+                // rightward over a directly-adjacent trailing comma, exactly
+                // like `range_with_surrounding_comma(:right)`.
+                let mut last_end = None;
+                for n in p.requireds().iter() {
+                    last_end = Some(n.location().end_offset());
+                }
+                for n in p.optionals().iter() {
+                    last_end = Some(n.location().end_offset());
+                }
+                if let Some(r) = p.rest() {
+                    last_end = Some(r.location().end_offset());
+                }
+                for n in p.posts().iter() {
+                    last_end = Some(n.location().end_offset());
+                }
+                for n in p.keywords().iter() {
+                    last_end = Some(n.location().end_offset());
+                }
+                if let Some(kr) = p.keyword_rest() {
+                    last_end = Some(kr.location().end_offset());
+                }
+                let last_end = last_end.unwrap_or_else(|| p.location().end_offset());
+                let mut e = last_end;
+                while e < src.len() && src[e] == b',' {
+                    e += 1;
+                }
+                let rep: Vec<u8> = if e > last_end { b" &block".to_vec() } else { b", &block".to_vec() };
+                EbaDefInfo {
+                    start_offset,
+                    block_name: b"block".to_vec(),
+                    needs_sig_edit: true,
+                    sig_edit: (e, e, rep),
+                    zsuper_arg_texts: eba_build_zsuper_args(src, &p),
+                }
+            }
+        }
+    }
+}
+
+/// This call's own shape for `add_block_argument`/`block_body_range` — see
+/// `EbaOwner`'s doc. `node`'s own `location()` already spans the receiver
+/// chain through the trailing block (prism, unlike whitequark's `send_node`),
+/// so `anchor` is simply its start.
+pub(crate) fn eba_call_owner(node: &ruby_prism::CallNode) -> EbaOwner {
+    let anchor = node.location().start_offset();
+    if let Some(args) = node.arguments() {
+        let Some(last) = args.arguments().iter().last() else {
+            return EbaOwner { anchor, call_end: node.location().end_offset(), kind: EbaKind::Bare, is_zsuper: false };
+        };
+        let last_end = last.location().end_offset();
+        let call_end = node.closing_loc().map(|c| c.end_offset()).unwrap_or(last_end);
+        EbaOwner { anchor, call_end, kind: EbaKind::HasArgs { last_arg_end: last_end }, is_zsuper: false }
+    } else if let (Some(op), Some(cl)) = (node.opening_loc(), node.closing_loc()) {
+        EbaOwner {
+            anchor,
+            call_end: cl.end_offset(),
+            kind: EbaKind::EmptyParens { start: op.start_offset(), end: cl.end_offset() },
+            is_zsuper: false,
+        }
+    } else {
+        let call_end = node.message_loc().map(|l| l.end_offset()).unwrap_or_else(|| node.location().end_offset());
+        EbaOwner { anchor, call_end, kind: EbaKind::Bare, is_zsuper: false }
+    }
+}
+
+/// Same as `eba_call_owner`, for an explicit `super(...)`/`super` call
+/// (`SuperNode` — always has at least `super`'s own keyword; a TRULY bare
+/// `super` with no parens/args at all is a distinct `ForwardingSuperNode`,
+/// handled by `eba_zsuper_owner`).
+pub(crate) fn eba_super_owner(node: &ruby_prism::SuperNode) -> EbaOwner {
+    let anchor = node.location().start_offset();
+    if let Some(args) = node.arguments() {
+        let Some(last) = args.arguments().iter().last() else {
+            return EbaOwner { anchor, call_end: node.location().end_offset(), kind: EbaKind::Bare, is_zsuper: false };
+        };
+        let last_end = last.location().end_offset();
+        let call_end = node.rparen_loc().map(|r| r.end_offset()).unwrap_or(last_end);
+        EbaOwner { anchor, call_end, kind: EbaKind::HasArgs { last_arg_end: last_end }, is_zsuper: false }
+    } else if let (Some(lp), Some(rp)) = (node.lparen_loc(), node.rparen_loc()) {
+        EbaOwner {
+            anchor,
+            call_end: rp.end_offset(),
+            kind: EbaKind::EmptyParens { start: lp.start_offset(), end: rp.end_offset() },
+            is_zsuper: false,
+        }
+    } else {
+        EbaOwner { anchor, call_end: node.keyword_loc().end_offset(), kind: EbaKind::Bare, is_zsuper: false }
+    }
+}
+
+/// A bare zsuper (`super { ... }`, no parens/args at all) — its `location()`
+/// spans through the trailing block same as a call's, but it has no
+/// dedicated keyword location; `super` is a fixed 5-byte spelling (see the
+/// matching note on `visit_forwarding_super_node`'s `sak_check`).
+pub(crate) fn eba_zsuper_owner(node: &ruby_prism::ForwardingSuperNode) -> EbaOwner {
+    let start = node.location().start_offset();
+    EbaOwner { anchor: start, call_end: start + 5, kind: EbaKind::Bare, is_zsuper: true }
+}
+
+/// The ordered parameter NAMES of a plain `ParametersNode` — `None` (bail:
+/// treat the enclosing block as unsupported, never an offense) for anything
+/// without a simple symbol name: a destructured positional (`|(a, b)|`), an
+/// anonymous `*`/`**`/`&`, or `...` forwarding. Mirrors upstream's
+/// `.children.first` read on each of `(args $...)`'s captured child nodes,
+/// restricted to the shapes this port actually supports.
+fn eba_simple_param_names(p: Option<ruby_prism::ParametersNode>) -> Option<Vec<Vec<u8>>> {
+    let Some(p) = p else { return Some(Vec::new()) };
+    let mut names = Vec::new();
+    for n in p.requireds().iter() {
+        names.push(n.as_required_parameter_node()?.name().as_slice().to_vec());
+    }
+    for n in p.optionals().iter() {
+        names.push(n.as_optional_parameter_node()?.name().as_slice().to_vec());
+    }
+    if let Some(r) = p.rest() {
+        names.push(r.as_rest_parameter_node()?.name()?.as_slice().to_vec());
+    }
+    for n in p.posts().iter() {
+        names.push(n.as_required_parameter_node()?.name().as_slice().to_vec());
+    }
+    for n in p.keywords().iter() {
+        if let Some(k) = n.as_required_keyword_parameter_node() {
+            names.push(k.name().as_slice().to_vec());
+        } else if let Some(k) = n.as_optional_keyword_parameter_node() {
+            names.push(k.name().as_slice().to_vec());
+        } else {
+            return None;
+        }
+    }
+    if let Some(kr) = p.keyword_rest() {
+        names.push(kr.as_keyword_rest_parameter_node()?.name()?.as_slice().to_vec());
+    }
+    if let Some(b) = p.block() {
+        names.push(b.name()?.as_slice().to_vec());
+    }
+    Some(names)
+}
+
+/// `eba_simple_param_names`, plus a `BlockParametersNode`'s shadow locals
+/// (`|i; a|`'s `a`) appended — whitequark's `(args $...)` includes
+/// `:shadowarg` children too, so upstream's length/name comparison sees them.
+fn eba_block_param_names(bp: &ruby_prism::BlockParametersNode) -> Option<Vec<Vec<u8>>> {
+    let mut names = eba_simple_param_names(bp.parameters())?;
+    for n in bp.locals().iter() {
+        names.push(n.as_block_local_variable_node()?.name().as_slice().to_vec());
+    }
+    Some(names)
+}
+
+/// The ordered argument names of a `yield`, or `None` if any argument isn't
+/// a plain local-variable reference (a block parameter read back inside its
+/// own block) — anything else's upstream `.children.first` essentially never
+/// equals a parameter's name symbol, so it can never contribute to a match.
+fn eba_yield_arg_names(y: &ruby_prism::YieldNode) -> Option<Vec<Vec<u8>>> {
+    match y.arguments() {
+        None => Some(Vec::new()),
+        Some(args) => {
+            let mut v = Vec::new();
+            for a in args.arguments().iter() {
+                v.push(a.as_local_variable_read_node()?.name().as_slice().to_vec());
+            }
+            Some(v)
+        }
+    }
+}
+
+impl<'a> super::Cops<'a> {
+    /// Style/ExplicitBlockArgument — see the module-level doc above.
+    pub(crate) fn check_explicit_block_argument(&mut self, node: &ruby_prism::BlockNode, owner: EbaOwner) {
+        const COP: &str = "Style/ExplicitBlockArgument";
+        if !self.on(COP) {
+            return;
+        }
+        // The block's body must be EXACTLY one `yield` statement — no more,
+        // no less (see the module doc on why this replaces whitequark's
+        // `node.parent` check).
+        let Some(body) = node.body() else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        let mut it = stmts.body().iter();
+        let Some(only) = it.next() else { return };
+        if it.next().is_some() {
+            return;
+        }
+        let Some(yield_node) = only.as_yield_node() else { return };
+
+        // Block parameters: `None` (no `|...|` at all) is fine (empty list);
+        // a numbered (`_1`)/`it`-implicit param list has no name to compare
+        // against and is left unsupported (no offense).
+        let block_names: Vec<Vec<u8>> = match node.parameters() {
+            None => Vec::new(),
+            Some(p) => {
+                let Some(bp) = p.as_block_parameters_node() else { return };
+                match eba_block_param_names(&bp) {
+                    Some(v) => v,
+                    None => return,
+                }
+            }
+        };
+        let Some(yield_names) = eba_yield_arg_names(&yield_node) else { return };
+        if yield_names != block_names {
+            return;
+        }
+
+        // Needs a real enclosing `def`/`defs` — `yield` outside of one (e.g.
+        // in a Haml/ERB template) is invalid Ruby but shouldn't crash us.
+        let Some(def_idx) = self.eba_def_stack.len().checked_sub(1) else { return };
+        let block_name = self.eba_def_stack[def_idx].block_name.clone();
+        let def_start = self.eba_def_stack[def_idx].start_offset;
+        let needs_sig_edit = self.eba_def_stack[def_idx].needs_sig_edit;
+        let sig_edit = self.eba_def_stack[def_idx].sig_edit.clone();
+        let zsuper_arg_texts = self.eba_def_stack[def_idx].zsuper_arg_texts.clone();
+
+        self.push(
+            owner.anchor,
+            COP,
+            true,
+            "Consider using explicit block argument in the surrounding method's signature over `yield`.",
+        );
+
+        let block_close_end = node.closing_loc().end_offset();
+        match owner.kind {
+            EbaKind::HasArgs { last_arg_end } => {
+                // `block_body_range`: wipe the block out entirely.
+                self.fixes.push((owner.call_end, block_close_end, Vec::new()));
+                // `insert_argument`.
+                let mut e = last_arg_end;
+                while e < self.src.len() && self.src[e] == b',' {
+                    e += 1;
+                }
+                let mut rep = if e > last_arg_end { b" &".to_vec() } else { b", &".to_vec() };
+                rep.extend_from_slice(&block_name);
+                self.fixes.push((e, e, rep));
+            }
+            EbaKind::EmptyParens { start, end } => {
+                self.fixes.push((owner.call_end, block_close_end, Vec::new()));
+                let mut rep = b"(&".to_vec();
+                rep.extend_from_slice(&block_name);
+                rep.push(b')');
+                self.fixes.push((start, end, rep));
+            }
+            EbaKind::Bare => {
+                // No separate arg-list edit exists to collide with the
+                // block removal — merge both into ONE replacement so the
+                // two operations can never tie on the same start offset.
+                let mut rep = b"(".to_vec();
+                if owner.is_zsuper {
+                    for (i, a) in zsuper_arg_texts.iter().enumerate() {
+                        if i > 0 {
+                            rep.extend_from_slice(b", ");
+                        }
+                        rep.extend_from_slice(a);
+                    }
+                    if !zsuper_arg_texts.is_empty() {
+                        rep.extend_from_slice(b", ");
+                    }
+                }
+                rep.push(b'&');
+                rep.extend_from_slice(&block_name);
+                rep.push(b')');
+                self.fixes.push((owner.call_end, block_close_end, rep));
+            }
+        }
+
+        // `@def_nodes.add?(def_node)`: only the FIRST offending block inside
+        // a given def edits that def's own signature.
+        if self.eba_def_fixed.insert(def_start) && needs_sig_edit {
+            self.fixes.push(sig_edit);
+        }
+    }
+}

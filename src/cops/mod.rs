@@ -73,6 +73,67 @@ pub(crate) enum NleFrame {
     Block { has_args: bool, is_define_method: bool, chained: bool },
 }
 
+/// Style/ExplicitBlockArgument: the shape of a `yield`-only block's owning
+/// call/super/zsuper site (the only three grammar positions a block can hang
+/// off of), used to build the `add_block_argument` autocorrect at the call
+/// site — see `Cops::eba_pending`'s doc.
+pub(crate) enum EbaKind {
+    /// Existing explicit argument(s) — `last_arg_end` is the last one's own
+    /// end offset (extended rightward over a directly-adjacent trailing
+    /// comma at use time, matching `range_with_surrounding_comma(:right)`).
+    HasArgs { last_arg_end: usize },
+    /// Explicit-but-empty parens, e.g. `foo()` / `super()` — `start`/`end`
+    /// bracket the `(...)` text to be replaced outright.
+    EmptyParens { start: usize, end: usize },
+    /// No parens, no arguments at all: `foo { }`, bare `super { }`, or the
+    /// bare zsuper `super { }` (flagged separately via `EbaOwner::is_zsuper`).
+    Bare,
+}
+/// Style/ExplicitBlockArgument: everything `check_explicit_block_argument`
+/// needs about the block's owning node, computed once (by
+/// `style::eba_call_owner`/`eba_super_owner`/`eba_zsuper_owner`) right before
+/// that owner's `self.visit(&block)` call.
+pub(crate) struct EbaOwner {
+    /// The offense anchor AND the block-removal's own highlighted start —
+    /// prism's `CallNode`/`SuperNode#location` already spans receiver
+    /// through the trailing block (unlike whitequark's `send_node`, which
+    /// stops short of it), so this is simply the owner's own
+    /// `location().start_offset()`.
+    pub(crate) anchor: usize,
+    /// This owner's own end offset EXCLUDING the block — where the block's
+    /// source text (`block_body_range`) starts being removed, and (for
+    /// `Bare`) also where the replacement `(&block)` text is inserted.
+    pub(crate) call_end: usize,
+    pub(crate) kind: EbaKind,
+    /// Whether this owner is a bare zsuper (`super` with no parens/args at
+    /// all) — its replacement must additionally forward the enclosing def's
+    /// own parameters (`build_new_arguments_for_zsuper`).
+    pub(crate) is_zsuper: bool,
+}
+/// Style/ExplicitBlockArgument: precomputed per-`def` facts, pushed on
+/// `visit_def_node` entry and popped on exit — stands in for upstream's
+/// parent-pointer `each_ancestor(:any_def).first` (prism gives none), whose
+/// innermost frame is always `.last()`.
+pub(crate) struct EbaDefInfo {
+    /// This def's own start offset — the `@def_nodes.add?` compare-by-identity
+    /// key (unique per lexical `def`, even for two textually-identical ones).
+    pub(crate) start_offset: usize,
+    /// `extract_block_name`: the existing `&block` param's name if the def
+    /// already declares one (empty for an anonymous bare `&`), else the
+    /// literal `block`.
+    pub(crate) block_name: Vec<u8>,
+    /// Whether the signature itself still needs a `(&block)`-shaped edit —
+    /// false when the def already declares an explicit block parameter.
+    pub(crate) needs_sig_edit: bool,
+    /// The (start, end, replacement) signature edit; only meaningful when
+    /// `needs_sig_edit`.
+    pub(crate) sig_edit: (usize, usize, Vec<u8>),
+    /// `build_new_arguments_for_zsuper`: each of this def's own parameters,
+    /// source text verbatim except a bare positional optional (`y = 42`),
+    /// which contributes just its name (`y`) — in declaration order.
+    pub(crate) zsuper_arg_texts: Vec<Vec<u8>>,
+}
+
 /// Per-RUN state derived from the Config once — parsed patterns, resolved
 /// enablement, compiled exemption maps. lint() is called per file; nothing
 /// here should be rebuilt per file.
@@ -245,6 +306,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/MissingSuper", "Style/LineEndConcatenation", "Style/CombinableLoops", "Style/SlicingWithRange",
     "Style/RedundantInterpolation", "Style/BisectedAttrAccessor",
     "Layout/SpaceAroundKeyword", "Style/MixinGrouping", "Style/ClassEqualityComparison", "Style/ParenthesesAroundCondition", "Layout/SpaceInsideParens",
+    "Style/ExplicitBlockArgument",
 ];
 
 impl Engine {
@@ -1061,6 +1123,19 @@ pub(crate) struct Cops<'a> {
     // rubocop's `Base#add_offense` collapses those onto one offense via
     // range-identity, which this reproduces explicitly.
     pub(crate) sak_end_seen: HashSet<usize>,
+    // Style/ExplicitBlockArgument: the owning call/super/zsuper site's shape
+    // for the block about to be visited — set by `visit_call_node`/
+    // `visit_super_node`/`visit_forwarding_super_node` right before their
+    // `self.visit(&b)` (the established `nle_pending` idiom), consumed at
+    // the top of `visit_block_node`. Always `Some` in practice: every
+    // `BlockNode` is reached through exactly one of those three call sites.
+    pub(crate) eba_pending: Option<EbaOwner>,
+    // Style/ExplicitBlockArgument: one entry per active `def`/`defs`
+    // ancestor, innermost last — see `EbaDefInfo`'s doc.
+    pub(crate) eba_def_stack: Vec<EbaDefInfo>,
+    // Style/ExplicitBlockArgument: start offsets of defs whose signature has
+    // already received its `(&block)` edit this run — `@def_nodes.add?`.
+    pub(crate) eba_def_fixed: HashSet<usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2184,6 +2259,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             None => NleFrame::Block { has_args, is_define_method: false, chained: false },
         };
         self.nle_stack.push(nle_frame);
+        // Style/ExplicitBlockArgument: consume the owning call/super/zsuper
+        // shape set right before this visit — see the `eba_pending` doc.
+        if let Some(owner) = self.eba_pending.take() {
+            self.check_explicit_block_argument(node, owner);
+        }
         let rs_names = node
             .parameters()
             .and_then(|p| p.as_block_parameters_node())
@@ -2732,7 +2812,11 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // upstream's ancestor climb (`scoped_node?`'s `any_def_type?`).
         self.nle_stack.push(NleFrame::Def);
         self.def_name_stack.push(node.name().as_slice().to_vec());
+        // Style/ExplicitBlockArgument: this def's precomputed facts (block
+        // name, signature edit, zsuper arg texts) — see `EbaDefInfo`'s doc.
+        self.eba_def_stack.push(style::eba_build_def_info(self.src, node));
         ruby_prism::visit_def_node(self, node);
+        self.eba_def_stack.pop();
         self.def_name_stack.pop();
         self.nle_stack.pop();
         self.se_ancestor_end_lines.pop();
@@ -2801,6 +2885,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 let owner_line = self.idx.loc(node.keyword_loc().start_offset()).0;
                 let end_line = self.idx.loc(bn.closing_loc().start_offset()).0;
                 self.check_empty_lines_around_exception_handling_keywords(bn.body(), owner_line, end_line);
+                // Style/ExplicitBlockArgument: this `super(...)`'s own
+                // shape — see the `eba_pending` field doc.
+                self.eba_pending = Some(style::eba_super_owner(node));
             }
             let has_args = node.arguments().is_some_and(|a| a.arguments().iter().count() > 0);
             let last_end = if node.lparen_loc().is_some() {
@@ -2836,6 +2923,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let owner_line = self.idx.loc(node.location().start_offset()).0;
             let end_line = self.idx.loc(b.closing_loc().start_offset()).0;
             self.check_empty_lines_around_exception_handling_keywords(b.body(), owner_line, end_line);
+            // Style/ExplicitBlockArgument: bare zsuper's own shape — see
+            // the `eba_pending` field doc.
+            self.eba_pending = Some(style::eba_zsuper_owner(node));
         }
         ruby_prism::visit_forwarding_super_node(self, node);
     }
@@ -3251,6 +3341,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 // Lint/MissingSuper: this block's `class_new_block` verdict —
                 // see the `ms_pending_block` field doc.
                 self.ms_pending_block = self.ms_class_new_pending(node);
+                // Style/ExplicitBlockArgument: this call's own shape — see
+                // the `eba_pending` field doc.
+                self.eba_pending = Some(style::eba_call_owner(node));
             }
             // Consumed by the `visit_block_node` call this triggers below
             // (`&:sym` block-pass args aren't block nodes, so this is false
@@ -3486,6 +3579,9 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         ms_pending_block: None,
         sak_ancestors: Vec::new(),
         sak_end_seen: HashSet::new(),
+        eba_pending: None,
+        eba_def_stack: Vec::new(),
+        eba_def_fixed: HashSet::new(),
     };
 
     let t = tick(&T_PREP, t);

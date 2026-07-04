@@ -267,6 +267,7 @@ COPS = {
   'Style/ClassEqualityComparison'    => 'style/class_equality_comparison',
   'Style/ParenthesesAroundCondition' => 'style/parentheses_around_condition',
   'Layout/SpaceInsideParens'         => 'layout/space_inside_parens',
+  'Style/ExplicitBlockArgument'      => 'style/explicit_block_argument',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
