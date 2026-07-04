@@ -369,7 +369,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/SpecialGlobalVars",
     "Style/StringConcatenation", "Metrics/BlockLength", "Metrics/ClassLength", "Lint/NonDeterministicRequireOrder", "Metrics/BlockNesting", "Lint/FormatParameterMismatch", "Style/TrailingCommaInArrayLiteral", "Metrics/MethodLength", "Layout/SpaceAroundMethodCallOperator", "Style/WordArray", "Layout/SpaceAroundBlockParameters", "Style/TrailingCommaInArguments",
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
-    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors",
+    "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
 ];
 
 impl Engine {
@@ -4758,6 +4758,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         .as_program_node()
         .and_then(|p| p.statements().body().iter().next().map(|n| n.location().start_offset()));
     cops.check_gem_filename();
+    cops.check_file_name(&result.node());
     cops.check_frozen_string_literal(first_code_line);
     cops.check_empty_line_after_magic_comment(first_code_line);
     cops.check_duplicate_magic_comment(first_code_line);

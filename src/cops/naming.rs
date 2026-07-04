@@ -2017,3 +2017,370 @@ fn variable_number_matches_style(name: &[u8], style: &str) -> bool {
 fn variable_number_implicit_param(chars: &[char]) -> bool {
     chars.len() >= 2 && chars[0] == '_' && chars[1..].iter().all(|c| c.is_ascii_digit())
 }
+
+
+// ---------------------------------------------------------------------------
+// Naming/FileName — a "global offense" cop (rubocop's `on_new_investigation`,
+// not a node visitor): it inspects `processed_source.file_path`, not the AST,
+// and always anchors its single possible offense at byte 0 (rubocop's
+// `Offense::NO_LOCATION` == line 1, column 0 — same pseudo-range every other
+// global-offense cop in this codebase uses, e.g. `check_gem_filename`).
+//
+// `ExpectMatchingDefinition` additionally requires a class/module (or
+// Struct/Class.new/Module.new constant assignment) matching the path-derived
+// namespace to exist ANYWHERE in the file. Upstream's own implementation
+// (`find_class_or_module`/`namespace_matches?`) walks the whole AST with a
+// single SHARED mutable "remaining expected segments" array that can, in
+// contrived multi-candidate cases, get partially consumed by a failed
+// candidate before a later candidate is tried. We instead compute, for every
+// class/module/casgn-as-module definition in the file, its FULL qualified
+// name (enclosing class/module ancestors' own qualified paths ++ its own
+// qualified constant path) and ask whether `expected` (the path-derived
+// namespace) is a per-segment (acronym-aware) SUFFIX of it. This is
+// observably identical to upstream for every case this fixture exercises
+// (verified by hand for each), and is simpler/safer than replicating the
+// mutable-array quirk — see the worker report for the residual-risk note.
+impl<'a> super::Cops<'a> {
+    /// Naming/FileName — basename snake_case check, `ExpectMatchingDefinition`
+    /// namespace check, and the custom `Regex` override, ported from
+    /// `on_new_investigation`/`for_bad_filename`/`perform_class_and_module_naming_checks`.
+    pub(crate) fn check_file_name(&mut self, root: &ruby_prism::Node) {
+        const COP: &str = "Naming/FileName";
+        if !self.on(COP) {
+            return;
+        }
+        // `config.file_to_exclude?` (AllCops: Exclude) is already applied by
+        // the engine before a file ever reaches `cops::lint` (see main.rs);
+        // only `allowed_camel_case_file?` needs replicating here.
+        let file_path = self.rel_path;
+        if fn_allowed_camel_case_file(file_path) {
+            return;
+        }
+
+        let basename = file_path.rsplit('/').next().unwrap_or(file_path);
+        let regex_raw = self.cfg.get(COP, "Regex");
+        let (good, regex_disp) = fn_filename_good(basename, regex_raw);
+
+        let msg = if good {
+            if self.cfg.get(COP, "ExpectMatchingDefinition") != Some("true") {
+                None
+            } else {
+                let acronyms: Vec<String> = self
+                    .cfg
+                    .get(COP, "AllowedAcronyms")
+                    .map(crate::config::parse_allowed_list)
+                    .unwrap_or_default();
+                let check_hierarchy = self.cfg.get(COP, "CheckDefinitionPathHierarchy") == Some("true");
+                let expected = if check_hierarchy {
+                    // `CheckDefinitionPathHierarchyRoots` is an array default
+                    // (rubocop's default.yml: `[lib, spec, test, src]`) — the
+                    // generated schema only carries scalar defaults, so the
+                    // fallback is hardcoded here per the porting brief.
+                    const DEFAULT_ROOTS: [&str; 4] = ["lib", "spec", "test", "src"];
+                    let roots: Vec<String> = self
+                        .cfg
+                        .get(COP, "CheckDefinitionPathHierarchyRoots")
+                        .map(crate::config::parse_allowed_list)
+                        .unwrap_or_else(|| DEFAULT_ROOTS.iter().map(|s| s.to_string()).collect());
+                    fn_to_namespace(file_path, &roots)
+                } else {
+                    fn_to_namespace(basename, &[])
+                };
+                if fn_matches_any_definition(root, &expected, &acronyms) {
+                    None
+                } else {
+                    Some(format!(
+                        "`{basename}` should define a class or module called `{}`.",
+                        expected.join("::")
+                    ))
+                }
+            }
+        } else if self.fn_bad_filename_allowed(COP) {
+            None
+        } else if let Some(disp) = regex_disp {
+            Some(format!("`{basename}` should match `{disp}`."))
+        } else {
+            Some(format!("The name of this source file (`{basename}`) should use snake_case."))
+        };
+
+        if let Some(msg) = msg {
+            self.push(0, COP, false, msg);
+        }
+    }
+
+    /// `bad_filename_allowed?`: `IgnoreExecutableScripts` (default true) and
+    /// the raw source starts with a shebang.
+    fn fn_bad_filename_allowed(&self, cop: &str) -> bool {
+        self.cfg.get(cop, "IgnoreExecutableScripts") == Some("true") && self.src.starts_with(b"#!")
+    }
+}
+
+/// `config.allowed_camel_case_file?`: `.gemspec` files are always allowed
+/// (bundler namespace-via-dash convention), and so is any basename that
+/// rubocop's OWN default `AllCops: Include` lists literally BY NAME with an
+/// uppercase letter (`Gemfile`, `Rakefile`, ...) — those are exempted because
+/// they're matched by an explicit filename, not a generic glob. The oracle
+/// harness's `let(:config) { RuboCop::Config.new({ 'AllCops' => { 'Include'
+/// => includes }, ... }) }` shape isn't wired through by `oracle.rb` (its
+/// static section parser can't see a section keyed by `described_class
+/// .badge.to_s`, nor unwrap the literal-hash `RuboCop::Config.new({...},
+/// path)` two-arg form — verified: `parse_config_sections` returns nil for
+/// it), so every example always runs under the engine's real defaults —
+/// hardcoding them here mirrors `main.rs::is_ruby_file`'s own default-name
+/// list and passes the fixture's "Gemfile" `AllCops/Include` example for the
+/// right underlying reason (both reflect rubocop's actual default.yml).
+fn fn_allowed_camel_case_file(file_path: &str) -> bool {
+    if file_path.ends_with(".gemspec") {
+        return true;
+    }
+    let basename = file_path.rsplit('/').next().unwrap_or(file_path);
+    const NAMES: &[&str] = &[
+        "Appraisals", "Berksfile", "Brewfile", "Buildfile", "Capfile", "Dangerfile", "Deliverfile",
+        "Fastfile", "Gemfile", "Guardfile", "Jarfile", "Mavenfile", "Podfile", "Puppetfile", "Rakefile",
+        "Schemafile", "Snapfile", "Steepfile", "Thorfile", "Vagrantfile",
+    ];
+    NAMES.contains(&basename) || basename.ends_with("Fastfile")
+}
+
+/// `filename_good?`: strip a leading dot, the trailing extension (last dot
+/// onward), turn the FIRST `+` into `_` (Action Pack Variants file names),
+/// then match the custom `Regex` (if set) or the default `SNAKE_CASE`
+/// pattern. Returns `(matched, custom_regex_display)` — the display string
+/// (rubocop `Regexp#to_s` format) is populated whenever a custom `Regex` is
+/// configured, regardless of match outcome, for use in the failure message.
+fn fn_filename_good(basename: &str, regex_raw: Option<&str>) -> (bool, Option<String>) {
+    let mut s = basename.strip_prefix('.').unwrap_or(basename).to_string();
+    if let Some(pos) = s.rfind('.') {
+        s.truncate(pos);
+    }
+    if let Some(pos) = s.find('+') {
+        s.replace_range(pos..pos + 1, "_");
+    }
+    match regex_raw {
+        Some(raw) => {
+            let (body, flags) = fn_parse_ruby_regex(raw);
+            let disp = fn_regexp_to_s(&flags, &body);
+            let matched = fn_build_regex(&body, &flags).is_some_and(|re| re.is_match(&s));
+            (matched, Some(disp))
+        }
+        None => {
+            // SNAKE_CASE = /^[\d[[:lower:]]_.?!]+$/ — `\d` is ASCII-only in
+            // Ruby; `[[:lower:]]` is Unicode-aware (matches `ü`/`é`), same as
+            // Rust's `char::is_lowercase`.
+            let ok = !s.is_empty()
+                && s.chars().all(|c| c.is_ascii_digit() || c.is_lowercase() || matches!(c, '_' | '.' | '?' | '!'));
+            (ok, None)
+        }
+    }
+}
+
+/// Split a Ruby regex LITERAL's source text (`/pattern/flags`, as it appears
+/// verbatim in a YAML scalar built from `cop_config['Regex'].inspect`-free
+/// interpolation) into its body and flag letters.
+fn fn_parse_ruby_regex(raw: &str) -> (String, String) {
+    if raw.starts_with('/') {
+        if let Some(last) = raw.rfind('/') {
+            if last > 0 {
+                return (raw[1..last].to_string(), raw[last + 1..].to_string());
+            }
+        }
+    }
+    (raw.to_string(), String::new())
+}
+
+/// Ruby's `Regexp#to_s`: `(?enabled-disabled:source)`, flags always listed in
+/// `m`, `i`, `x` order (enabled ones first, then the ones NOT set).
+fn fn_regexp_to_s(flags: &str, body: &str) -> String {
+    let mut enabled = String::new();
+    let mut disabled = String::new();
+    for c in ['m', 'i', 'x'] {
+        if flags.contains(c) {
+            enabled.push(c);
+        } else {
+            disabled.push(c);
+        }
+    }
+    format!("(?{enabled}-{disabled}:{body})")
+}
+
+/// Build the actual matcher for a `Regex` param: Ruby's `m` flag is DOTALL
+/// (unlike most other regex flavors' multiline `m`), which is Rust's `s`/
+/// `dot_matches_new_line`, not its own `m` (line-anchor multiline).
+fn fn_build_regex(body: &str, flags: &str) -> Option<regex::Regex> {
+    regex::RegexBuilder::new(body)
+        .case_insensitive(flags.contains('i'))
+        .dot_matches_new_line(flags.contains('m'))
+        .ignore_whitespace(flags.contains('x'))
+        .build()
+        .ok()
+}
+
+/// Ruby's `String#capitalize`: first char uppercased, the REST lowercased
+/// (not left alone) — `"HTTP".capitalize == "Http"`.
+fn fn_ruby_capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+    }
+}
+
+/// `to_module_name`: drop everything from the first `.` onward, split on
+/// `_`, `String#capitalize` each word, concatenate (no separator).
+fn fn_to_module_name(component: &str) -> String {
+    let stem = component.find('.').map_or(component, |pos| &component[..pos]);
+    stem.split('_').map(fn_ruby_capitalize).collect::<String>()
+}
+
+/// `to_namespace`: split the path on `/`, find the LAST (closest to the file)
+/// path component that's a `CheckDefinitionPathHierarchyRoots` root, and
+/// namespace-map everything after it; with no root match, namespace-map just
+/// the basename alone.
+fn fn_to_namespace(path: &str, roots: &[String]) -> Vec<String> {
+    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if components.is_empty() {
+        return vec![String::new()];
+    }
+    let start_index = components
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, c)| roots.iter().any(|r| r == *c))
+        .map(|(i, _)| i + 1);
+    match start_index {
+        None => vec![fn_to_module_name(components[components.len() - 1])],
+        Some(idx) => components[idx..].iter().map(|c| fn_to_module_name(c)).collect(),
+    }
+}
+
+/// `match_acronym?`: `expected.gsub(acronym.capitalize, acronym) == actual`
+/// for any allowed acronym.
+fn fn_match_acronym(expected: &str, actual: &str, acronyms: &[String]) -> bool {
+    acronyms.iter().any(|ac| {
+        let cap = fn_ruby_capitalize(ac);
+        expected.replace(&cap, ac) == actual
+    })
+}
+
+/// Is `expected` an (acronym-aware) per-segment SUFFIX of `full`?
+fn fn_suffix_matches(full: &[String], expected: &[String], acronyms: &[String]) -> bool {
+    if expected.len() > full.len() {
+        return false;
+    }
+    let offset = full.len() - expected.len();
+    expected
+        .iter()
+        .enumerate()
+        .all(|(i, e)| { let actual = &full[offset + i]; e == actual || fn_match_acronym(e, actual, acronyms) })
+}
+
+/// Is `node` a reference to the bare constant `target` — either a plain
+/// `ConstantReadNode`, or a top-level `::Target` (a parent-less
+/// `ConstantPathNode`)? Mirrors rubocop-ast's `global_const?` node matcher.
+fn fn_is_bare_or_cbase_const(node: &ruby_prism::Node, target: &[u8]) -> bool {
+    if let Some(c) = node.as_constant_read_node() {
+        return c.name().as_slice() == target;
+    }
+    if let Some(c) = node.as_constant_path_node() {
+        return c.parent().is_none() && c.name().is_some_and(|n| n.as_slice() == target);
+    }
+    false
+}
+
+/// Does `value` look like `Target.new(...)` (with or without a `do...end`
+/// block — a prism `CallNode`'s optional block is a field on the call itself,
+/// not a separate wrapping node), where `Target` is one of `names` referenced
+/// bare or via a leading `::`?
+fn fn_casgn_value_defines(value: &ruby_prism::Node, names: &[&[u8]]) -> bool {
+    let Some(call) = value.as_call_node() else { return false };
+    if call.name().as_slice() != b"new" {
+        return false;
+    }
+    let Some(recv) = call.receiver() else { return false };
+    names.iter().any(|t| fn_is_bare_or_cbase_const(&recv, t))
+}
+
+/// A qualified constant-path expression's segments, outer to inner (`A::B` ->
+/// `["A", "B"]`; a bare `A` -> `["A"]`; a leading `::` contributes nothing).
+fn fn_constant_path_segments(node: &ruby_prism::Node) -> Option<Vec<String>> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some(vec![String::from_utf8_lossy(c.name().as_slice()).into_owned()]);
+    }
+    if let Some(c) = node.as_constant_path_node() {
+        let name = c.name()?;
+        let mut segs = match c.parent() {
+            Some(p) => fn_constant_path_segments(&p)?,
+            None => Vec::new(),
+        };
+        segs.push(String::from_utf8_lossy(name.as_slice()).into_owned());
+        return Some(segs);
+    }
+    None
+}
+
+/// Every class/module/`casgn`-as-Struct-or-Class-or-Module definition in the
+/// file, as its FULL qualified name (enclosing class/module ancestors' own
+/// qualified paths ++ its own). A plain recursive descent (prism's default
+/// `Visit` behavior auto-descends into every node we don't override), NOT
+/// tied to the main `Cops` visitor/mutable state — this runs once, standalone,
+/// from `check_file_name`.
+#[derive(Default)]
+struct FnDefFinder {
+    defs: Vec<Vec<String>>,
+    prefix: Vec<String>,
+}
+impl<'pr> ruby_prism::Visit<'pr> for FnDefFinder {
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        match fn_constant_path_segments(&node.constant_path()) {
+            Some(own) => {
+                let full: Vec<String> = self.prefix.iter().chain(own.iter()).cloned().collect();
+                self.defs.push(full);
+                let saved = self.prefix.len();
+                self.prefix.extend(own);
+                ruby_prism::visit_class_node(self, node);
+                self.prefix.truncate(saved);
+            }
+            None => ruby_prism::visit_class_node(self, node),
+        }
+    }
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        match fn_constant_path_segments(&node.constant_path()) {
+            Some(own) => {
+                let full: Vec<String> = self.prefix.iter().chain(own.iter()).cloned().collect();
+                self.defs.push(full);
+                let saved = self.prefix.len();
+                self.prefix.extend(own);
+                ruby_prism::visit_module_node(self, node);
+                self.prefix.truncate(saved);
+            }
+            None => ruby_prism::visit_module_node(self, node),
+        }
+    }
+    fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+        let value = node.value();
+        if fn_casgn_value_defines(&value, &[b"Struct"]) || fn_casgn_value_defines(&value, &[b"Class", b"Module"]) {
+            let mut full = self.prefix.clone();
+            full.push(String::from_utf8_lossy(node.name().as_slice()).into_owned());
+            self.defs.push(full);
+        }
+        ruby_prism::visit_constant_write_node(self, node);
+    }
+    fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+        let value = node.value();
+        if fn_casgn_value_defines(&value, &[b"Struct"]) || fn_casgn_value_defines(&value, &[b"Class", b"Module"]) {
+            if let Some(own) = fn_constant_path_segments(&node.target().as_node()) {
+                let full: Vec<String> = self.prefix.iter().chain(own.iter()).cloned().collect();
+                self.defs.push(full);
+            }
+        }
+        ruby_prism::visit_constant_path_write_node(self, node);
+    }
+}
+
+/// Is `expected` (acronym-aware, per-segment) satisfied by ANY definition
+/// anywhere in the file?
+fn fn_matches_any_definition(root: &ruby_prism::Node, expected: &[String], acronyms: &[String]) -> bool {
+    let mut finder = FnDefFinder::default();
+    ruby_prism::Visit::visit(&mut finder, root);
+    finder.defs.iter().any(|full| fn_suffix_matches(full, expected, acronyms))
+}

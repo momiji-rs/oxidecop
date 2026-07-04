@@ -322,6 +322,7 @@ COPS = {
   'Lint/SafeNavigationChain'         => 'lint/safe_navigation_chain',
   'Style/MultipleComparison'         => 'style/style_multiple_comparison',
   'Style/TrivialAccessors'           => 'style/trivial_accessors',
+  'Naming/FileName'                  => 'naming/file_name',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',
