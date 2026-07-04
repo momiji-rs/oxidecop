@@ -241,7 +241,7 @@ const IMPLEMENTED: &[&str] = &[
     "Lint/RedundantRequireStatement", "Lint/SendWithMixinArgument", "Style/HashAsLastArrayItem", "Lint/ParenthesesAsGroupedExpression",
     "Naming/PredicatePrefix", "Bundler/InsecureProtocolSource", "Bundler/DuplicatedGem", "Bundler/GemFilename",
     "Gemspec/RubyVersionGlobalsUsage", "Gemspec/DuplicatedAssignment", "Gemspec/RequiredRubyVersion", "Gemspec/OrderedDependencies",
-    "Layout/IndentationStyle",
+    "Layout/IndentationStyle", "Layout/ParameterAlignment",
 ];
 
 impl Engine {
@@ -2431,6 +2431,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_method_parameter_name(node);
         self.check_keyword_parameters_order_def(node);
         self.check_non_nil_check_def(node);
+        self.check_parameter_alignment(node);
         // Default walk (receiver, params, body) one def level deeper — matches
         // rubocop's each_ancestor(:def) semantics, and covers offenses in
         // parameter default values, which a body-only walk silently skipped.

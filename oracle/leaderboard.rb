@@ -252,6 +252,7 @@ COPS = {
   'Gemspec/RequiredRubyVersion'      => 'gemspec/required_ruby_version',
   'Gemspec/OrderedDependencies'      => 'gemspec/ordered_dependencies',
   'Layout/IndentationStyle'          => 'layout/indentation_style',
+  'Layout/ParameterAlignment'        => 'layout/parameter_alignment',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

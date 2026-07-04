@@ -5465,3 +5465,150 @@ fn find_offense_match(line: &[u8], tabs_style: bool) -> Option<usize> {
     let target = if tabs_style { b' ' } else { b'\t' };
     line[..ws_end].iter().rposition(|&b| b == target).map(|p| p + 1)
 }
+
+
+impl<'a> super::Cops<'a> {
+    /// Layout/ParameterAlignment — checks that the parameters of a
+    /// multi-line method definition (`def`/`defs`, a single prism
+    /// `DefNode` with an optional `receiver` covering both) are aligned: to
+    /// the first parameter's own column (`EnforcedStyle: with_first_parameter`,
+    /// the default), or to the `def` line's own indentation plus one
+    /// configured indentation step (`with_fixed_indentation`). Ports
+    /// rubocop's `ParameterAlignment` cop + the shared `Alignment` mixin's
+    /// `check_alignment`/`each_bad_alignment`/`register_offense`, and the
+    /// `AlignmentCorrector` autocorrector.
+    ///
+    /// `on_def` (aliased `on_defs`) bails out when there are fewer than 2
+    /// parameters (`node.arguments.size < 2` — nothing to misalign). The
+    /// individual parameter nodes come from `mlbl_ordered_params`, which
+    /// walks prism's `ParametersNode` fields in Ruby's fixed grammar order
+    /// (requireds, optionals, rest, posts, keywords, keyword_rest, block) —
+    /// identical to their source order, since Ruby's own grammar enforces
+    /// that ordering textually too. (Not covered: a bare `...` forwarding
+    /// parameter, which prism represents outside these fields entirely, and
+    /// which the fixture never exercises.)
+    ///
+    /// `each_bad_alignment`'s core loop: walking the params in order, only a
+    /// parameter that (a) starts a NEW source line relative to the previous
+    /// param's line, and (b) is the first non-whitespace token on that line
+    /// (`begins_its_line?`, replicated as an all-whitespace scan from the
+    /// line start) is a candidate; its bad-alignment `column_delta` is
+    /// `base_column - display_column(param)` (the Unicode East-Asian-Width-
+    /// aware column, via the shared `display_column` helper). A zero delta
+    /// is fine; otherwise it's an offense anchored at the parameter's own
+    /// start (matching `current.source_range`'s begin — e.g. the `*` of a
+    /// splat, not just the identifier after it).
+    ///
+    /// NOT ported: `Alignment#check_alignment`'s `@current_offenses`
+    /// overlap guard (registers the offense without autocorrecting when its
+    /// range falls inside an offense already added earlier in THIS SAME
+    /// investigation). It only matters when one parameter's own range
+    /// (e.g. a multi-line default value) swallows a later line that also
+    /// starts a misaligned parameter — no fixture example has a multi-line
+    /// parameter, so it's unobservable here.
+    pub(crate) fn check_parameter_alignment(&mut self, node: &ruby_prism::DefNode) {
+        const COP: &str = "Layout/ParameterAlignment";
+        if !self.on(COP) {
+            return;
+        }
+        let Some(params) = node.parameters() else { return };
+        let items = mlbl_ordered_params(&params);
+        if items.len() < 2 {
+            return;
+        }
+        let fixed_indentation = self.cfg.enforced_style(COP) == "with_fixed_indentation";
+        let base = if fixed_indentation {
+            let kw_start = node.def_keyword_loc().start_offset();
+            let (line, _) = self.idx.loc(kw_start);
+            let line_start = self.idx.starts[line - 1];
+            let mut p = line_start;
+            while p < self.src.len() && self.src[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            let indentation_of_line = p - line_start;
+            indentation_of_line + self.parameter_alignment_indentation_width(COP)
+        } else {
+            self.display_column(items[0].location().start_offset())
+        };
+        let mut prev_line: Option<usize> = None;
+        for item in &items {
+            let start = item.location().start_offset();
+            let (line, _) = self.idx.loc(start);
+            let starts_new_line = prev_line.map_or(true, |p| line > p);
+            if starts_new_line {
+                let line_start = self.idx.starts[line - 1];
+                let begins_its_line = self.src[line_start..start].iter().all(u8::is_ascii_whitespace);
+                if begins_its_line {
+                    let actual = self.display_column(start);
+                    if actual != base {
+                        let delta = base as isize - actual as isize;
+                        let msg = if fixed_indentation {
+                            "Use one level of indentation for parameters following the first line of a multi-line method definition."
+                        } else {
+                            "Align the parameters of a method definition if they span more than one line."
+                        };
+                        self.push(start, COP, true, msg);
+                        let end = item.location().end_offset();
+                        self.parameter_alignment_correct(start, end, delta);
+                    }
+                }
+            }
+            prev_line = Some(line);
+        }
+    }
+
+    /// `AlignmentCorrector.correct`'s per-line loop, specialized to the
+    /// single misaligned parameter node (upstream's `autocorrect(corrector,
+    /// node)` always gets the one bad parameter, never the whole list).
+    /// Walks each physical line the parameter's own source spans (almost
+    /// always just one — no fixture parameter is multi-line), starting at
+    /// the node's OWN begin offset (not the physical line's start) for line
+    /// 1, then at each subsequent line's true start: widening (`delta > 0`)
+    /// inserts `delta` spaces immediately before that position; narrowing
+    /// removes `-delta` bytes, taken from the run starting at that position
+    /// if it itself is a space (an interior line's own leading whitespace)
+    /// or from just before it otherwise (the gap between the previous token
+    /// and the node's own start, on line 1). Skips a would-be removal whose
+    /// bytes aren't purely spaces/tabs (`/\A[ \t]+\z/`), matching upstream
+    /// leaving such a case uncorrected.
+    fn parameter_alignment_correct(&mut self, start: usize, end: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let mut line_begin = start;
+        loop {
+            if delta > 0 {
+                if self.src.get(line_begin) != Some(&b'\n') {
+                    self.fixes.push((line_begin, line_begin, vec![b' '; delta as usize]));
+                }
+            } else {
+                let n = (-delta) as usize;
+                let starts_with_space = self.src.get(line_begin) == Some(&b' ');
+                let (rs, re) = if starts_with_space { (line_begin, line_begin + n) } else { (line_begin.saturating_sub(n), line_begin) };
+                if re <= self.src.len() && rs < re && self.src[rs..re].iter().all(|&b| b == b' ' || b == b'\t') {
+                    self.fixes.push((rs, re, Vec::new()));
+                }
+            }
+            // Advance to the next physical line within [start, end), if any.
+            let mut p = line_begin;
+            while p < end && self.src[p] != b'\n' {
+                p += 1;
+            }
+            if p >= end {
+                break;
+            }
+            line_begin = p + 1;
+        }
+    }
+
+    /// `Alignment#configured_indentation_width`: cop-local `IndentationWidth`
+    /// (no schema default for this cop — meaningful only when a user sets it
+    /// directly), else `Layout/IndentationWidth`'s `Width` (schema default 2).
+    fn parameter_alignment_indentation_width(&self, cop: &'static str) -> usize {
+        self.cfg
+            .get(cop, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+}
