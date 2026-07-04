@@ -371,7 +371,7 @@ const IMPLEMENTED: &[&str] = &[
     "Layout/HeredocIndentation", "Style/RescueStandardError", "Naming/MemoizedInstanceVariableName", "Lint/OutOfRangeRegexpRef", "Style/PercentLiteralDelimiters", "Lint/RedundantSplatExpansion", "Style/DoubleNegation", "Naming/VariableNumber", "Style/CommandLiteral", "Style/AccessorGrouping", "Style/IfInsideElse", "Style/AndOr", "Style/IdenticalConditionalBranches",
     "Style/YodaCondition", "Style/TernaryParentheses", "Style/SignalException", "Style/RedundantBegin", "Style/SoleNestedConditional", "Style/Next", "Style/RegexpLiteral", "Lint/ShadowedException", "Lint/SafeNavigationChain", "Style/MultipleComparison", "Style/TrivialAccessors", "Naming/FileName",
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
-    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment",
+    "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier",
 ];
 
 impl Engine {
@@ -622,6 +622,10 @@ pub struct LintResult {
     pub offenses: Vec<Offense>,
     pub fixes: Vec<Fix>,
 }
+
+/// Style/IfUnlessModifier's `ium_collection_info` value: `(direct siblings,
+/// modifier-form descendants)` — see that field's own doc.
+pub(crate) type IumCollectionEntry = (Vec<(usize, usize, usize)>, Vec<(usize, usize)>);
 
 pub(crate) struct Cops<'a> {
     pub(crate) src: &'a [u8],
@@ -1755,6 +1759,54 @@ pub(crate) struct Cops<'a> {
     // `new_class_or_module_block?` (the block itself contributes nothing to
     // `parent_module_name`; the casgn ancestor already does).
     pub(crate) dm_pending_casgn_new_block: bool,
+    // Style/IfUnlessModifier: live depth of enclosing `InterpolatedStringNode`
+    // (dstr) ancestors — `node.ancestors.any?(&:dstr_type?)` guard (an `if`
+    // used inside a string interpolation, e.g. `"#{x if y}"`, is never
+    // offended on — converting it to/from modifier form there would corrupt
+    // the surrounding string literal).
+    pub(crate) ium_dstr_depth: usize,
+    // Style/IfUnlessModifier: an `if`/`unless` node's own start offset ->
+    // the set of local-variable names assigned by STATEMENTS BEFORE IT in
+    // its immediate enclosing `StatementsNode` (`node.left_siblings`,
+    // filtered to plain `lvasgn` statements) — used only by
+    // `defined_argument_is_undefined?`'s "was this name assigned earlier at
+    // the same statement-list level" check. Populated eagerly in
+    // `visit_statements_node`, in source order, before recursing.
+    pub(crate) ium_left_siblings: HashMap<usize, HashSet<Vec<u8>>>,
+    // Style/IfUnlessModifier: an `if`/`unless` node's own start offset (only
+    // for nodes that are themselves a DIRECT array element / call argument /
+    // hash value, after unwrapping one layer of parens and — for a hash
+    // value — its pair) -> `(siblings, modifier_form_descendants)`:
+    //   - `siblings`: every DIRECT sibling in that same collection that
+    //     unwraps to a non-ternary `if`/`unless`, as `(start_offset,
+    //     first_line, last_line)` — rubocop's `multiline_inside_collection?`
+    //     scans exactly these (`collection.children`, one level, via
+    //     `unwrap_begin`).
+    //   - `modifier_form_descendants`: every modifier-form `if`/`unless`
+    //     ANYWHERE in the collection's subtree (full recursive descent, not
+    //     just direct children), as `(start_offset, line)` — rubocop's
+    //     `another_modifier_if_on_same_line?` scans these
+    //     (`collection.each_descendant(:if)`).
+    // Populated eagerly in `visit_array_node`/`visit_call_node`/
+    // `visit_hash_node`, before recursing into children.
+    pub(crate) ium_collection_info: HashMap<usize, IumCollectionEntry>,
+    // Style/IfUnlessModifier: byte ranges `[start, end)` of `if`/`unless`
+    // nodes already given a FIX this pass — rubocop's `ignore_node`/
+    // `part_of_ignored_node?`. A nested modifier `if` inside an OUTER node's
+    // condition (`return x if items.map { |i| i.y if i.z? }`) still gets its
+    // own OFFENSE when eligible, but no fix is queued once an ancestor's fix
+    // already claims (contains) its range — the outer's corrector rewrite
+    // would otherwise clobber/duplicate the inner's edit. Checked/populated
+    // in visitation (pre-)order, matching upstream's top-down `on_if`.
+    pub(crate) ium_ignored_ranges: Vec<(usize, usize)>,
+    // Style/IfUnlessModifier: a statement's own start offset -> its RIGHT
+    // sibling's first physical line, within its immediate enclosing
+    // `StatementsNode` — `another_statement_on_same_line?`'s one-hop-up
+    // climb (`node.sibling_index`/`node.parent.children`), approximated as
+    // "this node's direct statement-list successor" rather than a full
+    // climb through intermediate non-`begin` ancestors (untested by the
+    // fixture beyond the direct-sibling case).
+    pub(crate) ium_right_sibling_line: HashMap<usize, usize>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2082,10 +2134,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.ll_dstr_delim.push(d);
         }
         self.interpolated_node_depth += 1;
+        self.ium_dstr_depth += 1;
         let prev_brace_eligible = self.sgv_brace_eligible;
         self.sgv_brace_eligible = true;
         ruby_prism::visit_interpolated_string_node(self, node);
         self.sgv_brace_eligible = prev_brace_eligible;
+        self.ium_dstr_depth -= 1;
         self.interpolated_node_depth -= 1;
         if delim.is_some() {
             self.ll_dstr_delim.pop();
@@ -2166,6 +2220,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_x_string_node(self, node);
     }
     fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
+        self.ium_register_collection(&node.as_node(), node.elements().iter().collect());
         self.check_hash_syntax_hash(node);
         self.check_duplicate_hash_key(node);
         self.check_multiline_hash_brace_layout(node);
@@ -2473,6 +2528,24 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.check_nested_modifier("if", node.predicate(), node.statements(), true);
             self.rrs_note_modifier_body(node.statements(), node.location().end_offset());
         }
+        // Style/IfUnlessModifier: fires for every real `if`/`elsif` (a
+        // ternary — `if_keyword_loc().is_none()` — never offends: see the
+        // cop's own doc comment), both full and modifier form. Pre-order,
+        // matching upstream's top-down `on_if` (needed for `ignore_node`'s
+        // outer-before-inner ordering on a nested modifier chain).
+        if let Some(kw) = node.if_keyword_loc() {
+            let is_elsif = kw.as_slice() == b"elsif";
+            self.check_if_unless_modifier(
+                &node.as_node(),
+                kw,
+                "if",
+                is_elsif,
+                node.predicate(),
+                node.statements(),
+                node.subsequent(),
+                node.end_keyword_loc(),
+            );
+        }
         self.cond_depth += 1;
         // Style/DoubleNegation: `conditional?` (`CONDITIONALS` includes
         // `:if`, which whitequark also uses for a ternary — this pushes for
@@ -2567,6 +2640,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.check_nested_modifier("unless", node.predicate(), node.statements(), true);
             self.rrs_note_modifier_body(node.statements(), node.location().end_offset());
         }
+        // Style/IfUnlessModifier: `unless` has no elsif/ternary form, so
+        // always eligible for the check (pre-order, see the if-visitor note).
+        self.check_if_unless_modifier(
+            &node.as_node(),
+            node.keyword_loc(),
+            "unless",
+            false,
+            node.predicate(),
+            node.statements(),
+            node.else_clause().map(|e| e.as_node()),
+            node.end_keyword_loc(),
+        );
         self.cond_depth += 1;
         self.dn_ancestors.push(DnFrame::Conditional(self.idx.loc(node.location().end_offset().saturating_sub(1)).0));
         self.hs_call_like_ctx.insert(node.predicate().location().start_offset());
@@ -3183,6 +3268,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_range_node(self, node);
     }
     fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        // Style/IfUnlessModifier: `if_node.left_siblings` — snapshot, for
+        // every `if`/`unless` statement directly in this list, the set of
+        // local-var names assigned by PLAIN `lvasgn` statements strictly
+        // before it (source order). See `ium_left_siblings`'s field doc.
+        if self.on("Style/IfUnlessModifier") {
+            let mut assigned: HashSet<Vec<u8>> = HashSet::new();
+            let body: Vec<ruby_prism::Node> = node.body().iter().collect();
+            for (i, child) in body.iter().enumerate() {
+                if child.as_if_node().is_some() || child.as_unless_node().is_some() {
+                    self.ium_left_siblings.insert(child.location().start_offset(), assigned.clone());
+                }
+                if let Some(next) = body.get(i + 1) {
+                    let line = self.idx.loc(next.location().start_offset()).0;
+                    self.ium_right_sibling_line.insert(child.location().start_offset(), line);
+                }
+                if let Some(w) = child.as_local_variable_write_node() {
+                    assigned.insert(w.name().as_slice().to_vec());
+                }
+            }
+        }
         // Lint/Void's `on_begin`/`on_kwbegin`: fires for EVERY implicit
         // whitequark `:begin` node, which is exactly a `StatementsNode` with
         // 2+ statements (a single statement is transparently unwrapped —
@@ -3815,6 +3920,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_parentheses_node(self, node);
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+        self.ium_register_collection(&node.as_node(), node.elements().iter().collect());
         self.check_trailing_comma_in_array_literal(node);
         self.check_hash_as_last_array_item(node);
         self.check_multiline_array_brace_layout(node);
@@ -4538,6 +4644,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_or_node(self, node);
     }
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if let Some(args) = node.arguments() {
+            self.ium_register_collection(&node.as_node(), args.arguments().iter().collect());
+        }
         self.hs_register_dispatch(
             node.location().start_offset(),
             node.message_loc().map(|l| l.end_offset()),
@@ -5357,6 +5466,11 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         hs_modifier_depth: 0,
         hs_pair_ctx: HashMap::new(),
         hs_wrapped_return: HashSet::new(),
+        ium_dstr_depth: 0,
+        ium_left_siblings: HashMap::new(),
+        ium_collection_info: HashMap::new(),
+        ium_ignored_ranges: Vec::new(),
+        ium_right_sibling_line: HashMap::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),

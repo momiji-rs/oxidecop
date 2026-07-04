@@ -991,7 +991,12 @@ examples.each_with_index do |ex, n|
       next unless part =~ /\A\s*['"]([^'"]+)['"]\s*=>\s*(.*)\z/m
 
       sec = Regexp.last_match(1)
-      h = resolve_cfg_variables!(parse_cfg(extract_hash(Regexp.last_match(2))), ex[:lets] || {}) || {}
+      val = Regexp.last_match(2).strip
+      # a bare-identifier section value (`'Layout/LineLength' =>
+      # line_length_config`) resolves through the example's lets, like
+      # resolve_section_text does for RuboCop::Config.new sections
+      val = (ex[:lets] || {})[val] || val if val =~ /\A\w+\z/
+      h = resolve_cfg_variables!(parse_cfg(extract_hash(val)), ex[:lets] || {}) || {}
       extra_sections << [sec, h]
     end
   end
