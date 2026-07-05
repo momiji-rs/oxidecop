@@ -6518,11 +6518,23 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 // doc for the same rule applied elsewhere).
                 let owner_off =
                     node.message_loc().map(|l| l.start_offset()).unwrap_or_else(|| node.location().start_offset());
-                self.rea_push(
+                // `send_node.last_line` for the non-`start_of_line` branch:
+                // the send part ends at the closing paren when present, else
+                // the last argument, else the selector itself.
+                let send_last = node
+                    .closing_loc()
+                    .map(|l| l.start_offset())
+                    .or_else(|| {
+                        node.arguments()
+                            .and_then(|a| a.arguments().iter().last().map(|n| n.location().end_offset() - 1))
+                    })
+                    .unwrap_or(owner_off);
+                self.rea_push_full(
                     layout::ReaKind::AnyBlock,
                     owner_off,
                     bn.opening_loc().end_offset(),
                     node.location().start_offset(),
+                    send_last,
                 );
                 rea_block_active = true;
             }

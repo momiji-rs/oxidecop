@@ -84,7 +84,7 @@ pub fn parse_allowed_list(s: &str) -> Vec<String> {
 pub struct Config {
     // cop/section name -> { key -> value }
     pub(crate) sections: HashMap<String, HashMap<String, String>>,
-    all_disabled_by_default: bool,
+    pub(crate) all_disabled_by_default: bool,
     // `--only Cop1,Cop2` — when set, ONLY these cops (or departments) run,
     // regardless of Enabled flags, like rubocop's flag.
     pub only: Option<Vec<String>>,

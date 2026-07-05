@@ -14063,6 +14063,14 @@ pub(crate) struct ReaFrame {
     /// kwbegin/block, the masgn LHS group's end, or — when overridden by an
     /// assignment — that assignment's own `.loc.name.end_pos`).
     msg_end: usize,
+    /// For an `AnyBlock` frame only: an offset on `send_node.last_line` —
+    /// upstream's non-`start_of_line` `alignment_location` branch for a
+    /// block re-anchors on the LAST line of the owning call's send part
+    /// (`processed_source.buffer.line_range(send_node.last_line)`), which
+    /// differs from `anchor`'s own line when the call's arguments span
+    /// lines (rails: `send_stream(\n  filename: ...,\n  type: ...) do`).
+    /// Every other kind stores `anchor` here (unused).
+    send_last: usize,
 }
 
 impl<'a> super::Cops<'a> {
@@ -14133,26 +14141,45 @@ impl<'a> super::Cops<'a> {
     /// `EnforcedStyleAlignWith` must equal that string — a disabled cop is
     /// (falsy && ...) upstream, never equal to the string either way.
     ///
-    /// Deliberately reads BOTH params RAW (`cfg.param`, never `cfg.get`'s
-    /// schema-default fallback, `cfg.cop_config_enabled`, or `self.on`): the
-    /// real spec's `:config` shared context builds `config` as a bare
-    /// `RuboCop::Config.new(hash, ...)` — NOT `ConfigLoader`'s normal
-    /// default.yml merge — so an `other_cops` section that sets one
-    /// `Layout/BeginEndAlignment` key (or omits the section entirely) really
-    /// does leave every OTHER key nil, not schema-default-backed; only
-    /// `Enabled` gets a computed fallback at all (`Config#enable_cop?`'s
-    /// `cop_options.fetch('Enabled') { !for_all_cops['DisabledByDefault'] }`,
-    /// true here since a real spec's `AllCops` never carries that flag) —
-    /// which is exactly `!= Some("false")` once nil-vs-explicit-false is the
-    /// only distinction that matters. The oracle harness's OWN `AllCops:
-    /// DisabledByDefault: true` (scoping which cop THIS run investigates)
-    /// has no equivalent in that real shared context, and `cfg.get`'s
-    /// schema-default fallback would likewise wrongly manufacture a
-    /// `start_of_line` EnforcedStyleAlignWith the real spec never has. See
-    /// `Cops::hi_line_too_long`'s identical doc for the matching `Enabled` trap.
+    /// Two config worlds to satisfy at once. The real spec's `:config`
+    /// shared context builds `config` as a bare `RuboCop::Config.new(hash)`
+    /// — NOT `ConfigLoader`'s default.yml merge — so an omitted
+    /// `Layout/BeginEndAlignment` section leaves `EnforcedStyleAlignWith`
+    /// nil (falsy `begin_end_alignment_style`, never `start_of_line`). A
+    /// real CLI run's config IS default-merged, so the same omission means
+    /// `start_of_line` (the default.yml value) — this branch fires on every
+    /// plain `x = begin ... rescue` in a real codebase. `cfg.get` threads
+    /// both: the oracle marks bare-Config sections `__replace_defaults__`
+    /// (get -> None, like the spec's nil), everything else falls back to
+    /// the schema default exactly like ConfigLoader's merge.
+    /// `Enabled` deliberately stays RAW (`param`, not `cop_config_enabled`):
+    /// upstream's `for_cop` computes it via `enable_cop?`'s
+    /// `fetch('Enabled') { !for_all_cops['DisabledByDefault'] }`, and the
+    /// real spec's `AllCops` never carries that flag — so nil means true.
+    /// The oracle harness's OWN `AllCops: DisabledByDefault: true` (scoping
+    /// which cop THIS run investigates) has no equivalent in the real spec
+    /// and must not leak into this check.
+    ///
+    /// `EnforcedStyleAlignWith` means different things in the two config
+    /// worlds: the real spec's bare `RuboCop::Config.new(hash)` leaves an
+    /// unmentioned param nil (falsy `begin_end_alignment_style`, else
+    /// branch), while a real CLI config is ConfigLoader-default-merged, so
+    /// the same omission means the default.yml `start_of_line` — the branch
+    /// that fires on every plain `x = begin ... rescue` in a real codebase.
+    /// The harness's ever-present `DisabledByDefault: true` distinguishes
+    /// them: raw `param` there, schema-default-backed `get` for the CLI.
+    /// (A real CLI run that itself sets `DisabledByDefault: true` lands in
+    /// the raw branch, whose conclusion still matches upstream: an unlisted
+    /// `Layout/BeginEndAlignment` is `enable_cop? == false` there — falsy
+    /// style, else branch — exactly what raw-nil concludes.)
     fn rea_style_start_of_line(&self) -> bool {
+        let style = if self.cfg.all_disabled_by_default {
+            self.cfg.param("Layout/BeginEndAlignment", "EnforcedStyleAlignWith")
+        } else {
+            self.cfg.get("Layout/BeginEndAlignment", "EnforcedStyleAlignWith")
+        };
         self.cfg.param("Layout/BeginEndAlignment", "Enabled") != Some("false")
-            && self.cfg.param("Layout/BeginEndAlignment", "EnforcedStyleAlignWith") == Some("start_of_line")
+            && style == Some("start_of_line")
     }
 
     /// `EndKeywordAlignment#start_line_range`: the physical line containing
@@ -14173,15 +14200,13 @@ impl<'a> super::Cops<'a> {
     /// `alignment_location`: the anchor's own (line, 1-based column,
     /// begin_pos).
     ///
-    /// A block frame ALWAYS resolves via `rea_line_trim`, regardless of
-    /// style: upstream's OWN non-`start_of_line` branch for a block
-    /// (`send_node.last_line`, trimmed) lands on the exact same physical
-    /// line as `start_of_line`'s `alignment_node.source_range.line` would
-    /// (both are "the block's owning call's own line" — the prism-vs-
-    /// whitequark block-range trap already anchors `anchor` there) for
-    /// every shape this fixture exercises (no call whose OWN arguments span
-    /// past its selector's line) — so the two branches coincide, and only
-    /// ONE needs implementing.
+    /// A block frame resolves via `rea_line_trim` in both styles, but on
+    /// DIFFERENT offsets: `start_of_line` rescans `anchor`'s line (the
+    /// owning call's selector line — the prism-vs-whitequark block-range
+    /// trap anchors there), while the non-`start_of_line` branch mirrors
+    /// upstream's `send_node.last_line` re-anchor via `send_last` (rails:
+    /// a call whose arguments span past its selector's line, `send_stream(
+    /// \n  ...,\n  type: ...) do ... rescue`).
     ///
     /// Every other kind's non-`start_of_line` case uses its own raw anchor
     /// untouched (`alignment_node.source_range`'s begin_pos, e.g. the
@@ -14189,8 +14214,13 @@ impl<'a> super::Cops<'a> {
     /// begin`, or a plain `:send`-shaped assignment/masgn/def/class/module/
     /// sclass node's own start).
     fn rea_alignment_loc(&self, frame: &ReaFrame) -> (usize, usize, usize) {
-        if self.rea_style_start_of_line() || matches!(frame.kind, ReaKind::AnyBlock) {
+        if self.rea_style_start_of_line() {
             return self.rea_line_trim(frame.anchor);
+        }
+        if matches!(frame.kind, ReaKind::AnyBlock) {
+            // Non-`start_of_line` block branch: upstream re-anchors on the
+            // last line of the owning call's send part — see `send_last`.
+            return self.rea_line_trim(frame.send_last);
         }
         let (line, col) = self.idx.loc(frame.anchor);
         (line, col, frame.anchor)
@@ -14213,7 +14243,12 @@ impl<'a> super::Cops<'a> {
     /// returns a `kwbegin_type?` ancestor immediately, before either check
     /// ever runs.
     pub(crate) fn rea_push_kwbegin(&mut self, begin_kw_start: usize, begin_kw_end: usize) {
-        self.rea_ancestors.push(ReaFrame { kind: ReaKind::KwBegin, anchor: begin_kw_start, msg_end: begin_kw_end });
+        self.rea_ancestors.push(ReaFrame {
+            kind: ReaKind::KwBegin,
+            anchor: begin_kw_start,
+            msg_end: begin_kw_end,
+            send_last: begin_kw_start,
+        });
     }
 
     /// Push a `def`/`defs`/`class`/`module`/`sclass`/block ancestor frame,
@@ -14240,13 +14275,36 @@ impl<'a> super::Cops<'a> {
     /// multi-line access-modifier wrap (`private(\n def foo\n end\n)`) is
     /// the one, untested, place this could theoretically diverge.
     pub(crate) fn rea_push(&mut self, natural_kind: ReaKind, natural_anchor: usize, natural_msg_end: usize, wrap_key: usize) {
+        self.rea_push_full(natural_kind, natural_anchor, natural_msg_end, wrap_key, natural_anchor);
+    }
+
+    /// `rea_push` with an explicit `send_last` — the `AnyBlock` call sites
+    /// whose owning call's send part may end on a later line than `anchor`'s.
+    pub(crate) fn rea_push_full(
+        &mut self,
+        natural_kind: ReaKind,
+        natural_anchor: usize,
+        natural_msg_end: usize,
+        wrap_key: usize,
+        send_last: usize,
+    ) {
         if let Some(&(assign_start, name_end)) = self.rea_assign_wrap.get(&wrap_key) {
             if self.idx.loc(assign_start).0 == self.idx.loc(natural_anchor).0 {
-                self.rea_ancestors.push(ReaFrame { kind: ReaKind::Assignment, anchor: assign_start, msg_end: name_end });
+                self.rea_ancestors.push(ReaFrame {
+                    kind: ReaKind::Assignment,
+                    anchor: assign_start,
+                    msg_end: name_end,
+                    send_last: assign_start,
+                });
                 return;
             }
         }
-        self.rea_ancestors.push(ReaFrame { kind: natural_kind, anchor: natural_anchor, msg_end: natural_msg_end });
+        self.rea_ancestors.push(ReaFrame {
+            kind: natural_kind,
+            anchor: natural_anchor,
+            msg_end: natural_msg_end,
+            send_last,
+        });
     }
 }
 
