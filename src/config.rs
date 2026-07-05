@@ -114,6 +114,16 @@ impl Config {
             let indented = line.starts_with(' ') || line.starts_with('\t');
             let t = line.trim();
             if !indented {
+                // YAML allows a block sequence at the SAME indentation as its
+                // key (`inherit_from:\n- .rubocop/style.yml`) — Psych even
+                // dumps that shape by default. A column-0 `- item` while an
+                // inherit_from list is open is a list entry, not a new key.
+                if in_inherit_list {
+                    if let Some(item) = t.strip_prefix("- ") {
+                        inherits.push(item.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+                        continue;
+                    }
+                }
                 cur_list_key = None;
                 in_inherit_list = false;
                 in_inherit_gem = false;
