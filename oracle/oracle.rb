@@ -268,10 +268,30 @@ def parse_config_sections(joined, lets = {})
     # `RuboCop::ConfigLoader.default_configuration['SEC']` — the section is
     # the cop's real defaults; flag it so scoring keeps defaults applying
     # (no __replace_defaults__) instead of an empty replacing section.
+    # `\s*` around `.` tolerates a chain split across lines and re-joined
+    # with spaces. Trailing `.merge(...)`s are peeled (rindex-based, same as
+    # the cop_config chain above) instead of discarded: a `cop_config` part
+    # sets the merge flag, every other part contributes its pairs (later
+    # keys win, like chained Hash#merge over the defaults).
     defaults_based = false
-    if val =~ /\ARuboCop::ConfigLoader\.default_configuration\[/
+    if (dm = val.match(/\ARuboCop::ConfigLoader\s*\.\s*default_configuration\s*\[[^\]]+\]/))
       defaults_based = true
-      val = '{}'
+      chain = val[dm[0].length..].strip
+      parts = []
+      while chain.end_with?(')') && (idx = chain.rindex('.merge('))
+        parts.unshift(chain[(idx + 7)...-1].strip)
+        chain = chain[0...idx].strip
+      end
+      parts = [] unless chain.empty?
+      resolved = parts.map do |p|
+        if p == 'cop_config'
+          merges_cop_config = true
+          next ''
+        end
+        p = lets[p] || LOCAL_HASHES[p] || p if p =~ /\A\w+\z/
+        p.sub(/\A\{\s*/, '').sub(/\s*\}\z/, '')
+      end
+      val = "{ #{resolved.reject(&:empty?).join(', ')} }"
     end
     # a bare identifier is a let reference — resolved per example, lazily
     # a braceless implicit-hash merge arg (`cop_config.merge('K' => 4)`)
@@ -604,7 +624,7 @@ while i < lines.length
     # Inline simple local assignments (`c = cop_config.merge(...)`,
     # `merged = RuboCop::ConfigLoader.default_configuration['X'].merge(cop_config)`)
     # so bare-identifier section values resolve to their defining expression.
-    joined.scan(/(\w+)\s*=\s*((?:RuboCop::ConfigLoader\.default_configuration\[[^\]]+\]|cop_config)\.merge\([^;]*?\))(?=\s+\w+\s*=|\s+RuboCop::Config\b)/) do |name, expr|
+    joined.scan(/(\w+)\s*=\s*((?:RuboCop::ConfigLoader\s*\.\s*default_configuration\s*\[[^\]]+\]|cop_config)\s*\.\s*merge\([^;]*?\))(?=\s+\w+\s*=|\s+RuboCop::Config\b)/) do |name, expr|
       joined = joined.gsub(/=>\s*#{Regexp.escape(name)}\b/, "=> #{expr}")
     end
     if (m = joined.match(/ActiveSupportExtensionsEnabled'\s*=>\s*(true|false)/)) && cfg_stack.any?
