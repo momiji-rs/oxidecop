@@ -79,8 +79,17 @@ jobs:
         with:
           ruby-version: '3.4'
 
-      - name: Install reference rubocop
-        run: gem install rubocop -v 1.88.0
+      # Pin the WHOLE reference stack, not just rubocop: parser-gem point
+      # releases change verdicts on real code (`"...#$-123..."` gvar
+      # interpolation, `(+ 1.second)` unary-vs-send), and parity would then
+      # diff reference-vs-reference noise instead of oxidecop.
+      - name: Install reference rubocop (pinned stack)
+        run: |
+          gem install parser -v 3.3.11.1
+          gem install rubocop-ast -v 1.49.1
+          gem install prism -v 1.9.0
+          gem install regexp_parser -v 2.12.0
+          gem install rubocop -v 1.88.0
 
       - uses: actions/download-artifact@v4
         with:
@@ -101,7 +110,7 @@ jobs:
       - name: Parity — byte-identical offenses on ${{ matrix.corpus }}
         run: cd "$HOME/corpus" && sh $GITHUB_WORKSPACE/tools/parity.sh .
 
-      - name: Bench smoke — whole-tree lint stays under 2s
+      - name: Bench smoke — whole-tree lint stays under 5s
         if: matrix.corpus == 'rubocop-src'
         run: |
           cd "$HOME/corpus"
@@ -109,4 +118,6 @@ jobs:
           $GITHUB_WORKSPACE/target/release/oxidecop . > /dev/null || true
           ms=$(( ($(date +%s%N) - start) / 1000000 ))
           echo "lint of rubocop-src took ${ms}ms"
-          test "$ms" -lt 2000
+          # order-of-magnitude bound (quadratic blowups are 30s+); the
+          # 2-vCPU matrix runner measured ~3.1s on a healthy build
+          test "$ms" -lt 5000
