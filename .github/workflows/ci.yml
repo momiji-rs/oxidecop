@@ -1,9 +1,14 @@
-# The guardrail: every push must keep (1) the unit tests green, (2) the
-# oracle at 100% — all representable examples of rubocop's own spec suite,
-# detection AND autocorrection, (3) real-tree parity byte-identical against
-# the reference rubocop on its own source, and (4) whole-repo lint speed
-# within an order-of-magnitude sanity bound (catches accidental
-# quadratic-ness, not noise).
+# The guardrail: every push must keep
+#   (1) the unit tests green,
+#   (2) the oracle at 100% — all representable examples of rubocop's own
+#       spec suite, detection AND autocorrection, on a cold cache and again
+#       on a warm one (the warm pass proves the cache read path returns the
+#       same verdicts the analysis path produced),
+#   (3) RuboCop compatibility: real-tree parity byte-identical against the
+#       reference rubocop 1.88.0 across four pinned corpora (rubocop's own
+#       source, rails, mastodon, rubygems.org — ~58k offense lines total),
+#   (4) whole-repo lint speed within an order-of-magnitude sanity bound
+#       (catches accidental quadratic-ness, not noise).
 name: ci
 on:
   push:
@@ -11,7 +16,7 @@ on:
   pull_request:
 
 jobs:
-  test-oracle-parity:
+  test-oracle:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -29,28 +34,77 @@ jobs:
       - name: Unit tests
         run: cargo test --release
 
-      - name: Oracle — 100% of rubocop's representable spec examples
+      - name: Oracle (cold cache) — 100% of rubocop's representable spec examples
         run: ruby oracle/leaderboard.rb target/release/oxidecop --assert
 
-      - name: Fetch reference rubocop + its source tree
-        run: |
-          gem install rubocop -v 1.88.0
-          git clone --depth 1 --branch v1.88.0 https://github.com/rubocop/rubocop /tmp/rubocop-src
+      - name: Oracle (warm cache) — cache read path returns identical verdicts
+        run: ruby oracle/leaderboard.rb target/release/oxidecop --assert
 
-      - name: Parity — byte-identical offenses on rubocop's own source
+      - name: Upload binary for the compatibility matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxidecop
+          path: target/release/oxidecop
+
+  # RuboCop compatibility: run the real reference rubocop and oxidecop over
+  # the same tree with the same config and the same cop list, and require
+  # BYTE-IDENTICAL output. Corpora are pinned by commit so a corpus-side
+  # change can never break CI. tools/prepare_corpus.rb strips plugin-gem
+  # configuration (the reference rubocop aborts on cop names whose gems
+  # aren't installed) — both sides then read the same cleaned config, so
+  # built-in-cop verdicts stay exactly comparable.
+  compat:
+    needs: test-oracle
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - corpus: rubocop-src
+            repo: https://github.com/rubocop/rubocop
+            sha: 37bf5ade07fac82275840181a351bc5d934a9af1 # v1.88.0
+          - corpus: rails
+            repo: https://github.com/rails/rails
+            sha: bf13f50eb663a1ad0a6e996634c9e298149f088d
+          - corpus: mastodon
+            repo: https://github.com/mastodon/mastodon
+            sha: 35251ee167c1e686c50350800727df2a2c14f066
+          - corpus: rubygemsorg
+            repo: https://github.com/rubygems/rubygems.org
+            sha: 535b3d2883e176f96b0f40c0e0565f8221605bb1
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+
+      - name: Install reference rubocop
+        run: gem install rubocop -v 1.88.0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: oxidecop
+          path: target/release
+      - run: chmod +x target/release/oxidecop
+
+      - name: Fetch corpus (pinned)
         run: |
-          # the repo config plugs in gems we don't install; parity.sh prefers
-          # a cleaned copy when present
-          ruby -e '
-            text = File.read("/tmp/rubocop-src/.rubocop.yml")
-            text = text.gsub(/^(plugins|require):\n(  - .*\n)+/, "")
-            File.write("/tmp/rubocop-src/.rubocop_bench.yml", text)
-          '
-          cd /tmp/rubocop-src && sh $GITHUB_WORKSPACE/tools/parity.sh .
+          mkdir -p "$HOME/corpus" && cd "$HOME/corpus"
+          git init -q . && git remote add origin ${{ matrix.repo }}
+          git fetch -q --depth 1 origin ${{ matrix.sha }}
+          git checkout -q FETCH_HEAD
+
+      - name: Strip plugin-gem configuration
+        run: ruby tools/prepare_corpus.rb "$HOME/corpus"
+
+      - name: Parity — byte-identical offenses on ${{ matrix.corpus }}
+        run: cd "$HOME/corpus" && sh $GITHUB_WORKSPACE/tools/parity.sh .
 
       - name: Bench smoke — whole-tree lint stays under 2s
+        if: matrix.corpus == 'rubocop-src'
         run: |
-          cd /tmp/rubocop-src
+          cd "$HOME/corpus"
           start=$(date +%s%N)
           $GITHUB_WORKSPACE/target/release/oxidecop . > /dev/null || true
           ms=$(( ($(date +%s%N) - start) / 1000000 ))
