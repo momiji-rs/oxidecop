@@ -96,6 +96,40 @@ pub struct Config {
     // config file's directory. The runner resolves and merges them.
     pub inherits: Vec<String>,
 }
+/// Decode one YAML scalar the way rubocop's YAML load would: a
+/// double-quoted scalar processes escapes (`"\\d"` is the two bytes `\d`),
+/// a single-quoted one only doubles quotes, a plain scalar is literal.
+fn yaml_unquote(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let inner = &s[1..s.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('\\') => out.push('\\'),
+                    Some('"') => out.push('"'),
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        return out;
+    }
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        return s[1..s.len() - 1].replace("''", "'");
+    }
+    s.to_string()
+}
+
 impl Config {
     pub fn parse(text: &str) -> Self {
         let mut sections: HashMap<String, HashMap<String, String>> = HashMap::new();
@@ -176,7 +210,7 @@ impl Config {
                 // quoted flow form can't represent.
                 if let (Some(sec), Some(key)) = (&cur, &cur_list_key) {
                     let map = sections.get_mut(sec).unwrap();
-                    let item = item.trim().trim_matches(|c| c == '\'' || c == '"');
+                    let item = &yaml_unquote(item);
                     let entry = map.entry(key.clone()).or_default();
                     if entry.is_empty() || entry == "[]" {
                         *entry = format!("\u{1}{item}");
