@@ -631,10 +631,9 @@ fn print_simple(results: &[(String, Vec<cops::Offense>)], nfiles: usize, color: 
             } else {
                 o.message.clone()
             };
-            // rubocop's clang/emacs-style formatters render a multi-line
-            // message (Lint/Syntax's `(Using Ruby ...)` suffix) on ONE line,
-            // newlines as spaces.
-            let msg = msg.replace('\n', " ");
+            // rubocop's simple formatter prints a multi-line message
+            // (Lint/Syntax's `(Using Ruby ...)` suffix, AmbiguousBlockAssociation's
+            // embedded source) verbatim — continuation lines carry no prefix.
             println!("{sev}:{:>3}:{:>3}: {}{}: {}", o.line, o.col, c, o.cop, msg);
         }
         total += offenses.len();
