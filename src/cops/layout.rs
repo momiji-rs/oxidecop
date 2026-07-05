@@ -15754,6 +15754,10 @@ pub(crate) struct MmciFrame<'a> {
     closing_end: Option<usize>,
     is_setter: bool,
     is_safe_nav: bool,
+    // Call: an attached do-end/`{}` block — on the whitequark side this
+    // call's PARENT is that `:block` node, so ancestor climbs that walk
+    // `node.parent` chains (`left_hand_side`) stop here.
+    has_block: bool,
     is_operator_method: bool,
     first_arg_range: Option<(usize, usize)>,
     last_arg_range: Option<(usize, usize)>,
@@ -15792,6 +15796,7 @@ impl<'a> MmciFrame<'a> {
             closing_end: None,
             is_setter: false,
             is_safe_nav: false,
+            has_block: false,
             is_operator_method: false,
             first_arg_range: None,
             last_arg_range: None,
@@ -16070,6 +16075,7 @@ impl<'a> super::Cops<'a> {
                 (l.start_offset(), l.end_offset())
             });
             f.is_safe_nav = c.is_safe_navigation();
+            f.has_block = c.block().is_some_and(|b| b.as_block_node().is_some());
             let name = c.name().as_slice();
             f.is_setter = mmci_is_assignment_method_name(name);
             f.is_operator_method = mmci_is_operator_method(name);
@@ -16217,10 +16223,16 @@ impl<'a> super::Cops<'a> {
     /// climbs from `node` outward through real ancestor frames that are
     /// themselves dotted, non-setter calls (`node.receiver`'s own immediate
     /// parent is always `node` itself, so the climb starts there
-    /// unconditionally — see the module doc for why this is unaffected by
-    /// any node along the way owning an attached block), returning the
-    /// range of whichever node it stopped at (or `node.receiver` unchanged,
-    /// if `node` itself doesn't qualify — a setter, e.g. `.foo=`).
+    /// unconditionally), returning the range of whichever node it stopped
+    /// at (or `node.receiver` unchanged, if `node` itself doesn't qualify —
+    /// a setter, e.g. `.foo=`).
+    ///
+    /// An attached do-end/`{}` block DOES stop the climb: on the whitequark
+    /// side the block-owning call's parent is the `:block` node itself
+    /// (never `call_type?`), so `while lhs.parent&.call_type? ...` ends
+    /// there — mastodon: `allow(x)\n  .to receive(:y)\n    .with(...) {
+    /// blk }` keeps lhs at the `.with` chain (whose own line's indentation
+    /// already matches), instead of escaping to the whole-statement root.
     fn mmci_left_hand_side(&self, node: &ruby_prism::CallNode<'_>) -> (usize, usize) {
         let node_is_setter = mmci_is_assignment_method_name(node.name().as_slice());
         if node_is_setter {
@@ -16230,12 +16242,18 @@ impl<'a> super::Cops<'a> {
         }
         let nl = node.location();
         let mut winner = (nl.start_offset(), nl.end_offset());
+        if node.block().is_some_and(|b| b.as_block_node().is_some()) {
+            return winner;
+        }
         let len = self.mmci_ancestors.len();
         let mut i = len as isize - 2;
         while i >= 0 {
             let f = &self.mmci_ancestors[i as usize];
             if f.tag == MmciTag::Call && f.dot.is_some() && !f.is_setter {
                 winner = (f.start, f.end);
+                if f.has_block {
+                    break;
+                }
                 i -= 1;
             } else {
                 break;
