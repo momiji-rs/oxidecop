@@ -3642,6 +3642,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `@responses[k] ||= if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         self.check_end_alignment_write(node.location().start_offset(), node.value());
+        // Layout/ElseAlignment: CheckAssignment fires for compound writes
+        // on attribute/index targets too (rails: `@responses[k] ||= if ...`).
+        self.check_else_alignment_assignment(
+            node.location().start_offset(),
+            node.location().end_offset(),
+            node.value(),
+        );
         self.check_self_assignment_reader_write(
             node.location().start_offset(),
             node.receiver(),
@@ -3662,6 +3669,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // writes on attribute-call targets (`foo.bar += if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         self.check_end_alignment_write(node.location().start_offset(), node.value());
+        // Layout/ElseAlignment: CheckAssignment fires for compound writes
+        // on attribute/index targets too (rails: `@responses[k] ||= if ...`).
+        self.check_else_alignment_assignment(
+            node.location().start_offset(),
+            node.location().end_offset(),
+            node.value(),
+        );
         // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
         {
             let vl = node.value().location();
@@ -3676,6 +3690,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `@responses[k] ||= if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         self.check_end_alignment_write(node.location().start_offset(), node.value());
+        // Layout/ElseAlignment: CheckAssignment fires for compound writes
+        // on attribute/index targets too (rails: `@responses[k] ||= if ...`).
+        self.check_else_alignment_assignment(
+            node.location().start_offset(),
+            node.location().end_offset(),
+            node.value(),
+        );
         self.check_self_assignment_reader_write(
             node.location().start_offset(),
             node.receiver(),
@@ -3698,6 +3719,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `@responses[k] ||= if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         self.check_end_alignment_write(node.location().start_offset(), node.value());
+        // Layout/ElseAlignment: CheckAssignment fires for compound writes
+        // on attribute/index targets too (rails: `@responses[k] ||= if ...`).
+        self.check_else_alignment_assignment(
+            node.location().start_offset(),
+            node.location().end_offset(),
+            node.value(),
+        );
         let key_args: Vec<ruby_prism::Node> =
             node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
         self.check_self_assignment_reader_write(
@@ -3727,6 +3755,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `@responses[k] ||= if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         self.check_end_alignment_write(node.location().start_offset(), node.value());
+        // Layout/ElseAlignment: CheckAssignment fires for compound writes
+        // on attribute/index targets too (rails: `@responses[k] ||= if ...`).
+        self.check_else_alignment_assignment(
+            node.location().start_offset(),
+            node.location().end_offset(),
+            node.value(),
+        );
         let key_args: Vec<ruby_prism::Node> =
             node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
         self.check_self_assignment_reader_write(
@@ -3757,6 +3792,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `@responses[k] ||= if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         self.check_end_alignment_write(node.location().start_offset(), node.value());
+        // Layout/ElseAlignment: CheckAssignment fires for compound writes
+        // on attribute/index targets too (rails: `@responses[k] ||= if ...`).
+        self.check_else_alignment_assignment(
+            node.location().start_offset(),
+            node.location().end_offset(),
+            node.value(),
+        );
         self.check_space_inside_reference_brackets_write(
             node.receiver(),
             node.opening_loc(),
