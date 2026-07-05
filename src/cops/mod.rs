@@ -5555,7 +5555,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let ll = node.location();
             self.rea_push(layout::ReaKind::AnyBlock, ll.start_offset(), node.opening_loc().end_offset(), ll.start_offset());
         }
+        // Layout/MultilineOperationIndentation: a stabby `->(){}` is a
+        // `:block` ancestor too (same rewrite noted above) — its body stops
+        // `part_of_assignment_rhs`'s climb (`disqualified_rhs?`), rails:
+        // `expected = ->(args) do ... a == b && c === d ... end`.
+        self.moi_stack.push(MoiFrame::Block {
+            body: node.body().map(|b| {
+                let l = b.location();
+                (l.start_offset(), l.end_offset())
+            }),
+        });
         ruby_prism::visit_lambda_node(self, node);
+        self.moi_stack.pop();
         self.rea_ancestors.pop();
         self.ic_macro_stack.pop();
         self.void_each_stack.pop();
