@@ -16553,8 +16553,12 @@ impl<'a> super::Cops<'a> {
     fn mmci_single_line_block_receiver<'b>(&self, receiver: &ruby_prism::Node<'b>) -> Option<ruby_prism::CallNode<'b>> {
         let c = receiver.as_call_node()?;
         let blk = c.block().and_then(|b| b.as_block_node())?;
-        let start = c.location().start_offset();
-        let end = blk.location().end_offset();
+        // `BlockNode#single_line?` is OVERRIDDEN upstream (block_node.rb):
+        // `loc.begin.line == loc.end.line` — only the `{`/`do`..`}`/`end`
+        // span counts, never the receiver chain the whitequark block range
+        // starts at (rails: `Thread.list\n  .reject { ... }` IS single-line).
+        let start = blk.opening_loc().start_offset();
+        let end = blk.closing_loc().end_offset();
         if self.mmci_line(start) == self.mmci_last_line(end) {
             Some(mmci_dup_call(&c))
         } else {
@@ -16710,6 +16714,14 @@ impl<'a> super::Cops<'a> {
             return Some(c);
         }
         let rc = receiver.as_call_node()?;
+        // A block-owning receiver is a `:block` node on the whitequark side
+        // (`receiver.call_type?` false) — only the single-line branch above
+        // may claim it; a multiline one bails to nil (rails:
+        // `table_structure_sql(x)\n  .select do ... end\n  .to_h do` falls
+        // through to part_of_assignment_rhs).
+        if rc.block().is_some_and(|b| b.as_block_node().is_some()) {
+            return None;
+        }
         let dot = rc.call_operator_loc()?;
         let rc_receiver = rc.receiver()?;
         let node_blk = node.block().and_then(|b| b.as_block_node())?;
@@ -16812,6 +16824,13 @@ impl<'a> super::Cops<'a> {
             return None;
         }
         if let Some(c) = receiver.as_call_node() {
+            // wq: a block-owning receiver is the `:block` node itself, so
+            // upstream's `receiver.call_type?` is FALSE there and it takes
+            // `block_node.parent` — the node consuming that block-receiver,
+            // i.e. `node` itself (self-alignment, never an offense).
+            if c.block().is_some_and(|b| b.as_block_node().is_some()) {
+                return Some(mmci_dup_call(node));
+            }
             return Some(c);
         }
         owner
