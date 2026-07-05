@@ -1,5 +1,5 @@
 //! Layout department: text-based cops that scan raw source lines (no AST).
-use super::{Cops, Offense};
+use super::{Cops, MoiFrame, Offense};
 
 impl<'a> Cops<'a> {
     /// Layout/LineLength — rubocop's check_line verbatim: character length
@@ -15288,4 +15288,313 @@ impl<'a> super::Cops<'a> {
             self.fhei_ignored.insert(hs);
         }
     }
+}
+
+impl<'a> Cops<'a> {
+    /// Layout/MultilineOperationIndentation — checks the indentation of the
+    /// right-hand operand of a binary operation (`&&`/`||`/`and`/`or`, or any
+    /// other binary-operator method call: `+`/`<<`/`==`/etc.) that spans more
+    /// than one line. Ports `MultilineOperationIndentation` +
+    /// `MultilineExpressionIndentation` + `Alignment`/`AlignmentCorrector` +
+    /// `ConfigurableEnforcedStyle` verbatim; the ancestor climbs those mixins
+    /// do via real `node.parent`/`each_ancestor` are replaced by
+    /// `self.moi_stack` (see `MoiFrame`'s doc in `mod.rs`), populated by the
+    /// SAME single traversal already visiting every other cop's nodes.
+    ///
+    /// `on_and`/`on_or` → `check_and_or`: called from `visit_and_node`/
+    /// `visit_or_node` with `(node.location(), node.right().location())` —
+    /// the left-hand side is ALWAYS `node_start` itself (an `AndNode`/
+    /// `OrNode`'s own location always starts exactly at its `left`'s start).
+    pub(crate) fn check_multiline_operation_indentation(
+        &mut self,
+        node_start: usize,
+        node_end: usize,
+        rhs_start: usize,
+        rhs_end: usize,
+    ) {
+        const COP: &str = "Layout/MultilineOperationIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        self.moi_check(node_start, node_end, rhs_start, rhs_end);
+    }
+
+    /// `on_send`/`on_csend` + `relevant_node?` + the cop's own
+    /// `right_hand_side` override (`send_node.first_argument&.source_range`).
+    /// The left-hand side is ALWAYS `node.receiver()` verbatim:
+    /// `left_hand_side`'s receiver-chain climb only ever continues past the
+    /// receiver when the CURRENT node itself has a dot — already excluded by
+    /// `relevant_node?` before we ever reach here — so it degenerates to a
+    /// no-op for every real binary operator call (that climb exists for
+    /// `MultilineMethodCallIndentation`, ported separately, which DOES
+    /// process dotted chains). A `CallNode`'s own location always starts
+    /// exactly at its receiver's start when a receiver is present, so
+    /// `node_start` doubles as "the receiver's start" too.
+    pub(crate) fn check_multiline_operation_indentation_send(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/MultilineOperationIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        // `on_send`: `return if !node.receiver || node.method?(:[])`.
+        if node.receiver().is_none() || node.name().as_slice() == b"[]" {
+            return;
+        }
+        // `relevant_node?`: `!node.loc.dot` — never check dotted method
+        // calls (`call_operator_loc` also holds `::`-as-connector, likewise
+        // excluded, matching whitequark's `loc.dot`).
+        if node.call_operator_loc().is_some() {
+            return;
+        }
+        // `relevant_node?`: `!(node.send_type? && node.unary_operation?)`.
+        if moi_is_unary_operation(node) {
+            return;
+        }
+        let Some(rhs) = node.arguments().and_then(|a| a.arguments().iter().next()) else { return };
+        let nl = node.location();
+        let rl = rhs.location();
+        self.moi_check(nl.start_offset(), nl.end_offset(), rl.start_offset(), rl.end_offset());
+    }
+
+    fn moi_check(&mut self, node_start: usize, node_end: usize, rhs_start: usize, rhs_end: usize) {
+        const COP: &str = "Layout/MultilineOperationIndentation";
+        // `offending_range`: `return false unless begins_its_line?(rhs)`.
+        if !self.moi_begins_its_line(rhs_start) {
+            return;
+        }
+        // `offending_range`: `return false if not_for_this_cop?(node)`.
+        if self.moi_not_for_this_cop(node_start, node_end) {
+            return;
+        }
+
+        let kw = self.moi_kw_special(node_start, node_end);
+        let assign = self.moi_assign_search(rhs_start, rhs_end);
+        let aligned_style = self.cfg.enforced_style(COP) == "aligned";
+
+        // `should_align?`.
+        let mut should_align = false;
+        if let Some((a_start, _)) = assign {
+            if self.moi_begins_its_line(a_start) {
+                should_align = true;
+            }
+        }
+        if !should_align && aligned_style {
+            if kw.is_some() || assign.is_some() {
+                should_align = true;
+            } else {
+                should_align = matches!(self.moi_arg_in_call(node_start, node_end), Some(false));
+            }
+        }
+
+        // `correct_indentation`: the cop's own (possibly overridden) width,
+        // plus `Layout/IndentationWidth`'s (never the cop's own override,
+        // even when both differ) when a NON-postfix keyword match applies.
+        let base_width = self.moi_indentation_width(COP);
+        let extra_width = self
+            .cfg
+            .get("Layout/IndentationWidth", "Width")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
+        let kw_postfix = kw.is_some_and(|(_, _, is_if_like, is_postfix)| is_if_like && is_postfix);
+        let correct_indentation = if kw.is_some() && !kw_postfix { base_width + extra_width } else { base_width };
+
+        let lhs_indent = self.moi_line_indent(node_start);
+        let correct_column =
+            if should_align { self.moi_column(node_start) } else { lhs_indent + correct_indentation };
+        let rhs_column = self.moi_column(rhs_start);
+        let column_delta = correct_column as i64 - rhs_column as i64;
+        if column_delta == 0 {
+            return;
+        }
+
+        // `operation_description` + `message`.
+        let what = if let Some((ks, ke, _, _)) = kw {
+            let kwtext = &self.src[ks..ke];
+            let kind = if kwtext == b"for" { "collection" } else { "condition" };
+            let article = if matches!(kwtext.first(), Some(b'i') | Some(b'u')) { "an" } else { "a" };
+            format!("a {kind} in {article} `{}` statement", String::from_utf8_lossy(kwtext))
+        } else if assign.is_some() {
+            "an expression in an assignment".to_string()
+        } else {
+            "an expression".to_string()
+        };
+        let message = if should_align {
+            format!("Align the operands of {what} spanning multiple lines.")
+        } else {
+            let used_indentation = rhs_column as i64 - lhs_indent as i64;
+            format!(
+                "Use {correct_indentation} (not {used_indentation}) spaces for indenting {what} spanning multiple lines."
+            )
+        };
+
+        self.push(rhs_start, COP, true, message);
+        self.moi_autocorrect(rhs_start, rhs_end, column_delta);
+    }
+
+    // ---- ancestor searches (mirror `MultilineExpressionIndentation`) ------
+
+    /// `kw_node_with_special_indentation`: nearest (innermost-first) `Kw`
+    /// frame whose "indented" sub-expression CONTAINS
+    /// `(node_start,node_end)` — returns `(keyword_start, keyword_end,
+    /// is_if_like, is_postfix)`.
+    fn moi_kw_special(&self, node_start: usize, node_end: usize) -> Option<(usize, usize, bool, bool)> {
+        for f in self.moi_stack.iter().rev() {
+            if let MoiFrame::Kw { keyword, expr, is_if_like, is_postfix } = f {
+                if node_start >= expr.0 && node_end <= expr.1 {
+                    return Some((keyword.0, keyword.1, *is_if_like, *is_postfix));
+                }
+            }
+        }
+        None
+    }
+
+    /// `part_of_assignment_rhs`: climbs the CURRENT `moi_stack` (already
+    /// exactly `node`'s own ancestor chain, since we check precisely when
+    /// visiting `node`) testing containment of `(cand_start,cand_end)`
+    /// (`rhs`). Returns the matched `Assign` frame's own `rhs` span — reused
+    /// by the caller both as the "found" signal and for
+    /// `begins_its_line?(assignment_rhs.source_range)`.
+    fn moi_assign_search(&self, cand_start: usize, cand_end: usize) -> Option<(usize, usize)> {
+        for f in self.moi_stack.iter().rev() {
+            match f {
+                MoiFrame::Kw { .. } | MoiFrame::Array | MoiFrame::Begin => return None,
+                MoiFrame::Block { body: Some((s, e)) } if cand_start >= *s && cand_end <= *e => return None,
+                MoiFrame::Assign { rhs } if cand_start >= rhs.0 && cand_end <= rhs.1 => return Some(*rhs),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `argument_in_method_call(node, :with_or_without_parentheses)`: a
+    /// `Block` ancestor stops the climb outright (`break false`); a setter
+    /// `Call` (pushed with empty `args`) is transparently skipped (`next if
+    /// a.setter_method?`); the first `Call` whose `args` contains `node`
+    /// wins.
+    fn moi_arg_in_call(&self, node_start: usize, node_end: usize) -> Option<bool> {
+        for f in self.moi_stack.iter().rev() {
+            match f {
+                MoiFrame::Block { .. } => return None,
+                MoiFrame::Call { args, is_def_modifier, .. } => {
+                    if args.iter().any(|(s, e)| node_start >= *s && node_end <= *e) {
+                        return Some(*is_def_modifier);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `not_for_this_cop?`: any `Group` (inclusive containment — always true
+    /// for a real descendant) or parenthesized-`Call` (STRICT containment,
+    /// excluding the call's own receiver) ancestor containing
+    /// `(node_start,node_end)`.
+    fn moi_not_for_this_cop(&self, node_start: usize, node_end: usize) -> bool {
+        self.moi_stack.iter().any(|f| match f {
+            MoiFrame::Group { start, end } => node_start >= *start && node_end <= *end,
+            MoiFrame::Call { paren: Some((o, c)), .. } => node_start > *o && node_end < *c,
+            _ => false,
+        })
+    }
+
+    // ---- small primitives --------------------------------------------
+
+    /// `Util#begins_its_line?`.
+    fn moi_begins_its_line(&self, offset: usize) -> bool {
+        let (line, _) = self.idx.loc(offset);
+        let line_start = self.idx.starts[line - 1];
+        self.src[line_start..offset].iter().all(u8::is_ascii_whitespace)
+    }
+
+    /// `MultilineExpressionIndentation#indentation`: the column of the first
+    /// non-whitespace byte on `offset`'s OWN line (NOT `offset`'s own
+    /// column!) — this module's `indentation` shadows `Alignment#indentation`
+    /// by inclusion order upstream.
+    fn moi_line_indent(&self, offset: usize) -> usize {
+        let (line, _) = self.idx.loc(offset);
+        let line_start = self.idx.starts[line - 1];
+        let line_end = self.line_end(line);
+        self.src[line_start..line_end].iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(0)
+    }
+
+    /// A plain (byte-based, not display-width) 0-based column. Every
+    /// comparison this cop makes (`node.loc.column`/`rhs.column`) is on
+    /// `Parser::Source::Range#column` (character offset from line start) —
+    /// `Alignment#display_column` is never invoked in this cop's own code
+    /// path (only by `Alignment#check_alignment`, which this cop bypasses
+    /// entirely with its own `check`) — ASCII-only, matching this codebase's
+    /// column arithmetic elsewhere (e.g. `check_assignment_indentation`).
+    fn moi_column(&self, offset: usize) -> usize {
+        self.idx.loc(offset).1 - 1
+    }
+
+    /// `Alignment#configured_indentation_width`.
+    fn moi_indentation_width(&self, cop: &'static str) -> usize {
+        self.cfg
+            .param(cop, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+
+    /// `AlignmentCorrector.correct`: re-indent every line of `[start,end)` by
+    /// `column_delta` (the FIRST "line" is really just `start`'s own
+    /// position, possibly mid-line — matches upstream's `each_line`, whose
+    /// first `line_begin_pos` is the range's own `begin_pos`; every
+    /// SUBSEQUENT one lands exactly on a true physical-line start once the
+    /// first partial line is consumed). `start`/`end` here are always a bare
+    /// `Parser::Source::Range` (never a real AST node —
+    /// `node.right().source_range`/`node.first_argument&.source_range`), so
+    /// upstream's `inside_string_ranges`/`block_comment_within?`
+    /// special-casing (`node.is_a?(Parser::AST::Node)`) never applies —
+    /// skipped here too (residual risk: an `=begin`/`=end` block comment
+    /// landing inside the flagged range — untested by the fixture — would
+    /// upstream abort the ENTIRE correction; this port doesn't check for
+    /// it).
+    fn moi_autocorrect(&mut self, start: usize, end: usize, column_delta: i64) {
+        if column_delta == 0 {
+            return;
+        }
+        if self.cfg.get("Layout/IndentationStyle", "EnforcedStyle") == Some("tabs") {
+            return;
+        }
+        let mut pos = start;
+        while pos < end {
+            let line_end =
+                self.src[pos..end].iter().position(|&b| b == b'\n').map(|i| pos + i + 1).unwrap_or(end);
+            if column_delta > 0 {
+                let d = column_delta as usize;
+                // `range.resize(1).source != "\n"` — never push spaces onto
+                // a blank line.
+                if self.src.get(pos) != Some(&b'\n') {
+                    self.fixes.push((pos, pos, vec![b' '; d]));
+                }
+            } else {
+                let d = (-column_delta) as usize;
+                let starts_with_space = self.src.get(pos) == Some(&b' ');
+                let (rs, re) = if starts_with_space { (pos, pos + d) } else { (pos.saturating_sub(d), pos) };
+                if re <= self.src.len() && self.src[rs..re].iter().all(|&b| b == b' ' || b == b'\t') {
+                    self.fixes.push((rs, re, Vec::new()));
+                }
+            }
+            pos = line_end;
+        }
+    }
+}
+
+/// `Node#unary_operation?`: `operator_method?` (name is one of
+/// `MethodIdentifierPredicates::OPERATOR_METHODS`) AND the call's own overall
+/// location starts EXACTLY at its message (`-a`/`!a`/`~a`/`+a` — no receiver
+/// TEXT precedes the operator symbol; `a - b` has the receiver's own text
+/// first, so its overall location starts earlier than the message/selector).
+fn moi_is_unary_operation(node: &ruby_prism::CallNode) -> bool {
+    const OPERATOR_METHODS: &[&[u8]] = &[
+        b"|", b"^", b"&", b"<=>", b"==", b"===", b"=~", b">", b">=", b"<", b"<=", b"<<", b">>", b"+", b"-",
+        b"*", b"/", b"%", b"**", b"~", b"+@", b"-@", b"!@", b"~@", b"[]", b"[]=", b"!", b"!=", b"!~", b"`",
+    ];
+    if !OPERATOR_METHODS.contains(&node.name().as_slice()) {
+        return false;
+    }
+    let Some(msg) = node.message_loc() else { return false };
+    node.location().start_offset() == msg.start_offset()
 }

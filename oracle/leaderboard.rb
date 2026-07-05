@@ -369,6 +369,7 @@ COPS = {
   'Lint/Syntax'                      => 'lint/syntax',
   'Layout/FirstArrayElementIndentation' => 'layout/first_array_element_indentation',
   'Layout/FirstHashElementIndentation' => 'layout/first_hash_element_indentation',
+  'Layout/MultilineOperationIndentation' => 'layout/multiline_operation_indentation',
   'Lint/EmptyEnsure'                 => 'lint/empty_ensure',
   'Lint/EmptyExpression'             => 'lint/empty_expression',
   'Lint/UriEscapeUnescape'           => 'lint/uri_escape_unescape',

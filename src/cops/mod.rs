@@ -190,6 +190,61 @@ pub(crate) enum DnFrame {
     BeginGroup { last_line: usize, child_starts: Vec<usize> },
 }
 
+/// Layout/MultilineOperationIndentation: one ancestor-stack frame, pushed
+/// (during the SAME single traversal already done for every other cop) by
+/// exactly the node kinds `MultilineExpressionIndentation`'s four ancestor
+/// searches (`kw_node_with_special_indentation`, `part_of_assignment_rhs`,
+/// `argument_in_method_call`, `not_for_this_cop?`) actually inspect. Any
+/// OTHER node kind is simply never pushed — structurally identical to a real
+/// `each_ancestor`/`each_ancestor(*TYPES)` climb silently passing over a
+/// non-matching ancestor and continuing outward.
+pub(crate) enum MoiFrame {
+    /// `if`/`unless`/`while`/`until`/`for`/`return` — unconditionally
+    /// disqualifies `part_of_assignment_rhs`'s climb (`UNALIGNED_RHS_TYPES`).
+    /// `kw_node_with_special_indentation` additionally needs the "indented"
+    /// sub-expression's span (`expr`: predicate for if/unless/while/until,
+    /// collection for `for`, first return value for `return`) and the
+    /// keyword's own source span (`keyword`, sliced on demand for the
+    /// message's kind/article/text). `is_postfix` is upstream's
+    /// `postfix_conditional?` — `node.if_type? && node.modifier_form?` —
+    /// which only ever fires for `if`/`unless` (whitequark collapses both to
+    /// `:if`); `while`/`until`/`for`/`return` are never postfix even in
+    /// their own modifier-form shape, so `is_postfix` is always `false` for
+    /// those (`is_if_like` gates it).
+    Kw { keyword: (usize, usize), expr: (usize, usize), is_if_like: bool, is_postfix: bool },
+    /// An array literal — always disqualifies `part_of_assignment_rhs`.
+    Array,
+    /// An EXPLICIT `begin...end` (`kwbegin`) — always disqualifies. An
+    /// implicit def-with-rescue `BeginNode` (no `begin` keyword) is NEVER
+    /// pushed: whitequark has no `:kwbegin` node for that shape at all.
+    Begin,
+    /// A `do...end`/`{}` block. Disqualifies `part_of_assignment_rhs` only
+    /// when the candidate lies within its own body (`body`, `None` for an
+    /// empty block); separately, ANY block ancestor unconditionally stops
+    /// `argument_in_method_call`'s climb outright (`break false`).
+    Block { body: Option<(usize, usize)> },
+    /// A write-node's (or setter-call's) assigned VALUE span. Qualifies
+    /// `part_of_assignment_rhs` when the candidate lies within `rhs`.
+    Assign { rhs: (usize, usize) },
+    /// A literal `(...)` grouping (`ParenthesesNode`) — excludes via
+    /// `not_for_this_cop?`'s `grouped_expression?` (inclusive containment;
+    /// always true for a real descendant).
+    Group { start: usize, end: usize },
+    /// A `CallNode`. `paren`, when the call has literal `(...)`, is that
+    /// span — `not_for_this_cop?`'s `inside_arg_list_parentheses?` (STRICT
+    /// containment: `>`/`<`, excluding the call's own receiver, which sits
+    /// outside the parens despite being a structural descendant). `args` is
+    /// each top-level argument's own span, for `argument_in_method_call`'s
+    /// `arguments.any? { within_node?(node, arg) }` — left EMPTY for a
+    /// setter call (`a.b = x`/`a[i] = x`, `equal_loc` present), mirroring
+    /// upstream's `next if a.setter_method?` skip (a setter's assigned value
+    /// is tracked separately, via a sibling `Assign` frame pushed at the
+    /// same tree position — see `visit_call_node`). `is_def_modifier` is
+    /// `def_modifier?` (`private def foo; end`-shaped): receiverless, first
+    /// argument is a `def`.
+    Call { paren: Option<(usize, usize)>, args: Vec<(usize, usize)>, is_def_modifier: bool },
+}
+
 /// Style/FormatStringToken's per-ancestor stack frame — see `fst_stack`'s
 /// field doc for how each variant is pushed/popped and why plain start-
 /// offset equality stands in for `each_ancestor`/single-ascend node-pattern
@@ -389,7 +444,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
-    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment", "Lint/Syntax", "Layout/FirstArrayElementIndentation", "Layout/FirstHashElementIndentation",
+    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment", "Lint/Syntax", "Layout/FirstArrayElementIndentation", "Layout/FirstHashElementIndentation", "Layout/MultilineOperationIndentation",
 ];
 
 impl Engine {
@@ -2128,6 +2183,12 @@ pub(crate) struct Cops<'a> {
     // extra conditions `indent_base`'s `:parent_hash_key` branch needs), so
     // a present entry always means "use this key's own column".
     pub(crate) fhei_parent_pair: HashMap<usize, usize>,
+    // Layout/MultilineOperationIndentation: hand-rolled ancestor stack for
+    // `MultilineExpressionIndentation`'s four ancestor searches — see
+    // `MoiFrame`'s doc for exactly which node kinds push a frame and why
+    // every other kind is safe to leave untracked (transparent, same as
+    // `each_ancestor` skipping past it).
+    pub(crate) moi_stack: Vec<MoiFrame>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -2716,7 +2777,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // ancestor contributes its own name to `parent_module_name` (the
         // block itself contributes nothing — see `dm_pending_casgn_new_block`).
         let dm_pushed = self.dm_check_casgn_value(&v, String::from_utf8_lossy(node.name().as_slice()).into_owned());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_constant_write_node(self, node);
+        self.moi_stack.pop();
         if dm_pushed {
             self.dm_ns_stack.pop();
         }
@@ -2730,7 +2797,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_mutable_constant(node.value());
         self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_constant_or_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_constant_target_node(&mut self, node: &ruby_prism::ConstantTargetNode<'pr>) {
         // a constant target in a multiple assignment (`A, B = 1, 2`)
@@ -2769,7 +2842,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             }
         };
         let dm_pushed = self.dm_check_casgn_value(&node.value(), dm_frag);
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_constant_path_write_node(self, node);
+        self.moi_stack.pop();
         if dm_pushed {
             self.dm_ns_stack.pop();
         }
@@ -2779,20 +2858,38 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_class_length_casgn(&node.value());
         self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_write!(self, node);
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_constant_and_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_constant_operator_write_node(&mut self, node: &ruby_prism::ConstantOperatorWriteNode<'pr>) {
         self.check_class_length_casgn(&node.value());
         self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_operator_write!(self, node);
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_constant_operator_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_constant_path_operator_write_node(&mut self, node: &ruby_prism::ConstantPathOperatorWriteNode<'pr>) {
         self.check_class_length_casgn(&node.value());
         self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_path_operator_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_constant_path_operator_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_constant_path_or_write_node(&mut self, node: &ruby_prism::ConstantPathOrWriteNode<'pr>) {
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
@@ -2801,14 +2898,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_constant_path_or_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_constant_path_and_write_node(&mut self, node: &ruby_prism::ConstantPathAndWriteNode<'pr>) {
         self.check_class_length_casgn(&node.value());
         self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         assignment_path_write!(self, node);
         self.rvgu_mark_write_target(&node.target());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_constant_path_and_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_regular_expression_node(&mut self, node: &ruby_prism::RegularExpressionNode<'pr>) {
         self.check_mixed_regexp_capture_types(node);
@@ -2982,7 +3091,24 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // alias/attr/delegate ANYWHERE inside this whole subtree (condition,
         // branches, elsif chain) is exempted.
         self.dm_if_depth += 1;
+        // Layout/MultilineOperationIndentation: a ternary (`if_keyword_loc`
+        // absent) is never pushed — upstream's own ancestor search `next`s
+        // straight past it (`kw_node_with_special_indentation`'s `next if
+        // ancestor.if_type? && ancestor.ternary?`), identical to not being an
+        // ancestor at all.
+        let moi_pushed = node.if_keyword_loc().map(|kw| {
+            let pl = node.predicate().location();
+            self.moi_stack.push(MoiFrame::Kw {
+                keyword: (kw.start_offset(), kw.end_offset()),
+                expr: (pl.start_offset(), pl.end_offset()),
+                is_if_like: true,
+                is_postfix: node.end_keyword_loc().is_none(),
+            });
+        });
         ruby_prism::visit_if_node(self, node);
+        if moi_pushed.is_some() {
+            self.moi_stack.pop();
+        }
         self.dm_if_depth -= 1;
         if hs_modifier {
             self.hs_modifier_depth -= 1;
@@ -3093,7 +3219,20 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         // Lint/DuplicateMethods: see the matching comment in `visit_if_node`.
         self.dm_if_depth += 1;
+        // Layout/MultilineOperationIndentation: `unless` collapses to `:if`
+        // in whitequark, so it's `is_if_like` too (never a ternary).
+        {
+            let kw = node.keyword_loc();
+            let pl = node.predicate().location();
+            self.moi_stack.push(MoiFrame::Kw {
+                keyword: (kw.start_offset(), kw.end_offset()),
+                expr: (pl.start_offset(), pl.end_offset()),
+                is_if_like: true,
+                is_postfix: node.end_keyword_loc().is_none(),
+            });
+        }
         ruby_prism::visit_unless_node(self, node);
+        self.moi_stack.pop();
         self.dm_if_depth -= 1;
         if hs_modifier {
             self.hs_modifier_depth -= 1;
@@ -3119,7 +3258,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_class_variable_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_class_variable_operator_write_node(&mut self, node: &ruby_prism::ClassVariableOperatorWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
@@ -3127,7 +3272,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_operator_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_class_variable_operator_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_class_variable_or_write_node(&mut self, node: &ruby_prism::ClassVariableOrWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
@@ -3137,7 +3288,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_class_variable_or_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_class_variable_and_write_node(&mut self, node: &ruby_prism::ClassVariableAndWriteNode<'pr>) {
         self.check_class_vars(node.name().as_slice(), node.name_loc().start_offset());
@@ -3146,7 +3303,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_class_variable_and_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_class_variable_target_node(&mut self, node: &ruby_prism::ClassVariableTargetNode<'pr>) {
         // a class var target in a multiple assignment (`@@a, @@b = 1, 2`) is a
@@ -3174,7 +3337,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_global_variable_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_global_variable_operator_write_node(&mut self, node: &ruby_prism::GlobalVariableOperatorWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
@@ -3182,7 +3351,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_operator_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_global_variable_operator_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_global_variable_or_write_node(&mut self, node: &ruby_prism::GlobalVariableOrWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
@@ -3192,7 +3367,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_global_variable_or_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_global_variable_and_write_node(&mut self, node: &ruby_prism::GlobalVariableAndWriteNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.name_loc().start_offset());
@@ -3201,7 +3382,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.check_variable_name_gvasgn(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_global_variable_and_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_global_variable_target_node(&mut self, node: &ruby_prism::GlobalVariableTargetNode<'pr>) {
         self.check_global_var(node.name().as_slice(), node.location().start_offset());
@@ -3249,7 +3436,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // this name is a live "ancestor assignment" for the whole `value`
         // subtree — see the `mcwap_assign_stack` field doc.
         self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_local_variable_write_node(self, node);
+        self.moi_stack.pop();
         self.mcwap_assign_stack.pop();
     }
     fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
@@ -3258,7 +3451,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_local_variable_operator_write_node(self, node);
+        self.moi_stack.pop();
         self.mcwap_assign_stack.pop();
     }
     fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
@@ -3270,7 +3469,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_local_variable_or_write_node(self, node);
+        self.moi_stack.pop();
         self.mcwap_assign_stack.pop();
     }
     fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
@@ -3281,7 +3486,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
         self.mcwap_assign_stack.push(vec![node.name().as_slice().to_vec()]);
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_local_variable_and_write_node(self, node);
+        self.moi_stack.pop();
         self.mcwap_assign_stack.pop();
     }
     fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
@@ -3306,7 +3517,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_instance_variable_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_instance_variable_operator_write_node(
         &mut self,
@@ -3316,7 +3533,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_operator_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_instance_variable_operator_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_instance_variable_or_write_node(&mut self, node: &ruby_prism::InstanceVariableOrWriteNode<'pr>) {
         self.check_self_assignment_ivar(node.location().start_offset(), node.name().as_slice(), &node.value());
@@ -3325,7 +3548,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_instance_variable_or_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_instance_variable_and_write_node(&mut self, node: &ruby_prism::InstanceVariableAndWriteNode<'pr>) {
         self.check_self_assignment_ivar(node.location().start_offset(), node.name().as_slice(), &node.value());
@@ -3333,7 +3562,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         assignment_write!(self, node);
         self.check_variable_name(node.name().as_slice(), node.name_loc().start_offset());
         self.check_variable_number(node.name().as_slice(), node.name_loc().start_offset());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_instance_variable_and_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_instance_variable_target_node(&mut self, node: &ruby_prism::InstanceVariableTargetNode<'pr>) {
         // an ivar target in a multiple assignment (`@a, @b = 1, 2`) or a
@@ -3392,7 +3627,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             Self::mcwap_collect_lvar_target_names(&t, &mut mcwap_names);
         }
         self.mcwap_assign_stack.push(mcwap_names);
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_multi_write_node(self, node);
+        self.moi_stack.pop();
         self.mcwap_assign_stack.pop();
     }
     fn visit_call_and_write_node(&mut self, node: &ruby_prism::CallAndWriteNode<'pr>) {
@@ -3408,14 +3649,26 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             &[],
             &node.value(),
         );
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_call_and_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_call_operator_write_node(&mut self, node: &ruby_prism::CallOperatorWriteNode<'pr>) {
         // Layout/IndentationWidth: CheckAssignment also fires for compound
         // writes on attribute-call targets (`foo.bar += if ...`).
         self.check_indentation_width_assignment(node.location().start_offset(), node.value());
         self.check_end_alignment_write(node.location().start_offset(), node.value());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_call_operator_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_call_or_write_node(&mut self, node: &ruby_prism::CallOrWriteNode<'pr>) {
         // Layout/IndentationWidth: CheckAssignment also fires for
@@ -3431,7 +3684,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             &node.value(),
         );
         self.check_multiline_memoization(node.location().start_offset(), &node.value());
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_call_or_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_index_and_write_node(&mut self, node: &ruby_prism::IndexAndWriteNode<'pr>) {
         // Layout/IndentationWidth: CheckAssignment also fires for
@@ -3454,7 +3713,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.closing_loc(),
             node.arguments().is_some(),
         );
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_index_and_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_index_or_write_node(&mut self, node: &ruby_prism::IndexOrWriteNode<'pr>) {
         // Layout/IndentationWidth: CheckAssignment also fires for
@@ -3478,7 +3743,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.closing_loc(),
             node.arguments().is_some(),
         );
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_index_or_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_index_operator_write_node(&mut self, node: &ruby_prism::IndexOperatorWriteNode<'pr>) {
         // Layout/IndentationWidth: CheckAssignment also fires for
@@ -3492,7 +3763,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             node.closing_loc(),
             node.arguments().is_some(),
         );
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Assign`'s doc.
+        {
+            let vl = node.value().location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (vl.start_offset(), vl.end_offset()) });
+        }
         ruby_prism::visit_index_operator_write_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_index_target_node(&mut self, node: &ruby_prism::IndexTargetNode<'pr>) {
         self.check_space_inside_reference_brackets_target(node);
@@ -3681,7 +3958,23 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        // Layout/MultilineOperationIndentation: only when there's a real
+        // first return value — a bare `return` can never be a real ancestor
+        // of anything (nothing to descend into), so pushing a frame for it
+        // would be pointless.
+        let moi_pushed = node.arguments().and_then(|a| a.arguments().iter().next()).map(|first| {
+            let fl = first.location();
+            self.moi_stack.push(MoiFrame::Kw {
+                keyword: (kw.start_offset(), kw.end_offset()),
+                expr: (fl.start_offset(), fl.end_offset()),
+                is_if_like: false,
+                is_postfix: false,
+            });
+        });
         ruby_prism::visit_return_node(self, node);
+        if moi_pushed.is_some() {
+            self.moi_stack.pop();
+        }
     }
     fn visit_break_node(&mut self, node: &ruby_prism::BreakNode<'pr>) {
         self.ecc_mark_not_supported_parent(node.arguments());
@@ -3913,6 +4206,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     // `ruby_prism::visit_block_node`) to flag "the body about to be visited
     // IS this block's own StatementsNode" right before descending into it.
     fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        // Layout/MultilineOperationIndentation: see `MoiFrame::Block`'s doc.
+        self.moi_stack.push(MoiFrame::Block {
+            body: node.body().map(|b| {
+                let l = b.location();
+                (l.start_offset(), l.end_offset())
+            }),
+        });
         // Lint/Void: consume the owning call's method name (see
         // `void_pending_block_name`'s doc); `None` only if somehow reached
         // without that stash (never happens in practice — every `BlockNode`
@@ -4171,6 +4471,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if is_metrics_ctor_block {
             self.metrics_in_struct_data_define_block.pop();
         }
+        self.moi_stack.pop();
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
         self.check_next_while(node);
@@ -4249,7 +4550,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if hs_modifier {
             self.hs_modifier_depth += 1;
         }
+        {
+            let kw = node.keyword_loc();
+            let pl = node.predicate().location();
+            self.moi_stack.push(MoiFrame::Kw {
+                keyword: (kw.start_offset(), kw.end_offset()),
+                expr: (pl.start_offset(), pl.end_offset()),
+                is_if_like: false,
+                is_postfix: false,
+            });
+        }
         ruby_prism::visit_while_node(self, node);
+        self.moi_stack.pop();
         if hs_modifier {
             self.hs_modifier_depth -= 1;
         }
@@ -4328,7 +4640,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if hs_modifier {
             self.hs_modifier_depth += 1;
         }
+        {
+            let kw = node.keyword_loc();
+            let pl = node.predicate().location();
+            self.moi_stack.push(MoiFrame::Kw {
+                keyword: (kw.start_offset(), kw.end_offset()),
+                expr: (pl.start_offset(), pl.end_offset()),
+                is_if_like: false,
+                is_postfix: false,
+            });
+        }
         ruby_prism::visit_until_node(self, node);
+        self.moi_stack.pop();
         if hs_modifier {
             self.hs_modifier_depth -= 1;
         }
@@ -4350,12 +4673,23 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // `void_pending_ctx` is set immediately before (and only before) the
         // STATEMENTS child specifically — `ForNode#void_context?` is always
         // `true` upstream (see `void_pending_ctx`'s field doc).
+        {
+            let kw = node.for_keyword_loc();
+            let cl = node.collection().location();
+            self.moi_stack.push(MoiFrame::Kw {
+                keyword: (kw.start_offset(), kw.end_offset()),
+                expr: (cl.start_offset(), cl.end_offset()),
+                is_if_like: false,
+                is_postfix: false,
+            });
+        }
         self.visit(&node.index());
         self.visit(&node.collection());
         if let Some(stmts) = node.statements() {
             self.void_pending_ctx = Some(true);
             self.visit_statements_node(&stmts);
         }
+        self.moi_stack.pop();
     }
     fn visit_pre_execution_node(&mut self, node: &ruby_prism::PreExecutionNode<'pr>) {
         if self.on("Style/BeginBlock") {
@@ -4397,6 +4731,12 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_indentation_width_rescue(node);
         self.check_indentation_width_resbody(node);
         let kwbegin = node.begin_keyword_loc().is_some();
+        // Layout/MultilineOperationIndentation: an EXPLICIT `begin...end`
+        // only — an implicit def-with-rescue body never counts as `:kwbegin`
+        // upstream (see `MoiFrame::Begin`'s doc).
+        if kwbegin {
+            self.moi_stack.push(MoiFrame::Begin);
+        }
         // Layout/IndentationConsistency's `on_kwbegin`: fires only for an
         // EXPLICIT `begin...end` (whitequark never wraps the implicit
         // def/class/module rescue/ensure body in a `:kwbegin` — see
@@ -4516,6 +4856,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.renv_just_closed_kwbegin_renames =
                 self.renv_pending_kwbegin_stack.pop().unwrap_or_default();
             self.rea_ancestors.pop();
+            self.moi_stack.pop();
         }
     }
     fn visit_ensure_node(&mut self, node: &ruby_prism::EnsureNode<'pr>) {
@@ -4562,7 +4903,14 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
                 }
             }
         }
+        // Layout/MultilineOperationIndentation: `not_for_this_cop?`'s
+        // `grouped_expression?` (`MoiFrame::Group`).
+        {
+            let l = node.location();
+            self.moi_stack.push(MoiFrame::Group { start: l.start_offset(), end: l.end_offset() });
+        }
         ruby_prism::visit_parentheses_node(self, node);
+        self.moi_stack.pop();
     }
     fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
         self.ium_register_collection(&node.as_node(), node.elements().iter().collect());
@@ -4678,7 +5026,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             start: node.location().start_offset(),
             child_starts: node.elements().iter().map(|e| e.location().start_offset()).collect(),
         });
+        self.moi_stack.push(MoiFrame::Array);
         ruby_prism::visit_array_node(self, node);
+        self.moi_stack.pop();
         self.dn_ancestors.pop();
         self.wa_matrix_stack.pop();
         self.ll_exit_collection();
@@ -5335,6 +5685,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
         self.rsn_cond_pos.insert(node.left().location().start_offset());
         self.rsn_cond_pos.insert(node.right().location().start_offset());
+        {
+            let nl = node.location();
+            let rl = node.right().location();
+            self.check_multiline_operation_indentation(
+                nl.start_offset(),
+                nl.end_offset(),
+                rl.start_offset(),
+                rl.end_offset(),
+            );
+        }
         self.check_and_or_and(node);
         self.check_and_with_identical_operands(node);
         self.check_literal_as_condition_and(node);
@@ -5365,6 +5725,16 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
     fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
         self.rsn_cond_pos.insert(node.left().location().start_offset());
         self.rsn_cond_pos.insert(node.right().location().start_offset());
+        {
+            let nl = node.location();
+            let rl = node.right().location();
+            self.check_multiline_operation_indentation(
+                nl.start_offset(),
+                nl.end_offset(),
+                rl.start_offset(),
+                rl.end_offset(),
+            );
+        }
         self.check_redundant_safe_navigation_or(node);
         self.check_and_or_or(node);
         self.check_or_with_identical_operands(node);
@@ -5453,6 +5823,50 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         // below, so any braced hash literal it claims (`fhei_ignored`) is
         // marked before `visit_hash_node` later reaches that same node.
         self.check_first_hash_element_indentation_send(node);
+        // Layout/MultilineOperationIndentation: `on_send`/`on_csend` — a
+        // binary operator call (receiver present, no `.`/`&.`, not `[]`, not
+        // a unary op like `-@`) whose first argument starts a line of its
+        // own. MUST run before `moi_stack` gets THIS call's own `Call` frame
+        // pushed below, so ancestor searches never see this node as its own
+        // ancestor (moot in practice — operator calls never carry their own
+        // parens — but keeps the ordering honest).
+        self.check_multiline_operation_indentation_send(node);
+        // Layout/MultilineOperationIndentation: this call's own ancestor
+        // frame(s) — see `MoiFrame::Call`/`MoiFrame::Assign`'s docs. A setter
+        // call (`a.b = x`/`a[i] = x`) pushes BOTH: `Call` with empty `args`
+        // (mirrors upstream's `next if a.setter_method?` skip) and a sibling
+        // `Assign` for its assigned value.
+        let moi_paren = match (node.opening_loc(), node.closing_loc()) {
+            (Some(o), Some(c)) if o.as_slice() == b"(" => Some((o.start_offset(), c.end_offset())),
+            _ => None,
+        };
+        let moi_is_setter = node.equal_loc().is_some();
+        let moi_args: Vec<(usize, usize)> = if moi_is_setter {
+            Vec::new()
+        } else {
+            node.arguments()
+                .map(|a| {
+                    a.arguments()
+                        .iter()
+                        .map(|n| {
+                            let l = n.location();
+                            (l.start_offset(), l.end_offset())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let moi_is_def_mod = node.receiver().is_none()
+            && node
+                .arguments()
+                .and_then(|a| a.arguments().iter().next())
+                .is_some_and(|n| n.as_def_node().is_some());
+        self.moi_stack.push(MoiFrame::Call { paren: moi_paren, args: moi_args, is_def_modifier: moi_is_def_mod });
+        let moi_setter_value = if moi_is_setter { node.arguments().and_then(|a| a.arguments().iter().last()) } else { None };
+        if let Some(v) = &moi_setter_value {
+            let l = v.location();
+            self.moi_stack.push(MoiFrame::Assign { rhs: (l.start_offset(), l.end_offset()) });
+        }
         // Layout/HashAlignment: `on_send`/`on_csend`'s `ignore_hash_argument?`
         // and `autocorrect_incompatible_with_other_cops?` both key off THIS
         // call's own shape — see the `ha_ignored`/`ha_incompatible` field docs.
@@ -6154,6 +6568,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
         self.fst_stack.pop();
         self.ll_exit_collection();
+        if moi_setter_value.is_some() {
+            self.moi_stack.pop();
+        }
+        self.moi_stack.pop();
     }
     fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
         self.check_redundant_splat_expansion(node);
@@ -6387,6 +6805,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         rea_assign_wrap: HashMap::new(),
         fhei_ignored: HashSet::new(),
         fhei_parent_pair: HashMap::new(),
+        moi_stack: Vec::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),
