@@ -15663,3 +15663,1400 @@ fn moi_is_unary_operation(node: &ruby_prism::CallNode) -> bool {
     let Some(msg) = node.message_loc() else { return false };
     node.location().start_offset() == msg.start_offset()
 }
+
+// ===========================================================================
+// Layout/MultilineMethodCallIndentation
+//
+// Ports rubocop's `MultilineMethodCallIndentation` cop plus the shared
+// `MultilineExpressionIndentation`/`Alignment`/`ConfigurableEnforcedStyle`
+// mixins (lib/rubocop/cop/layout/multiline_method_call_indentation.rb +
+// lib/rubocop/cop/mixin/multiline_expression_indentation.rb). The
+// `ConfigurableEnforcedStyle` bookkeeping (`style_detected`/`config_to_
+// allow_offenses`) is pure `--auto-gen-config` plumbing with zero effect on
+// offenses/autocorrect, so it's not ported at all.
+//
+// `on_send`/`alias on_csend`: prism unifies both into one `CallNode` hook —
+// `node.is_safe_navigation()` covers the only place `csend`-ness matters.
+//
+// ANCESTOR MODEL: `Cops::mmci_ancestors` is a flat, precomputed-fields stack
+// (`MmciFrame`, one entry per real ancestor, pushed/popped in `visit_branch_
+// node_enter`/`_leave` like `rp_ancestors`) — NOT the live `ruby_prism::Node`
+// itself, because storing a node whose lifetime comes from the generic
+// `Visit<'pr>` trait method into a `Cops<'a>`-owned field would require
+// `'pr` to unify with `'a`, which the trait signature never guarantees (the
+// same reason `rp_ancestors` stores `RpKind<'a>` — plain `usize` offsets and
+// `&'a [u8]` slices sliced fresh off `self.src`, never anything borrowed
+// from the traversal parameter). Every helper below that walks `each_
+// ancestor`-style reads `mmci_ancestors`; every helper that only walks
+// DOWNWARD from the CURRENTLY-VISITED call (through `.receiver`/`.
+// arguments`/`.block`) works directly off the live, generically-lifetimed
+// node parameter instead — those never need to survive past one call.
+//
+// PRISM-VS-WHITEQUARK DIVERGENCE around blocks: whitequark's translation
+// makes a `CallNode` that owns its own attached block appear, to `node.
+// parent`, as if wrapped in a synthetic `:block` node (the call becomes the
+// block's first child; the block occupies the call's old slot in ITS OWN
+// parent's chain). Prism attaches the block as a plain field on the same
+// `CallNode`, with no extra tree level. Upstream's `check_regular_
+// indentation` explicitly climbs past this exact wrapper (`parent = parent.
+// parent if parent&.any_block_type?`) — prism's plain one-hop real ancestor
+// already lands on the same target upstream reaches only after that extra
+// hop, so `mmci_extra_indentation` needs no such unwrap. Deeper, UNFILTERED
+// `each_ancestor` walks could in principle see one spurious intermediate
+// "this call is itself call-type" frame at the position where whitequark
+// shows a `:block` frame instead — every walk here either (a) filters to
+// specific non-call/non-block tags (an extra Call frame is silently skipped,
+// same as a Block frame would be) or (b) stops dead the instant it meets a
+// Block-tagged frame (and prism inserts a genuine `BlockNode` frame in the
+// same relative position for anything actually inside that block's own
+// body, so the stop still fires before ever reaching the spurious frame).
+// The one theoretical gap is `mmci_get_dot_right_above`'s unfiltered,
+// non-stopping walk (a spurious call-with-block ancestor could coincidentally
+// have a dot on the exact right line/column) — the fixture never exercises
+// it; see that helper's doc.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MmciTag {
+    If,
+    Unless,
+    While,
+    Until,
+    For,
+    Return,
+    Call,
+    Block,
+    Array,
+    Begin,
+    Assoc,
+    Splat,
+    Kwsplat,
+    Assignment,
+    Other,
+}
+
+#[derive(Clone)]
+pub(crate) struct MmciFrame<'a> {
+    tag: MmciTag,
+    start: usize,
+    end: usize,
+    // If/Unless/While/Until/For/Return: `indented_keyword_expression`'s
+    // range (predicate/collection/first-return-argument) and the keyword's
+    // own text — `special_range` stays `None` for a ternary `IfNode`
+    // (`if_keyword_loc` absent), which transparently fails every match
+    // below exactly like upstream's `next if ... ternary?`.
+    special_range: Option<(usize, usize)>,
+    keyword: &'a [u8],
+    modifier_form: bool,
+    // Call
+    dot: Option<(usize, usize)>,
+    selector: Option<(usize, usize)>,
+    receiver_range: Option<(usize, usize)>,
+    opening: Option<(usize, u8)>,
+    closing_end: Option<usize>,
+    is_setter: bool,
+    is_safe_nav: bool,
+    is_operator_method: bool,
+    first_arg_range: Option<(usize, usize)>,
+    last_arg_range: Option<(usize, usize)>,
+    any_arg_ranges: Vec<(usize, usize)>,
+    // Block
+    body_range: Option<(usize, usize)>,
+    // Begin: distinguishes an explicit `begin...end` (upstream's `:kwbegin`)
+    // from a plain `(...)` (upstream's `:begin`) — `grouped_expression?`
+    // wants either; `UNALIGNED_RHS_TYPES`' `:kwbegin` wants only the former.
+    is_kwbegin: bool,
+    // Assoc
+    key_range: Option<(usize, usize)>,
+    // Splat/Kwsplat
+    operator_len: Option<usize>,
+    // Assignment (the `is_assignment_like` family — plain writes, compound
+    // `+=`-style, and `||=`/`&&=`, for locals/ivars/cvars/gvars/consts/
+    // const-paths/multi-assign; setter/index assignment is a `Call` frame
+    // with `is_setter` instead, matching upstream's OWN split between
+    // `Node#assignment?` and `send_type?` in `valid_rhs?`).
+    rhs_range: Option<(usize, usize)>,
+}
+
+impl<'a> MmciFrame<'a> {
+    fn other(start: usize, end: usize) -> Self {
+        MmciFrame {
+            tag: MmciTag::Other,
+            start,
+            end,
+            special_range: None,
+            keyword: b"",
+            modifier_form: false,
+            dot: None,
+            selector: None,
+            receiver_range: None,
+            opening: None,
+            closing_end: None,
+            is_setter: false,
+            is_safe_nav: false,
+            is_operator_method: false,
+            first_arg_range: None,
+            last_arg_range: None,
+            any_arg_ranges: Vec::new(),
+            body_range: None,
+            is_kwbegin: false,
+            key_range: None,
+            operator_len: None,
+            rhs_range: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MmciKwInfo<'a> {
+    range: (usize, usize),
+    keyword: &'a [u8],
+    modifier_form: bool,
+}
+
+/// The offense's alignment/indentation base, plus the two side-channel
+/// numbers upstream stashes in `@hash_pair_base_column`/leaves in `@base` —
+/// see `Cops::mmci_offending_range`'s callers.
+struct MmciCtx {
+    base: Option<(usize, usize)>,
+    hash_pair_base_column: Option<usize>,
+    column_delta: i64,
+}
+
+/// `Node#receiver` == this call's `.receiver()` (prism never wraps a
+/// block-owning call, so no `any_block_type?` unwrap is needed — see the
+/// module doc). `find_base_receiver`'s descent, captured once so `first_
+/// call_has_a_dot`'s upward re-walk doesn't need to re-derive it.
+fn mmci_chain_to_base<'x>(node: &ruby_prism::CallNode<'x>) -> (Vec<ruby_prism::CallNode<'x>>, ruby_prism::Node<'x>) {
+    let mut chain = vec![mmci_dup_call(node)];
+    let mut base: ruby_prism::Node<'x> = node.as_node();
+    loop {
+        let recv = match base.as_call_node() {
+            Some(c) => c.receiver(),
+            None => None,
+        };
+        match recv {
+            Some(r) => {
+                if let Some(c) = r.as_call_node() {
+                    chain.push(mmci_dup_call(&c));
+                }
+                base = r;
+            }
+            None => break,
+        }
+    }
+    (chain, base)
+}
+
+fn mmci_dup_call<'x>(c: &ruby_prism::CallNode<'x>) -> ruby_prism::CallNode<'x> {
+    c.as_node().as_call_node().unwrap()
+}
+
+/// `first_call_has_a_dot`: scanning from the base outward (i.e. `chain`
+/// reversed), the first call that has an explicit dot/safe-nav operator —
+/// `chain[0]` (`node` itself) always qualifies (guaranteed by `relevant_
+/// node?`), so the scan always terminates.
+fn mmci_first_call_has_a_dot_idx<'x>(chain: &[ruby_prism::CallNode<'x>]) -> (ruby_prism::CallNode<'x>, usize) {
+    for (i, c) in chain.iter().enumerate().rev() {
+        if c.call_operator_loc().is_some() {
+            return (mmci_dup_call(c), i);
+        }
+    }
+    (mmci_dup_call(&chain[0]), 0)
+}
+
+/// `Util::OPERATOR_METHODS`.
+fn mmci_is_operator_method(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"|" | b"^"
+            | b"&"
+            | b"<=>"
+            | b"=="
+            | b"==="
+            | b"=~"
+            | b">"
+            | b">="
+            | b"<"
+            | b"<="
+            | b"<<"
+            | b">>"
+            | b"+"
+            | b"-"
+            | b"*"
+            | b"/"
+            | b"%"
+            | b"**"
+            | b"~"
+            | b"+@"
+            | b"-@"
+            | b"!@"
+            | b"~@"
+            | b"[]"
+            | b"[]="
+            | b"!"
+            | b"!="
+            | b"!~"
+            | b"`"
+    )
+}
+
+/// `setter_method?` (also covers `[]=`, which already ends in `=`).
+fn mmci_is_assignment_method_name(name: &[u8]) -> bool {
+    name.ends_with(b"=") && !matches!(name, b"==" | b"===" | b"!=" | b"<=" | b">=")
+}
+
+/// `assignment_rhs`'s generic `node.children.last` fallback for every
+/// plain-write/compound-write node kind `is_assignment_like` recognizes
+/// (`:casgn`/`:op_asgn`'s dedicated `.rhs` branch collapses to the exact
+/// same accessor in every one of prism's corresponding node kinds).
+fn mmci_static_assignment_rhs_range(node: &ruby_prism::Node<'_>) -> Option<(usize, usize)> {
+    macro_rules! val {
+        ($v:expr) => {{
+            let l = $v.location();
+            Some((l.start_offset(), l.end_offset()))
+        }};
+    }
+    if let Some(n) = node.as_local_variable_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_local_variable_operator_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_local_variable_or_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_local_variable_and_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_instance_variable_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_instance_variable_operator_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_instance_variable_or_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_instance_variable_and_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_class_variable_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_class_variable_operator_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_class_variable_or_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_class_variable_and_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_global_variable_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_global_variable_operator_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_global_variable_or_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_global_variable_and_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_constant_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_constant_operator_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_constant_or_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_constant_and_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_constant_path_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_constant_path_operator_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_constant_path_or_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_constant_path_and_write_node() {
+        return val!(n.value());
+    }
+    if let Some(n) = node.as_multi_write_node() {
+        return val!(n.value());
+    }
+    None
+}
+
+fn mmci_dot_selector_range(c: &ruby_prism::CallNode<'_>) -> Option<(usize, usize)> {
+    let dot = c.call_operator_loc()?;
+    let sel = c.message_loc()?;
+    Some((dot.start_offset(), sel.end_offset()))
+}
+
+impl<'a> super::Cops<'a> {
+    /// Populates one `mmci_ancestors` frame per branch node — see the module
+    /// doc above. Called from `visit_branch_node_enter` in mod.rs, BEFORE
+    /// that node's own children are visited.
+    pub(crate) fn mmci_classify(&self, node: &ruby_prism::Node<'_>) -> MmciFrame<'a> {
+        let loc = node.location();
+        let (start, end) = (loc.start_offset(), loc.end_offset());
+        let mut f = MmciFrame::other(start, end);
+
+        if let Some(i) = node.as_if_node() {
+            if let Some(kw) = i.if_keyword_loc() {
+                let pred = i.predicate().location();
+                f.tag = MmciTag::If;
+                f.special_range = Some((pred.start_offset(), pred.end_offset()));
+                f.keyword = &self.src[kw.start_offset()..kw.end_offset()];
+                f.modifier_form = i.end_keyword_loc().is_none();
+            }
+            return f;
+        }
+        if let Some(u) = node.as_unless_node() {
+            let pred = u.predicate().location();
+            let kw = u.keyword_loc();
+            f.tag = MmciTag::Unless;
+            f.special_range = Some((pred.start_offset(), pred.end_offset()));
+            f.keyword = &self.src[kw.start_offset()..kw.end_offset()];
+            f.modifier_form = u.end_keyword_loc().is_none();
+            return f;
+        }
+        if let Some(w) = node.as_while_node() {
+            let pred = w.predicate().location();
+            let kw = w.keyword_loc();
+            f.tag = MmciTag::While;
+            f.special_range = Some((pred.start_offset(), pred.end_offset()));
+            f.keyword = &self.src[kw.start_offset()..kw.end_offset()];
+            return f;
+        }
+        if let Some(u) = node.as_until_node() {
+            let pred = u.predicate().location();
+            let kw = u.keyword_loc();
+            f.tag = MmciTag::Until;
+            f.special_range = Some((pred.start_offset(), pred.end_offset()));
+            f.keyword = &self.src[kw.start_offset()..kw.end_offset()];
+            return f;
+        }
+        if let Some(fo) = node.as_for_node() {
+            let coll = fo.collection().location();
+            f.tag = MmciTag::For;
+            f.special_range = Some((coll.start_offset(), coll.end_offset()));
+            f.keyword = b"for";
+            return f;
+        }
+        if let Some(r) = node.as_return_node() {
+            f.tag = MmciTag::Return;
+            f.keyword = b"return";
+            if let Some(args) = r.arguments() {
+                if let Some(first) = args.arguments().iter().next() {
+                    let l = first.location();
+                    f.special_range = Some((l.start_offset(), l.end_offset()));
+                }
+            }
+            return f;
+        }
+        if let Some(c) = node.as_call_node() {
+            f.tag = MmciTag::Call;
+            f.dot = c.call_operator_loc().map(|l| (l.start_offset(), l.end_offset()));
+            f.selector = c.message_loc().map(|l| (l.start_offset(), l.end_offset()));
+            f.receiver_range = c.receiver().map(|r| {
+                let l = r.location();
+                (l.start_offset(), l.end_offset())
+            });
+            f.is_safe_nav = c.is_safe_navigation();
+            let name = c.name().as_slice();
+            f.is_setter = mmci_is_assignment_method_name(name);
+            f.is_operator_method = mmci_is_operator_method(name);
+            f.opening = c.opening_loc().and_then(|l| l.as_slice().first().map(|&b| (l.start_offset(), b)));
+            f.closing_end = c.closing_loc().map(|l| l.end_offset());
+            if let Some(args) = c.arguments() {
+                let ranges: Vec<(usize, usize)> = args
+                    .arguments()
+                    .iter()
+                    .map(|a| {
+                        let l = a.location();
+                        (l.start_offset(), l.end_offset())
+                    })
+                    .collect();
+                f.first_arg_range = ranges.first().copied();
+                f.last_arg_range = ranges.last().copied();
+                f.any_arg_ranges = ranges;
+            }
+            return f;
+        }
+        if let Some(b) = node.as_block_node() {
+            f.tag = MmciTag::Block;
+            f.body_range = b.body().map(|bd| {
+                let l = bd.location();
+                (l.start_offset(), l.end_offset())
+            });
+            return f;
+        }
+        if node.as_array_node().is_some() {
+            f.tag = MmciTag::Array;
+            return f;
+        }
+        if node.as_parentheses_node().is_some() {
+            f.tag = MmciTag::Begin;
+            f.is_kwbegin = false;
+            return f;
+        }
+        if let Some(b) = node.as_begin_node() {
+            if b.begin_keyword_loc().is_some() {
+                f.tag = MmciTag::Begin;
+                f.is_kwbegin = true;
+            }
+            return f;
+        }
+        if let Some(a) = node.as_assoc_node() {
+            f.tag = MmciTag::Assoc;
+            let kl = a.key().location();
+            f.key_range = Some((kl.start_offset(), kl.end_offset()));
+            return f;
+        }
+        if let Some(s) = node.as_splat_node() {
+            f.tag = MmciTag::Splat;
+            f.operator_len = Some(s.operator_loc().as_slice().len());
+            return f;
+        }
+        if let Some(s) = node.as_assoc_splat_node() {
+            f.tag = MmciTag::Kwsplat;
+            f.operator_len = Some(s.operator_loc().as_slice().len());
+            return f;
+        }
+        if is_assignment_like(node) {
+            f.tag = MmciTag::Assignment;
+            f.rhs_range = mmci_static_assignment_rhs_range(node);
+            return f;
+        }
+        f
+    }
+
+    fn mmci_line(&self, off: usize) -> usize {
+        self.idx.loc(off).0
+    }
+    fn mmci_col(&self, off: usize) -> usize {
+        self.idx.loc(off).1 - 1
+    }
+    fn mmci_same_line(&self, a: usize, b: usize) -> bool {
+        self.mmci_line(a) == self.mmci_line(b)
+    }
+    fn mmci_last_line(&self, end_offset: usize) -> usize {
+        self.mmci_line(end_offset.saturating_sub(1))
+    }
+    fn mmci_line_start(&self, off: usize) -> usize {
+        let l = self.mmci_line(off);
+        self.idx.starts[l - 1]
+    }
+    fn mmci_line_end(&self, off: usize) -> usize {
+        let mut p = off;
+        while p < self.src.len() && self.src[p] != b'\n' {
+            p += 1;
+        }
+        p
+    }
+    fn mmci_begins_its_line(&self, start: usize) -> bool {
+        let ls = self.mmci_line_start(start);
+        self.src[ls..start].iter().all(|&b| b == b' ' || b == b'\t')
+    }
+    /// `MultilineExpressionIndentation#indentation`: the byte column of the
+    /// first non-whitespace character on the line containing `off`.
+    fn mmci_indentation_of(&self, off: usize) -> usize {
+        let ls = self.mmci_line_start(off);
+        let mut p = ls;
+        while p < self.src.len() && (self.src[p] == b' ' || self.src[p] == b'\t') {
+            p += 1;
+        }
+        p - ls
+    }
+
+    /// `rhs.source.start_with?('.', '&.')` — a `.`-anchored rhs (dot+
+    /// selector, or a lone leading-dot chain continuation) as opposed to
+    /// the trailing-dot style where rhs is a bare selector starting with
+    /// a letter.
+    fn mmci_rhs_starts_with_dot(&self, rhs: (usize, usize)) -> bool {
+        self.src.get(rhs.0) == Some(&b'.') || self.src.get(rhs.0..rhs.0 + 2) == Some(&b"&."[..])
+    }
+
+    fn mmci_configured_indentation_width(&self) -> usize {
+        const COP: &str = "Layout/MultilineMethodCallIndentation";
+        self.cfg
+            .param(COP, "IndentationWidth")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()))
+            .unwrap_or(2)
+    }
+    fn mmci_layout_indentation_width_width(&self) -> usize {
+        self.cfg.get("Layout/IndentationWidth", "Width").and_then(|v| v.parse().ok()).unwrap_or(2)
+    }
+
+    /// `right_hand_side`: the offense anchor — dot+selector when both sit on
+    /// the same line, the bare selector otherwise (trailing-dot style, e.g.
+    /// `a.\n  b`), or dot+opening-paren for the anonymous `.()` proc-call
+    /// shorthand (`implicit_call?`: no selector token at all).
+    fn mmci_right_hand_side(&self, node: &ruby_prism::CallNode<'_>) -> Option<(usize, usize)> {
+        let dot = node.call_operator_loc()?;
+        let is_dot_or_safe_nav = matches!(dot.as_slice(), b"." | b"&.");
+        if let Some(sel) = node.message_loc() {
+            if is_dot_or_safe_nav && self.mmci_same_line(dot.start_offset(), sel.start_offset()) {
+                return Some((dot.start_offset(), sel.end_offset()));
+            }
+            return Some((sel.start_offset(), sel.end_offset()));
+        }
+        let op = node.opening_loc()?;
+        Some((dot.start_offset(), op.end_offset()))
+    }
+
+    /// `left_hand_side(node.receiver)` + `Alignment#indentation` fused:
+    /// climbs from `node` outward through real ancestor frames that are
+    /// themselves dotted, non-setter calls (`node.receiver`'s own immediate
+    /// parent is always `node` itself, so the climb starts there
+    /// unconditionally — see the module doc for why this is unaffected by
+    /// any node along the way owning an attached block), returning the
+    /// range of whichever node it stopped at (or `node.receiver` unchanged,
+    /// if `node` itself doesn't qualify — a setter, e.g. `.foo=`).
+    fn mmci_left_hand_side(&self, node: &ruby_prism::CallNode<'_>) -> (usize, usize) {
+        let node_is_setter = mmci_is_assignment_method_name(node.name().as_slice());
+        if node_is_setter {
+            let r = node.receiver().unwrap();
+            let l = r.location();
+            return (l.start_offset(), l.end_offset());
+        }
+        let nl = node.location();
+        let mut winner = (nl.start_offset(), nl.end_offset());
+        let len = self.mmci_ancestors.len();
+        let mut i = len as isize - 2;
+        while i >= 0 {
+            let f = &self.mmci_ancestors[i as usize];
+            if f.tag == MmciTag::Call && f.dot.is_some() && !f.is_setter {
+                winner = (f.start, f.end);
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+        winner
+    }
+
+    /// `find_pair_ancestor`: nearest `AssocNode` ancestor, any distance,
+    /// unfiltered by intervening tags (upstream's plain, unbounded `each_
+    /// ancestor` — no early stop here at all).
+    fn mmci_find_pair_ancestor_idx(&self) -> Option<usize> {
+        let len = self.mmci_ancestors.len();
+        (0..len.saturating_sub(1)).rev().find(|&i| self.mmci_ancestors[i].tag == MmciTag::Assoc)
+    }
+
+    /// `hash_arg_in_chain?`/`find_enclosing_chain_call`: the pair's real
+    /// parent (the enclosing hash/kwargs node, one frame below the pair)
+    /// must itself be the ARGUMENT (not the receiver) of a dotted call whose
+    /// selector doesn't share the receiver's first line.
+    fn mmci_inside_multiline_chain_arg(&self, pair_idx: usize) -> bool {
+        if pair_idx < 2 {
+            return false;
+        }
+        let hash_frame = &self.mmci_ancestors[pair_idx - 1];
+        let (hash_start, hash_end) = (hash_frame.start, hash_frame.end);
+        let call_f = &self.mmci_ancestors[pair_idx - 2];
+        if call_f.tag != MmciTag::Call || call_f.dot.is_none() {
+            return false;
+        }
+        let Some(recv) = call_f.receiver_range else { return false };
+        // `call.receiver != hash_node` (object identity) — comparing the
+        // START offset alone is unsound: a receiver that's itself a call
+        // chain BOTTOMING OUT at the hash reports that SAME start (every
+        // node in a receiver chain shares its ultimate base's start), so
+        // both ends must match to mean "receiver really IS the hash node".
+        if recv == (hash_start, hash_end) {
+            return false;
+        }
+        let Some(sel) = call_f.selector else { return false };
+        !self.mmci_same_line(sel.0, recv.0)
+    }
+
+    fn mmci_skip_for_context(&self, node: &ruby_prism::CallNode<'_>, pair_idx: Option<usize>) -> bool {
+        match pair_idx {
+            Some(idx) => self.mmci_inside_multiline_chain_arg(idx),
+            None => {
+                let l = node.location();
+                self.mmci_not_for_this_cop(l.start_offset(), l.end_offset())
+            }
+        }
+    }
+
+    /// `not_for_this_cop?`: is `node` nested inside an explicit `(...)`/
+    /// `begin...end` group, or strictly inside some OTHER call's
+    /// parenthesized argument list?
+    fn mmci_not_for_this_cop(&self, node_start: usize, node_end: usize) -> bool {
+        let len = self.mmci_ancestors.len();
+        for i in (0..len.saturating_sub(1)).rev() {
+            let f = &self.mmci_ancestors[i];
+            if f.tag == MmciTag::Begin {
+                return true;
+            }
+            if f.tag == MmciTag::Call {
+                if let (Some((op_start, b'(')), Some(close_end)) = (f.opening, f.closing_end) {
+                    if node_start > op_start && node_end < close_end {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `kw_node_with_special_indentation`: nearest if/unless/while/until/
+    /// for/return ancestor whose predicate/collection/first-return-value
+    /// range CONTAINS `node` — a ternary `IfNode` (`special_range` left
+    /// `None` by `mmci_classify`) transparently fails the match and the walk
+    /// continues outward, matching upstream's `next if ... ternary?`.
+    fn mmci_kw_node_with_special_indentation(&self, node_start: usize, node_end: usize) -> Option<MmciKwInfo<'a>> {
+        let len = self.mmci_ancestors.len();
+        for i in (0..len.saturating_sub(1)).rev() {
+            let f = &self.mmci_ancestors[i];
+            let is_kw = matches!(
+                f.tag,
+                MmciTag::If | MmciTag::Unless | MmciTag::While | MmciTag::Until | MmciTag::For | MmciTag::Return
+            );
+            if !is_kw {
+                continue;
+            }
+            let Some(range) = f.special_range else { continue };
+            if node_start >= range.0 && node_end <= range.1 {
+                return Some(MmciKwInfo { range, keyword: f.keyword, modifier_form: f.modifier_form });
+            }
+        }
+        None
+    }
+
+    /// `correct_indentation`: the configured width, doubled (plus `Layout/
+    /// IndentationWidth`'s own `Width`, in case it differs from THIS cop's
+    /// configured width) for a node inside a prefix keyword's special
+    /// indentation zone — UNLESS that keyword is a postfix `if`/`unless`
+    /// modifier (`postfix_conditional?`, folded into `modifier_form` — only
+    /// ever `true` for If/Unless frames; While/Until/For/Return always
+    /// leave it `false`, matching `node.if_type?` being unconditionally
+    /// false for them).
+    fn mmci_correct_indentation(&self, node_start: usize, node_end: usize) -> usize {
+        let width = self.mmci_configured_indentation_width();
+        match self.mmci_kw_node_with_special_indentation(node_start, node_end) {
+            Some(kw) if !kw.modifier_form => width + self.mmci_layout_indentation_width_width(),
+            _ => width,
+        }
+    }
+
+    /// `operation_description`: the message's trailing "spanning multiple
+    /// lines" qualifier.
+    fn mmci_operation_description(&self, node_start: usize, node_end: usize, candidate: Option<(usize, usize)>) -> String {
+        if let Some(kw) = self.mmci_kw_node_with_special_indentation(node_start, node_end) {
+            let keyword = String::from_utf8_lossy(kw.keyword).into_owned();
+            let kind = if keyword == "for" { "collection" } else { "condition" };
+            let article = if keyword.starts_with('i') || keyword.starts_with('u') { "an" } else { "a" };
+            return format!("a {kind} in {article} `{keyword}` statement");
+        }
+        if self.mmci_part_of_assignment_rhs(candidate).is_some() {
+            return "an expression in an assignment".to_string();
+        }
+        "an expression".to_string()
+    }
+
+    /// `argument_in_method_call(node, :with_parentheses)`: walking OUTWARD,
+    /// stop dead (return `false`) the instant a Block frame is met; among
+    /// Call frames, skip setters and non-parenthesized calls, and for the
+    /// first parenthesized non-setter call found, check whether `node` sits
+    /// within one of ITS OWN top-level arguments — if not, keep scanning
+    /// outward (matches upstream's `.find` block returning a falsy value
+    /// without `break`ing).
+    fn mmci_argument_in_method_call_with_parens(&self, node_start: usize, node_end: usize) -> bool {
+        let len = self.mmci_ancestors.len();
+        for i in (0..len.saturating_sub(1)).rev() {
+            let f = &self.mmci_ancestors[i];
+            if f.tag == MmciTag::Block {
+                return false;
+            }
+            if f.tag != MmciTag::Call || f.is_setter {
+                continue;
+            }
+            if !matches!(f.opening, Some((_, b'('))) {
+                continue;
+            }
+            if f.any_arg_ranges.iter().any(|&(s, e)| node_start >= s && node_end <= e) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `get_dot_right_above`: nearest-outward-first, unfiltered scan for a
+    /// Call frame whose own dot sits exactly one line above `node`'s dot, at
+    /// the identical column — see the module doc's note on why an extra
+    /// spurious frame here is a purely theoretical (fixture-unexercised)
+    /// risk.
+    fn mmci_get_dot_right_above(&self, node_dot: (usize, usize)) -> Option<(usize, usize)> {
+        let node_dot_line = self.mmci_line(node_dot.0);
+        let node_dot_col = self.mmci_col(node_dot.0);
+        let len = self.mmci_ancestors.len();
+        for i in (0..len.saturating_sub(1)).rev() {
+            let f = &self.mmci_ancestors[i];
+            if f.tag != MmciTag::Call {
+                continue;
+            }
+            let Some(dot) = f.dot else { continue };
+            if self.mmci_line(dot.0) + 1 == node_dot_line && self.mmci_col(dot.0) == node_dot_col {
+                let sel = f.selector?;
+                return Some((dot.0, sel.1));
+            }
+        }
+        None
+    }
+
+    /// `part_of_assignment_rhs`: walking outward, stop dead (no match at
+    /// all) at an UNALIGNED_RHS_TYPES ancestor or at a Block ancestor whose
+    /// OWN body contains `candidate`; otherwise the first Call-setter or
+    /// Assignment-family ancestor whose own RHS value CONTAINS `candidate`
+    /// (or `candidate` is `None`, meaning "existence only") is the match.
+    fn mmci_part_of_assignment_rhs(&self, candidate: Option<(usize, usize)>) -> Option<(usize, usize)> {
+        let len = self.mmci_ancestors.len();
+        for i in (0..len.saturating_sub(1)).rev() {
+            let f = &self.mmci_ancestors[i];
+            if Self::mmci_disqualified_rhs(candidate, f) {
+                return None;
+            }
+            if let Some(r) = Self::mmci_valid_rhs(candidate, f) {
+                return Some(r);
+            }
+        }
+        None
+    }
+    fn mmci_disqualified_rhs(candidate: Option<(usize, usize)>, f: &MmciFrame<'_>) -> bool {
+        if matches!(
+            f.tag,
+            MmciTag::If | MmciTag::Unless | MmciTag::While | MmciTag::Until | MmciTag::For | MmciTag::Return | MmciTag::Array
+        ) {
+            return true;
+        }
+        if f.tag == MmciTag::Begin && f.is_kwbegin {
+            return true;
+        }
+        if f.tag == MmciTag::Block {
+            if let (Some(body), Some(c)) = (f.body_range, candidate) {
+                return c.0 >= body.0 && c.1 <= body.1;
+            }
+        }
+        false
+    }
+    fn mmci_valid_rhs(candidate: Option<(usize, usize)>, f: &MmciFrame<'_>) -> Option<(usize, usize)> {
+        if f.tag == MmciTag::Call {
+            if !f.is_setter {
+                return None;
+            }
+            let last = f.last_arg_range?;
+            return mmci_within_opt(candidate, last).then_some(last);
+        }
+        if f.tag == MmciTag::Assignment {
+            let r = f.rhs_range?;
+            return mmci_within_opt(candidate, r).then_some(r);
+        }
+        None
+    }
+
+    /// `operation_rhs`: `node.receiver.each_ancestor(:send)` — starting AT
+    /// `node` itself (its receiver's own immediate parent), NOT excluding
+    /// it, unlike every other walk here — filtered to a plain (non-safe-nav)
+    /// operator-method call whose first argument contains the receiver.
+    fn mmci_operation_rhs(&self, recv_range: (usize, usize)) -> Option<(usize, usize)> {
+        let len = self.mmci_ancestors.len();
+        for i in (0..len).rev() {
+            let f = &self.mmci_ancestors[i];
+            if f.tag != MmciTag::Call || f.is_safe_nav || !f.is_operator_method {
+                continue;
+            }
+            let Some(first_arg) = f.first_arg_range else { continue };
+            if recv_range.0 >= first_arg.0 && recv_range.1 <= first_arg.1 {
+                return Some(first_arg);
+            }
+        }
+        None
+    }
+
+    /// `extra_indentation`: `indented_relative_to_receiver`-only extra step
+    /// — the configured width, minus a splat/double-splat parent's own
+    /// operator length, when `node`'s real one-hop ancestor is a `Splat`/
+    /// `AssocSplatNode` (no block-wrapper unwrap needed — see module doc).
+    fn mmci_extra_indentation(&self, style: &str) -> i64 {
+        if style != "indented_relative_to_receiver" {
+            return 0;
+        }
+        let width = self.mmci_configured_indentation_width() as i64;
+        let len = self.mmci_ancestors.len();
+        if len >= 2 {
+            let f = &self.mmci_ancestors[len - 2];
+            if matches!(f.tag, MmciTag::Splat | MmciTag::Kwsplat) {
+                if let Some(oplen) = f.operator_len {
+                    return width - oplen as i64;
+                }
+            }
+        }
+        width
+    }
+
+    fn mmci_delta_ctx(
+        &self,
+        rhs: (usize, usize),
+        correct_column: i64,
+        base: Option<(usize, usize)>,
+        hash_pair_base_column: Option<usize>,
+    ) -> Option<MmciCtx> {
+        let delta = correct_column - self.mmci_col(rhs.0) as i64;
+        if delta == 0 {
+            return None;
+        }
+        Some(MmciCtx { base, hash_pair_base_column, column_delta: delta })
+    }
+
+    // -- descend-only helpers (no ancestor stack — pure live-node walks) --
+
+    /// `find_hash_pair_alignment_base`: fires only when the WHOLE chain's
+    /// base receiver is itself an explicit `{...}` hash literal.
+    fn mmci_find_hash_pair_alignment_base(node: &ruby_prism::CallNode<'_>) -> Option<(usize, usize)> {
+        let (chain, base) = mmci_chain_to_base(node);
+        if base.as_hash_node().is_none() {
+            return None;
+        }
+        let (first_call, _idx) = mmci_first_call_has_a_dot_idx(&chain);
+        mmci_dot_selector_range(&first_call)
+    }
+
+    fn mmci_single_line_block_receiver<'b>(&self, receiver: &ruby_prism::Node<'b>) -> Option<ruby_prism::CallNode<'b>> {
+        let c = receiver.as_call_node()?;
+        let blk = c.block().and_then(|b| b.as_block_node())?;
+        let start = c.location().start_offset();
+        let end = blk.location().end_offset();
+        if self.mmci_line(start) == self.mmci_last_line(end) {
+            Some(mmci_dup_call(&c))
+        } else {
+            None
+        }
+    }
+
+    fn mmci_is_multiline(&self, n: &ruby_prism::Node<'_>) -> bool {
+        let l = n.location();
+        self.mmci_line(l.start_offset()) != self.mmci_last_line(l.end_offset())
+    }
+    fn mmci_is_single_line(&self, n: &ruby_prism::Node<'_>) -> bool {
+        !self.mmci_is_multiline(n)
+    }
+
+    /// `after_multiline_block_base`: `first_call`'s own real "consumer" is
+    /// simply the PREVIOUS chain entry (`chain[first_call_idx - 1]`) —
+    /// `chain` is built by literally following `.receiver()` one hop at a
+    /// time, so adjacent entries are exactly parent/child in the real tree,
+    /// with no block-wrapper divergence possible here (this walk never
+    /// climbs past a call that OWNS `first_call` as ITS OWN attached block —
+    /// it only reads `first_call`'s OWN block, a plain field access).
+    fn mmci_after_multiline_block_base(
+        &self,
+        chain: &[ruby_prism::CallNode<'_>],
+        first_call_idx: usize,
+        node: &ruby_prism::CallNode<'_>,
+    ) -> Option<(usize, usize)> {
+        let first_call = &chain[first_call_idx];
+        let blk = first_call.block().and_then(|b| b.as_block_node())?;
+        if !self.mmci_is_multiline(&blk.as_node()) {
+            return None;
+        }
+        if first_call_idx == 0 {
+            return None;
+        }
+        let after_block = &chain[first_call_idx - 1];
+        if after_block.call_operator_loc().is_none() {
+            return None;
+        }
+        if after_block.location().end_offset() == node.location().end_offset() {
+            return None;
+        }
+        mmci_dot_selector_range(after_block)
+    }
+
+    fn mmci_first_dot_alignment_base(&self, node: &ruby_prism::CallNode<'_>, rhs: (usize, usize)) -> Option<(usize, usize)> {
+        if !self.mmci_rhs_starts_with_dot(rhs) {
+            return None;
+        }
+        let (chain, _base) = mmci_chain_to_base(node);
+        let (first_call, idx) = mmci_first_call_has_a_dot_idx(&chain);
+        let dot = first_call.call_operator_loc()?;
+        // `first_call == node` (object identity): every call along a
+        // receiver chain shares the SAME start offset (they all bottom out
+        // at the same base receiver), so only the END offset reliably
+        // distinguishes distinct nodes here.
+        if first_call.location().end_offset() == node.location().end_offset() {
+            return None;
+        }
+        if let Some(b) = self.mmci_after_multiline_block_base(&chain, idx, node) {
+            return Some(b);
+        }
+        let recv = first_call.receiver()?;
+        if !self.mmci_same_line(dot.start_offset(), recv.location().start_offset()) {
+            return None;
+        }
+        let sel = first_call.message_loc()?;
+        Some((dot.start_offset(), sel.end_offset()))
+    }
+
+    fn mmci_aligned_with_first_line_dot(&self, node: &ruby_prism::CallNode<'_>, rhs: (usize, usize)) -> bool {
+        if !self.mmci_rhs_starts_with_dot(rhs) {
+            return false;
+        }
+        let (chain, _base) = mmci_chain_to_base(node);
+        let (first_call, _idx) = mmci_first_call_has_a_dot_idx(&chain);
+        if let Some(recv) = node.receiver() {
+            if first_call.location().end_offset() == recv.location().end_offset() {
+                return false;
+            }
+        }
+        let Some(dot) = first_call.call_operator_loc() else { return false };
+        self.mmci_line(dot.start_offset()) == self.mmci_line(node.location().start_offset())
+            && self.mmci_col(dot.start_offset()) == self.mmci_col(rhs.0)
+    }
+
+    fn mmci_method_on_receiver_last_line(&self, dot: &ruby_prism::Location<'_>, base: &ruby_prism::Node<'_>, is_type: bool) -> bool {
+        is_type && self.mmci_same_line(dot.start_offset(), base.location().end_offset().saturating_sub(1))
+    }
+
+    fn mmci_first_call_alignment_node<'b>(&self, node: &ruby_prism::CallNode<'b>) -> Option<ruby_prism::CallNode<'b>> {
+        let (chain, base) = mmci_chain_to_base(node);
+        let (fc, _idx) = mmci_first_call_has_a_dot_idx(&chain);
+        let dot = fc.call_operator_loc()?;
+        if self.mmci_method_on_receiver_last_line(&dot, &base, base.as_array_node().is_some()) {
+            return Some(fc);
+        }
+        if self.mmci_line(dot.start_offset()) != self.mmci_line(fc.location().start_offset()) {
+            return None;
+        }
+        let is_begin = base.as_begin_node().is_some() || base.as_parentheses_node().is_some();
+        if self.mmci_method_on_receiver_last_line(&dot, &base, is_begin) {
+            return None;
+        }
+        Some(fc)
+    }
+
+    fn mmci_find_hash_method_base_in_receiver_chain(&self, node: &ruby_prism::CallNode<'_>) -> Option<(usize, usize)> {
+        let mut receiver_chain = node.receiver()?;
+        loop {
+            let Some(rc) = receiver_chain.as_call_node() else { break };
+            let base_receiver = rc.receiver();
+            let matches = match &base_receiver {
+                Some(br) => {
+                    br.as_hash_node().is_some()
+                        || match rc.call_operator_loc() {
+                            Some(dot) => self.mmci_method_on_receiver_last_line(
+                                &dot,
+                                br,
+                                br.as_begin_node().is_some() || br.as_parentheses_node().is_some(),
+                            ),
+                            None => false,
+                        }
+                }
+                None => false,
+            };
+            if matches {
+                return mmci_dot_selector_range(&rc);
+            }
+            match base_receiver {
+                Some(br) => receiver_chain = br,
+                None => break,
+            }
+        }
+        None
+    }
+
+    fn mmci_receiver_alignment_base(&self, node: &ruby_prism::CallNode<'_>) -> Option<(usize, usize)> {
+        if let Some(b) = self.mmci_find_hash_method_base_in_receiver_chain(node) {
+            return Some(b);
+        }
+        let (chain, _base) = mmci_chain_to_base(node);
+        let (fc, _idx) = mmci_first_call_has_a_dot_idx(&chain);
+        let recv = fc.receiver()?;
+        let l = recv.location();
+        Some((l.start_offset(), l.end_offset()))
+    }
+
+    fn mmci_find_continuation_node<'b>(&self, node: &ruby_prism::CallNode<'b>) -> Option<ruby_prism::CallNode<'b>> {
+        let receiver = node.receiver()?;
+        if let Some(c) = self.mmci_single_line_block_receiver(&receiver) {
+            return Some(c);
+        }
+        let rc = receiver.as_call_node()?;
+        let dot = rc.call_operator_loc()?;
+        let rc_receiver = rc.receiver()?;
+        let node_blk = node.block().and_then(|b| b.as_block_node())?;
+        if (rc_receiver.as_begin_node().is_some() || rc_receiver.as_parentheses_node().is_some())
+            && self.mmci_is_single_line(&node_blk.as_node())
+        {
+            return Some(mmci_dup_call(&rc));
+        }
+        if self.mmci_line(dot.start_offset()) <= self.mmci_last_line(rc_receiver.location().end_offset()) {
+            return None;
+        }
+        Some(mmci_dup_call(&rc))
+    }
+
+    fn mmci_first_any_block_descendant<'x>(
+        node: &ruby_prism::Node<'x>,
+    ) -> Option<(Option<ruby_prism::CallNode<'x>>, ruby_prism::Node<'x>)> {
+        if let Some(l) = node.as_lambda_node() {
+            return Some((None, l.as_node()));
+        }
+        if let Some(c) = node.as_call_node() {
+            if let Some(bn) = c.block().and_then(|b| b.as_block_node()) {
+                return Some((Some(mmci_dup_call(&c)), bn.as_node()));
+            }
+            if let Some(r) = c.receiver() {
+                if let Some(found) = Self::mmci_first_any_block_descendant(&r) {
+                    return Some(found);
+                }
+            }
+            if let Some(args) = c.arguments() {
+                for a in args.arguments().iter() {
+                    if let Some(found) = Self::mmci_first_any_block_descendant(&a) {
+                        return Some(found);
+                    }
+                }
+            }
+            return None;
+        }
+        if let Some(p) = node.as_parentheses_node() {
+            return p.body().and_then(|b| Self::mmci_first_any_block_descendant(&b));
+        }
+        if let Some(b) = node.as_begin_node() {
+            if let Some(s) = b.statements() {
+                for st in s.body().iter() {
+                    if let Some(found) = Self::mmci_first_any_block_descendant(&st) {
+                        return Some(found);
+                    }
+                }
+            }
+            return None;
+        }
+        if let Some(s) = node.as_statements_node() {
+            for st in s.body().iter() {
+                if let Some(found) = Self::mmci_first_any_block_descendant(&st) {
+                    return Some(found);
+                }
+            }
+            return None;
+        }
+        if let Some(arr) = node.as_array_node() {
+            for e in arr.elements().iter() {
+                if let Some(found) = Self::mmci_first_any_block_descendant(&e) {
+                    return Some(found);
+                }
+            }
+            return None;
+        }
+        if let Some(h) = node.as_hash_node() {
+            for e in h.elements().iter() {
+                if let Some(found) = Self::mmci_first_any_block_descendant(&e) {
+                    return Some(found);
+                }
+            }
+            return None;
+        }
+        if let Some(kw) = node.as_keyword_hash_node() {
+            for e in kw.elements().iter() {
+                if let Some(found) = Self::mmci_first_any_block_descendant(&e) {
+                    return Some(found);
+                }
+            }
+            return None;
+        }
+        if let Some(a) = node.as_assoc_node() {
+            if let Some(found) = Self::mmci_first_any_block_descendant(&a.key()) {
+                return Some(found);
+            }
+            return Self::mmci_first_any_block_descendant(&a.value());
+        }
+        None
+    }
+
+    fn mmci_handle_descendant_block<'b>(&self, node: &ruby_prism::CallNode<'b>) -> Option<ruby_prism::CallNode<'b>> {
+        let receiver = node.receiver()?;
+        if let Some(c) = self.mmci_single_line_block_receiver(&receiver) {
+            return Some(c);
+        }
+        let (owner, blk) = Self::mmci_first_any_block_descendant(&node.as_node())?;
+        if !self.mmci_is_multiline(&blk) {
+            return None;
+        }
+        if let Some(c) = receiver.as_call_node() {
+            return Some(c);
+        }
+        owner
+    }
+
+    fn mmci_find_multiline_block_chain_node<'b>(&self, node: &ruby_prism::CallNode<'b>) -> Option<ruby_prism::CallNode<'b>> {
+        if node.block().and_then(|b| b.as_block_node()).is_some() {
+            self.mmci_find_continuation_node(node)
+        } else {
+            self.mmci_handle_descendant_block(node)
+        }
+    }
+
+    fn mmci_semantic_alignment_node(&self, node: &ruby_prism::CallNode<'_>) -> Option<(usize, usize)> {
+        let l = node.location();
+        if self.mmci_argument_in_method_call_with_parens(l.start_offset(), l.end_offset()) {
+            return None;
+        }
+        if let Some(dot) = node.call_operator_loc() {
+            if let Some(b) = self.mmci_get_dot_right_above((dot.start_offset(), dot.end_offset())) {
+                return Some(b);
+            }
+        }
+        if let Some(c) = self.mmci_find_multiline_block_chain_node(node) {
+            if let Some(r) = mmci_dot_selector_range(&c) {
+                return Some(r);
+            }
+        }
+        self.mmci_first_call_alignment_node(node).and_then(|c| mmci_dot_selector_range(&c))
+    }
+
+    fn mmci_semantic_alignment_base(&self, node: &ruby_prism::CallNode<'_>, rhs: (usize, usize)) -> Option<(usize, usize)> {
+        if !self.mmci_rhs_starts_with_dot(rhs) {
+            return None;
+        }
+        self.mmci_semantic_alignment_node(node)
+    }
+
+    fn mmci_syntactic_alignment_base(&self, node: &ruby_prism::CallNode<'_>, rhs: (usize, usize)) -> Option<(usize, usize)> {
+        let l = node.location();
+        if let Some(kw) = self.mmci_kw_node_with_special_indentation(l.start_offset(), l.end_offset()) {
+            return Some(kw.range);
+        }
+        if let Some(b) = self.mmci_part_of_assignment_rhs(Some(rhs)) {
+            return Some(b);
+        }
+        let recv = node.receiver()?;
+        let recv_range = { let rl = recv.location(); (rl.start_offset(), rl.end_offset()) };
+        self.mmci_operation_rhs(recv_range)
+    }
+
+    fn mmci_alignment_base(&self, node: &ruby_prism::CallNode<'_>, rhs: (usize, usize), style: &str) -> Option<(usize, usize)> {
+        match style {
+            "aligned" => self.mmci_semantic_alignment_base(node, rhs).or_else(|| self.mmci_syntactic_alignment_base(node, rhs)),
+            "indented_relative_to_receiver" => self.mmci_receiver_alignment_base(node),
+            _ => None,
+        }
+    }
+
+    fn mmci_check_regular_indentation(
+        &self,
+        node: &ruby_prism::CallNode<'_>,
+        lhs_range: (usize, usize),
+        rhs: (usize, usize),
+        style: &str,
+    ) -> Option<MmciCtx> {
+        let base = self.mmci_alignment_base(node, rhs, style);
+        let correct_column = if let Some(b) = base {
+            self.mmci_col(b.0) as i64 + self.mmci_extra_indentation(style)
+        } else {
+            let l = node.location();
+            self.mmci_indentation_of(lhs_range.0) as i64 + self.mmci_correct_indentation(l.start_offset(), l.end_offset()) as i64
+        };
+        self.mmci_delta_ctx(rhs, correct_column, base, None)
+    }
+
+    fn mmci_check_hash_pair_indented_style(&self, rhs: (usize, usize), pair_idx: usize) -> Option<MmciCtx> {
+        let key_range = self.mmci_ancestors[pair_idx].key_range?;
+        let key_col = self.mmci_col(key_range.0) as i64;
+        let width = self.mmci_configured_indentation_width() as i64;
+        let correct_column = key_col + width * 2;
+        let hpbc = (key_col + width) as usize;
+        self.mmci_delta_ctx(rhs, correct_column, None, Some(hpbc))
+    }
+
+    fn mmci_check_hash_pair_indentation(&self, node: &ruby_prism::CallNode<'_>, rhs: (usize, usize), pair_idx: usize) -> Option<MmciCtx> {
+        let mut base = Self::mmci_find_hash_pair_alignment_base(node);
+        if base.is_none() && self.mmci_inside_multiline_chain_arg(pair_idx) {
+            return None;
+        }
+        if base.is_none() {
+            base = self.mmci_first_dot_alignment_base(node, rhs);
+        }
+        if base.is_none() {
+            base = Some(self.mmci_left_hand_side(node));
+        }
+        let base = base.unwrap();
+        if self.mmci_aligned_with_first_line_dot(node, rhs) {
+            return None;
+        }
+        self.mmci_delta_ctx(rhs, self.mmci_col(base.0) as i64, Some(base), None)
+    }
+
+    fn mmci_offending_range(
+        &self,
+        node: &ruby_prism::CallNode<'_>,
+        lhs_range: (usize, usize),
+        rhs: (usize, usize),
+        style: &str,
+    ) -> Option<MmciCtx> {
+        let pair_idx = self.mmci_find_pair_ancestor_idx();
+        if let Some(idx) = pair_idx {
+            if style == "aligned" {
+                return self.mmci_check_hash_pair_indentation(node, rhs, idx);
+            }
+            if style == "indented" {
+                let (_, base) = mmci_chain_to_base(node);
+                if base.as_hash_node().is_some() {
+                    return self.mmci_check_hash_pair_indented_style(rhs, idx);
+                }
+            }
+        }
+        if self.mmci_skip_for_context(node, pair_idx) {
+            return None;
+        }
+        self.mmci_check_regular_indentation(node, lhs_range, rhs, style)
+    }
+
+    /// `base.source[/[^\n]*/]`: `base`'s own text, truncated to its first
+    /// physical line.
+    fn mmci_base_source(&self, base: (usize, usize)) -> String {
+        let mut end = base.1;
+        if let Some(nl) = self.src[base.0..base.1].iter().position(|&b| b == b'\n') {
+            end = base.0 + nl;
+        }
+        String::from_utf8_lossy(&self.src[base.0..end]).into_owned()
+    }
+
+    fn mmci_message(&self, style: &str, ctx: &MmciCtx, node: &ruby_prism::CallNode<'_>, rhs: (usize, usize), lhs_range: (usize, usize)) -> String {
+        let rhs_text = String::from_utf8_lossy(&self.src[rhs.0..rhs.1]);
+        if let Some(base) = ctx.base {
+            if style == "indented_relative_to_receiver" {
+                let width = self.mmci_configured_indentation_width();
+                return format!(
+                    "Indent `{}` {} spaces more than `{}` on line {}.",
+                    rhs_text,
+                    width,
+                    self.mmci_base_source(base),
+                    self.mmci_line(base.0)
+                );
+            }
+            if style == "aligned" {
+                return format!("Align `{}` with `{}` on line {}.", rhs_text, self.mmci_base_source(base), self.mmci_line(base.0));
+            }
+        }
+        let l = node.location();
+        let (node_start, node_end) = (l.start_offset(), l.end_offset());
+        let (used, expected) = if let Some(hpbc) = ctx.hash_pair_base_column {
+            (self.mmci_col(rhs.0) as i64 - hpbc as i64, self.mmci_configured_indentation_width() as i64)
+        } else {
+            (
+                self.mmci_col(rhs.0) as i64 - self.mmci_indentation_of(lhs_range.0) as i64,
+                self.mmci_correct_indentation(node_start, node_end) as i64,
+            )
+        };
+        let what = self.mmci_operation_description(node_start, node_end, Some(rhs));
+        format!("Use {expected} (not {used}) spaces for indenting {what} spanning multiple lines.")
+    }
+
+    /// `AlignmentCorrector.correct`'s per-line walk, ported verbatim (see
+    /// `argalign_correct`'s doc for the same shared shape) — deliberately
+    /// NOT guarded against heredoc/string-interior taboo ranges or a tabs-
+    /// indentation-style bail-out beyond the plain `Layout/IndentationStyle`
+    /// check in `mmci_autocorrect`'s caller; the fixture has no heredoc
+    /// inside an offending span.
+    fn mmci_align_shift(&mut self, start: usize, end: usize, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let mut line_begin = start;
+        loop {
+            if delta > 0 {
+                if self.src.get(line_begin) != Some(&b'\n') {
+                    self.fixes.push((line_begin, line_begin, vec![b' '; delta as usize]));
+                }
+            } else {
+                let n = (-delta) as usize;
+                let starts_with_space = self.src.get(line_begin) == Some(&b' ');
+                let (rs, re) = if starts_with_space { (line_begin, line_begin + n) } else { (line_begin.saturating_sub(n), line_begin) };
+                if re <= self.src.len() && rs < re && self.src[rs..re].iter().all(|&b| b == b' ' || b == b'\t') {
+                    self.fixes.push((rs, re, Vec::new()));
+                }
+            }
+            let mut p = line_begin;
+            while p < end && self.src[p] != b'\n' {
+                p += 1;
+            }
+            if p >= end {
+                break;
+            }
+            line_begin = p + 1;
+        }
+    }
+
+    /// `autocorrect`: when the OFFENDING call itself owns a directly
+    /// attached block, upstream re-indents the selector's WHOLE physical
+    /// line (`correct_selector_only`) plus the block's own body span AND
+    /// its closing line (`correct_block`) — all by the SAME delta. Note
+    /// `correct_block`'s FIRST shift targets the block body's OWN span
+    /// (not padded out to a whole line): when the body sits on the SAME
+    /// line as the block's opening (`{ |x| body }`), this reproduces a real
+    /// upstream quirk the fixture pins byte-for-byte (see "method chain
+    /// with array literal receiver" in the fixture — the space right after
+    /// `|entry|` gets eaten by a negative-delta backward removal anchored
+    /// at the body's own start, exactly like real rubocop does).
+    fn mmci_autocorrect(&mut self, node: &ruby_prism::CallNode<'_>, rhs: (usize, usize), delta: i64) {
+        if self.cfg.enforced_style("Layout/IndentationStyle") == "tabs" {
+            return;
+        }
+        if let Some(blk) = node.block().and_then(|b| b.as_block_node()) {
+            let ls = self.mmci_line_start(rhs.0);
+            let le = self.mmci_line_end(rhs.0);
+            self.mmci_align_shift(ls, le, delta);
+            if let Some(body) = blk.body() {
+                let l = body.location();
+                self.mmci_align_shift(l.start_offset(), l.end_offset(), delta);
+            }
+            let cl = blk.closing_loc();
+            let cls = self.mmci_line_start(cl.start_offset());
+            let cle = self.mmci_line_end(cl.start_offset());
+            self.mmci_align_shift(cls, cle, delta);
+        } else {
+            self.mmci_align_shift(rhs.0, rhs.1, delta);
+        }
+    }
+
+    /// Layout/MultilineMethodCallIndentation — see the module doc above
+    /// this `impl` block for the ancestor model and the prism-vs-whitequark
+    /// block divergence this whole port has to account for.
+    pub(crate) fn check_multiline_method_call_indentation(&mut self, node: &ruby_prism::CallNode) {
+        const COP: &str = "Layout/MultilineMethodCallIndentation";
+        if !self.on(COP) {
+            return;
+        }
+        if node.receiver().is_none() || node.name().as_slice() == b"[]" {
+            return;
+        }
+        let Some(rhs) = self.mmci_right_hand_side(node) else { return };
+        if !self.mmci_begins_its_line(rhs.0) {
+            return;
+        }
+        let style = self.cfg.enforced_style(COP).to_string();
+        let lhs_range = self.mmci_left_hand_side(node);
+        let Some(ctx) = self.mmci_offending_range(node, lhs_range, rhs, &style) else { return };
+        let msg = self.mmci_message(&style, &ctx, node, rhs, lhs_range);
+        self.push(rhs.0, COP, true, msg);
+        self.mmci_autocorrect(node, rhs, ctx.column_delta);
+    }
+}
+
+fn mmci_within_opt(candidate: Option<(usize, usize)>, range: (usize, usize)) -> bool {
+    match candidate {
+        None => true,
+        Some(c) => c.0 >= range.0 && c.1 <= range.1,
+    }
+}

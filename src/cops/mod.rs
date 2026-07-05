@@ -444,7 +444,7 @@ const IMPLEMENTED: &[&str] = &[
     "Style/Lambda", "Style/GuardClause", "Lint/LiteralAsCondition", "Lint/ShadowedArgument", "Lint/Void", "Style/HashSyntax", "Lint/UnusedBlockArgument", "Lint/UnusedMethodArgument", "Lint/UselessAccessModifier", "Style/HashEachMethods", "Style/MutableConstant", "Style/InverseMethods",
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
-    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment", "Lint/Syntax", "Layout/FirstArrayElementIndentation", "Layout/FirstHashElementIndentation", "Layout/MultilineOperationIndentation",
+    "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment", "Lint/Syntax", "Layout/FirstArrayElementIndentation", "Layout/FirstHashElementIndentation", "Layout/MultilineOperationIndentation", "Layout/MultilineMethodCallIndentation",
 ];
 
 impl Engine {
@@ -2189,6 +2189,23 @@ pub(crate) struct Cops<'a> {
     // every other kind is safe to leave untracked (transparent, same as
     // `each_ancestor` skipping past it).
     pub(crate) moi_stack: Vec<MoiFrame>,
+    // Layout/MultilineMethodCallIndentation: a real (literal, not
+    // whitequark-shape-remapped) ancestor stack — but, like `rp_ancestors`,
+    // storing PRE-CLASSIFIED per-node data (`layout::MmciFrame<'a>`, built
+    // by `layout::Cops::mmci_classify`) rather than the live `ruby_prism::
+    // Node` itself: this method's `node` parameter is generic over
+    // `Visit<'pr>`'s own `'pr`, unrelated to `Cops<'a>`'s `'a`, so nothing
+    // borrowed from it can be moved into an `'a`-tied field — `mmci_classify`
+    // immediately reduces every node to plain `usize` offsets and `&'a [u8]`
+    // slices cut fresh from `self.src`. TOP entry is always the node
+    // currently being visited (pushed on entry, like `rp_ancestors`/
+    // `sak_ancestors`), so `each_ancestor`-style walks read `self.
+    // mmci_ancestors[..len - 1]` in reverse. See `check_multiline_method_
+    // call_indentation`'s module doc (top of its section in layout.rs) for
+    // the prism-vs-whitequark block-wrapping divergence this stack has to
+    // account for, and the one theoretical (fixture-unexercised) gap it
+    // leaves open.
+    pub(crate) mmci_ancestors: Vec<layout::MmciFrame<'a>>,
 }
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
@@ -6180,6 +6197,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_parentheses_as_grouped_expression(node);
         self.check_non_nil_check(node);
         self.check_multiline_method_call_brace_layout(node);
+        self.check_multiline_method_call_indentation(node);
         self.check_closing_parenthesis_indentation_call(node);
         // Naming/AsciiIdentifiers scans tIDENTIFIER tokens — method call
         // selectors included (weird.なまえ); operators/[] have no message_loc
@@ -6677,12 +6695,18 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.rp_ancestors.push(kind);
         let ba_kind = self.ba_classify(&node);
         self.ba_ancestors.push(ba_kind);
+        // Layout/MultilineMethodCallIndentation: see `mmci_ancestors`' field
+        // doc — `mmci_classify` only borrows `node`, so this can run in any
+        // order relative to the pushes above.
+        let mmci_frame = self.mmci_classify(&node);
+        self.mmci_ancestors.push(mmci_frame);
     }
     fn visit_branch_node_leave(&mut self) {
         self.sak_ancestors.pop();
         self.im_ancestors.pop();
         self.rp_ancestors.pop();
         self.ba_ancestors.pop();
+        self.mmci_ancestors.pop();
     }
     fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
         self.sak_ancestors.push(Self::sak_classify(&node));
@@ -6871,6 +6895,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         fhei_ignored: HashSet::new(),
         fhei_parent_pair: HashMap::new(),
         moi_stack: Vec::new(),
+        mmci_ancestors: Vec::new(),
         def_macro_args: HashSet::new(),
         sad_chain_receivers: HashSet::new(),
         sc_handled: HashSet::new(),
