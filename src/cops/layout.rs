@@ -15254,6 +15254,13 @@ impl<'a> super::Cops<'a> {
             return;
         }
         let Some(open) = node.opening_loc() else { return }; // left_parenthesis = node.loc.begin
+        // whitequark's `loc.begin` is nil for index sends (`foo[...]`,
+        // `foo[...] = x` — the whole bracketed list is the SELECTOR), so
+        // upstream's `return unless left_parenthesis` skips them. prism's
+        // `opening_loc` is the `[` there — only a real `(` qualifies.
+        if open.as_slice() != b"(" {
+            return;
+        }
         let Some(args) = node.arguments() else { return };
         let left_paren_start = open.start_offset();
         let paren_line = self.idx.loc(left_paren_start).0;
