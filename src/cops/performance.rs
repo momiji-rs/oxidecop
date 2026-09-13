@@ -114,9 +114,13 @@ impl<'a> Cops<'a> {
         }
         let flatten_level = flatten_arg_int(node, self.src);
         let warn_bare = self.cfg.get(COP, "EnabledForFlattenWithoutParams") == Some("true");
+        // `flatten_arg_int` is None both for a bare `flatten` and for a
+        // non-literal depth (`flatten(depth)`). The bare-flatten warning
+        // only applies when no argument is supplied.
+        let has_flatten_arg = positional_args(node) != 0;
         let (ok, extra) = match flatten_level {
             Some(1) => (true, false),
-            None if warn_bare => (true, true),
+            None if warn_bare && !has_flatten_arg => (true, true),
             _ => (false, false),
         };
         if !ok {

@@ -7565,6 +7565,7 @@ mod tests {
         assert_eq!(r.offenses.len(), 1);
         assert!(r.offenses[0].message.contains("Beware"));
         assert!(r.fixes.is_empty() || !r.offenses[0].correctable);
+        assert_eq!(offenses("[1].map { |e| [e] }.flatten(depth)\n", &warn), vec![]);
     }
 
     #[test]
@@ -7631,10 +7632,18 @@ mod tests {
         let re = perf("Performance/ReverseEach:\n  Enabled: true\n");
         assert_eq!(offenses("result = ([1].reverse.each {})\n", &re), vec![]);
         assert_eq!(offenses("[1, 2, 3].reverse.each(1) {}\n", &re), vec![]);
+        assert_eq!(offenses("[1].reverse().each {}\n", &re).len(), 1);
+        assert_eq!(offenses("[1].reverse.each() {}\n", &re).len(), 1);
 
         let sz = perf("Performance/Size:\n  Enabled: true\n");
         assert_eq!(offenses("obj.to_a(1).count\n", &sz), vec![]);
         assert_eq!(offenses("Array.count\n", &sz), vec![]);
+        assert_eq!(offenses("[1, 2].count()\n", &sz).len(), 1);
+        assert_eq!(offenses("(1..3).to_a().count()\n", &sz).len(), 1);
+        assert_eq!(offenses("Array[].count\n", &sz), vec![]);
+        assert_eq!(offenses("Array(1, 2).count\n", &sz), vec![]);
+        assert_eq!(offenses("Hash[].count\n", &sz), vec![]);
+        assert_eq!(offenses("Hash(1, 2).count\n", &sz), vec![]);
 
         let fm = perf("Performance/FlatMap:\n  Enabled: true\n");
         assert_eq!(offenses("obj.map(flag) { |e| [e] }.flatten(1)\n", &fm), vec![]);
