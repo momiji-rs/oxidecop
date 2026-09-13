@@ -400,7 +400,22 @@ impl Config {
     pub fn cop_config_enabled(&self, cop: &str) -> bool {
         match self.sections.get(cop).and_then(|s| s.get("Enabled")) {
             Some(v) => v != "false",
-            None => !self.all_disabled_by_default,
+            None => {
+                // RuboCop: a department `Enabled: false` disables every cop
+                // in that department unless the cop itself sets Enabled.
+                if let Some(dept) = cop.split('/').next() {
+                    if dept != cop
+                        && self
+                            .sections
+                            .get(dept)
+                            .and_then(|s| s.get("Enabled"))
+                            .is_some_and(|v| v == "false")
+                    {
+                        return false;
+                    }
+                }
+                !self.all_disabled_by_default
+            }
         }
     }
     pub fn param(&self, cop: &str, key: &str) -> Option<&str> {
@@ -680,6 +695,37 @@ mod tests {
         );
         assert!(cfg.enabled("Performance/ReverseEach"));
         assert!(!cfg.enabled("Performance/Size"));
+    }
+
+    #[test]
+    fn department_enabled_false_disables_plugin_cops() {
+        let cfg = Config::parse(
+            "plugins: rubocop-performance\nPerformance:\n  Enabled: false\n",
+        );
+        assert!(cfg.performance_plugin_loaded());
+        assert!(!cfg.enabled("Performance/ReverseEach"));
+        assert!(!cfg.enabled("Performance/Size"));
+        assert!(cfg.enabled("Style/Sample"));
+    }
+
+    #[test]
+    fn department_enabled_false_allows_per_cop_override() {
+        let cfg = Config::parse(
+            "plugins: rubocop-performance\nPerformance:\n  Enabled: false\n\
+             Performance/ReverseEach:\n  Enabled: true\n",
+        );
+        assert!(cfg.enabled("Performance/ReverseEach"));
+        assert!(!cfg.enabled("Performance/Size"));
+    }
+
+    #[test]
+    fn only_still_wins_over_department_enabled_false() {
+        let mut cfg = Config::parse(
+            "plugins: rubocop-performance\nPerformance:\n  Enabled: false\n",
+        );
+        cfg.only = Some(vec!["Performance/Size".into()]);
+        assert!(cfg.enabled("Performance/Size"));
+        assert!(!cfg.enabled("Performance/ReverseEach"));
     }
 
     #[test]
