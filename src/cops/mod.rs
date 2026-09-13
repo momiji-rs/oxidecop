@@ -9,6 +9,7 @@ mod lint_cops;
 mod metrics;
 mod migration;
 mod naming;
+mod performance;
 mod style;
 
 use crate::config::{parse_allowed_list, Config, SCHEMA};
@@ -445,6 +446,8 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
     "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment", "Lint/Syntax", "Layout/FirstArrayElementIndentation", "Layout/FirstHashElementIndentation", "Layout/MultilineOperationIndentation", "Layout/MultilineMethodCallIndentation",
+    "Performance/ReverseEach", "Performance/Size", "Performance/RangeInclude", "Performance/FlatMap",
+    "Performance/Detect", "Performance/StringReplacement", "Performance/RedundantMerge",
 ];
 
 impl Engine {
@@ -1793,6 +1796,10 @@ pub(crate) struct Cops<'a> {
     // node.parent.parent` is exactly this node's parent whenever the splat's
     // immediate container equals that value outright.
     pub(crate) rse_assignment_value: HashSet<usize>,
+    // Start offsets of nodes whose result is used by an assignment, an outer
+    // send (receiver or argument), or return/break/next — stands in for
+    // rubocop-ast's `node.value_used?` / ReverseEach's ancestor walk.
+    pub(crate) value_used_offsets: HashSet<usize>,
     // Style/DoubleNegation: a hand-rolled "ancestor stack" mirroring exactly
     // the node kinds `allowed_in_returns?` climbs through (prism gives no
     // parent pointers) — pushed/popped by `visit_def_node`, `visit_block_node`
@@ -2442,6 +2449,7 @@ macro_rules! assignment_write {
             $node.value(),
         );
         $self.rea_note_assignment(lhs_start, $node.name_loc().end_offset(), $node.value().location().start_offset());
+        $self.value_used_offsets.insert($node.value().location().start_offset());
     }};
 }
 macro_rules! assignment_operator_write {
@@ -2461,6 +2469,7 @@ macro_rules! assignment_operator_write {
             $node.value(),
         );
         $self.rea_note_assignment(lhs_start, $node.name_loc().end_offset(), $node.value().location().start_offset());
+        $self.value_used_offsets.insert($node.value().location().start_offset());
     }};
 }
 macro_rules! assignment_path_write {
@@ -2480,6 +2489,7 @@ macro_rules! assignment_path_write {
         );
         let rea_name_end = $node.target().name_loc().end_offset();
         $self.rea_note_assignment(lhs_start, rea_name_end, $node.value().location().start_offset());
+        $self.value_used_offsets.insert($node.value().location().start_offset());
     }};
 }
 macro_rules! assignment_path_operator_write {
@@ -2499,6 +2509,7 @@ macro_rules! assignment_path_operator_write {
         );
         let rea_name_end = $node.target().name_loc().end_offset();
         $self.rea_note_assignment(lhs_start, rea_name_end, $node.value().location().start_offset());
+        $self.value_used_offsets.insert($node.value().location().start_offset());
     }};
 }
 
@@ -4002,6 +4013,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if let Some(args) = node.arguments() {
             for a in args.arguments().iter() {
                 self.dn_return_arg_offsets.insert(a.location().start_offset());
+                self.value_used_offsets.insert(a.location().start_offset());
             }
         }
         let kw = node.keyword_loc();
@@ -4039,12 +4051,22 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ecc_mark_not_supported_parent(node.arguments());
         let kw = node.keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"break");
+        if let Some(args) = node.arguments() {
+            for a in args.arguments().iter() {
+                self.value_used_offsets.insert(a.location().start_offset());
+            }
+        }
         ruby_prism::visit_break_node(self, node);
     }
     fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
         self.ecc_mark_not_supported_parent(node.arguments());
         let kw = node.keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"next");
+        if let Some(args) = node.arguments() {
+            for a in args.arguments().iter() {
+                self.value_used_offsets.insert(a.location().start_offset());
+            }
+        }
         ruby_prism::visit_next_node(self, node);
     }
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
@@ -6191,6 +6213,13 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_lambda_method(node);
         self.check_preferred_hash_methods(node);
         self.check_sample(node);
+        self.check_reverse_each(node);
+        self.check_size(node);
+        self.check_range_include(node);
+        self.check_flat_map(node);
+        self.check_detect(node);
+        self.check_string_replacement(node);
+        self.check_redundant_merge(node);
         self.check_single_argument_dig(node);
         self.check_nested_parenthesized_calls(node);
         self.check_require_parentheses(node);
@@ -6426,6 +6455,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if isc_track {
                 self.isc_send_child.insert(r.location().start_offset());
             }
+            self.value_used_offsets.insert(r.location().start_offset());
             self.visit(&r);
         }
         if self.hot.semicolon {
@@ -6462,6 +6492,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let rse_track = self.on("Lint/RedundantSplatExpansion");
             let rse_call_range = node.location();
             for arg in a.arguments().iter() {
+                self.value_used_offsets.insert(arg.location().start_offset());
                 if track_args {
                     self.assumed_arg_offsets.insert(arg.location().start_offset());
                 }
@@ -6859,6 +6890,7 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         sgv_climb: HashMap::new(),
         rse_ctx: HashMap::new(),
         rse_assignment_value: HashSet::new(),
+        value_used_offsets: HashSet::new(),
         dn_ancestors: Vec::new(),
         dn_return_arg_offsets: HashSet::new(),
         dn_pending_define_method: None,
@@ -7372,5 +7404,158 @@ mod tests {
         // csend dispatch: zero-shapes flag, nonzero-shapes don't (on_send only)
         assert_eq!(offenses("x&.length == 0\n", cfg), vec![(1, 1, "Style/ZeroLengthPredicate")]);
         assert_eq!(offenses("x&.length > 0\n", cfg), vec![]);
+    }
+
+    fn perf(extra: &str) -> String {
+        format!("plugins: rubocop-performance\nAllCops:\n  DisabledByDefault: true\n{extra}")
+    }
+    fn lint_all(src: &str, cfg: &str) -> LintResult {
+        let cfg = Config::parse(cfg);
+        let eng = Engine::new(&cfg);
+        lint(src.as_bytes(), &cfg, &eng, "test.rb")
+    }
+    fn apply_fixes(src: &str, mut fixes: Vec<Fix>) -> String {
+        fixes.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut s = src.as_bytes().to_vec();
+        for (start, end, repl) in fixes {
+            if start > end || end > s.len() {
+                continue;
+            }
+            s.splice(start..end, repl);
+        }
+        String::from_utf8(s).unwrap()
+    }
+
+    #[test]
+    fn performance_silent_without_plugin() {
+        let cfg = "AllCops:\n  DisabledByDefault: true\nPerformance/ReverseEach:\n  Enabled: true\n";
+        assert_eq!(offenses("[1, 2, 3].reverse.each { |e| puts e }\n", cfg), vec![]);
+    }
+
+    #[test]
+    fn reverse_each_spec_cases() {
+        let cfg = perf("Performance/ReverseEach:\n  Enabled: true\n");
+        let src = "[1, 2, 3].reverse.each { |e| puts e }\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(r.offenses[0].cop, "Performance/ReverseEach");
+        assert_eq!(r.offenses[0].message, "Use `reverse_each` instead of `reverse.each`.");
+        assert_eq!(apply_fixes(src, r.fixes), "[1, 2, 3].reverse_each { |e| puts e }\n");
+
+        assert_eq!(offenses("array&.reverse.each { |e| puts e }\n", &cfg).len(), 1);
+        assert_eq!(offenses("array&.reverse&.each { |e| puts e }\n", &cfg).len(), 1);
+        assert_eq!(offenses("[1, 2, 3].reverse\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].each { |e| puts e }\n", &cfg), vec![]);
+        assert_eq!(offenses("ret = [1, 2, 3].reverse.each { |e| puts e }\n", &cfg), vec![]);
+        assert_eq!(offenses("@ret = [1, 2, 3].reverse.each { |e| puts e }\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].reverse.each { |e| puts e }.last\n", &cfg), vec![]);
+        assert_eq!(offenses("return [1, 2, 3].reverse.each { |e| puts e }\n", &cfg), vec![]);
+    }
+
+    #[test]
+    fn size_spec_cases() {
+        let cfg = perf("Performance/Size:\n  Enabled: true\n");
+        let src = "[1, 2, 3].count\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `size` instead of `count`.");
+        assert_eq!(apply_fixes(src, r.fixes), "[1, 2, 3].size\n");
+        assert_eq!(offenses("[1, 2, 3]&.count\n", &cfg).len(), 1);
+        assert_eq!(offenses("(1..3).to_a.count\n", &cfg).len(), 1);
+        assert_eq!(offenses("Array(1..5).count\n", &cfg).len(), 1);
+        assert_eq!(offenses("{a: 1, b: 2, c: 3}.count\n", &cfg).len(), 1);
+        assert_eq!(offenses("[[:foo, :bar], [1, 2]].to_h.count\n", &cfg).len(), 1);
+        assert_eq!(offenses("count(items)\n", &cfg), vec![]);
+        assert_eq!(offenses("object.count(items)\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].count { |e| e > 3 }\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].count(&:nil?)\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].count(1)\n", &cfg), vec![]);
+    }
+
+    #[test]
+    fn range_include_spec_cases() {
+        let cfg = perf("Performance/RangeInclude:\n  Enabled: true\n");
+        let src = "(a..b).include? 1\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `Range#cover?` instead of `Range#include?`.");
+        assert_eq!(apply_fixes(src, r.fixes), "(a..b).cover? 1\n");
+        assert_eq!(apply_fixes("(a..b).member? 1\n", lint_all("(a..b).member? 1\n", &cfg).fixes), "(a..b).cover? 1\n");
+        assert_eq!(apply_fixes("(a..b)&.include? 1\n", lint_all("(a..b)&.include? 1\n", &cfg).fixes), "(a..b)&.cover? 1\n");
+        assert_eq!(apply_fixes("(a...b).include?(1)\n", lint_all("(a...b).include?(1)\n", &cfg).fixes), "(a...b).cover?(1)\n");
+    }
+
+    #[test]
+    fn flat_map_spec_cases() {
+        let cfg = perf("Performance/FlatMap:\n  Enabled: true\n");
+        let src = "[1, 2, 3, 4].map { |e| [e, e] }.flatten(1)\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `flat_map` instead of `map...flatten`.");
+        assert_eq!(apply_fixes(src, r.fixes), "[1, 2, 3, 4].flat_map { |e| [e, e] }\n");
+        assert_eq!(
+            apply_fixes("[1, 2, 3, 4].map(&:foo).flatten(1)\n", lint_all("[1, 2, 3, 4].map(&:foo).flatten(1)\n", &cfg).fixes),
+            "[1, 2, 3, 4].flat_map(&:foo)\n"
+        );
+        assert_eq!(offenses("[1, 2, 3, 4].map { |e| [e, e] }.flatten(3)\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3, 4].map { |e| [e, e] }.flatten\n", &cfg), vec![]);
+        let warn = perf("Performance/FlatMap:\n  Enabled: true\n  EnabledForFlattenWithoutParams: true\n");
+        let r = lint_all("[1, 2, 3, 4].map { |e| [e, e] }.flatten\n", &warn);
+        assert_eq!(r.offenses.len(), 1);
+        assert!(r.offenses[0].message.contains("Beware"));
+        assert!(r.fixes.is_empty() || !r.offenses[0].correctable);
+    }
+
+    #[test]
+    fn detect_spec_cases() {
+        let cfg = perf("Performance/Detect:\n  Enabled: true\n");
+        let src = "[1, 2, 3].select { |i| i % 2 == 0 }.first\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `detect` instead of `select.first`.");
+        assert_eq!(apply_fixes(src, r.fixes), "[1, 2, 3].detect { |i| i % 2 == 0 }\n");
+        assert_eq!(
+            apply_fixes("[1, 2, 3].select { |i| i % 2 == 0 }.last\n", lint_all("[1, 2, 3].select { |i| i % 2 == 0 }.last\n", &cfg).fixes),
+            "[1, 2, 3].reverse.detect { |i| i % 2 == 0 }\n"
+        );
+        assert_eq!(
+            apply_fixes("[1, 2, 3].select(&:even?).first\n", lint_all("[1, 2, 3].select(&:even?).first\n", &cfg).fixes),
+            "[1, 2, 3].detect(&:even?)\n"
+        );
+        assert_eq!(offenses("[1, 2, 3].select { |i| i % 2 == 0 }.first(n)\n", &cfg), vec![]);
+        assert_eq!(offenses("adapter.select.first\n", &cfg), vec![]);
+        assert_eq!(offenses("adapter.lazy.select { 'something' }.first\n", &cfg), vec![]);
+    }
+
+    #[test]
+    fn string_replacement_spec_cases() {
+        let cfg = perf("Performance/StringReplacement:\n  Enabled: true\n");
+        let src = "'abc'.gsub('a', '1')\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `tr` instead of `gsub`.");
+        assert_eq!(apply_fixes(src, r.fixes), "'abc'.tr('a', '1')\n");
+        assert_eq!(apply_fixes("'abc'.gsub!('a', '')\n", lint_all("'abc'.gsub!('a', '')\n", &cfg).fixes), "'abc'.delete!('a')\n");
+        assert_eq!(offenses("'abc'.gsub('ab', 'de')\n", &cfg), vec![]);
+        assert_eq!(offenses("'abc'.gsub('a', 'ab')\n", &cfg), vec![]);
+        assert_eq!(offenses("'abc'.gsub(/a+/, 'def')\n", &cfg), vec![]);
+        assert_eq!(offenses("'abc'.insert(2, 'a')\n", &cfg), vec![]);
+    }
+
+    #[test]
+    fn redundant_merge_spec_cases() {
+        let cfg = perf("Performance/RedundantMerge:\n  Enabled: true\n");
+        let src = "hash.merge!(a: 1)\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `hash[:a] = 1` instead of `hash.merge!(a: 1)`.");
+        assert_eq!(apply_fixes(src, r.fixes), "hash[:a] = 1\n");
+        assert_eq!(
+            apply_fixes("hash.merge!(\"abc\" => \"value\")\n", lint_all("hash.merge!(\"abc\" => \"value\")\n", &cfg).fixes),
+            "hash[\"abc\"] = \"value\"\n"
+        );
+        assert_eq!(offenses("foo.merge!(**bar)\n", &cfg), vec![]);
+        assert_eq!(offenses("foo.merge!({})\n", &cfg), vec![]);
+        assert_eq!(offenses("variable = hash.merge!(a: 1)\n", &cfg), vec![]);
+        assert_eq!(
+            offenses("foo.each_with_object({}) do |f, hash|\n  changes = hash.merge!(a: 1, b: 2)\nend\n", &cfg),
+            vec![]
+        );
+        let max1 = perf("Performance/RedundantMerge:\n  Enabled: true\n  MaxKeyValuePairs: 1\n");
+        assert_eq!(offenses("hash = {}\nhash.merge!(a: 1, b: 2)\n", &max1), vec![]);
     }
 }

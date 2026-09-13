@@ -418,7 +418,14 @@ COPS = {
   'Style/DefWithParentheses'         => 'style/def_with_parentheses',
   'Style/WhileUntilDo'               => 'style/while_until_do',
   'Style/MultilineIfThen'            => 'style/multiline_if_then',
-  'Style/Not'                        => 'style/not'
+  'Style/Not'                        => 'style/not',
+  'Performance/ReverseEach'          => 'performance/reverse_each',
+  'Performance/Size'                 => 'performance/size',
+  'Performance/RangeInclude'         => 'performance/range_include',
+  'Performance/FlatMap'              => 'performance/flat_map',
+  'Performance/Detect'               => 'performance/detect',
+  'Performance/StringReplacement'    => 'performance/string_replacement',
+  'Performance/RedundantMerge'       => 'performance/redundant_merge'
 }.freeze
 
 FileUtils.mkdir_p(DIR)
