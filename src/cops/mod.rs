@@ -2288,8 +2288,23 @@ impl<'a> Cops<'a> {
             }
             return;
         }
+        if let Some(c) = n.as_case_match_node() {
+            for w in c.conditions().iter() {
+                self.mark_value_context(&w, block_tail);
+            }
+            if let Some(e) = c.else_clause() {
+                self.mark_value_context(&e.as_node(), block_tail);
+            }
+            return;
+        }
         if let Some(w) = n.as_when_node() {
             if let Some(s) = w.statements() {
+                self.mark_value_context(&s.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(i) = n.as_in_node() {
+            if let Some(s) = i.statements() {
                 self.mark_value_context(&s.as_node(), block_tail);
             }
             return;
@@ -2320,6 +2335,16 @@ impl<'a> Cops<'a> {
         if let Some(b) = n.as_begin_node() {
             if let Some(s) = b.statements() {
                 self.mark_value_context(&s.as_node(), block_tail);
+            }
+            let mut rescue = b.rescue_clause();
+            while let Some(r) = rescue {
+                if let Some(s) = r.statements() {
+                    self.mark_value_context(&s.as_node(), block_tail);
+                }
+                rescue = r.subsequent();
+            }
+            if let Some(e) = b.else_clause() {
+                self.mark_value_context(&e.as_node(), block_tail);
             }
         }
     }
@@ -7762,6 +7787,23 @@ mod tests {
         assert_eq!(apply_fixes("'abc'.gsub(Regexp.new('a'), '1')\n", r.fixes), "'abc'.tr('a', '1')\n");
         let r = lint_all("'abc'.gsub(Regexp.compile('a'), '')\n", &sr);
         assert_eq!(apply_fixes("'abc'.gsub(Regexp.compile('a'), '')\n", r.fixes), "'abc'.delete('a')\n");
+        let r = lint_all("'abc'.gsub(/\\xA/, '1')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub(/\\xA/, '1')\n", r.fixes), "'abc'.tr(\"\\n\", '1')\n");
+        let r = lint_all("'abc'.gsub(/\\e/, ',')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub(/\\e/, ',')\n", r.fixes), "'abc'.tr(\"\\e\", ',')\n");
+        for (pat, lit) in [
+            ("\\a", "\\a"),
+            ("\\b", "\\b"),
+            ("\\f", "\\f"),
+            ("\\v", "\\v"),
+        ] {
+            let src = format!("'abc'.gsub(/{pat}/, ',')\n");
+            let r = lint_all(&src, &sr);
+            assert_eq!(r.offenses.len(), 1, "{pat}");
+            assert_eq!(apply_fixes(&src, r.fixes), format!("'abc'.tr(\"{lit}\", ',')\n"));
+        }
 
         let mg = perf("Performance/RedundantMerge:\n  Enabled: true\n");
         assert_eq!(offenses("hash.merge!(a: 1) { |_, o, n| n }\n", &mg), vec![]);
@@ -7772,6 +7814,15 @@ mod tests {
         assert_eq!(offenses("({ key: build() }).merge!(a: 1, b: 2)\n", &mg), vec![]);
         assert_eq!(offenses("result = if cond; hash.merge!(a: 1); end\n", &mg), vec![]);
         assert_eq!(offenses("items.map { if cond; hash.merge!(a: 1); end }\n", &mg), vec![]);
+        assert_eq!(offenses("result = case value; in x; hash.merge!(a: 1); end\n", &mg), vec![]);
+        assert_eq!(
+            offenses("result = begin; work; rescue; hash.merge!(a: 1); end\n", &mg),
+            vec![]
+        );
+        assert_eq!(
+            offenses("result = begin; work; rescue; 0; else; hash.merge!(a: 1); end\n", &mg),
+            vec![]
+        );
         assert_eq!(offenses("items.each_with_object({}) { |item, acc| other.merge!(a: 1) }\n", &mg), vec![]);
         assert_eq!(offenses("items.each_with_object({}) { |item, acc| acc.merge!(a: 1) }\n", &mg).len(), 1);
         assert_eq!(offenses("x = [hash.merge!(a: 1)]\n", &mg), vec![]);
