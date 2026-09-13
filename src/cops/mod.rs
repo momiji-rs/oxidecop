@@ -9,6 +9,7 @@ mod lint_cops;
 mod metrics;
 mod migration;
 mod naming;
+mod performance;
 mod style;
 
 use crate::config::{parse_allowed_list, Config, SCHEMA};
@@ -445,6 +446,8 @@ const IMPLEMENTED: &[&str] = &[
     "Style/RedundantCondition", "Lint/RedundantSafeNavigation", "Style/ClassAndModuleChildren", "Lint/DuplicateMethods", "Lint/UselessAssignment", "Style/IfUnlessModifier", "Style/FormatString", "Style/FormatStringToken", "Style/ConditionalAssignment", "Style/AccessModifierDeclarations", "Style/BlockDelimiters", "Style/RedundantParentheses",
     "Layout/SpaceInsideHashLiteralBraces", "Layout/SpaceInsideReferenceBrackets", "Layout/SpaceInsideBlockBraces", "Layout/SpaceInsideArrayLiteralBrackets", "Layout/EmptyLineAfterGuardClause", "Layout/ExtraSpacing", "Layout/ClosingParenthesisIndentation", "Layout/IndentationConsistency", "Layout/ArgumentAlignment", "Layout/MultilineBlockLayout", "Layout/HashAlignment", "Layout/IndentationWidth",
     "Lint/ScriptPermission", "Migration/DepartmentName", "Layout/ElseAlignment", "Layout/BlockAlignment", "Layout/FirstArgumentIndentation", "Layout/EndAlignment", "Layout/RescueEnsureAlignment", "Lint/Syntax", "Layout/FirstArrayElementIndentation", "Layout/FirstHashElementIndentation", "Layout/MultilineOperationIndentation", "Layout/MultilineMethodCallIndentation",
+    "Performance/ReverseEach", "Performance/Size", "Performance/RangeInclude", "Performance/FlatMap",
+    "Performance/Detect", "Performance/StringReplacement", "Performance/RedundantMerge",
 ];
 
 impl Engine {
@@ -1793,6 +1796,21 @@ pub(crate) struct Cops<'a> {
     // node.parent.parent` is exactly this node's parent whenever the splat's
     // immediate container equals that value outright.
     pub(crate) rse_assignment_value: HashSet<usize>,
+    // Start offsets of nodes whose result is used by an assignment, an outer
+    // send (receiver or argument), or return/break/next — stands in for
+    // rubocop-ast's `node.value_used?` / ReverseEach's ancestor walk.
+    pub(crate) value_used_offsets: HashSet<usize>,
+    // Last expression of a block — rubocop-ast's `node.value_used?` for a
+    // block's return value. ReverseEach does NOT consult this (its ancestor
+    // walk is assignment/send/return only). `each_with_object` tails are
+    // still marked; RedundantMerge exempts only the accumulator receiver.
+    pub(crate) block_tail_offsets: HashSet<usize>,
+    // Second `|item, acc|` name of the current `each_with_object` block
+    // (`None` for any other block). Nearest frame is `.last()`.
+    pub(crate) ewo_accum: Vec<Option<Vec<u8>>>,
+    // Count of enclosing plain `send` CallNodes (not `csend`). ReverseEach's
+    // `use_return_value?` treats any `send_type?` ancestor as "value used".
+    pub(crate) perf_send_depth: u32,
     // Style/DoubleNegation: a hand-rolled "ancestor stack" mirroring exactly
     // the node kinds `allowed_in_returns?` climbs through (prism gives no
     // parent pointers) — pushed/popped by `visit_def_node`, `visit_block_node`
@@ -2210,6 +2228,143 @@ pub(crate) struct Cops<'a> {
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
     /// short static list, called on every node for every check.
+    /// Record that `n`'s result is used, walking through parentheses,
+    /// statement lists, conditionals, and collection literals so a nested
+    /// call is marked too (`x = if cond; hash.merge!(a: 1); end`).
+    pub(crate) fn mark_used_value(&mut self, n: &ruby_prism::Node) {
+        self.mark_value_context(n, false);
+    }
+    fn mark_block_tail(&mut self, n: &ruby_prism::Node) {
+        self.mark_value_context(n, true);
+    }
+    fn mark_value_context(&mut self, n: &ruby_prism::Node, block_tail: bool) {
+        if block_tail {
+            self.block_tail_offsets.insert(n.location().start_offset());
+        } else {
+            self.value_used_offsets.insert(n.location().start_offset());
+        }
+        if let Some(p) = n.as_parentheses_node() {
+            if let Some(b) = p.body() {
+                self.mark_value_context(&b, block_tail);
+            }
+            return;
+        }
+        if let Some(s) = n.as_statements_node() {
+            if let Some(last) = s.body().iter().last() {
+                self.mark_value_context(&last, block_tail);
+            }
+            return;
+        }
+        if let Some(a) = n.as_and_node() {
+            self.mark_value_context(&a.left(), block_tail);
+            self.mark_value_context(&a.right(), block_tail);
+            return;
+        }
+        if let Some(o) = n.as_or_node() {
+            self.mark_value_context(&o.left(), block_tail);
+            self.mark_value_context(&o.right(), block_tail);
+            return;
+        }
+        if let Some(i) = n.as_if_node() {
+            if let Some(stmts) = i.statements() {
+                self.mark_value_context(&stmts.as_node(), block_tail);
+            }
+            if let Some(sub) = i.subsequent() {
+                self.mark_value_context(&sub, block_tail);
+            }
+            return;
+        }
+        if let Some(u) = n.as_unless_node() {
+            if let Some(stmts) = u.statements() {
+                self.mark_value_context(&stmts.as_node(), block_tail);
+            }
+            if let Some(e) = u.else_clause() {
+                self.mark_value_context(&e.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(e) = n.as_else_node() {
+            if let Some(s) = e.statements() {
+                self.mark_value_context(&s.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(c) = n.as_case_node() {
+            for w in c.conditions().iter() {
+                self.mark_value_context(&w, block_tail);
+            }
+            if let Some(e) = c.else_clause() {
+                self.mark_value_context(&e.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(c) = n.as_case_match_node() {
+            for w in c.conditions().iter() {
+                self.mark_value_context(&w, block_tail);
+            }
+            if let Some(e) = c.else_clause() {
+                self.mark_value_context(&e.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(w) = n.as_when_node() {
+            if let Some(s) = w.statements() {
+                self.mark_value_context(&s.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(i) = n.as_in_node() {
+            if let Some(s) = i.statements() {
+                self.mark_value_context(&s.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(a) = n.as_array_node() {
+            for e in a.elements().iter() {
+                self.mark_value_context(&e, block_tail);
+            }
+            return;
+        }
+        if let Some(h) = n.as_hash_node() {
+            for e in h.elements().iter() {
+                self.mark_value_context(&e, block_tail);
+            }
+            return;
+        }
+        if let Some(h) = n.as_keyword_hash_node() {
+            for e in h.elements().iter() {
+                self.mark_value_context(&e, block_tail);
+            }
+            return;
+        }
+        if let Some(p) = n.as_assoc_node() {
+            self.mark_value_context(&p.key(), block_tail);
+            self.mark_value_context(&p.value(), block_tail);
+            return;
+        }
+        if let Some(b) = n.as_begin_node() {
+            if let Some(s) = b.statements() {
+                self.mark_value_context(&s.as_node(), block_tail);
+            }
+            let mut rescue = b.rescue_clause();
+            while let Some(r) = rescue {
+                if let Some(s) = r.statements() {
+                    self.mark_value_context(&s.as_node(), block_tail);
+                }
+                rescue = r.subsequent();
+            }
+            if let Some(e) = b.else_clause() {
+                self.mark_value_context(&e.as_node(), block_tail);
+            }
+        }
+    }
+    fn ewo_second_arg(node: &ruby_prism::BlockNode) -> Option<Vec<u8>> {
+        let bp = node.parameters()?.as_block_parameters_node()?;
+        let params = bp.parameters()?;
+        let mut it = params.requireds().iter();
+        it.next()?;
+        it.next()?.as_required_parameter_node().map(|p| p.name().as_slice().to_vec())
+    }
     pub(crate) fn on(&self, cop: &str) -> bool {
         if !self.file_disabled.is_empty() && self.file_disabled.iter().any(|c| *c == cop) {
             return false;
@@ -2442,6 +2597,7 @@ macro_rules! assignment_write {
             $node.value(),
         );
         $self.rea_note_assignment(lhs_start, $node.name_loc().end_offset(), $node.value().location().start_offset());
+        $self.mark_used_value(&$node.value());
     }};
 }
 macro_rules! assignment_operator_write {
@@ -2461,6 +2617,7 @@ macro_rules! assignment_operator_write {
             $node.value(),
         );
         $self.rea_note_assignment(lhs_start, $node.name_loc().end_offset(), $node.value().location().start_offset());
+        $self.mark_used_value(&$node.value());
     }};
 }
 macro_rules! assignment_path_write {
@@ -2480,6 +2637,7 @@ macro_rules! assignment_path_write {
         );
         let rea_name_end = $node.target().name_loc().end_offset();
         $self.rea_note_assignment(lhs_start, rea_name_end, $node.value().location().start_offset());
+        $self.mark_used_value(&$node.value());
     }};
 }
 macro_rules! assignment_path_operator_write {
@@ -2499,6 +2657,7 @@ macro_rules! assignment_path_operator_write {
         );
         let rea_name_end = $node.target().name_loc().end_offset();
         $self.rea_note_assignment(lhs_start, rea_name_end, $node.value().location().start_offset());
+        $self.mark_used_value(&$node.value());
     }};
 }
 
@@ -2943,6 +3102,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_regular_expression_node(self, node);
     }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        // rubocop-ast: an `if` condition is always value-used.
+        self.mark_used_value(&node.predicate());
         self.rsn_cond_pos.insert(node.predicate().location().start_offset());
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_and_or_conditional(&node.predicate());
@@ -3141,6 +3302,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        self.mark_used_value(&node.predicate());
         self.rsn_cond_pos.insert(node.predicate().location().start_offset());
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_else_layout_unless(node);
@@ -3595,6 +3757,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_variable_number(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        self.mark_used_value(&node.value());
         self.check_class_length_casgn(&node.value());
         self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         let lhs_start = node.location().start_offset();
@@ -4002,6 +4165,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         if let Some(args) = node.arguments() {
             for a in args.arguments().iter() {
                 self.dn_return_arg_offsets.insert(a.location().start_offset());
+                self.mark_used_value(&a);
             }
         }
         let kw = node.keyword_loc();
@@ -4039,12 +4203,22 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.ecc_mark_not_supported_parent(node.arguments());
         let kw = node.keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"break");
+        if let Some(args) = node.arguments() {
+            for a in args.arguments().iter() {
+                self.mark_used_value(&a);
+            }
+        }
         ruby_prism::visit_break_node(self, node);
     }
     fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
         self.ecc_mark_not_supported_parent(node.arguments());
         let kw = node.keyword_loc();
         self.sak_check(kw.start_offset(), kw.end_offset(), b"next");
+        if let Some(args) = node.arguments() {
+            for a in args.arguments().iter() {
+                self.mark_used_value(&a);
+            }
+        }
         ruby_prism::visit_next_node(self, node);
     }
     fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
@@ -4279,6 +4453,24 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let void_method_name = self.void_pending_block_name.take();
         let void_is_each = void_method_name.as_deref() == Some(&b"each"[..]);
         let void_is_tap = void_method_name.as_deref() == Some(&b"tap"[..]);
+        // Last expression of any block is a block-tail (value-used). The
+        // `each_with_object` accumulator exception is receiver-specific and
+        // applied in RedundantMerge, not by skipping the mark.
+        if let Some(body) = node.body() {
+            if let Some(stmts) = body.as_statements_node() {
+                if let Some(last) = stmts.body().iter().last() {
+                    self.mark_block_tail(&last);
+                }
+            } else {
+                self.mark_block_tail(&body);
+            }
+        }
+        let ewo_acc = if void_method_name.as_deref() == Some(&b"each_with_object"[..]) {
+            Self::ewo_second_arg(node)
+        } else {
+            None
+        };
+        self.ewo_accum.push(ewo_acc);
         self.void_each_stack.push(void_is_each);
         // Lint/DuplicateMethods: consume the `(is_new_block, ns_frame)`
         // classification `visit_call_node` stashed right before descending
@@ -4510,6 +4702,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.ic_macro_stack.pop();
         }
         self.void_each_stack.pop();
+        self.ewo_accum.pop();
         self.dm_anon_stack.pop();
         self.dm_ns_stack.pop();
         if dn_define_method.is_some() {
@@ -4533,6 +4726,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.moi_stack.pop();
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        self.mark_used_value(&node.predicate());
         self.check_next_while(node);
         self.check_loop_while(node);
         self.check_unreachable_loop_while(node);
@@ -4630,6 +4824,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth -= 1;
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        self.mark_used_value(&node.predicate());
         self.check_next_until(node);
         self.check_loop_until(node);
         self.check_unreachable_loop_until(node);
@@ -6191,6 +6386,17 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_lambda_method(node);
         self.check_preferred_hash_methods(node);
         self.check_sample(node);
+        let perf_send_anc = !node.is_safe_navigation();
+        if perf_send_anc {
+            self.perf_send_depth += 1;
+        }
+        self.check_reverse_each(node);
+        self.check_size(node);
+        self.check_range_include(node);
+        self.check_flat_map(node);
+        self.check_detect(node);
+        self.check_string_replacement(node);
+        self.check_redundant_merge(node);
         self.check_single_argument_dig(node);
         self.check_nested_parenthesized_calls(node);
         self.check_require_parentheses(node);
@@ -6426,6 +6632,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             if isc_track {
                 self.isc_send_child.insert(r.location().start_offset());
             }
+            self.mark_used_value(&r);
             self.visit(&r);
         }
         if self.hot.semicolon {
@@ -6462,6 +6669,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             let rse_track = self.on("Lint/RedundantSplatExpansion");
             let rse_call_range = node.location();
             for arg in a.arguments().iter() {
+                self.mark_used_value(&arg);
                 if track_args {
                     self.assumed_arg_offsets.insert(arg.location().start_offset());
                 }
@@ -6655,6 +6863,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.moi_stack.pop();
         }
         self.moi_stack.pop();
+        if perf_send_anc {
+            self.perf_send_depth -= 1;
+        }
     }
     fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
         self.check_redundant_splat_expansion(node);
@@ -6859,6 +7070,10 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         sgv_climb: HashMap::new(),
         rse_ctx: HashMap::new(),
         rse_assignment_value: HashSet::new(),
+        value_used_offsets: HashSet::new(),
+        block_tail_offsets: HashSet::new(),
+        ewo_accum: Vec::new(),
+        perf_send_depth: 0,
         dn_ancestors: Vec::new(),
         dn_return_arg_offsets: HashSet::new(),
         dn_pending_define_method: None,
@@ -7372,5 +7587,279 @@ mod tests {
         // csend dispatch: zero-shapes flag, nonzero-shapes don't (on_send only)
         assert_eq!(offenses("x&.length == 0\n", cfg), vec![(1, 1, "Style/ZeroLengthPredicate")]);
         assert_eq!(offenses("x&.length > 0\n", cfg), vec![]);
+    }
+
+    fn perf(extra: &str) -> String {
+        format!("plugins: rubocop-performance\nAllCops:\n  DisabledByDefault: true\n{extra}")
+    }
+    fn lint_all(src: &str, cfg: &str) -> LintResult {
+        let cfg = Config::parse(cfg);
+        let eng = Engine::new(&cfg);
+        lint(src.as_bytes(), &cfg, &eng, "test.rb")
+    }
+    fn apply_fixes(src: &str, mut fixes: Vec<Fix>) -> String {
+        fixes.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut s = src.as_bytes().to_vec();
+        for (start, end, repl) in fixes {
+            if start > end || end > s.len() {
+                continue;
+            }
+            s.splice(start..end, repl);
+        }
+        String::from_utf8(s).unwrap()
+    }
+
+    #[test]
+    fn performance_silent_without_plugin() {
+        let cfg = "AllCops:\n  DisabledByDefault: true\nPerformance/ReverseEach:\n  Enabled: true\n";
+        assert_eq!(offenses("[1, 2, 3].reverse.each { |e| puts e }\n", cfg), vec![]);
+    }
+
+    #[test]
+    fn reverse_each_spec_cases() {
+        let cfg = perf("Performance/ReverseEach:\n  Enabled: true\n");
+        let src = "[1, 2, 3].reverse.each { |e| puts e }\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(r.offenses[0].cop, "Performance/ReverseEach");
+        assert_eq!(r.offenses[0].message, "Use `reverse_each` instead of `reverse.each`.");
+        assert_eq!(apply_fixes(src, r.fixes), "[1, 2, 3].reverse_each { |e| puts e }\n");
+
+        assert_eq!(offenses("array&.reverse.each { |e| puts e }\n", &cfg).len(), 1);
+        assert_eq!(offenses("array&.reverse&.each { |e| puts e }\n", &cfg).len(), 1);
+        assert_eq!(offenses("[1, 2, 3].reverse().each { |e| puts e }\n", &cfg).len(), 1);
+        assert_eq!(offenses("[1, 2, 3].reverse.each() { |e| puts e }\n", &cfg).len(), 1);
+        assert_eq!(offenses("[1, 2, 3].reverse\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].each { |e| puts e }\n", &cfg), vec![]);
+        assert_eq!(offenses("ret = [1, 2, 3].reverse.each { |e| puts e }\n", &cfg), vec![]);
+        assert_eq!(offenses("@ret = [1, 2, 3].reverse.each { |e| puts e }\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].reverse.each { |e| puts e }.last\n", &cfg), vec![]);
+        assert_eq!(offenses("return [1, 2, 3].reverse.each { |e| puts e }\n", &cfg), vec![]);
+    }
+
+    #[test]
+    fn size_spec_cases() {
+        let cfg = perf("Performance/Size:\n  Enabled: true\n");
+        let src = "[1, 2, 3].count\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `size` instead of `count`.");
+        assert_eq!(apply_fixes(src, r.fixes), "[1, 2, 3].size\n");
+        assert_eq!(offenses("[1, 2, 3]&.count\n", &cfg).len(), 1);
+        assert_eq!(offenses("[1, 2, 3].count()\n", &cfg).len(), 1);
+        assert_eq!(offenses("(1..3).to_a.count\n", &cfg).len(), 1);
+        assert_eq!(offenses("(1..3).to_a().count()\n", &cfg).len(), 1);
+        assert_eq!(offenses("Array(1..5).count\n", &cfg).len(), 1);
+        assert_eq!(offenses("Array[*1..5].count\n", &cfg).len(), 1);
+        assert_eq!(offenses("{a: 1, b: 2, c: 3}.count\n", &cfg).len(), 1);
+        assert_eq!(offenses("[[:foo, :bar], [1, 2]].to_h.count\n", &cfg).len(), 1);
+        assert_eq!(offenses("count(items)\n", &cfg), vec![]);
+        assert_eq!(offenses("Array[].count\n", &cfg), vec![]);
+        assert_eq!(offenses("Array(1, 2).count\n", &cfg), vec![]);
+        assert_eq!(offenses("Hash[].count\n", &cfg), vec![]);
+        assert_eq!(offenses("Hash(1, 2).count\n", &cfg), vec![]);
+        assert_eq!(offenses("object.count(items)\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].count { |e| e > 3 }\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].count(&:nil?)\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].count(1)\n", &cfg), vec![]);
+    }
+
+    #[test]
+    fn range_include_spec_cases() {
+        let cfg = perf("Performance/RangeInclude:\n  Enabled: true\n");
+        let src = "(a..b).include? 1\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `Range#cover?` instead of `Range#include?`.");
+        assert_eq!(apply_fixes(src, r.fixes), "(a..b).cover? 1\n");
+        assert_eq!(apply_fixes("(a..b).member? 1\n", lint_all("(a..b).member? 1\n", &cfg).fixes), "(a..b).cover? 1\n");
+        assert_eq!(apply_fixes("(a..b)&.include? 1\n", lint_all("(a..b)&.include? 1\n", &cfg).fixes), "(a..b)&.cover? 1\n");
+        assert_eq!(apply_fixes("(a...b).include?(1)\n", lint_all("(a...b).include?(1)\n", &cfg).fixes), "(a...b).cover?(1)\n");
+    }
+
+    #[test]
+    fn flat_map_spec_cases() {
+        let cfg = perf("Performance/FlatMap:\n  Enabled: true\n");
+        let src = "[1, 2, 3, 4].map { |e| [e, e] }.flatten(1)\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `flat_map` instead of `map...flatten`.");
+        assert_eq!(apply_fixes(src, r.fixes), "[1, 2, 3, 4].flat_map { |e| [e, e] }\n");
+        assert_eq!(
+            apply_fixes("[1, 2, 3, 4].map(&:foo).flatten(1)\n", lint_all("[1, 2, 3, 4].map(&:foo).flatten(1)\n", &cfg).fixes),
+            "[1, 2, 3, 4].flat_map(&:foo)\n"
+        );
+        assert_eq!(offenses("[1, 2, 3, 4].map { |e| [e, e] }.flatten(3)\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3, 4].map { |e| [e, e] }.flatten\n", &cfg), vec![]);
+        let warn = perf("Performance/FlatMap:\n  Enabled: true\n  EnabledForFlattenWithoutParams: true\n");
+        let r = lint_all("[1, 2, 3, 4].map { |e| [e, e] }.flatten\n", &warn);
+        assert_eq!(r.offenses.len(), 1);
+        assert!(r.offenses[0].message.contains("Beware"));
+        assert!(r.fixes.is_empty() || !r.offenses[0].correctable);
+        assert_eq!(offenses("[1].map { |e| [e] }.flatten(depth)\n", &warn), vec![]);
+        assert_eq!(offenses("[1].map { |e| [e] }.flatten(&blk)\n", &warn), vec![]);
+        assert_eq!(offenses("[1].map { |e| [e] }.flatten(&:itself)\n", &warn), vec![]);
+        let r = lint_all("[1, 2, 3, 4].map { |e| [e, e] }.flatten(1)\n", &warn);
+        assert_eq!(apply_fixes("[1, 2, 3, 4].map { |e| [e, e] }.flatten(1)\n", r.fixes), "[1, 2, 3, 4].flat_map { |e| [e, e] }\n");
+    }
+
+    #[test]
+    fn detect_spec_cases() {
+        let cfg = perf("Performance/Detect:\n  Enabled: true\n");
+        let src = "[1, 2, 3].select { |i| i % 2 == 0 }.first\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `find` instead of `select.first`.");
+        assert_eq!(apply_fixes(src, r.fixes), "[1, 2, 3].find { |i| i % 2 == 0 }\n");
+        assert_eq!(
+            apply_fixes("[1, 2, 3].select { |i| i % 2 == 0 }.last\n", lint_all("[1, 2, 3].select { |i| i % 2 == 0 }.last\n", &cfg).fixes),
+            "[1, 2, 3].reverse.find { |i| i % 2 == 0 }\n"
+        );
+        assert_eq!(
+            apply_fixes("[1, 2, 3].select(&:even?).first\n", lint_all("[1, 2, 3].select(&:even?).first\n", &cfg).fixes),
+            "[1, 2, 3].find(&:even?)\n"
+        );
+        assert_eq!(offenses("[1, 2, 3].select { |i| i % 2 == 0 }.first(n)\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].select { |i| i % 2 == 0 }&.first\n", &cfg), vec![]);
+        assert_eq!(offenses("array&.select { |i| i % 2 == 0 }.first\n", &cfg).len(), 1);
+        assert_eq!(offenses("adapter.select.first\n", &cfg), vec![]);
+        assert_eq!(offenses("adapter.lazy.select { 'something' }.first\n", &cfg), vec![]);
+    }
+
+    #[test]
+    fn string_replacement_spec_cases() {
+        let cfg = perf("Performance/StringReplacement:\n  Enabled: true\n");
+        let src = "'abc'.gsub('a', '1')\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `tr` instead of `gsub`.");
+        assert_eq!(apply_fixes(src, r.fixes), "'abc'.tr('a', '1')\n");
+        assert_eq!(apply_fixes("'abc'.gsub!('a', '')\n", lint_all("'abc'.gsub!('a', '')\n", &cfg).fixes), "'abc'.delete!('a')\n");
+        assert_eq!(offenses("'abc'.gsub('ab', 'de')\n", &cfg), vec![]);
+        assert_eq!(offenses("'abc'.gsub('a', 'ab')\n", &cfg), vec![]);
+        assert_eq!(offenses("'abc'.gsub(/a+/, 'def')\n", &cfg), vec![]);
+        assert_eq!(offenses("'abc'.insert(2, 'a')\n", &cfg), vec![]);
+    }
+
+    #[test]
+    fn redundant_merge_spec_cases() {
+        let cfg = perf("Performance/RedundantMerge:\n  Enabled: true\n");
+        let src = "hash.merge!(a: 1)\n";
+        let r = lint_all(src, &cfg);
+        assert_eq!(r.offenses[0].message, "Use `hash[:a] = 1` instead of `hash.merge!(a: 1)`.");
+        assert_eq!(apply_fixes(src, r.fixes), "hash[:a] = 1\n");
+        assert_eq!(
+            apply_fixes("hash.merge!(\"abc\" => \"value\")\n", lint_all("hash.merge!(\"abc\" => \"value\")\n", &cfg).fixes),
+            "hash[\"abc\"] = \"value\"\n"
+        );
+        assert_eq!(offenses("foo.merge!(**bar)\n", &cfg), vec![]);
+        assert_eq!(offenses("foo.merge!({})\n", &cfg), vec![]);
+        assert_eq!(offenses("hash&.merge!(a: 1)\n", &cfg), vec![]);
+        assert_eq!(offenses("variable = hash.merge!(a: 1)\n", &cfg), vec![]);
+        assert_eq!(
+            offenses("foo.each_with_object({}) do |f, hash|\n  changes = hash.merge!(a: 1, b: 2)\nend\n", &cfg),
+            vec![]
+        );
+        let max1 = perf("Performance/RedundantMerge:\n  Enabled: true\n  MaxKeyValuePairs: 1\n");
+        assert_eq!(offenses("hash = {}\nhash.merge!(a: 1, b: 2)\n", &max1), vec![]);
+    }
+
+    #[test]
+    fn copilot_used_value_wrappers_and_matchers() {
+        let re = perf("Performance/ReverseEach:\n  Enabled: true\n");
+        assert_eq!(offenses("result = ([1].reverse.each {})\n", &re), vec![]);
+        assert_eq!(offenses("[1, 2, 3].reverse.each(1) {}\n", &re), vec![]);
+        assert_eq!(offenses("[1].reverse().each {}\n", &re).len(), 1);
+        assert_eq!(offenses("[1].reverse.each() {}\n", &re).len(), 1);
+        assert_eq!(offenses("result = if cond; items.reverse.each; end\n", &re), vec![]);
+        assert_eq!(offenses("items.map { items.reverse.each {} }\n", &re), vec![]);
+        assert_eq!(offenses("a, b = items.reverse.each\n", &re), vec![]);
+        assert_eq!(offenses("result = cond && items.reverse.each\n", &re), vec![]);
+        assert_eq!(offenses("result = cond || items.reverse.each\n", &re), vec![]);
+
+        let sz = perf("Performance/Size:\n  Enabled: true\n");
+        assert_eq!(offenses("obj.to_a(1).count\n", &sz), vec![]);
+        assert_eq!(offenses("Array.count\n", &sz), vec![]);
+        assert_eq!(offenses("[1, 2].count()\n", &sz).len(), 1);
+        assert_eq!(offenses("(1..3).to_a().count()\n", &sz).len(), 1);
+        assert_eq!(offenses("Array[].count\n", &sz), vec![]);
+        assert_eq!(offenses("Array(1, 2).count\n", &sz), vec![]);
+        assert_eq!(offenses("Hash[].count\n", &sz), vec![]);
+        assert_eq!(offenses("Hash(1, 2).count\n", &sz), vec![]);
+
+        let fm = perf("Performance/FlatMap:\n  Enabled: true\n");
+        assert_eq!(offenses("obj.map(flag) { |e| [e] }.flatten(1)\n", &fm), vec![]);
+        assert_eq!(offenses("obj.map(flag, &:x).flatten(1)\n", &fm), vec![]);
+
+        let dt = perf("Performance/Detect:\n  Enabled: true\n");
+        assert_eq!(offenses("obj.select(flag) { |x| x }.first\n", &dt), vec![]);
+        assert_eq!(offenses("items.select { true }&.first\n", &dt), vec![]);
+        let dt_detect = perf(
+            "Performance/Detect:\n  Enabled: true\nStyle/CollectionMethods:\n  detect: detect\n",
+        );
+        let r = lint_all("[1].select { true }.first\n", &dt_detect);
+        assert!(r.offenses[0].message.contains("`detect`"));
+
+        let sr = perf("Performance/StringReplacement:\n  Enabled: true\n");
+        assert_eq!(offenses("'abc'.gsub(Regexp.new('a', Regexp::IGNORECASE), 'x')\n", &sr), vec![]);
+        let r = lint_all("'abc'.gsub('a', 'é')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub('a', 'é')\n", r.fixes), "'abc'.tr('a', 'é')\n");
+        let r = lint_all("'abc'.gsub(Regexp.new('a'), '1')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub(Regexp.new('a'), '1')\n", r.fixes), "'abc'.tr('a', '1')\n");
+        let r = lint_all("'abc'.gsub(Regexp.compile('a'), '')\n", &sr);
+        assert_eq!(apply_fixes("'abc'.gsub(Regexp.compile('a'), '')\n", r.fixes), "'abc'.delete('a')\n");
+        let r = lint_all("'abc'.gsub(/\\xA/, '1')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub(/\\xA/, '1')\n", r.fixes), "'abc'.tr(\"\\n\", '1')\n");
+        let r = lint_all("'abc'.gsub(/\\e/, ',')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub(/\\e/, ',')\n", r.fixes), "'abc'.tr(\"\\e\", ',')\n");
+        // `/\b/` is a word-boundary assertion, not backspace; use `\x08`.
+        for (pat, lit) in [
+            ("\\a", "\\a"),
+            ("\\x08", "\\b"),
+            ("\\f", "\\f"),
+            ("\\v", "\\v"),
+        ] {
+            let src = format!("'abc'.gsub(/{pat}/, ',')\n");
+            let r = lint_all(&src, &sr);
+            assert_eq!(r.offenses.len(), 1, "{pat}");
+            assert_eq!(apply_fixes(&src, r.fixes), format!("'abc'.tr(\"{lit}\", ',')\n"));
+        }
+        let r = lint_all("'abc'.gsub(/\\xFF/, '1')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub(/\\xFF/, '1')\n", r.fixes), "'abc'.tr(\"\\xFF\", '1')\n");
+        let r = lint_all("'abc'.gsub(/\\x80/, '1')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub(/\\x80/, '1')\n", r.fixes), "'abc'.tr(\"\\x80\", '1')\n");
+
+        let mg = perf("Performance/RedundantMerge:\n  Enabled: true\n");
+        assert_eq!(offenses("hash.merge!(a: 1) { |_, o, n| n }\n", &mg), vec![]);
+        assert_eq!(offenses("items.map { hash.merge!(a: 1) }\n", &mg), vec![]);
+        assert_eq!(offenses("result = (hash.merge!(a: 1))\n", &mg), vec![]);
+        assert_eq!(offenses("({}).merge!(a: 1, b: 2)\n", &mg).len(), 1);
+        assert_eq!(offenses("hash&.merge!(a: 1)\n", &mg), vec![]);
+        assert_eq!(offenses("({ key: build() }).merge!(a: 1, b: 2)\n", &mg), vec![]);
+        assert_eq!(offenses("result = if cond; hash.merge!(a: 1); end\n", &mg), vec![]);
+        assert_eq!(offenses("items.map { if cond; hash.merge!(a: 1); end }\n", &mg), vec![]);
+        assert_eq!(offenses("a, b = hash.merge!(x: 1)\n", &mg), vec![]);
+        assert_eq!(offenses("result = cond && hash.merge!(x: nil)\n", &mg), vec![]);
+        assert_eq!(offenses("result = cond || hash.merge!(x: nil)\n", &mg), vec![]);
+        assert_eq!(offenses("if cond && hash.merge!(x: nil); end\n", &mg), vec![]);
+        assert_eq!(offenses("result = case value; in x; hash.merge!(a: 1); end\n", &mg), vec![]);
+        assert_eq!(
+            offenses("result = begin; work; rescue; hash.merge!(a: 1); end\n", &mg),
+            vec![]
+        );
+        assert_eq!(
+            offenses("result = begin; work; rescue; 0; else; hash.merge!(a: 1); end\n", &mg),
+            vec![]
+        );
+        assert_eq!(offenses("items.each_with_object({}) { |item, acc| other.merge!(a: 1) }\n", &mg), vec![]);
+        assert_eq!(offenses("items.each_with_object({}) { |item, acc| acc.merge!(a: 1) }\n", &mg).len(), 1);
+        assert_eq!(offenses("x = [hash.merge!(a: 1)]\n", &mg), vec![]);
+        assert_eq!(offenses("if hash.merge!(a: 1); end\n", &mg), vec![]);
+        let r = lint_all("hash = {}\nhash.merge!(a: 1, b: 2) if cond\n", &mg);
+        assert_eq!(r.offenses.len(), 1, "modifier two-pair merge");
+        assert!(!r.offenses[0].correctable);
+        let nilmax = perf("Performance/RedundantMerge:\n  Enabled: true\n  MaxKeyValuePairs: nil\n");
+        assert_eq!(offenses("hash = {}\nhash.merge!(a: 1, b: 2, c: 3)\n", &nilmax), vec![]);
     }
 }

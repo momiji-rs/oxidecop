@@ -5,8 +5,9 @@ use std::collections::HashMap;
 /// Per-cop config schema: parameter defaults and (for style cops) the supported
 /// `EnforcedStyle`s + default. This is the ONE place defaults live — no default
 /// literals scattered at call sites, EnforcedStyle resolution/validation in one
-/// spot. The table itself (`SCHEMA`, all 606 cops) is GENERATED from rubocop's
-/// own `config/default.yml` by `tools/gen_schema.rb` — see `src/schema_gen.rs`.
+/// spot. The table itself (`SCHEMA`) is GENERATED from rubocop's own
+/// `config/default.yml` plus rubocop-performance's, by `tools/gen_schema.rb`
+/// — see `src/schema_gen.rs`.
 pub struct Schema {
     pub cop: &'static str,
     /// (param, default-as-string). For style cops, includes `EnforcedStyle`.
@@ -95,6 +96,38 @@ pub struct Config {
     // `inherit_from:` targets, in order (base-most first), relative to the
     // config file's directory. The runner resolves and merges them.
     pub inherits: Vec<String>,
+    // Top-level `plugins:` entries (`rubocop-performance`, …). A Performance
+    // cop is live only when one of these (or `require:`) names that gem —
+    // matching RuboCop, which does not instantiate plugin cops otherwise.
+    pub plugins: Vec<String>,
+    // Top-level `require:` entries. Older configs load the extension with
+    // `require: rubocop-performance` instead of `plugins:`.
+    pub requires: Vec<String>,
+}
+
+/// Names that mean "load rubocop-performance" on `plugins:` / `require:`.
+fn is_performance_plugin(s: &str) -> bool {
+    matches!(
+        s.trim(),
+        "rubocop-performance" | "rubocop/cop/performance" | "rubocop/performance"
+    )
+}
+
+/// A YAML flow sequence (`[a, b]`) or a single scalar, unquoted.
+fn parse_name_list(v: &str) -> Vec<String> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Vec::new();
+    }
+    if v.starts_with('[') && v.ends_with(']') {
+        v[1..v.len() - 1]
+            .split(',')
+            .map(|s| yaml_unquote(s.trim()))
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        vec![yaml_unquote(v)]
+    }
 }
 /// Decode one YAML scalar the way rubocop's YAML load would: a
 /// double-quoted scalar processes escapes (`"\\d"` is the two bytes `\d`),
@@ -137,8 +170,12 @@ impl Config {
         let mut cur_list_key: Option<String> = None;
         let mut inherits: Vec<String> = Vec::new();
         let mut inherit_gems: Vec<(String, Vec<String>)> = Vec::new();
+        let mut plugins: Vec<String> = Vec::new();
+        let mut requires: Vec<String> = Vec::new();
         let mut in_inherit_list = false;
         let mut in_inherit_gem = false;
+        let mut in_plugins_list = false;
+        let mut in_require_list = false;
         let mut cur_gem: Option<String> = None;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or(""); // strip comments
@@ -158,9 +195,23 @@ impl Config {
                         continue;
                     }
                 }
+                if in_plugins_list {
+                    if let Some(item) = t.strip_prefix("- ") {
+                        plugins.push(yaml_unquote(item));
+                        continue;
+                    }
+                }
+                if in_require_list {
+                    if let Some(item) = t.strip_prefix("- ") {
+                        requires.push(yaml_unquote(item));
+                        continue;
+                    }
+                }
                 cur_list_key = None;
                 in_inherit_list = false;
                 in_inherit_gem = false;
+                in_plugins_list = false;
+                in_require_list = false;
                 cur_gem = None;
                 // `inherit_from:` — scalar or block list of config paths
                 if t == "inherit_from:" {
@@ -174,8 +225,28 @@ impl Config {
                     cur = None;
                     continue;
                 }
+                if t == "plugins:" {
+                    in_plugins_list = true;
+                    cur = None;
+                    continue;
+                }
+                if t == "require:" {
+                    in_require_list = true;
+                    cur = None;
+                    continue;
+                }
                 if let Some(v) = t.strip_prefix("inherit_from:") {
                     inherits.push(v.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+                    cur = None;
+                    continue;
+                }
+                if let Some(v) = t.strip_prefix("plugins:") {
+                    plugins.extend(parse_name_list(v));
+                    cur = None;
+                    continue;
+                }
+                if let Some(v) = t.strip_prefix("require:") {
+                    requires.extend(parse_name_list(v));
                     cur = None;
                     continue;
                 }
@@ -190,6 +261,14 @@ impl Config {
             } else if in_inherit_list {
                 if let Some(item) = t.strip_prefix("- ") {
                     inherits.push(item.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+                }
+            } else if in_plugins_list {
+                if let Some(item) = t.strip_prefix("- ") {
+                    plugins.push(yaml_unquote(item));
+                }
+            } else if in_require_list {
+                if let Some(item) = t.strip_prefix("- ") {
+                    requires.push(yaml_unquote(item));
                 }
             } else if in_inherit_gem {
                 if let Some(item) = t.strip_prefix("- ") {
@@ -233,7 +312,24 @@ impl Config {
             .and_then(|s| s.get("DisabledByDefault"))
             .map(|v| v == "true")
             .unwrap_or(false);
-        Config { sections, all_disabled_by_default, only: None, except: None, inherits, inherit_gems }
+        Config {
+            sections,
+            all_disabled_by_default,
+            only: None,
+            except: None,
+            inherits,
+            inherit_gems,
+            plugins,
+            requires,
+        }
+    }
+    /// True when this config loaded rubocop-performance via `plugins:` or
+    /// `require:` — the only way Performance cops exist in real RuboCop.
+    pub fn performance_plugin_loaded(&self) -> bool {
+        self.plugins
+            .iter()
+            .chain(self.requires.iter())
+            .any(|s| is_performance_plugin(s))
     }
     /// Overlay `child` on top of self (self is the inherited base). Scalar
     /// keys override; `Exclude` lists MERGE (union), matching rubocop's
@@ -264,6 +360,16 @@ impl Config {
             .unwrap_or(false);
         self.inherits = Vec::new();
         self.inherit_gems = Vec::new();
+        for p in child.plugins {
+            if !self.plugins.iter().any(|e| e == &p) {
+                self.plugins.push(p);
+            }
+        }
+        for r in child.requires {
+            if !self.requires.iter().any(|e| e == &r) {
+                self.requires.push(r);
+            }
+        }
     }
     pub fn enabled(&self, cop: &str) -> bool {
         if let Some(except) = &self.except {
@@ -273,6 +379,14 @@ impl Config {
         }
         if let Some(only) = &self.only {
             return only.iter().any(|o| o == cop || cop.starts_with(&format!("{o}/")));
+        }
+        // Plugin cops are absent unless the gem was loaded — even an explicit
+        // `Performance/X: Enabled: true` is a no-op without `plugins:` (RuboCop
+        // reports an unrecognized cop). `--only Performance/X` still wins, so
+        // the oracle / parity harness can force-enable a cop the way they do
+        // for core.
+        if cop.starts_with("Performance/") && !self.performance_plugin_loaded() {
+            return false;
         }
         self.cop_config_enabled(cop)
     }
@@ -286,7 +400,22 @@ impl Config {
     pub fn cop_config_enabled(&self, cop: &str) -> bool {
         match self.sections.get(cop).and_then(|s| s.get("Enabled")) {
             Some(v) => v != "false",
-            None => !self.all_disabled_by_default,
+            None => {
+                // RuboCop: a department `Enabled: false` disables every cop
+                // in that department unless the cop itself sets Enabled.
+                if let Some(dept) = cop.split('/').next() {
+                    if dept != cop
+                        && self
+                            .sections
+                            .get(dept)
+                            .and_then(|s| s.get("Enabled"))
+                            .is_some_and(|v| v == "false")
+                    {
+                        return false;
+                    }
+                }
+                !self.all_disabled_by_default
+            }
         }
     }
     pub fn param(&self, cop: &str, key: &str) -> Option<&str> {
@@ -327,6 +456,18 @@ impl Config {
         let mut secs: Vec<_> = self.sections.iter().collect();
         secs.sort_by(|a, b| a.0.cmp(b.0));
         let mut out = String::new();
+        out.push_str("plugins");
+        out.push('\u{1}');
+        for p in &self.plugins {
+            out.push_str(p);
+            out.push('\u{2}');
+        }
+        out.push_str("require");
+        out.push('\u{1}');
+        for r in &self.requires {
+            out.push_str(r);
+            out.push('\u{2}');
+        }
         for (sec, kv) in secs {
             let mut kvs: Vec<_> = kv.iter().collect();
             kvs.sort_by(|a, b| a.0.cmp(b.0));
@@ -474,4 +615,123 @@ pub fn exclude_regex(pat: &str) -> Option<regex::Regex> {
         return regex::Regex::new(body).ok();
     }
     glob_regex(pat)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugins_scalar_loads_performance() {
+        let cfg = Config::parse("plugins: rubocop-performance\n");
+        assert_eq!(cfg.plugins, vec!["rubocop-performance"]);
+        assert!(cfg.performance_plugin_loaded());
+        assert!(cfg.enabled("Performance/ReverseEach"));
+    }
+
+    #[test]
+    fn plugins_block_list_and_quoted_flow() {
+        let block = Config::parse("plugins:\n  - rubocop-rspec\n  - rubocop-performance\n");
+        assert!(block.performance_plugin_loaded());
+        let flow = Config::parse("plugins: ['rubocop-other', 'rubocop-performance']\n");
+        assert!(flow.performance_plugin_loaded());
+        assert!(!Config::parse("plugins: rubocop-rspec\n").performance_plugin_loaded());
+    }
+
+    #[test]
+    fn require_forms_load_performance() {
+        assert!(Config::parse("require: rubocop-performance\n").performance_plugin_loaded());
+        assert!(Config::parse("require: rubocop/cop/performance\n").performance_plugin_loaded());
+        assert!(Config::parse("require:\n  - rubocop/performance\n").performance_plugin_loaded());
+        assert!(!Config::parse("require: rubocop-rspec\n").performance_plugin_loaded());
+    }
+
+    #[test]
+    fn performance_cops_stay_off_without_plugin() {
+        let cfg = Config::parse("Performance/ReverseEach:\n  Enabled: true\n");
+        assert!(!cfg.performance_plugin_loaded());
+        assert!(!cfg.enabled("Performance/ReverseEach"));
+        // core cops are unaffected
+        assert!(cfg.enabled("Style/Sample"));
+    }
+
+    #[test]
+    fn only_force_enables_performance_without_plugin() {
+        let mut cfg = Config::parse("AllCops:\n  DisabledByDefault: true\n");
+        assert!(!cfg.enabled("Performance/ReverseEach"));
+        cfg.only = Some(vec!["Performance/ReverseEach".into()]);
+        assert!(cfg.enabled("Performance/ReverseEach"));
+        assert!(!cfg.enabled("Performance/Size"));
+        cfg.only = Some(vec!["Performance".into()]);
+        assert!(cfg.enabled("Performance/Size"));
+    }
+
+    #[test]
+    fn except_still_wins_over_plugin() {
+        let mut cfg = Config::parse("plugins: rubocop-performance\n");
+        cfg.except = Some(vec!["Performance/ReverseEach".into()]);
+        assert!(!cfg.enabled("Performance/ReverseEach"));
+        assert!(cfg.enabled("Performance/Size"));
+    }
+
+    #[test]
+    fn inherit_merge_unions_plugins() {
+        let mut base = Config::parse("plugins: rubocop-rspec\n");
+        base.merge_child(Config::parse("plugins:\n  - rubocop-performance\n"));
+        assert!(base.performance_plugin_loaded());
+        assert_eq!(base.plugins.len(), 2);
+    }
+
+    #[test]
+    fn disabled_by_default_still_applies_with_plugin() {
+        let cfg = Config::parse(
+            "plugins: rubocop-performance\nAllCops:\n  DisabledByDefault: true\n",
+        );
+        assert!(cfg.performance_plugin_loaded());
+        assert!(!cfg.enabled("Performance/ReverseEach"));
+        let cfg = Config::parse(
+            "plugins: rubocop-performance\nAllCops:\n  DisabledByDefault: true\n\
+             Performance/ReverseEach:\n  Enabled: true\n",
+        );
+        assert!(cfg.enabled("Performance/ReverseEach"));
+        assert!(!cfg.enabled("Performance/Size"));
+    }
+
+    #[test]
+    fn department_enabled_false_disables_plugin_cops() {
+        let cfg = Config::parse(
+            "plugins: rubocop-performance\nPerformance:\n  Enabled: false\n",
+        );
+        assert!(cfg.performance_plugin_loaded());
+        assert!(!cfg.enabled("Performance/ReverseEach"));
+        assert!(!cfg.enabled("Performance/Size"));
+        assert!(cfg.enabled("Style/Sample"));
+    }
+
+    #[test]
+    fn department_enabled_false_allows_per_cop_override() {
+        let cfg = Config::parse(
+            "plugins: rubocop-performance\nPerformance:\n  Enabled: false\n\
+             Performance/ReverseEach:\n  Enabled: true\n",
+        );
+        assert!(cfg.enabled("Performance/ReverseEach"));
+        assert!(!cfg.enabled("Performance/Size"));
+    }
+
+    #[test]
+    fn only_still_wins_over_department_enabled_false() {
+        let mut cfg = Config::parse(
+            "plugins: rubocop-performance\nPerformance:\n  Enabled: false\n",
+        );
+        cfg.only = Some(vec!["Performance/Size".into()]);
+        assert!(cfg.enabled("Performance/Size"));
+        assert!(!cfg.enabled("Performance/ReverseEach"));
+    }
+
+    #[test]
+    fn identity_includes_plugin_load() {
+        let a = Config::parse("Style/Sample:\n  Enabled: true\n");
+        let b = Config::parse("plugins: rubocop-performance\nStyle/Sample:\n  Enabled: true\n");
+        assert_ne!(a.identity(), b.identity());
+    }
 }

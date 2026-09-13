@@ -13,6 +13,7 @@ require 'open3'
 require 'fileutils'
 
 REF  = 'v1.88.0'
+PERF_REF = 'v1.27.0'
 ROOT = File.expand_path('..', __dir__)
 BIN  = File.join(ROOT, 'target/release/oxidecop')
 DIR  = File.expand_path('spec_fixtures', __dir__)
@@ -417,16 +418,27 @@ COPS = {
   'Style/DefWithParentheses'         => 'style/def_with_parentheses',
   'Style/WhileUntilDo'               => 'style/while_until_do',
   'Style/MultilineIfThen'            => 'style/multiline_if_then',
-  'Style/Not'                        => 'style/not'
+  'Style/Not'                        => 'style/not',
+  'Performance/ReverseEach'          => 'performance/reverse_each',
+  'Performance/Size'                 => 'performance/size',
+  'Performance/RangeInclude'         => 'performance/range_include',
+  'Performance/FlatMap'              => 'performance/flat_map',
+  'Performance/Detect'               => 'performance/detect',
+  'Performance/StringReplacement'    => 'performance/string_replacement',
+  'Performance/RedundantMerge'       => 'performance/redundant_merge'
 }.freeze
 
 FileUtils.mkdir_p(DIR)
 
-def fetch(rel)
+def fetch(rel, cop)
   local = File.join(DIR, "#{File.basename(rel)}_spec.rb")
   return local if File.exist?(local)
 
-  url = "https://raw.githubusercontent.com/rubocop/rubocop/#{REF}/spec/rubocop/cop/#{rel}_spec.rb"
+  url = if cop.start_with?('Performance/')
+          "https://raw.githubusercontent.com/rubocop/rubocop-performance/#{PERF_REF}/spec/rubocop/cop/#{rel}_spec.rb"
+        else
+          "https://raw.githubusercontent.com/rubocop/rubocop/#{REF}/spec/rubocop/cop/#{rel}_spec.rb"
+        end
   out, st = Open3.capture2('curl', '-fsSL', url)
   if st.success? && !out.empty?
     File.write(local, out)
@@ -440,7 +452,7 @@ end
 
 rows = []
 COPS.each do |cop, rel|
-  spec = fetch(rel)
+  spec = fetch(rel, cop)
   next unless spec
 
   _out, err, = Open3.capture3({ 'ORACLE_QUIET' => '1' },
