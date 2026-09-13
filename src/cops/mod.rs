@@ -2255,6 +2255,16 @@ impl<'a> Cops<'a> {
             }
             return;
         }
+        if let Some(a) = n.as_and_node() {
+            self.mark_value_context(&a.left(), block_tail);
+            self.mark_value_context(&a.right(), block_tail);
+            return;
+        }
+        if let Some(o) = n.as_or_node() {
+            self.mark_value_context(&o.left(), block_tail);
+            self.mark_value_context(&o.right(), block_tail);
+            return;
+        }
         if let Some(i) = n.as_if_node() {
             if let Some(stmts) = i.statements() {
                 self.mark_value_context(&stmts.as_node(), block_tail);
@@ -3747,6 +3757,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_variable_number(node.name().as_slice(), node.location().start_offset());
     }
     fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+        self.mark_used_value(&node.value());
         self.check_class_length_casgn(&node.value());
         self.check_conditional_assignment_write(node.location().start_offset(), node.value());
         let lhs_start = node.location().start_offset();
@@ -7753,6 +7764,9 @@ mod tests {
         assert_eq!(offenses("[1].reverse.each() {}\n", &re).len(), 1);
         assert_eq!(offenses("result = if cond; items.reverse.each; end\n", &re), vec![]);
         assert_eq!(offenses("items.map { items.reverse.each {} }\n", &re), vec![]);
+        assert_eq!(offenses("a, b = items.reverse.each\n", &re), vec![]);
+        assert_eq!(offenses("result = cond && items.reverse.each\n", &re), vec![]);
+        assert_eq!(offenses("result = cond || items.reverse.each\n", &re), vec![]);
 
         let sz = perf("Performance/Size:\n  Enabled: true\n");
         assert_eq!(offenses("obj.to_a(1).count\n", &sz), vec![]);
@@ -7805,6 +7819,12 @@ mod tests {
             assert_eq!(r.offenses.len(), 1, "{pat}");
             assert_eq!(apply_fixes(&src, r.fixes), format!("'abc'.tr(\"{lit}\", ',')\n"));
         }
+        let r = lint_all("'abc'.gsub(/\\xFF/, '1')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub(/\\xFF/, '1')\n", r.fixes), "'abc'.tr(\"\\xFF\", '1')\n");
+        let r = lint_all("'abc'.gsub(/\\x80/, '1')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub(/\\x80/, '1')\n", r.fixes), "'abc'.tr(\"\\x80\", '1')\n");
 
         let mg = perf("Performance/RedundantMerge:\n  Enabled: true\n");
         assert_eq!(offenses("hash.merge!(a: 1) { |_, o, n| n }\n", &mg), vec![]);
@@ -7815,6 +7835,10 @@ mod tests {
         assert_eq!(offenses("({ key: build() }).merge!(a: 1, b: 2)\n", &mg), vec![]);
         assert_eq!(offenses("result = if cond; hash.merge!(a: 1); end\n", &mg), vec![]);
         assert_eq!(offenses("items.map { if cond; hash.merge!(a: 1); end }\n", &mg), vec![]);
+        assert_eq!(offenses("a, b = hash.merge!(x: 1)\n", &mg), vec![]);
+        assert_eq!(offenses("result = cond && hash.merge!(x: nil)\n", &mg), vec![]);
+        assert_eq!(offenses("result = cond || hash.merge!(x: nil)\n", &mg), vec![]);
+        assert_eq!(offenses("if cond && hash.merge!(x: nil); end\n", &mg), vec![]);
         assert_eq!(offenses("result = case value; in x; hash.merge!(a: 1); end\n", &mg), vec![]);
         assert_eq!(
             offenses("result = begin; work; rescue; hash.merge!(a: 1); end\n", &mg),

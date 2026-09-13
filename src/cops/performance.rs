@@ -287,8 +287,12 @@ impl<'a> Cops<'a> {
         if from_regex.0 && !deterministic_regex(&raw) {
             return;
         }
-        let interpreted = if from_regex.0 { interpret_escapes(&raw) } else { raw.clone() };
-        if interpreted.chars().count() != 1 {
+        let interpreted = if from_regex.0 {
+            interpret_escapes(&raw)
+        } else {
+            raw.clone().into_bytes()
+        };
+        if interpreted_len(&interpreted) != 1 {
             return;
         }
         let delete = second_s.is_empty();
@@ -305,7 +309,7 @@ impl<'a> Cops<'a> {
         );
         self.fixes.push((sel.start_offset(), sel.end_offset(), prefer.into_bytes()));
         if from_regex.0 {
-            let lit = to_string_literal(&interpreted);
+            let lit = to_string_literal_bytes(&interpreted);
             self.fixes.push((first.location().start_offset(), first.location().end_offset(), lit.into_bytes()));
         }
         if delete {
@@ -662,24 +666,31 @@ fn deterministic_regex(src: &str) -> bool {
     re.is_match(src)
 }
 
-fn interpret_escapes(s: &str) -> String {
-    let mut out = String::new();
+fn push_char(out: &mut Vec<u8>, c: char) {
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+}
+
+/// Interpret Ruby string/regexp escapes as bytes so `\xNN` above 0x7F stays
+/// a single 8-bit value instead of a UTF-8 Unicode scalar.
+fn interpret_escapes(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
-            out.push(c);
+            push_char(&mut out, c);
             continue;
         }
         match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('f') => out.push('\u{c}'),
-            Some('v') => out.push('\u{b}'),
-            Some('b') => out.push('\u{8}'),
-            Some('a') => out.push('\u{7}'),
-            Some('e') => out.push('\u{1b}'),
-            Some('\\') => out.push('\\'),
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('r') => out.push(b'\r'),
+            Some('f') => out.push(0x0c),
+            Some('v') => out.push(0x0b),
+            Some('b') => out.push(0x08),
+            Some('a') => out.push(0x07),
+            Some('e') => out.push(0x1b),
+            Some('\\') => out.push(b'\\'),
             Some('x') => {
                 // Ruby accepts one or two hex digits after `\x`.
                 let mut hex = String::new();
@@ -690,25 +701,39 @@ fn interpret_escapes(s: &str) -> String {
                     }
                 }
                 if let Ok(v) = u8::from_str_radix(&hex, 16) {
-                    out.push(v as char);
+                    out.push(v);
                     continue;
                 }
-                out.push('x');
+                out.push(b'x');
             }
             Some('u') => {
                 let hex: String = chars.by_ref().take(4).collect();
                 if let Ok(v) = u32::from_str_radix(&hex, 16) {
                     if let Some(ch) = char::from_u32(v) {
-                        out.push(ch);
+                        push_char(&mut out, ch);
                         continue;
                     }
                 }
             }
-            Some(other) => out.push(other),
-            None => out.push('\\'),
+            Some(other) => push_char(&mut out, other),
+            None => out.push(b'\\'),
         }
     }
     out
+}
+
+fn interpreted_len(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.chars().count(),
+        Err(_) => bytes.len(),
+    }
+}
+
+fn to_string_literal_bytes(s: &[u8]) -> String {
+    match std::str::from_utf8(s) {
+        Ok(text) => to_string_literal(text),
+        Err(_) => ruby_inspect_bytes(s),
+    }
 }
 
 fn to_string_literal(s: &str) -> String {
@@ -738,6 +763,30 @@ fn ruby_inspect(s: &str) -> String {
                 out.push_str(&format!("\\x{:02X}", c as u32));
             }
             c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Inspect a non-UTF-8 byte string the way Ruby does for ASCII-8BIT:
+/// high bytes stay `\\xNN` rather than becoming Unicode scalars.
+fn ruby_inspect_bytes(s: &[u8]) -> String {
+    let mut out = String::from("\"");
+    for &b in s {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\t' => out.push_str("\\t"),
+            b'\r' => out.push_str("\\r"),
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x0b => out.push_str("\\v"),
+            0x0c => out.push_str("\\f"),
+            0x1b => out.push_str("\\e"),
+            b if b < 0x20 || b >= 0x7f => out.push_str(&format!("\\x{b:02X}")),
+            b => out.push(b as char),
         }
     }
     out.push('"');
