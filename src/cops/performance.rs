@@ -136,8 +136,12 @@ impl<'a> Cops<'a> {
         let warn_bare = self.cfg.get(COP, "EnabledForFlattenWithoutParams") == Some("true");
         // `flatten_arg_int` is None both for a bare `flatten` and for a
         // non-literal depth (`flatten(depth)`). The bare-flatten warning
-        // only applies when no argument is supplied.
-        let has_flatten_arg = positional_args(node) != 0;
+        // only applies when no argument is supplied, including a block-pass:
+        // upstream `params.first` is truthy for `flatten(&blk)`, so it is
+        // not a bare-flatten warning. Prism may put `&blk`/`&:sym` on
+        // `block()` as a BlockArgumentNode rather than in `arguments()`.
+        let has_flatten_arg = arg_count(node) != 0
+            || node.block().is_some_and(|b| b.as_block_argument_node().is_some());
         let (ok, extra) = match flatten_level {
             Some(1) => (true, false),
             None if warn_bare && !has_flatten_arg => (true, true),

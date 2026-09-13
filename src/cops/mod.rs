@@ -7694,6 +7694,10 @@ mod tests {
         assert!(r.offenses[0].message.contains("Beware"));
         assert!(r.fixes.is_empty() || !r.offenses[0].correctable);
         assert_eq!(offenses("[1].map { |e| [e] }.flatten(depth)\n", &warn), vec![]);
+        assert_eq!(offenses("[1].map { |e| [e] }.flatten(&blk)\n", &warn), vec![]);
+        assert_eq!(offenses("[1].map { |e| [e] }.flatten(&:itself)\n", &warn), vec![]);
+        let r = lint_all("[1, 2, 3, 4].map { |e| [e, e] }.flatten(1)\n", &warn);
+        assert_eq!(apply_fixes("[1, 2, 3, 4].map { |e| [e, e] }.flatten(1)\n", r.fixes), "[1, 2, 3, 4].flat_map { |e| [e, e] }\n");
     }
 
     #[test]
