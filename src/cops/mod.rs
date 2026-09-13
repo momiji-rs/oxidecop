@@ -1800,10 +1800,17 @@ pub(crate) struct Cops<'a> {
     // send (receiver or argument), or return/break/next — stands in for
     // rubocop-ast's `node.value_used?` / ReverseEach's ancestor walk.
     pub(crate) value_used_offsets: HashSet<usize>,
-    // Last expression of a non-`each_with_object` block — rubocop-ast's
-    // `node.value_used?` for a block's return value. ReverseEach does NOT
-    // consult this (its ancestor walk is assignment/send/return only).
+    // Last expression of a block — rubocop-ast's `node.value_used?` for a
+    // block's return value. ReverseEach does NOT consult this (its ancestor
+    // walk is assignment/send/return only). `each_with_object` tails are
+    // still marked; RedundantMerge exempts only the accumulator receiver.
     pub(crate) block_tail_offsets: HashSet<usize>,
+    // Second `|item, acc|` name of the current `each_with_object` block
+    // (`None` for any other block). Nearest frame is `.last()`.
+    pub(crate) ewo_accum: Vec<Option<Vec<u8>>>,
+    // Count of enclosing plain `send` CallNodes (not `csend`). ReverseEach's
+    // `use_return_value?` treats any `send_type?` ancestor as "value used".
+    pub(crate) perf_send_depth: u32,
     // Style/DoubleNegation: a hand-rolled "ancestor stack" mirroring exactly
     // the node kinds `allowed_in_returns?` climbs through (prism gives no
     // parent pointers) — pushed/popped by `visit_def_node`, `visit_block_node`
@@ -2221,42 +2228,107 @@ pub(crate) struct Cops<'a> {
 impl<'a> Cops<'a> {
     /// Resolved once per run in Engine::new — this is a binary search over a
     /// short static list, called on every node for every check.
-    /// Record that `n`'s result is used, walking through parentheses and
-    /// single-statement `StatementsNode` wrappers so a nested call is marked
-    /// too (`x = (hash.merge!(a: 1))`).
+    /// Record that `n`'s result is used, walking through parentheses,
+    /// statement lists, conditionals, and collection literals so a nested
+    /// call is marked too (`x = if cond; hash.merge!(a: 1); end`).
     pub(crate) fn mark_used_value(&mut self, n: &ruby_prism::Node) {
-        self.value_used_offsets.insert(n.location().start_offset());
+        self.mark_value_context(n, false);
+    }
+    fn mark_block_tail(&mut self, n: &ruby_prism::Node) {
+        self.mark_value_context(n, true);
+    }
+    fn mark_value_context(&mut self, n: &ruby_prism::Node, block_tail: bool) {
+        if block_tail {
+            self.block_tail_offsets.insert(n.location().start_offset());
+        } else {
+            self.value_used_offsets.insert(n.location().start_offset());
+        }
         if let Some(p) = n.as_parentheses_node() {
             if let Some(b) = p.body() {
-                self.mark_used_value(&b);
+                self.mark_value_context(&b, block_tail);
             }
             return;
         }
         if let Some(s) = n.as_statements_node() {
-            let mut it = s.body().iter();
-            if let Some(first) = it.next() {
-                if it.next().is_none() {
-                    self.mark_used_value(&first);
-                }
+            if let Some(last) = s.body().iter().last() {
+                self.mark_value_context(&last, block_tail);
+            }
+            return;
+        }
+        if let Some(i) = n.as_if_node() {
+            if let Some(stmts) = i.statements() {
+                self.mark_value_context(&stmts.as_node(), block_tail);
+            }
+            if let Some(sub) = i.subsequent() {
+                self.mark_value_context(&sub, block_tail);
+            }
+            return;
+        }
+        if let Some(u) = n.as_unless_node() {
+            if let Some(stmts) = u.statements() {
+                self.mark_value_context(&stmts.as_node(), block_tail);
+            }
+            if let Some(e) = u.else_clause() {
+                self.mark_value_context(&e.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(e) = n.as_else_node() {
+            if let Some(s) = e.statements() {
+                self.mark_value_context(&s.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(c) = n.as_case_node() {
+            for w in c.conditions().iter() {
+                self.mark_value_context(&w, block_tail);
+            }
+            if let Some(e) = c.else_clause() {
+                self.mark_value_context(&e.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(w) = n.as_when_node() {
+            if let Some(s) = w.statements() {
+                self.mark_value_context(&s.as_node(), block_tail);
+            }
+            return;
+        }
+        if let Some(a) = n.as_array_node() {
+            for e in a.elements().iter() {
+                self.mark_value_context(&e, block_tail);
+            }
+            return;
+        }
+        if let Some(h) = n.as_hash_node() {
+            for e in h.elements().iter() {
+                self.mark_value_context(&e, block_tail);
+            }
+            return;
+        }
+        if let Some(h) = n.as_keyword_hash_node() {
+            for e in h.elements().iter() {
+                self.mark_value_context(&e, block_tail);
+            }
+            return;
+        }
+        if let Some(p) = n.as_assoc_node() {
+            self.mark_value_context(&p.key(), block_tail);
+            self.mark_value_context(&p.value(), block_tail);
+            return;
+        }
+        if let Some(b) = n.as_begin_node() {
+            if let Some(s) = b.statements() {
+                self.mark_value_context(&s.as_node(), block_tail);
             }
         }
     }
-    fn mark_block_tail(&mut self, n: &ruby_prism::Node) {
-        self.block_tail_offsets.insert(n.location().start_offset());
-        if let Some(p) = n.as_parentheses_node() {
-            if let Some(b) = p.body() {
-                self.mark_block_tail(&b);
-            }
-            return;
-        }
-        if let Some(s) = n.as_statements_node() {
-            let mut it = s.body().iter();
-            if let Some(first) = it.next() {
-                if it.next().is_none() {
-                    self.mark_block_tail(&first);
-                }
-            }
-        }
+    fn ewo_second_arg(node: &ruby_prism::BlockNode) -> Option<Vec<u8>> {
+        let bp = node.parameters()?.as_block_parameters_node()?;
+        let params = bp.parameters()?;
+        let mut it = params.requireds().iter();
+        it.next()?;
+        it.next()?.as_required_parameter_node().map(|p| p.name().as_slice().to_vec())
     }
     pub(crate) fn on(&self, cop: &str) -> bool {
         if !self.file_disabled.is_empty() && self.file_disabled.iter().any(|c| *c == cop) {
@@ -2995,6 +3067,8 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         ruby_prism::visit_regular_expression_node(self, node);
     }
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        // rubocop-ast: an `if` condition is always value-used.
+        self.mark_used_value(&node.predicate());
         self.rsn_cond_pos.insert(node.predicate().location().start_offset());
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_and_or_conditional(&node.predicate());
@@ -3193,6 +3267,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         }
     }
     fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        self.mark_used_value(&node.predicate());
         self.rsn_cond_pos.insert(node.predicate().location().start_offset());
         self.rs_scan_conditional(&node.as_node(), &node.predicate());
         self.check_else_layout_unless(node);
@@ -4342,19 +4417,24 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         let void_method_name = self.void_pending_block_name.take();
         let void_is_each = void_method_name.as_deref() == Some(&b"each"[..]);
         let void_is_tap = void_method_name.as_deref() == Some(&b"tap"[..]);
-        // Last expression of a block is value-used, except `each_with_object`
-        // whose accumulator mutations are the cop's intended hit.
-        if void_method_name.as_deref() != Some(&b"each_with_object"[..]) {
-            if let Some(body) = node.body() {
-                if let Some(stmts) = body.as_statements_node() {
-                    if let Some(last) = stmts.body().iter().last() {
-                        self.mark_block_tail(&last);
-                    }
-                } else {
-                    self.mark_block_tail(&body);
+        // Last expression of any block is a block-tail (value-used). The
+        // `each_with_object` accumulator exception is receiver-specific and
+        // applied in RedundantMerge, not by skipping the mark.
+        if let Some(body) = node.body() {
+            if let Some(stmts) = body.as_statements_node() {
+                if let Some(last) = stmts.body().iter().last() {
+                    self.mark_block_tail(&last);
                 }
+            } else {
+                self.mark_block_tail(&body);
             }
         }
+        let ewo_acc = if void_method_name.as_deref() == Some(&b"each_with_object"[..]) {
+            Self::ewo_second_arg(node)
+        } else {
+            None
+        };
+        self.ewo_accum.push(ewo_acc);
         self.void_each_stack.push(void_is_each);
         // Lint/DuplicateMethods: consume the `(is_new_block, ns_frame)`
         // classification `visit_call_node` stashed right before descending
@@ -4586,6 +4666,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.ic_macro_stack.pop();
         }
         self.void_each_stack.pop();
+        self.ewo_accum.pop();
         self.dm_anon_stack.pop();
         self.dm_ns_stack.pop();
         if dn_define_method.is_some() {
@@ -4609,6 +4690,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.moi_stack.pop();
     }
     fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+        self.mark_used_value(&node.predicate());
         self.check_next_while(node);
         self.check_loop_while(node);
         self.check_unreachable_loop_while(node);
@@ -4706,6 +4788,7 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.cond_depth -= 1;
     }
     fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+        self.mark_used_value(&node.predicate());
         self.check_next_until(node);
         self.check_loop_until(node);
         self.check_unreachable_loop_until(node);
@@ -6267,6 +6350,10 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
         self.check_lambda_method(node);
         self.check_preferred_hash_methods(node);
         self.check_sample(node);
+        let perf_send_anc = !node.is_safe_navigation();
+        if perf_send_anc {
+            self.perf_send_depth += 1;
+        }
         self.check_reverse_each(node);
         self.check_size(node);
         self.check_range_include(node);
@@ -6740,6 +6827,9 @@ impl<'pr, 'a> Visit<'pr> for Cops<'a> {
             self.moi_stack.pop();
         }
         self.moi_stack.pop();
+        if perf_send_anc {
+            self.perf_send_depth -= 1;
+        }
     }
     fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
         self.check_redundant_splat_expansion(node);
@@ -6946,6 +7036,8 @@ pub fn lint(src: &[u8], cfg: &Config, eng: &Engine, rel_path: &str) -> LintResul
         rse_assignment_value: HashSet::new(),
         value_used_offsets: HashSet::new(),
         block_tail_offsets: HashSet::new(),
+        ewo_accum: Vec::new(),
+        perf_send_depth: 0,
         dn_ancestors: Vec::new(),
         dn_return_arg_offsets: HashSet::new(),
         dn_pending_define_method: None,
@@ -7634,6 +7726,8 @@ mod tests {
         assert_eq!(offenses("[1, 2, 3].reverse.each(1) {}\n", &re), vec![]);
         assert_eq!(offenses("[1].reverse().each {}\n", &re).len(), 1);
         assert_eq!(offenses("[1].reverse.each() {}\n", &re).len(), 1);
+        assert_eq!(offenses("result = if cond; items.reverse.each; end\n", &re), vec![]);
+        assert_eq!(offenses("items.map { items.reverse.each {} }\n", &re), vec![]);
 
         let sz = perf("Performance/Size:\n  Enabled: true\n");
         assert_eq!(offenses("obj.to_a(1).count\n", &sz), vec![]);
@@ -7676,6 +7770,12 @@ mod tests {
         assert_eq!(offenses("({}).merge!(a: 1, b: 2)\n", &mg).len(), 1);
         assert_eq!(offenses("hash&.merge!(a: 1)\n", &mg), vec![]);
         assert_eq!(offenses("({ key: build() }).merge!(a: 1, b: 2)\n", &mg), vec![]);
+        assert_eq!(offenses("result = if cond; hash.merge!(a: 1); end\n", &mg), vec![]);
+        assert_eq!(offenses("items.map { if cond; hash.merge!(a: 1); end }\n", &mg), vec![]);
+        assert_eq!(offenses("items.each_with_object({}) { |item, acc| other.merge!(a: 1) }\n", &mg), vec![]);
+        assert_eq!(offenses("items.each_with_object({}) { |item, acc| acc.merge!(a: 1) }\n", &mg).len(), 1);
+        assert_eq!(offenses("x = [hash.merge!(a: 1)]\n", &mg), vec![]);
+        assert_eq!(offenses("if hash.merge!(a: 1); end\n", &mg), vec![]);
         let r = lint_all("hash = {}\nhash.merge!(a: 1, b: 2) if cond\n", &mg);
         assert_eq!(r.offenses.len(), 1, "modifier two-pair merge");
         assert!(!r.offenses[0].correctable);

@@ -12,6 +12,20 @@ impl<'a> Cops<'a> {
     fn block_tail(&self, node: &ruby_prism::CallNode) -> bool {
         self.block_tail_offsets.contains(&node.location().start_offset())
     }
+    fn receiver_is_ewo_accum(&self, recv: &ruby_prism::Node) -> bool {
+        let Some(want) = self.ewo_accum.last().and_then(|n| n.as_ref()) else {
+            return false;
+        };
+        let mut owned: Option<ruby_prism::Node> = None;
+        loop {
+            let n = owned.as_ref().unwrap_or(recv);
+            match n.as_call_node().and_then(|c| c.receiver()) {
+                Some(r) => owned = Some(r),
+                None => break,
+            }
+        }
+        owned.as_ref().unwrap_or(recv).as_local_variable_read_node().is_some_and(|l| l.name().as_slice() == want)
+    }
 
     /// Performance/ReverseEach — `recv.reverse.each` → `recv.reverse_each`,
     /// unless the result is used (assignment, outer send, return/break/next).
@@ -26,6 +40,12 @@ impl<'a> Cops<'a> {
         // Prism wraps `each()` in an empty ArgumentsNode; count children so
         // empty parens match the upstream no-argument `(call _ :each)`.
         if arg_count(node) != 0 {
+            return;
+        }
+        // `use_return_value?` walks ancestors for assignment/send/return.
+        // `perf_send_depth` includes this call, so > 1 means an outer send
+        // (including the owner of an enclosing block).
+        if self.perf_send_depth > 1 {
             return;
         }
         if self.value_used(node) {
@@ -343,7 +363,9 @@ impl<'a> Cops<'a> {
         if self.value_used(node) {
             return;
         }
-        if self.block_tail(node) {
+        // Block tails are value-used except `each_with_object` when the
+        // receiver unwinds to that block's accumulator.
+        if self.block_tail(node) && !self.receiver_is_ewo_accum(&recv) {
             return;
         }
         let recv_src = String::from_utf8_lossy(self.node_src(&recv)).into_owned();
