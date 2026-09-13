@@ -9,6 +9,9 @@ impl<'a> Cops<'a> {
     fn value_used(&self, node: &ruby_prism::CallNode) -> bool {
         self.value_used_offsets.contains(&node.location().start_offset())
     }
+    fn block_tail(&self, node: &ruby_prism::CallNode) -> bool {
+        self.block_tail_offsets.contains(&node.location().start_offset())
+    }
 
     /// Performance/ReverseEach — `recv.reverse.each` → `recv.reverse_each`,
     /// unless the result is used (assignment, outer send, return/break/next).
@@ -18,6 +21,9 @@ impl<'a> Cops<'a> {
             return;
         }
         if node.name().as_slice() != b"each" {
+            return;
+        }
+        if node.arguments().is_some() {
             return;
         }
         if self.value_used(node) {
@@ -101,11 +107,7 @@ impl<'a> Cops<'a> {
         if map_name.as_slice() != b"map" && map_name.as_slice() != b"collect" {
             return;
         }
-        let has_block = map_call.block().is_some();
-        let has_block_pass = map_call.arguments().is_some_and(|a| {
-            a.arguments().iter().any(|n| n.as_block_argument_node().is_some())
-        });
-        if !has_block && !has_block_pass {
+        if !map_collect_shape(&map_call) {
             return;
         }
         let flatten_level = flatten_arg_int(node, self.src);
@@ -168,11 +170,7 @@ impl<'a> Cops<'a> {
         if !matches!(first_method.as_slice(), b"select" | b"find_all" | b"filter") {
             return;
         }
-        let has_block = sel_call.block().is_some();
-        let has_block_pass = sel_call.arguments().is_some_and(|a| {
-            a.arguments().iter().any(|n| n.as_block_argument_node().is_some())
-        });
-        if !has_block && !has_block_pass {
+        if !select_shape(&sel_call) {
             return;
         }
         if lazy_receiver(&sel_call) {
@@ -215,12 +213,13 @@ impl<'a> Cops<'a> {
     }
 
     fn preferred_detect(&self) -> String {
-        // Style/CollectionMethods PreferredMethods['detect'] is a nested hash
-        // the SCHEMA flattens away. Specs that override it emit a flat
-        // `detect:` key; otherwise the cop's own fallback is `detect`.
+        // Style/CollectionMethods PreferredMethods['detect'] defaults to
+        // `find` in RuboCop's default.yml. Nested hashes never reach SCHEMA,
+        // so an absent key uses that default; a flat `detect:` override (the
+        // oracle's replacement config) still wins.
         match self.cfg.get("Style/CollectionMethods", "detect") {
             Some(s) if !s.is_empty() && s != "nil" => s.to_string(),
-            _ => "detect".to_string(),
+            _ => "find".to_string(),
         }
     }
 
@@ -246,7 +245,7 @@ impl<'a> Cops<'a> {
             return;
         }
         let Some(second_s) = string_unescaped(&second) else { return };
-        if second_s.len() > 1 {
+        if second_s.chars().count() > 1 {
             return;
         }
         let Some((first_src, from_regex)) = first_pattern_source(&first, self.src) else { return };
@@ -296,6 +295,9 @@ impl<'a> Cops<'a> {
         if node.name().as_slice() != b"merge!" {
             return;
         }
+        if node.block().is_some() {
+            return;
+        }
         let Some(recv) = node.receiver() else { return };
         let Some(args) = node.arguments() else { return };
         let mut ait = args.arguments().iter();
@@ -312,7 +314,7 @@ impl<'a> Cops<'a> {
         }
         let max = self.cfg.get(COP, "MaxKeyValuePairs").and_then(|s| {
             if s == "nil" {
-                Some(usize::MAX)
+                Some(2)
             } else {
                 s.parse().ok()
             }
@@ -323,11 +325,10 @@ impl<'a> Cops<'a> {
         if pairs.len() > 1 && !receiver_pure(&recv) {
             return;
         }
-        // rubocop-ast treats a last-of-block statement as value-used; we only
-        // mark assignment / outer-send / return, so an `each_with_object`
-        // accumulator statement still flags (matching the spec) while
-        // `x = h.merge!(...)` does not.
         if self.value_used(node) {
+            return;
+        }
+        if self.block_tail(node) {
             return;
         }
         let recv_src = String::from_utf8_lossy(self.node_src(&recv)).into_owned();
@@ -342,7 +343,11 @@ impl<'a> Cops<'a> {
         let prefer = assigns.join("; ");
         let current = String::from_utf8_lossy(self.node_src(&node.as_node()));
         let msg = format!("Use `{prefer}` instead of `{current}`.");
-        self.push(node.location().start_offset(), COP, true, msg);
+        let postfix = self.hs_modifier_depth > 0 && pairs.len() > 1;
+        self.push(node.location().start_offset(), COP, !postfix, msg);
+        if postfix {
+            return;
+        }
         let joined = if pairs.len() == 1 {
             assigns[0].clone()
         } else {
@@ -403,11 +408,35 @@ fn format_hash_key(cops: &Cops, key: &ruby_prism::Node, colon: bool) -> String {
 }
 
 fn receiver_pure(recv: &ruby_prism::Node) -> bool {
-    recv.as_local_variable_read_node().is_some()
+    if recv.as_local_variable_read_node().is_some()
         || recv.as_instance_variable_read_node().is_some()
         || recv.as_class_variable_read_node().is_some()
         || recv.as_global_variable_read_node().is_some()
         || recv.as_constant_read_node().is_some()
+        || recv.as_self_node().is_some()
+        || recv.as_nil_node().is_some()
+        || recv.as_true_node().is_some()
+        || recv.as_false_node().is_some()
+        || recv.as_integer_node().is_some()
+        || recv.as_float_node().is_some()
+        || recv.as_string_node().is_some()
+        || recv.as_symbol_node().is_some()
+        || recv.as_hash_node().is_some()
+        || recv.as_array_node().is_some()
+        || recv.as_range_node().is_some()
+    {
+        return true;
+    }
+    if let Some(p) = recv.as_parentheses_node() {
+        let Some(body) = p.body() else { return false };
+        if let Some(stmts) = body.as_statements_node() {
+            let mut it = stmts.body().iter();
+            let Some(first) = it.next() else { return false };
+            return it.next().is_none() && receiver_pure(&first);
+        }
+        return receiver_pure(&body);
+    }
+    false
 }
 
 fn leading_spaces(src: &[u8], off: usize) -> String {
@@ -421,12 +450,12 @@ fn size_array_receiver(n: &ruby_prism::Node) -> bool {
     }
     let Some(c) = n.as_call_node() else { return false };
     if c.name().as_slice() == b"to_a" {
-        return true;
+        return c.arguments().is_none() && c.block().is_none();
     }
     if c.name().as_slice() == b"[]" {
         return const_named(c.receiver().as_ref(), b"Array");
     }
-    c.receiver().is_none() && c.name().as_slice() == b"Array"
+    c.receiver().is_none() && c.name().as_slice() == b"Array" && c.arguments().is_some()
 }
 
 fn size_hash_receiver(n: &ruby_prism::Node) -> bool {
@@ -435,12 +464,12 @@ fn size_hash_receiver(n: &ruby_prism::Node) -> bool {
     }
     let Some(c) = n.as_call_node() else { return false };
     if c.name().as_slice() == b"to_h" {
-        return true;
+        return c.arguments().is_none() && c.block().is_none();
     }
     if c.name().as_slice() == b"[]" {
         return const_named(c.receiver().as_ref(), b"Hash");
     }
-    c.receiver().is_none() && c.name().as_slice() == b"Hash"
+    c.receiver().is_none() && c.name().as_slice() == b"Hash" && c.arguments().is_some()
 }
 
 fn const_named(recv: Option<&ruby_prism::Node>, name: &[u8]) -> bool {
@@ -500,6 +529,25 @@ fn int_value(n: &ruby_prism::Node, src: &[u8]) -> Option<i32> {
     None
 }
 
+fn positional_args(c: &ruby_prism::CallNode) -> usize {
+    c.arguments()
+        .map(|a| a.arguments().iter().filter(|n| n.as_block_argument_node().is_none()).count())
+        .unwrap_or(0)
+}
+
+fn map_collect_shape(c: &ruby_prism::CallNode) -> bool {
+    if positional_args(c) != 0 {
+        return false;
+    }
+    c.block().is_some()
+        || c.arguments()
+            .is_some_and(|a| a.arguments().iter().any(|n| n.as_block_argument_node().is_some()))
+}
+
+fn select_shape(c: &ruby_prism::CallNode) -> bool {
+    map_collect_shape(c)
+}
+
 fn lazy_receiver(sel: &ruby_prism::CallNode) -> bool {
     sel.receiver()
         .and_then(|r| r.as_call_node())
@@ -539,6 +587,9 @@ fn first_pattern_source(n: &ruby_prism::Node, src: &[u8]) -> Option<(String, (bo
     let args = c.arguments()?;
     let mut it = args.arguments().iter();
     let first = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
     first_pattern_source(&first, src)
 }
 
@@ -566,6 +617,7 @@ fn interpret_escapes(s: &str) -> String {
             Some('v') => out.push('\u{b}'),
             Some('b') => out.push('\u{8}'),
             Some('a') => out.push('\u{7}'),
+            Some('e') => out.push('\u{1b}'),
             Some('\\') => out.push('\\'),
             Some('x') => {
                 let h1 = chars.next();
