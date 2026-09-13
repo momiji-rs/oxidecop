@@ -949,6 +949,10 @@ def build_cfg(cop, cfg_hash, as_val = nil, extra_sections = [], replace: false, 
   lines = ['AllCops:', '  DisabledByDefault: true']
   lines << "  ActiveSupportExtensionsEnabled: #{as_val}" if as_val
   lines << "  TargetRubyVersion: #{ruby}" if ruby
+  # Performance cops only exist when the plugin gem is loaded — emit the
+  # same `plugins:` string a real project would. `--only` on --fix still
+  # force-enables, matching core.
+  lines.unshift('plugins: rubocop-performance') if cop.start_with?('Performance/')
   lines += ["#{cop}:", '  Enabled: true']
   lines << '  __replace_defaults__: true' if replace
   emit_pairs(lines, cfg_hash)
