@@ -7499,6 +7499,8 @@ mod tests {
 
         assert_eq!(offenses("array&.reverse.each { |e| puts e }\n", &cfg).len(), 1);
         assert_eq!(offenses("array&.reverse&.each { |e| puts e }\n", &cfg).len(), 1);
+        assert_eq!(offenses("[1, 2, 3].reverse().each { |e| puts e }\n", &cfg).len(), 1);
+        assert_eq!(offenses("[1, 2, 3].reverse.each() { |e| puts e }\n", &cfg).len(), 1);
         assert_eq!(offenses("[1, 2, 3].reverse\n", &cfg), vec![]);
         assert_eq!(offenses("[1, 2, 3].each { |e| puts e }\n", &cfg), vec![]);
         assert_eq!(offenses("ret = [1, 2, 3].reverse.each { |e| puts e }\n", &cfg), vec![]);
@@ -7515,11 +7517,18 @@ mod tests {
         assert_eq!(r.offenses[0].message, "Use `size` instead of `count`.");
         assert_eq!(apply_fixes(src, r.fixes), "[1, 2, 3].size\n");
         assert_eq!(offenses("[1, 2, 3]&.count\n", &cfg).len(), 1);
+        assert_eq!(offenses("[1, 2, 3].count()\n", &cfg).len(), 1);
         assert_eq!(offenses("(1..3).to_a.count\n", &cfg).len(), 1);
+        assert_eq!(offenses("(1..3).to_a().count()\n", &cfg).len(), 1);
         assert_eq!(offenses("Array(1..5).count\n", &cfg).len(), 1);
+        assert_eq!(offenses("Array[*1..5].count\n", &cfg).len(), 1);
         assert_eq!(offenses("{a: 1, b: 2, c: 3}.count\n", &cfg).len(), 1);
         assert_eq!(offenses("[[:foo, :bar], [1, 2]].to_h.count\n", &cfg).len(), 1);
         assert_eq!(offenses("count(items)\n", &cfg), vec![]);
+        assert_eq!(offenses("Array[].count\n", &cfg), vec![]);
+        assert_eq!(offenses("Array(1, 2).count\n", &cfg), vec![]);
+        assert_eq!(offenses("Hash[].count\n", &cfg), vec![]);
+        assert_eq!(offenses("Hash(1, 2).count\n", &cfg), vec![]);
         assert_eq!(offenses("object.count(items)\n", &cfg), vec![]);
         assert_eq!(offenses("[1, 2, 3].count { |e| e > 3 }\n", &cfg), vec![]);
         assert_eq!(offenses("[1, 2, 3].count(&:nil?)\n", &cfg), vec![]);
@@ -7574,6 +7583,8 @@ mod tests {
             "[1, 2, 3].find(&:even?)\n"
         );
         assert_eq!(offenses("[1, 2, 3].select { |i| i % 2 == 0 }.first(n)\n", &cfg), vec![]);
+        assert_eq!(offenses("[1, 2, 3].select { |i| i % 2 == 0 }&.first\n", &cfg), vec![]);
+        assert_eq!(offenses("array&.select { |i| i % 2 == 0 }.first\n", &cfg).len(), 1);
         assert_eq!(offenses("adapter.select.first\n", &cfg), vec![]);
         assert_eq!(offenses("adapter.lazy.select { 'something' }.first\n", &cfg), vec![]);
     }
@@ -7605,6 +7616,7 @@ mod tests {
         );
         assert_eq!(offenses("foo.merge!(**bar)\n", &cfg), vec![]);
         assert_eq!(offenses("foo.merge!({})\n", &cfg), vec![]);
+        assert_eq!(offenses("hash&.merge!(a: 1)\n", &cfg), vec![]);
         assert_eq!(offenses("variable = hash.merge!(a: 1)\n", &cfg), vec![]);
         assert_eq!(
             offenses("foo.each_with_object({}) do |f, hash|\n  changes = hash.merge!(a: 1, b: 2)\nend\n", &cfg),

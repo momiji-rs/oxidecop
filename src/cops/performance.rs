@@ -23,7 +23,9 @@ impl<'a> Cops<'a> {
         if node.name().as_slice() != b"each" {
             return;
         }
-        if node.arguments().is_some() {
+        // Prism wraps `each()` in an empty ArgumentsNode; count children so
+        // empty parens match the upstream no-argument `(call _ :each)`.
+        if arg_count(node) != 0 {
             return;
         }
         if self.value_used(node) {
@@ -34,7 +36,7 @@ impl<'a> Cops<'a> {
         if rev.name().as_slice() != b"reverse" {
             return;
         }
-        if rev.arguments().is_some() || rev.block().is_some() {
+        if arg_count(&rev) != 0 || rev.block().is_some() {
             return;
         }
         let Some(rev_sel) = rev.message_loc() else { return };
@@ -54,7 +56,7 @@ impl<'a> Cops<'a> {
         if node.name().as_slice() != b"count" {
             return;
         }
-        if node.arguments().is_some() || node.block().is_some() {
+        if arg_count(node) != 0 || node.block().is_some() {
             return;
         }
         let Some(recv) = node.receiver() else { return };
@@ -153,6 +155,11 @@ impl<'a> Cops<'a> {
         let second = node.name();
         let is_index = second.as_slice() == b"[]";
         if second.as_slice() != b"first" && second.as_slice() != b"last" && !is_index {
+            return;
+        }
+        // Upstream matcher is `(send ...)`, not `(call ...)`. Rewriting
+        // `select { ... }&.first` would drop `&.`.
+        if node.is_safe_navigation() {
             return;
         }
         if !is_index {
@@ -293,6 +300,10 @@ impl<'a> Cops<'a> {
             return;
         }
         if node.name().as_slice() != b"merge!" {
+            return;
+        }
+        // Upstream matcher is `(send ...)`. `hash&.merge!(a: 1)` must keep `&.`.
+        if node.is_safe_navigation() {
             return;
         }
         if node.block().is_some() {
@@ -450,12 +461,14 @@ fn size_array_receiver(n: &ruby_prism::Node) -> bool {
     }
     let Some(c) = n.as_call_node() else { return false };
     if c.name().as_slice() == b"to_a" {
-        return c.arguments().is_none() && c.block().is_none();
+        // `(call _ :to_a)` accepts `to_a()`; Prism stores empty parens as a wrapper.
+        return arg_count(&c) == 0 && c.block().is_none();
     }
     if c.name().as_slice() == b"[]" {
-        return const_named(c.receiver().as_ref(), b"Array");
+        // `(send (const nil? :Array) :[] _)` — exactly one argument.
+        return const_named(c.receiver().as_ref(), b"Array") && arg_count(&c) == 1;
     }
-    c.receiver().is_none() && c.name().as_slice() == b"Array" && c.arguments().is_some()
+    c.receiver().is_none() && c.name().as_slice() == b"Array" && arg_count(&c) == 1
 }
 
 fn size_hash_receiver(n: &ruby_prism::Node) -> bool {
@@ -464,12 +477,12 @@ fn size_hash_receiver(n: &ruby_prism::Node) -> bool {
     }
     let Some(c) = n.as_call_node() else { return false };
     if c.name().as_slice() == b"to_h" {
-        return c.arguments().is_none() && c.block().is_none();
+        return arg_count(&c) == 0 && c.block().is_none();
     }
     if c.name().as_slice() == b"[]" {
-        return const_named(c.receiver().as_ref(), b"Hash");
+        return const_named(c.receiver().as_ref(), b"Hash") && arg_count(&c) == 1;
     }
-    c.receiver().is_none() && c.name().as_slice() == b"Hash" && c.arguments().is_some()
+    c.receiver().is_none() && c.name().as_slice() == b"Hash" && arg_count(&c) == 1
 }
 
 fn const_named(recv: Option<&ruby_prism::Node>, name: &[u8]) -> bool {
@@ -527,6 +540,10 @@ fn int_value(n: &ruby_prism::Node, src: &[u8]) -> Option<i32> {
         }
     }
     None
+}
+
+fn arg_count(c: &ruby_prism::CallNode) -> usize {
+    c.arguments().map(|a| a.arguments().iter().count()).unwrap_or(0)
 }
 
 fn positional_args(c: &ruby_prism::CallNode) -> usize {
