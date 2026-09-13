@@ -664,7 +664,7 @@ fn deterministic_regex(src: &str) -> bool {
 
 fn interpret_escapes(s: &str) -> String {
     let mut out = String::new();
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
             out.push(c);
@@ -681,14 +681,19 @@ fn interpret_escapes(s: &str) -> String {
             Some('e') => out.push('\u{1b}'),
             Some('\\') => out.push('\\'),
             Some('x') => {
-                let h1 = chars.next();
-                let h2 = chars.next();
-                if let (Some(a), Some(b)) = (h1, h2) {
-                    if let Ok(v) = u8::from_str_radix(&format!("{a}{b}"), 16) {
-                        out.push(v as char);
-                        continue;
+                // Ruby accepts one or two hex digits after `\x`.
+                let mut hex = String::new();
+                if chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                    hex.push(chars.next().unwrap());
+                    if chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+                        hex.push(chars.next().unwrap());
                     }
                 }
+                if let Ok(v) = u8::from_str_radix(&hex, 16) {
+                    out.push(v as char);
+                    continue;
+                }
+                out.push('x');
             }
             Some('u') => {
                 let hex: String = chars.by_ref().take(4).collect();
@@ -708,8 +713,33 @@ fn interpret_escapes(s: &str) -> String {
 
 fn to_string_literal(s: &str) -> String {
     if s.contains('\'') || s.chars().any(|c| c.is_control() || c == '\\') {
-        format!("{s:?}")
+        ruby_inspect(s)
     } else {
         format!("'{s}'")
     }
+}
+
+/// Ruby `String#inspect` spellings for the escapes StringReplacement emits.
+fn ruby_inspect(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{b}' => out.push_str("\\v"),
+            '\u{c}' => out.push_str("\\f"),
+            '\u{1b}' => out.push_str("\\e"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\x{:02X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

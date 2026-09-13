@@ -7793,9 +7793,10 @@ mod tests {
         let r = lint_all("'abc'.gsub(/\\e/, ',')\n", &sr);
         assert_eq!(r.offenses.len(), 1);
         assert_eq!(apply_fixes("'abc'.gsub(/\\e/, ',')\n", r.fixes), "'abc'.tr(\"\\e\", ',')\n");
+        // `/\b/` is a word-boundary assertion, not backspace; use `\x08`.
         for (pat, lit) in [
             ("\\a", "\\a"),
-            ("\\b", "\\b"),
+            ("\\x08", "\\b"),
             ("\\f", "\\f"),
             ("\\v", "\\v"),
         ] {
