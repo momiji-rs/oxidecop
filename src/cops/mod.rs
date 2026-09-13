@@ -7651,6 +7651,7 @@ mod tests {
 
         let dt = perf("Performance/Detect:\n  Enabled: true\n");
         assert_eq!(offenses("obj.select(flag) { |x| x }.first\n", &dt), vec![]);
+        assert_eq!(offenses("items.select { true }&.first\n", &dt), vec![]);
         let dt_detect = perf(
             "Performance/Detect:\n  Enabled: true\nStyle/CollectionMethods:\n  detect: detect\n",
         );
@@ -7662,12 +7663,19 @@ mod tests {
         let r = lint_all("'abc'.gsub('a', 'é')\n", &sr);
         assert_eq!(r.offenses.len(), 1);
         assert_eq!(apply_fixes("'abc'.gsub('a', 'é')\n", r.fixes), "'abc'.tr('a', 'é')\n");
+        let r = lint_all("'abc'.gsub(Regexp.new('a'), '1')\n", &sr);
+        assert_eq!(r.offenses.len(), 1);
+        assert_eq!(apply_fixes("'abc'.gsub(Regexp.new('a'), '1')\n", r.fixes), "'abc'.tr('a', '1')\n");
+        let r = lint_all("'abc'.gsub(Regexp.compile('a'), '')\n", &sr);
+        assert_eq!(apply_fixes("'abc'.gsub(Regexp.compile('a'), '')\n", r.fixes), "'abc'.delete('a')\n");
 
         let mg = perf("Performance/RedundantMerge:\n  Enabled: true\n");
         assert_eq!(offenses("hash.merge!(a: 1) { |_, o, n| n }\n", &mg), vec![]);
         assert_eq!(offenses("items.map { hash.merge!(a: 1) }\n", &mg), vec![]);
         assert_eq!(offenses("result = (hash.merge!(a: 1))\n", &mg), vec![]);
         assert_eq!(offenses("({}).merge!(a: 1, b: 2)\n", &mg).len(), 1);
+        assert_eq!(offenses("hash&.merge!(a: 1)\n", &mg), vec![]);
+        assert_eq!(offenses("({ key: build() }).merge!(a: 1, b: 2)\n", &mg), vec![]);
         let r = lint_all("hash = {}\nhash.merge!(a: 1, b: 2) if cond\n", &mg);
         assert_eq!(r.offenses.len(), 1, "modifier two-pair merge");
         assert!(!r.offenses[0].correctable);

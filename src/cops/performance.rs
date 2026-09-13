@@ -436,11 +436,19 @@ fn receiver_pure(recv: &ruby_prism::Node) -> bool {
         || recv.as_float_node().is_some()
         || recv.as_string_node().is_some()
         || recv.as_symbol_node().is_some()
-        || recv.as_hash_node().is_some()
-        || recv.as_array_node().is_some()
-        || recv.as_range_node().is_some()
     {
         return true;
+    }
+    if let Some(h) = recv.as_hash_node() {
+        return h.elements().iter().all(|e| assoc_pure(&e));
+    }
+    if let Some(a) = recv.as_array_node() {
+        return a.elements().iter().all(|e| receiver_pure(&e));
+    }
+    if let Some(r) = recv.as_range_node() {
+        let left = r.left().is_none_or(|n| receiver_pure(&n));
+        let right = r.right().is_none_or(|n| receiver_pure(&n));
+        return left && right;
     }
     if let Some(p) = recv.as_parentheses_node() {
         let Some(body) = p.body() else { return false };
@@ -450,6 +458,13 @@ fn receiver_pure(recv: &ruby_prism::Node) -> bool {
             return it.next().is_none() && receiver_pure(&first);
         }
         return receiver_pure(&body);
+    }
+    false
+}
+
+fn assoc_pure(n: &ruby_prism::Node) -> bool {
+    if let Some(a) = n.as_assoc_node() {
+        return receiver_pure(&a.key()) && receiver_pure(&a.value());
     }
     false
 }
@@ -611,7 +626,10 @@ fn first_pattern_source(n: &ruby_prism::Node, src: &[u8]) -> Option<(String, (bo
     if it.next().is_some() {
         return None;
     }
-    first_pattern_source(&first, src)
+    // Recurse for the pattern text/options, but the constructor itself is a
+    // regexp source so autocorrect can replace `Regexp.new('a')` with `'a'`.
+    let (src_text, (_inner_regex, has_options)) = first_pattern_source(&first, src)?;
+    Some((src_text, (true, has_options)))
 }
 
 fn deterministic_regex(src: &str) -> bool {
