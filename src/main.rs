@@ -172,6 +172,14 @@ fn detect_target_ruby(dir: &Path) -> Option<String> {
     None
 }
 
+/// Whether `AllCops: Exclude` skips `rel`. `explicit` marks a path NAMED on the
+/// command line: rubocop inspects those even when Exclude matches (skipping them
+/// needs `--force-exclusion`, which we don't have) — verified against rubocop
+/// 1.86.0 with rubocop-rails loaded, 2026-09-14. Only walked files are filtered.
+fn excluded_by_all_cops(rel: &str, explicit: bool, excludes: &[regex::Regex]) -> bool {
+    !explicit && excludes.iter().any(|re| re.is_match(rel))
+}
+
 /// The effective config for `path`: its `inherit_from`/`inherit_gem` chain,
 /// then the plugin gems' core-cop defaults layered underneath the whole chain
 /// (a plugin named by an inherited file counts as loaded, so this can only run
@@ -359,11 +367,13 @@ fn main() {
     let includes = cfg.include_matchers();
     let cfg_dirs = std::sync::Mutex::new(std::collections::HashSet::new());
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut explicit: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for p in &paths {
         // an explicitly named file is linted regardless of extension
         if p.is_dir() {
             files.extend(collect_files(p, 0, &includes, &cfg_dirs));
         } else {
+            explicit.insert(p.clone());
             files.push(p.clone());
         }
     }
@@ -376,7 +386,7 @@ fn main() {
     if !excludes.is_empty() {
         files.retain(|f| {
             let rel = f.strip_prefix("./").unwrap_or(f).to_string_lossy().replace('\\', "/");
-            !excludes.iter().any(|re| re.is_match(&rel))
+            !excluded_by_all_cops(&rel, explicit.contains(f), &excludes)
         });
     }
 
@@ -483,7 +493,7 @@ fn main() {
                     let rel = f.strip_prefix(dir).unwrap_or(f).to_string_lossy().replace('\\', "/");
                     // the nested config's own AllCops Exclude (root excludes
                     // were applied during collection)
-                    if ex.iter().any(|re| re.is_match(&rel)) {
+                    if excluded_by_all_cops(&rel, explicit.contains(f), ex) {
                         return (display, Vec::new());
                     }
                     (c, e, rel)
@@ -742,5 +752,17 @@ mod tests {
         assert_eq!(cfg.param("Metrics/BlockLength", "Max"), Some("40"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rubocop-rails excludes `log/**/*` through AllCops, so the walk must skip
+    /// it — but a file named on the command line is inspected anyway.
+    #[test]
+    fn command_line_files_bypass_all_cops_exclude() {
+        let mut cfg = config::Config::parse("plugins: rubocop-rails\n");
+        cfg.apply_plugin_defaults();
+        let excludes = cfg.exclude_matchers();
+        assert!(excluded_by_all_cops("log/a.rb", false, &excludes));
+        assert!(!excluded_by_all_cops("log/a.rb", true, &excludes));
+        assert!(!excluded_by_all_cops("app/models/a.rb", false, &excludes));
     }
 }
