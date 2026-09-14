@@ -52,9 +52,9 @@ pub enum InheritMode {
 }
 pub use crate::plugin_config_gen::PLUGIN_CONFIGS;
 
-/// The plugin config a `plugins:`/`require:` entry loads, if we carry one.
-fn plugin_config(name: &str) -> Option<&'static PluginConfig> {
-    PLUGIN_CONFIGS.iter().find(|p| p.names.contains(&name))
+/// The plugin config a `plugins:`/`require:` entry loads, if the table has one.
+fn plugin_config<'a>(table: &'a [PluginConfig], name: &str) -> Option<&'a PluginConfig> {
+    table.iter().find(|p| p.names.contains(&name))
 }
 
 pub fn schema(cop: &str) -> Option<&'static Schema> {
@@ -422,10 +422,15 @@ impl Config {
     /// `Enabled` is deliberately not carried (see `tools/gen_plugin_config.rb`),
     /// so `DisabledByDefault` needs no recomputing here.
     pub fn apply_plugin_defaults(&mut self) {
+        self.apply_plugin_layer(PLUGIN_CONFIGS);
+    }
+    /// `apply_plugin_defaults` against an explicit table, so the fold rules can
+    /// be tested on plugin combinations the installed gems don't happen to form.
+    fn apply_plugin_layer(&mut self, table: &[PluginConfig]) {
         // The plugin layer, folded in `plugins:` order so "first-in wins" holds.
         let mut layer: Vec<(&'static str, &'static str, String, InheritMode)> = Vec::new();
         for name in self.plugins.iter().chain(self.requires.iter()) {
-            let Some(pc) = plugin_config(name.trim()) else { continue };
+            let Some(pc) = plugin_config(table, name.trim()) else { continue };
             for &(section, key, value, mode) in pc.entries {
                 let Some(slot) = layer.iter_mut().find(|(s, k, _, _)| *s == section && *k == key)
                 else {
@@ -945,6 +950,164 @@ mod tests {
         base.merge_child(Config::parse("Metrics/BlockLength:\n  Max: 40\n"));
         base.apply_plugin_defaults();
         assert!(excluded(&base, "Metrics/BlockLength", "spec/models/user_spec.rb"));
+    }
+
+    #[test]
+    fn applying_the_plugin_layer_twice_is_idempotent() {
+        // The runner calls it once per config, but a merge-mode union that ran
+        // twice would silently double a list; assert it can't.
+        let once = with_plugins("plugins:\n  - rubocop-rails\n  - rubocop-rspec\n");
+        let mut twice = with_plugins("plugins:\n  - rubocop-rails\n  - rubocop-rspec\n");
+        twice.apply_plugin_defaults();
+        assert_eq!(once.identity(), twice.identity());
+    }
+
+    #[test]
+    fn flow_sequence_plugins_load_every_gem() {
+        let cfg = with_plugins("plugins: [rubocop-rails, rubocop-rspec]\n");
+        assert!(cfg.active_support());
+        assert!(excluded(&cfg, "Metrics/BlockLength", "spec/models/user_spec.rb"));
+        // a bare comma list is a plain YAML scalar, not a sequence — rubocop
+        // would fail to require it, and we must not read it as two gems
+        assert!(!with_plugins("plugins: rubocop-rails, rubocop-rspec\n").active_support());
+    }
+
+    #[test]
+    fn plugins_declared_by_the_child_config_apply() {
+        // The inverse of plugins_from_an_inherited_config_still_apply: the base
+        // is the inherited file and the project's own config names the gem.
+        let mut base = Config::parse("Metrics/BlockLength:\n  Max: 40\n");
+        base.merge_child(Config::parse("plugins: rubocop-rspec\n"));
+        base.apply_plugin_defaults();
+        assert!(excluded(&base, "Metrics/BlockLength", "spec/models/user_spec.rb"));
+    }
+
+    #[test]
+    fn merge_child_takes_the_childs_exclude_when_the_base_has_none() {
+        let mut base = Config::parse("Metrics/BlockLength:\n  Max: 40\n");
+        base.merge_child(Config::parse("Metrics/BlockLength:\n  Exclude:\n    - tmp/**/*\n"));
+        assert!(excluded(&base, "Metrics/BlockLength", "tmp/a.rb"));
+        // and an empty child list must not wipe the base's globs
+        let mut base = Config::parse("AllCops:\n  Exclude:\n    - vendor/**/*\n");
+        base.merge_child(Config::parse("AllCops:\n  Exclude: []\n"));
+        assert!(excluded(&base, "AllCops", "vendor/bundle/x.rb"));
+    }
+
+    #[test]
+    fn union_list_values_dedupes_and_keeps_base_order() {
+        let got = parse_allowed_list(&union_list_values(
+            &encode_list(&["a".into(), "b".into()]),
+            "['b', 'c']",
+        ));
+        assert_eq!(got, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        // an empty side on either end contributes nothing
+        assert_eq!(parse_allowed_list(&union_list_values("[]", "['a']")), vec!["a".to_string()]);
+        assert_eq!(parse_allowed_list(&union_list_values("['a']", "[]")), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn encoded_lists_survive_items_holding_quotes() {
+        // Why the accumulator form and not the flow form: rubocop configs really
+        // do exclude paths through `!ruby/regexp` patterns containing quotes.
+        let items = vec!["a's.rb".to_string(), "\"b\".rb".to_string()];
+        assert_eq!(parse_allowed_list(&encode_list(&items)), items);
+    }
+
+    // A synthetic table: the installed gems never both configure the same key,
+    // so the cross-plugin fold rules need combinations only a fixture can form.
+    const FAKE_PLUGINS: &[PluginConfig] = &[
+        PluginConfig {
+            names: &["fake-one"],
+            entries: &[
+                ("AllCops", "Exclude", "['one/**/*']", InheritMode::Override),
+                ("AllCops", "TargetRubyVersion", "3.1", InheritMode::Override),
+                ("Metrics/BlockLength", "Exclude", "['one_spec.rb']", InheritMode::Merge),
+                ("Style/AndOr", "EnforcedStyle", "always", InheritMode::Override),
+            ],
+        },
+        PluginConfig {
+            names: &["fake-two"],
+            entries: &[
+                ("AllCops", "Exclude", "['two/**/*', 'one/**/*']", InheritMode::Override),
+                ("AllCops", "TargetRubyVersion", "3.4", InheritMode::Override),
+                ("Metrics/BlockLength", "Exclude", "['two_spec.rb']", InheritMode::Merge),
+                ("Style/AndOr", "EnforcedStyle", "conditionals", InheritMode::Override),
+            ],
+        },
+    ];
+
+    fn with_fake_plugins(text: &str) -> Config {
+        let mut cfg = Config::parse(text);
+        cfg.apply_plugin_layer(FAKE_PLUGINS);
+        cfg
+    }
+
+    #[test]
+    fn all_cops_lists_union_across_plugins() {
+        let cfg = with_fake_plugins("plugins:\n  - fake-one\n  - fake-two\n");
+        assert!(excluded(&cfg, "AllCops", "one/a.rb"));
+        assert!(excluded(&cfg, "AllCops", "two/a.rb"));
+        assert_eq!(
+            parse_allowed_list(cfg.get("AllCops", "Exclude").unwrap()),
+            vec!["one/**/*".to_string(), "two/**/*".to_string()]
+        );
+    }
+
+    #[test]
+    fn all_cops_scalars_keep_the_first_plugins_value() {
+        // rubocop's merge_all_cop_settings is first-in-wins for scalars, so the
+        // order of `plugins:` decides — assert both directions.
+        let cfg = with_fake_plugins("plugins:\n  - fake-one\n  - fake-two\n");
+        assert_eq!(cfg.get("AllCops", "TargetRubyVersion"), Some("3.1"));
+        let cfg = with_fake_plugins("plugins:\n  - fake-two\n  - fake-one\n");
+        assert_eq!(cfg.get("AllCops", "TargetRubyVersion"), Some("3.4"));
+    }
+
+    #[test]
+    fn merge_mode_params_union_across_plugins_and_with_the_core_default() {
+        let cfg = with_fake_plugins("plugins:\n  - fake-one\n  - fake-two\n");
+        let got = parse_allowed_list(cfg.get("Metrics/BlockLength", "Exclude").unwrap());
+        assert!(got.contains(&"one_spec.rb".to_string()));
+        assert!(got.contains(&"two_spec.rb".to_string()));
+        assert!(got.contains(&"**/*.gemspec".to_string()), "core default lost: {got:?}");
+    }
+
+    #[test]
+    fn override_params_let_the_last_plugin_win() {
+        // Not AllCops, so merge_all_cop_settings does not apply: a later plugin
+        // simply overwrites the earlier one in the default layer.
+        let cfg = with_fake_plugins("plugins:\n  - fake-one\n  - fake-two\n");
+        assert_eq!(cfg.get("Style/AndOr", "EnforcedStyle"), Some("conditionals"));
+        let cfg = with_fake_plugins("plugins:\n  - fake-two\n  - fake-one\n");
+        assert_eq!(cfg.get("Style/AndOr", "EnforcedStyle"), Some("always"));
+    }
+
+    #[test]
+    fn generated_plugin_configs_stay_within_core() {
+        // Guards a regeneration: tools/gen_plugin_config.rb must keep the table
+        // to AllCops plus core departments, and must never carry `Enabled`.
+        const CORE: &[&str] = &[
+            "Bundler", "Gemspec", "Layout", "Lint", "Metrics", "Migration", "Naming", "Security",
+            "Style",
+        ];
+        for pc in PLUGIN_CONFIGS {
+            assert!(pc.names[0].starts_with("rubocop-"), "{:?}", pc.names);
+            assert!(!pc.entries.is_empty(), "{} has no entries", pc.names[0]);
+            let mut seen: Vec<(&str, &str)> = Vec::new();
+            for &(section, key, value, mode) in pc.entries {
+                assert!(
+                    section == "AllCops" || CORE.contains(&section.split('/').next().unwrap()),
+                    "{section} is not core"
+                );
+                assert_ne!(key, "Enabled", "{section} carries Enabled");
+                assert!(seen.iter().all(|s| *s != (section, key)), "duplicate {section} {key}");
+                assert!(
+                    mode == InheritMode::Override || is_list_value(value),
+                    "{section} {key} merges a non-list value"
+                );
+                seen.push((section, key));
+            }
+        }
     }
 
     #[test]

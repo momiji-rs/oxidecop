@@ -714,3 +714,33 @@ fn print_json(results: &[(String, Vec<cops::Offense>)], cfg: &config::Config) {
         n = results.len()
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runner's own plumbing: a plugin named by an INHERITED file must
+    /// still contribute its core-cop defaults, which only holds because
+    /// `load_config` applies the layer after the whole chain has merged.
+    #[test]
+    fn load_config_applies_plugins_named_by_an_inherited_file() {
+        let dir = std::env::temp_dir().join(format!("oxidecop-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("base.yml"), "plugins: rubocop-rspec\n").unwrap();
+        std::fs::write(
+            dir.join(".rubocop.yml"),
+            "inherit_from: base.yml\nMetrics/BlockLength:\n  Max: 40\n",
+        )
+        .unwrap();
+
+        let cfg = load_config(&dir.join(".rubocop.yml"));
+        let excluded = |path: &str| {
+            cfg.section_exclude_matchers("Metrics/BlockLength").iter().any(|re| re.is_match(path))
+        };
+        assert!(excluded("spec/models/user_spec.rb"));
+        assert!(!excluded("app/models/user.rb"));
+        assert_eq!(cfg.param("Metrics/BlockLength", "Max"), Some("40"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
