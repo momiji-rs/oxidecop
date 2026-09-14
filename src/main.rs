@@ -11,6 +11,7 @@ mod config;
 mod cops;
 mod declarative;
 mod nodepattern;
+mod plugin_config_gen;
 mod schema_gen;
 
 use rayon::prelude::*;
@@ -171,6 +172,16 @@ fn detect_target_ruby(dir: &Path) -> Option<String> {
     None
 }
 
+/// The effective config for `path`: its `inherit_from`/`inherit_gem` chain,
+/// then the plugin gems' core-cop defaults layered underneath the whole chain
+/// (a plugin named by an inherited file counts as loaded, so this can only run
+/// once the chain is resolved).
+fn load_config(path: &Path) -> config::Config {
+    let mut cfg = load_config_chain(path, 0);
+    cfg.apply_plugin_defaults();
+    cfg
+}
+
 /// Load a config honoring `inherit_from` (base files first, child overrides;
 /// Exclude lists merge), recursively with a depth cap.
 fn load_config_chain(path: &Path, depth: usize) -> config::Config {
@@ -308,7 +319,7 @@ fn main() {
     }
 
     let cfg_file = cfg_path.clone().unwrap_or_else(|| ".rubocop.yml".to_string());
-    let mut cfg = load_config_chain(Path::new(&cfg_file), 0);
+    let mut cfg = load_config(Path::new(&cfg_file));
     // rubocop's TargetRuby source chain when the config doesn't pin it:
     // .ruby-version -> .tool-versions -> *.gemspec required_ruby_version
     // (BundlerLockFile omitted), else the 2.7 default in Config::target_ruby.
@@ -436,7 +447,7 @@ fn main() {
                             && dir.join(".rubocop.yml").is_file())
                     {
                         let cf = dir.join(".rubocop.yml");
-                        let mut sub = load_config_chain(&cf, 0);
+                        let mut sub = load_config(&cf);
                         sub.only = cfg.only.clone();
                         sub.except = cfg.except.clone();
                         let e = cops::Engine::new(&sub);

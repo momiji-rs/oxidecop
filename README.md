@@ -95,6 +95,14 @@ trailers), and `TargetRubyVersion`. Parameter defaults for **all 606 cops**
 are generated from RuboCop's own `config/default.yml` into one schema table,
 so a newly ported cop's defaults are already correct.
 
+`plugins:` / `require:` also apply the named gem's own `default.yml` overrides
+of **core** cops and the `AllCops` flags it sets — `rubocop-rspec` exempting
+specs from `Metrics/BlockLength`, `rubocop-rails` turning on
+`ActiveSupportExtensionsEnabled`, and so on. Without this a Rails+RSpec tree
+reports thousands of offenses RuboCop never would. That layer is generated
+from the installed gems by `tools/gen_plugin_config.rb`; the plugins' own cops
+are still out of scope.
+
 A result cache (stat-keyed, content-hash fallback) makes unchanged-tree reruns
 ~2× faster; `--cache false` disables it.
 
@@ -103,6 +111,7 @@ A result cache (stat-keyed, content-hash fallback) makes unchanged-tree reruns
 ```
 src/main.rs            the runner: argv, file/config discovery, output, --fix loop
 src/config.rs          .rubocop.yml subset + the generated per-cop SCHEMA
+src/plugin_config_gen.rs  the plugin gems' core-cop defaults (generated)
 src/declarative.rs     the DECLARATIVE pattern-cop table (node-pattern rows)
 src/nodepattern.rs     RuboCop's node-pattern DSL, parsed and matched over Prism
 src/cops/              the visitor + per-department cop logic
