@@ -7862,4 +7862,49 @@ mod tests {
         let nilmax = perf("Performance/RedundantMerge:\n  Enabled: true\n  MaxKeyValuePairs: nil\n");
         assert_eq!(offenses("hash = {}\nhash.merge!(a: 1, b: 2, c: 3)\n", &nilmax), vec![]);
     }
+
+    // ---- the plugin gems' core-cop defaults, end to end through the Engine ----
+
+    /// Like `offenses`, but with the plugin layer folded in and a chosen path —
+    /// the two inputs a plugin default.yml can change the outcome through.
+    fn plugin_offenses(src: &str, cfg: &str, path: &str) -> Vec<&'static str> {
+        let mut cfg = Config::parse(cfg);
+        cfg.apply_plugin_defaults();
+        let eng = Engine::new(&cfg);
+        lint(src.as_bytes(), &cfg, &eng, path).offenses.iter().map(|o| o.cop).collect()
+    }
+
+    #[test]
+    fn rspec_plugin_exempts_specs_from_block_length() {
+        let cfg = "AllCops:\n  DisabledByDefault: true\nMetrics/BlockLength:\n  Enabled: true\n";
+        let src = format!("describe Foo do\n{}end\n", "  x = 1\n".repeat(30));
+        assert_eq!(plugin_offenses(&src, cfg, "spec/models/user_spec.rb"), vec!["Metrics/BlockLength"]);
+        let with_rspec = format!("plugins: rubocop-rspec\n{cfg}");
+        assert_eq!(plugin_offenses(&src, &with_rspec, "spec/models/user_spec.rb"), Vec::<&str>::new());
+        // the exemption is path-scoped: the same block in app/ still offends
+        assert_eq!(plugin_offenses(&src, &with_rspec, "app/models/user.rb"), vec!["Metrics/BlockLength"]);
+    }
+
+    #[test]
+    fn rails_plugin_gates_symbol_proc_through_active_support() {
+        let cfg = "AllCops:\n  DisabledByDefault: true\nStyle/SymbolProc:\n  Enabled: true\n";
+        let with_rails = format!("plugins: rubocop-rails\n{cfg}");
+        // ActiveSupportExtensionsEnabled: `lambda`/`proc` blocks stop being
+        // candidates, and AllowedMethods gains `mail`
+        assert_eq!(plugin_offenses("lambda { |a| a.to_s }\n", cfg, "a.rb"), vec!["Style/SymbolProc"]);
+        assert_eq!(plugin_offenses("lambda { |a| a.to_s }\n", &with_rails, "a.rb"), Vec::<&str>::new());
+        assert_eq!(plugin_offenses("mail { |a| a.to_s }\n", cfg, "a.rb"), vec!["Style/SymbolProc"]);
+        assert_eq!(plugin_offenses("mail { |a| a.to_s }\n", &with_rails, "a.rb"), Vec::<&str>::new());
+        // unrelated blocks are untouched either way
+        assert_eq!(plugin_offenses("x.map { |a| a.to_s }\n", &with_rails, "a.rb"), vec!["Style/SymbolProc"]);
+    }
+
+    #[test]
+    fn rails_plugin_exempts_controllers_from_useless_method_definition() {
+        let cfg = "plugins: rubocop-rails\nAllCops:\n  DisabledByDefault: true\n\
+                   Lint/UselessMethodDefinition:\n  Enabled: true\n";
+        let src = "class FooController\n  def show\n    super\n  end\nend\n";
+        assert_eq!(plugin_offenses(src, cfg, "app/controllers/foo_controller.rb"), Vec::<&str>::new());
+        assert_eq!(plugin_offenses(src, cfg, "app/models/foo.rb"), vec!["Lint/UselessMethodDefinition"]);
+    }
 }

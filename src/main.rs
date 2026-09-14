@@ -11,6 +11,7 @@ mod config;
 mod cops;
 mod declarative;
 mod nodepattern;
+mod plugin_config_gen;
 mod schema_gen;
 
 use rayon::prelude::*;
@@ -171,6 +172,24 @@ fn detect_target_ruby(dir: &Path) -> Option<String> {
     None
 }
 
+/// Whether `AllCops: Exclude` skips `rel`. `explicit` marks a path NAMED on the
+/// command line: rubocop inspects those even when Exclude matches (skipping them
+/// needs `--force-exclusion`, which we don't have) — verified against rubocop
+/// 1.86.0 with rubocop-rails loaded, 2026-09-14. Only walked files are filtered.
+fn excluded_by_all_cops(rel: &str, explicit: bool, excludes: &[regex::Regex]) -> bool {
+    !explicit && excludes.iter().any(|re| re.is_match(rel))
+}
+
+/// The effective config for `path`: its `inherit_from`/`inherit_gem` chain,
+/// then the plugin gems' core-cop defaults layered underneath the whole chain
+/// (a plugin named by an inherited file counts as loaded, so this can only run
+/// once the chain is resolved).
+fn load_config(path: &Path) -> config::Config {
+    let mut cfg = load_config_chain(path, 0);
+    cfg.apply_plugin_defaults();
+    cfg
+}
+
 /// Load a config honoring `inherit_from` (base files first, child overrides;
 /// Exclude lists merge), recursively with a depth cap.
 fn load_config_chain(path: &Path, depth: usize) -> config::Config {
@@ -308,7 +327,7 @@ fn main() {
     }
 
     let cfg_file = cfg_path.clone().unwrap_or_else(|| ".rubocop.yml".to_string());
-    let mut cfg = load_config_chain(Path::new(&cfg_file), 0);
+    let mut cfg = load_config(Path::new(&cfg_file));
     // rubocop's TargetRuby source chain when the config doesn't pin it:
     // .ruby-version -> .tool-versions -> *.gemspec required_ruby_version
     // (BundlerLockFile omitted), else the 2.7 default in Config::target_ruby.
@@ -348,11 +367,13 @@ fn main() {
     let includes = cfg.include_matchers();
     let cfg_dirs = std::sync::Mutex::new(std::collections::HashSet::new());
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut explicit: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for p in &paths {
         // an explicitly named file is linted regardless of extension
         if p.is_dir() {
             files.extend(collect_files(p, 0, &includes, &cfg_dirs));
         } else {
+            explicit.insert(p.clone());
             files.push(p.clone());
         }
     }
@@ -365,7 +386,7 @@ fn main() {
     if !excludes.is_empty() {
         files.retain(|f| {
             let rel = f.strip_prefix("./").unwrap_or(f).to_string_lossy().replace('\\', "/");
-            !excludes.iter().any(|re| re.is_match(&rel))
+            !excluded_by_all_cops(&rel, explicit.contains(f), &excludes)
         });
     }
 
@@ -436,7 +457,7 @@ fn main() {
                             && dir.join(".rubocop.yml").is_file())
                     {
                         let cf = dir.join(".rubocop.yml");
-                        let mut sub = load_config_chain(&cf, 0);
+                        let mut sub = load_config(&cf);
                         sub.only = cfg.only.clone();
                         sub.except = cfg.except.clone();
                         let e = cops::Engine::new(&sub);
@@ -472,7 +493,7 @@ fn main() {
                     let rel = f.strip_prefix(dir).unwrap_or(f).to_string_lossy().replace('\\', "/");
                     // the nested config's own AllCops Exclude (root excludes
                     // were applied during collection)
-                    if ex.iter().any(|re| re.is_match(&rel)) {
+                    if excluded_by_all_cops(&rel, explicit.contains(f), ex) {
                         return (display, Vec::new());
                     }
                     (c, e, rel)
@@ -702,4 +723,46 @@ fn print_json(results: &[(String, Vec<cops::Offense>)], cfg: &config::Config) {
         files.join(","),
         n = results.len()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runner's own plumbing: a plugin named by an INHERITED file must
+    /// still contribute its core-cop defaults, which only holds because
+    /// `load_config` applies the layer after the whole chain has merged.
+    #[test]
+    fn load_config_applies_plugins_named_by_an_inherited_file() {
+        let dir = std::env::temp_dir().join(format!("oxidecop-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("base.yml"), "plugins: rubocop-rspec\n").unwrap();
+        std::fs::write(
+            dir.join(".rubocop.yml"),
+            "inherit_from: base.yml\nMetrics/BlockLength:\n  Max: 40\n",
+        )
+        .unwrap();
+
+        let cfg = load_config(&dir.join(".rubocop.yml"));
+        let excluded = |path: &str| {
+            cfg.section_exclude_matchers("Metrics/BlockLength").iter().any(|re| re.is_match(path))
+        };
+        assert!(excluded("spec/models/user_spec.rb"));
+        assert!(!excluded("app/models/user.rb"));
+        assert_eq!(cfg.param("Metrics/BlockLength", "Max"), Some("40"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rubocop-rails excludes `log/**/*` through AllCops, so the walk must skip
+    /// it — but a file named on the command line is inspected anyway.
+    #[test]
+    fn command_line_files_bypass_all_cops_exclude() {
+        let mut cfg = config::Config::parse("plugins: rubocop-rails\n");
+        cfg.apply_plugin_defaults();
+        let excludes = cfg.exclude_matchers();
+        assert!(excluded_by_all_cops("log/a.rb", false, &excludes));
+        assert!(!excluded_by_all_cops("log/a.rb", true, &excludes));
+        assert!(!excluded_by_all_cops("app/models/a.rb", false, &excludes));
+    }
 }
